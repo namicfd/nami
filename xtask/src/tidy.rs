@@ -165,7 +165,8 @@ fn density_violations(stats_by_crate: &BTreeMap<PathBuf, AssertionStats>) -> Vec
     violations
 }
 
-/// Lists every file below `root`, skipping build output and docs, in sorted order.
+/// Lists every file below `root`, skipping build output, docs and nested checkouts (git
+/// worktrees such as `.claude/worktrees/*`), in sorted order.
 fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut pending = vec![root.to_path_buf()];
     let mut found = Vec::new();
@@ -188,7 +189,9 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn is_skipped(directory: &Path) -> bool {
     let name = directory.file_name().map(|name| name.to_string_lossy());
-    name.is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name.as_ref()))
+    let is_listed = name.is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name.as_ref()));
+    // A nested `.git` (a directory, or the file a worktree has) marks another checkout.
+    is_listed || directory.join(".git").exists()
 }
 
 #[cfg(test)]
@@ -221,6 +224,10 @@ mod tests {
         let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
         std::fs::write(source.join("lib.rs"), unasserted).unwrap();
         std::fs::write(root.join("target/ignored/skipped.rs"), "fn a() { loop {} }").unwrap();
+        let worktree = root.join(".claude/worktrees/other");
+        std::fs::create_dir_all(worktree.join("crates/old/src")).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+        std::fs::write(worktree.join("crates/old/src/lib.rs"), "fn a() { loop {} }").unwrap();
         std::fs::write(source.join("a.snap.new"), "").unwrap();
         let violations = check(&root).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
