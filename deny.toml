@@ -19,8 +19,8 @@ confidence-threshold = 0.8
 exceptions = []
 
 [licenses.private]
-# nami's own crates are unpublished (`publish = false`).
-ignore = true
+# nami's own crates are checked too: they are MIT.
+ignore = false
 registries = []
 
 [bans]

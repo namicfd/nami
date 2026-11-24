@@ -1,6 +1,6 @@
 # ADR-0003: Kernel crate, static allocation and data access
 
-- Status: Accepted (amendment proposed in ADR-0013)
+- Status: Accepted (amended by ADR-0013)
 - Date: 2026-11-24
 - Deciders: maintainer
 

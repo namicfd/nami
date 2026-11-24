@@ -1,6 +1,6 @@
 # ADR-0013: Lint table refinements from the first scaffold
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0003, ADR-0006
