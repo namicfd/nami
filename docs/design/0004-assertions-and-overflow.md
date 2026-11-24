@@ -1,6 +1,6 @@
 # ADR-0004: Assertions, overflow checks and build profiles
 
-- Status: Accepted (amendment proposed in ADR-0014)
+- Status: Accepted (amended by ADR-0014)
 - Date: 2026-11-24
 - Deciders: maintainer
 
