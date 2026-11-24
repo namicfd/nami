@@ -1,0 +1,7 @@
+[alias]
+xtask = "run --quiet --locked --package xtask --"
+
+# Hardware FMA for explicit `mul_add` on x86_64 CI and release builds (ADR-0005).
+# The target CPU changes speed, not results: rustc never contracts a*b+c on its own.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

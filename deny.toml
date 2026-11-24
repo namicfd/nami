@@ -1,0 +1,52 @@
+# Supply-chain policy (ADR-0001). Code-owned (ADR-0008).
+# Adding a crate to `bans.allow` requires an ADR approved by a human.
+
+[graph]
+targets = []
+all-features = true
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = []
+
+[licenses]
+# Licenses of allowed third-party crates.
+allow = ["MIT"]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+# nami's own crates are unpublished (`publish = false`).
+ignore = true
+registries = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# Every third-party crate in the graph, including dev and transitive dependencies (ADR-0001).
+# Anything not listed here fails the check. WARNING: an empty list allows everything, so this
+# list must never become empty.
+allow = [
+  "libm",
+]
+allow-workspace = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

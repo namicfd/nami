@@ -1,0 +1,30 @@
+# Paths that always need maintainer review (ADR-0008).
+# Effective once the repo is on GitHub with code-owner review required (ADR-0009).
+
+# Manifests, lockfile and tool configuration.
+/Cargo.toml                @cxkoda
+**/Cargo.toml              @cxkoda
+/Cargo.lock                @cxkoda
+/deny.toml                 @cxkoda
+/clippy.toml               @cxkoda
+/rustfmt.toml              @cxkoda
+/rust-toolchain.toml       @cxkoda
+/.cargo/                   @cxkoda
+/.config/                  @cxkoda
+
+# Tooling and automation.
+/xtask/                    @cxkoda
+/lints/                    @cxkoda
+/justfile                  @cxkoda
+/.github/                  @cxkoda
+/.claude/                  @cxkoda
+
+# Agent instructions and policy.
+/AGENTS.md                 @cxkoda
+/CLAUDE.md                 @cxkoda
+/docs/design/              @cxkoda
+/docs/TIGER_STYLE.md       @cxkoda
+
+# Numerical oracles, generators and reference data (ADR-0007).
+/crates/nami-oracle/       @cxkoda
+/tools/                    @cxkoda

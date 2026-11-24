@@ -1,0 +1,8 @@
+# Stable rustfmt options only, so that formatting never needs a nightly toolchain.
+# 100 columns: two copies of the code side by side on one screen (TIGER_STYLE.md).
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+# Use the full width before wrapping (TIGER_STYLE.md: "Use it up. Never go beyond.").
+use_small_heuristics = "Max"

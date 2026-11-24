@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+# The only runtime dependency nami may have (ADR-0001). Pinned exactly.
+[workspace.dependencies]
+libm = { version = "=0.2.16", default-features = false, features = ["arch"] }
+
+# Build profiles (ADR-0004).
+[profile.release]
+overflow-checks = true
+debug-assertions = false
+
+[profile.release-checked]
+inherits = "release"
+debug-assertions = true
+
+# Lint table (ADR-0006, amended by ADR-0013). Every crate opts in with `[lints] workspace = true`.
+# Warnings are denied in `just` and CI through `-D warnings`, never in source.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_results = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(kani)"] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Panics and error handling.
+unwrap_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+missing_assert_message = "warn"
+# Assertions are programmer-error crashes, not API behaviour; documenting each would be noise.
+missing_panics_doc = "allow"
+
+# Suppressions must be `#[expect(lint, reason = "...")]`.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# Integer width and casts (ADR-0002). Overflow itself is caught by overflow-checks (ADR-0013).
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+
+# Data access (ADR-0003).
+indexing_slicing = "deny"
+missing_asserts_for_indexing = "warn"
+
+# Floating point (ADR-0005).
+float_cmp = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+iter_over_hash_type = "deny"
+
+# Control flow and size (ADR-0006).
+too_many_lines = "deny"
+excessive_nesting = "warn"
+infinite_loop = "warn"
+wildcard_enum_match_arm = "warn"
+shadow_unrelated = "warn"
+
+# Bans configured in clippy.toml. Their reason strings tell you what to use instead.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+disallowed_macros = "deny"
+upper_case_acronyms = "warn"
+
+# Standard mathematical notation: u_l / u_r, rho_l / rho_r, and x, y, u, v, p.
+similar_names = "allow"
+many_single_char_names = "allow"

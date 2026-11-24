@@ -1,0 +1,5 @@
+# Pinned toolchain. Bumping it is a code-owned change and may change output bits (ADR-0005).
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

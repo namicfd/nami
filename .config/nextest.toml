@@ -1,0 +1,7 @@
+# Tests are deterministic (ADR-0005), so a test that passes on retry is a bug, not a flake (ADR-0009).
+[profile.default]
+retries = 0
+status-level = "fail"
+final-status-level = "fail"
+failure-output = "immediate-final"
+slow-timeout = { period = "30s", terminate-after = 4 }

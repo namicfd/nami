@@ -1,0 +1,13 @@
+[package]
+name = "nami-kernels"
+description = "Numerical kernels: no_std, no allocation, bitwise deterministic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+libm.workspace = true
+
+[lints]
+workspace = true
