@@ -16,6 +16,8 @@ const SUM_LANES: usize = 8;
 #[must_use]
 pub fn sum_fixed(values: &[f64]) -> f64 {
     let (chunks, remainder) = values.as_chunks::<SUM_LANES>();
+    assert!(remainder.len() < SUM_LANES, "the remainder is shorter than one chunk");
+    assert_eq!(chunks.len() * SUM_LANES + remainder.len(), values.len(), "chunks cover the input");
     let mut lanes = [0.0_f64; SUM_LANES];
     for chunk in chunks {
         for (lane, &value) in lanes.iter_mut().zip(chunk) {
@@ -49,6 +51,7 @@ pub fn sum_compensated(values: &[f64]) -> f64 {
         }
         sum = total;
     }
+    assert!(compensation.is_finite(), "compensation must be finite");
     let result = sum + compensation;
     assert!(result.is_finite(), "sum must be finite; NaN or overflow is a bug (ADR-0005)");
     result

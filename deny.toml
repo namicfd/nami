@@ -16,7 +16,8 @@ ignore = []
 # Licenses of allowed third-party crates.
 allow = ["MIT"]
 confidence-threshold = 0.8
-exceptions = []
+# Unicode data license, for the tooling-only crate that needs it.
+exceptions = [{ allow = ["Unicode-3.0"], crate = "unicode-ident" }]
 
 [licenses.private]
 # nami's own crates are checked too: they are MIT.
@@ -33,7 +34,13 @@ external-default-features = "allow"
 # Anything not listed here fails the check. WARNING: an empty list allows everything, so this
 # list must never become empty.
 allow = [
+  # Runtime (ADR-0001).
   "libm",
+  # Tooling, xtask only (ADR-0001).
+  "proc-macro2",
+  "quote",
+  "syn",
+  "unicode-ident",
 ]
 allow-workspace = true
 deny = []

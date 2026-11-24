@@ -1,28 +1,37 @@
 //! Tidy: style rules that clippy cannot express (ADR-0006).
 //!
-//! Each rule lives in exactly one tool. Tidy only checks what clippy and rustfmt do not. This
-//! first version is text-based; the syntax-aware rules (function length, assertion density,
-//! bounded loops, `usize` placement) arrive with a `syn`-based pass.
+//! Each rule lives in exactly one tool, so tidy only checks what clippy and rustfmt do not:
+//!
+//! - text rules: line length, debt markers, a goal comment on every test;
+//! - syntax rules: function length, assertion density, bounded loops, `usize` placement, no
+//!   `Default`, no `Vec` fields, no `dyn` or function pointers in kernels, no `async`, no
+//!   `#[ignore]` without a reason;
+//! - workspace rules: runtime dependencies, the ADR index, the `#[expect]` budget, unreviewed
+//!   snapshots.
 //!
 //! Every violation reads `path:line: error[rule]: what; fix (reference)`, so the message tells
 //! the reader how to fix it.
 
+mod rust_source;
+mod text;
+mod workspace;
+
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Maximum line length in Rust sources (`TIGER_STYLE.md`, Style by the numbers).
-const LINE_COLUMNS_MAX: usize = 100;
+pub use rust_source::AssertionStats;
 
 /// Upper bound on directories visited, so the walk is bounded (`TIGER_STYLE.md`, Limits).
 const DIRECTORIES_MAX: u32 = 100_000;
 
-/// Directories that tidy never enters.
+/// Directories that the source walk never enters. ADRs are checked separately.
 const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "docs"];
 
-/// Debt markers that must not reach `main`. Built with `concat!` so this file passes its own check.
-const DEBT_MARKERS: [&str; 3] = [concat!("TO", "DO"), concat!("FIX", "ME"), concat!("X", "XX")];
+/// The one file allowed to use `usize` in signatures and fields (ADR-0002).
+const INDEX_MODULE: &str = "crates/nami-core/src/index.rs";
 
 /// One rule violation at one place in the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,13 +43,59 @@ pub struct Violation {
     /// Short rule identifier.
     pub rule: &'static str,
     /// What is wrong and how to fix it.
-    pub message: &'static str,
+    pub message: String,
+}
+
+impl Violation {
+    pub(crate) fn new(
+        path: &Path,
+        line: u32,
+        rule: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self { path: path.to_path_buf(), line, rule, message: message.into() }
+    }
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let path = self.path.display();
         write!(formatter, "{path}:{}: error[{}]: {}", self.line, self.rule, self.message)
+    }
+}
+
+/// Where a source file lives, which decides the rules that apply to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// A nami crate under `crates/`, other than the two special cases below.
+    Crate,
+    /// `crates/nami-kernels`: additionally no `dyn` and no function pointers (ADR-0003).
+    Kernels,
+    /// The index module: the only place where `usize` may appear in signatures (ADR-0002).
+    IndexModule,
+    /// Tooling (`xtask/`) and anything else outside `crates/`.
+    Tooling,
+}
+
+impl Scope {
+    /// Classifies a path relative to the workspace root.
+    #[must_use]
+    pub fn of(relative: &Path) -> Self {
+        if relative == Path::new(INDEX_MODULE) {
+            Self::IndexModule
+        } else if relative.starts_with("crates/nami-kernels") {
+            Self::Kernels
+        } else if relative.starts_with("crates") {
+            Self::Crate
+        } else {
+            Self::Tooling
+        }
+    }
+
+    /// True for nami's own crates, where the full style applies.
+    #[must_use]
+    pub fn is_nami(self) -> bool {
+        self != Self::Tooling
     }
 }
 
@@ -52,58 +107,62 @@ impl fmt::Display for Violation {
 pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
     assert!(root.is_dir(), "tidy root must be a directory");
     let mut violations = Vec::new();
+    let mut expect_count: u32 = 0;
+    let mut stats_by_crate: BTreeMap<PathBuf, AssertionStats> = BTreeMap::new();
     for path in files(root)? {
         let relative = path.strip_prefix(root).expect("walk stays below the root").to_path_buf();
-        if is_snapshot_draft(&path) {
-            violations.push(snapshot_draft_violation(relative));
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        if workspace::is_snapshot_draft(&relative) {
+            violations.push(workspace::snapshot_draft_violation(&relative));
+        } else if relative.extension().is_some_and(|extension| extension == "rs") {
             let text = fs::read_to_string(&path)?;
-            violations.extend(check_rust_source(&relative, &text));
+            expect_count += text::expect_count(&text);
+            let (file_violations, stats) = check_rust_source(&relative, &text);
+            violations.extend(file_violations);
+            if let Some(crate_root) = crate_root(&relative) {
+                stats_by_crate.entry(crate_root).or_insert_with(AssertionStats::zero).add(stats);
+            }
         }
     }
-    violations.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    violations.extend(density_violations(&stats_by_crate));
+    violations.extend(workspace::check_expect_budget(root, expect_count)?);
+    violations.extend(workspace::check_manifests(root)?);
+    violations.extend(workspace::check_adrs(root)?);
+    violations.sort_by(|a, b| (&a.path, a.line, a.rule).cmp(&(&b.path, b.line, b.rule)));
     Ok(violations)
 }
 
-/// Checks one Rust source file.
+/// Checks one Rust source file. Returns its violations and its assertion statistics.
 #[must_use]
-pub fn check_rust_source(path: &Path, text: &str) -> Vec<Violation> {
+pub fn check_rust_source(relative: &Path, text: &str) -> (Vec<Violation>, AssertionStats) {
+    let scope = Scope::of(relative);
+    let mut violations = text::check(relative, text);
+    let report = rust_source::check(relative, text, scope);
+    violations.extend(report.violations);
+    (violations, report.stats)
+}
+
+/// Returns `crates/<name>` for files inside a nami crate.
+fn crate_root(relative: &Path) -> Option<PathBuf> {
+    let mut components = relative.components();
+    let first = components.next()?;
+    let second = components.next()?;
+    (first.as_os_str() == "crates").then(|| Path::new(&first).join(second))
+}
+
+/// Assertion density: at least two assertions per non-trivial function, per crate (ADR-0004).
+fn density_violations(stats_by_crate: &BTreeMap<PathBuf, AssertionStats>) -> Vec<Violation> {
     let mut violations = Vec::new();
-    for (line_index, line) in text.lines().enumerate() {
-        let line_number = u32::try_from(line_index + 1).expect("source files have < 2^32 lines");
-        if line.chars().count() > LINE_COLUMNS_MAX {
-            violations.push(Violation {
-                path: path.to_path_buf(),
-                line: line_number,
-                rule: "line-length",
-                message: "line is longer than 100 columns; wrap it (TIGER_STYLE.md)",
-            });
-        }
-        if DEBT_MARKERS.iter().any(|marker| line.contains(marker)) {
-            violations.push(Violation {
-                path: path.to_path_buf(),
-                line: line_number,
-                rule: "debt-marker",
-                message: "debt marker in source; finish the work, or record it as a task in \
-                          docs/exec-plans/ (TIGER_STYLE.md, Zero technical debt)",
-            });
+    for (crate_root, stats) in stats_by_crate {
+        if !stats.meets_density() {
+            let message = format!(
+                "{} assertions across {} non-trivial functions; the minimum is 2 per function on \
+                 average. Assert arguments, results and invariants (ADR-0004)",
+                stats.assertions, stats.functions
+            );
+            violations.push(Violation::new(crate_root, 0, "assertion-density", message));
         }
     }
     violations
-}
-
-fn is_snapshot_draft(path: &Path) -> bool {
-    path.to_string_lossy().ends_with(".snap.new")
-}
-
-fn snapshot_draft_violation(path: PathBuf) -> Violation {
-    Violation {
-        path,
-        line: 0,
-        rule: "snapshot-draft",
-        message: "unreviewed insta snapshot; review it with `cargo insta review` or delete it, \
-                  never accept snapshots blindly (ADR-0006)",
-    }
 }
 
 /// Lists every file below `root`, skipping build output and docs, in sorted order.
@@ -134,12 +193,8 @@ fn is_skipped(directory: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Violation, check, check_rust_source};
+    use super::{Scope, check};
     use std::path::Path;
-
-    fn rules(violations: &[Violation]) -> Vec<&'static str> {
-        violations.iter().map(|violation| violation.rule).collect()
-    }
 
     // Goal: the repository itself is tidy. This is what makes tidy part of every test run.
     #[test]
@@ -149,21 +204,12 @@ mod tests {
         assert_eq!(report.join("\n"), "", "tidy found violations");
     }
 
-    // Fixtures: each rule fires on a deliberate violation (ADR-0006, fixture tests).
+    // Goal: paths map to the scopes whose rules apply to them.
     #[test]
-    fn line_length_rule_fires() {
-        let long_line = "x".repeat(101);
-        let violations = check_rust_source(Path::new("fixture.rs"), &long_line);
-        assert_eq!(rules(&violations), ["line-length"]);
-        let at_limit = check_rust_source(Path::new("fixture.rs"), &"x".repeat(100));
-        assert_eq!(rules(&at_limit), Vec::<&str>::new());
-    }
-
-    #[test]
-    fn debt_marker_rule_fires() {
-        let source = format!("// {}: later\nfn main() {{}}\n", concat!("TO", "DO"));
-        let violations = check_rust_source(Path::new("fixture.rs"), &source);
-        assert_eq!(rules(&violations), ["debt-marker"]);
-        assert_eq!(violations[0].line, 1);
+    fn scopes_follow_the_crate_layout() {
+        assert_eq!(Scope::of(Path::new("crates/nami-core/src/index.rs")), Scope::IndexModule);
+        assert_eq!(Scope::of(Path::new("crates/nami-core/src/lib.rs")), Scope::Crate);
+        assert_eq!(Scope::of(Path::new("crates/nami-kernels/src/reduce.rs")), Scope::Kernels);
+        assert_eq!(Scope::of(Path::new("xtask/src/tidy.rs")), Scope::Tooling);
     }
 }

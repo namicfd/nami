@@ -9,3 +9,8 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+# Tooling-only dependencies, allowed by ADR-0001. Never used by nami crates.
+[dependencies]
+proc-macro2 = { version = "=1.0.107", default-features = false, features = ["span-locations"] }
+syn = { version = "=3.0.10", default-features = false, features = ["full", "parsing", "printing", "visit"] }
