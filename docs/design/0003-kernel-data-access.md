@@ -20,7 +20,7 @@ The `windows` form was also the fastest version measured, with no bounds checks 
 
 ### Crate layout and allocation
 
-1. Numerical kernels (reconstruction, Riemann solvers, flux and update kernels, invariant reductions) live in **`nami-kernels`**, which is `#![no_std]` with **no `extern crate alloc`**. The compiler therefore rejects `Vec`, `Box` and `String` in that crate.
+1. Numerical kernels (reconstruction, Riemann solvers, flux and update kernels, invariant reductions) live in **`kernels`**, which is `#![no_std]` with **no `extern crate alloc`**. The compiler therefore rejects `Vec`, `Box` and `String` in that crate.
 2. All allocation happens in `Solver::init()` (or equivalent) in the orchestration crate: fields, ghost layers, pencil scratch buffers and output buffers. After init, nothing allocates.
 3. In test and `release-checked` builds, a counting `#[global_allocator]` (about 40 lines, in-house) **aborts** on any allocation once an `INIT_DONE` flag is set. It aborts rather than panics because panic formatting can itself allocate. A test asserts zero allocations across N timesteps.
 
@@ -34,13 +34,13 @@ There are exactly three sanctioned ways to read data:
 
 Raw slice indexing (`u[i]`) is not allowed anywhere. There is no escape hatch. If a scheme cannot be expressed in these forms (for example CTU transverse corrections or constrained transport), it needs a new ADR that defines the exception.
 
-`dyn Trait` objects and function pointers are banned in `nami-kernels`, so that the call graph can be fully resolved statically for the recursion check (ADR-0006).
+`dyn Trait` objects and function pointers are banned in `kernels`, so that the call graph can be fully resolved statically for the recursion check (ADR-0006).
 
 ## Enforcement
 
-- `nami-kernels` has `#![no_std]` and no `alloc`, enforced by the compiler.
+- `kernels` has `#![no_std]` and no `alloc`, enforced by the compiler.
 - Clippy: `indexing_slicing = "deny"` and `arithmetic_side_effects = "warn"`, one table for the whole workspace. `disallowed-methods`/`disallowed-macros` cover `Vec::push`, `Extend::extend` and `vec!` outside init code, with reasons.
-- Tidy: no `dyn` and no `fn(` pointer types in `nami-kernels`.
+- Tidy: no `dyn` and no `fn(` pointer types in `kernels`.
 - The counting-allocator test runs in `just check`.
 - The `/add-flux-scheme` skill and a template kernel show the canonical pencil form.
 

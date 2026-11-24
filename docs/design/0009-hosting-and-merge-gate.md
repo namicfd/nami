@@ -31,7 +31,7 @@ The target is about 5 minutes, on Linux x86_64. Every check must pass on the reb
 
 - `cargo fmt --check`, tidy, clippy, dylint, build (`--locked`, `release` and `release-checked`);
 - `cargo nextest run` (unit and property tests) plus `cargo test --doc`;
-- the fast oracle tier: invariants, symmetry, same-seed determinism, coarse convergence, exact Riemann at low resolution;
+- the fast reference tier: invariants, symmetry, same-seed determinism, coarse convergence, exact Riemann at low resolution;
 - `cargo mutants --in-diff` on the PR's changes, **capped at a fixed time budget**. It is advisory until it reliably fits the budget, then blocking with zero surviving mutants.
 
 ### No retries for test failures

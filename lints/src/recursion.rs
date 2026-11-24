@@ -3,7 +3,7 @@
 //! The lint builds the crate's call graph from resolved calls: free functions, inherent and trait
 //! methods (resolved to the concrete impl where the types are known), and closures, which count
 //! as part of the function that defines them. It then reports every function that can reach
-//! itself. Cargo forbids dependency cycles between crates, and nami-kernels bans `dyn` and
+//! itself. Cargo forbids dependency cycles between crates, and kernels bans `dyn` and
 //! function pointers (ADR-0003), so checking each crate on its own finds every cycle there.
 
 use clippy_utils::diagnostics::span_lint;

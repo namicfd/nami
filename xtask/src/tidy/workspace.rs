@@ -63,19 +63,26 @@ pub fn check_expect_budget(root: &Path, expect_count: u32) -> io::Result<Vec<Vio
     Ok(vec![Violation::new(path, 1, "expect-budget", message)])
 }
 
-/// Runtime dependencies of nami crates: only `libm` and other nami crates (ADR-0001).
+/// Runtime dependencies of nami's crates: only `libm` and the crates under `crates/`
+/// (ADR-0001). A workspace crate is named after its directory.
 pub fn check_manifests(root: &Path) -> io::Result<Vec<Violation>> {
     let mut violations = Vec::new();
     let mut crate_directories: Vec<_> = fs::read_dir(root.join("crates"))?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<_>>()?;
     crate_directories.sort();
-    for directory in crate_directories {
+    let workspace_crates: Vec<String> = crate_directories
+        .iter()
+        .filter_map(|directory| directory.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(workspace_crates.len(), crate_directories.len(), "crate directories have names");
+    for directory in &crate_directories {
         let manifest = directory.join("Cargo.toml");
         if manifest.is_file() {
             let relative = manifest.strip_prefix(root).expect("manifest is below the root");
             let text = fs::read_to_string(&manifest)?;
-            violations.extend(check_manifest(relative, &text));
+            violations.extend(check_manifest(relative, &text, &workspace_crates));
         }
     }
     Ok(violations)
@@ -83,7 +90,7 @@ pub fn check_manifests(root: &Path) -> io::Result<Vec<Violation>> {
 
 /// Checks the normal and build dependencies of one manifest. Dev-dependencies are governed by
 /// the cargo-deny allow-list instead.
-pub fn check_manifest(relative: &Path, text: &str) -> Vec<Violation> {
+pub fn check_manifest(relative: &Path, text: &str, workspace_crates: &[String]) -> Vec<Violation> {
     let mut violations = Vec::new();
     let mut in_runtime_section = false;
     for (line_index, line) in text.lines().enumerate() {
@@ -96,7 +103,7 @@ pub fn check_manifest(relative: &Path, text: &str) -> Vec<Violation> {
         if in_runtime_section
             && !key.is_empty()
             && !key.starts_with('#')
-            && !is_allowed_runtime(key)
+            && !is_allowed_runtime(key, workspace_crates)
         {
             let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
             let message = format!(
@@ -116,8 +123,8 @@ fn is_runtime_dependency_section(header: &str) -> bool {
     is_dependencies || is_build
 }
 
-fn is_allowed_runtime(key: &str) -> bool {
-    key == "libm" || key.starts_with("nami-")
+fn is_allowed_runtime(key: &str, workspace_crates: &[String]) -> bool {
+    key == "libm" || workspace_crates.iter().any(|name| name == key)
 }
 
 /// Every ADR is indexed, has a valid status and has the required sections (ADR-0000).
@@ -175,15 +182,18 @@ mod tests {
         violations.iter().map(|violation| violation.rule).collect()
     }
 
-    // Goal: only libm and nami crates may be runtime dependencies; dev-dependencies are exempt.
+    // Goal: only libm and workspace crates may be runtime dependencies; dev-dependencies are
+    // exempt. A crate that merely looks like a workspace crate (`base-extra`) is rejected.
     #[test]
     fn runtime_dependency_rule_fires() {
         let manifest = "[package]\nname = \"x\"\n\n[dependencies]\nlibm.workspace = true\n\
-                        nami-core = { path = \"../nami-core\" }\nserde = \"1\"\n\n\
+                        base = { path = \"../base\" }\nserde = \"1\"\nbase-extra = \"1\"\n\n\
                         [dev-dependencies]\nproptest = \"1\"\n";
-        let violations = check_manifest(Path::new("Cargo.toml"), manifest);
-        assert_eq!(rules(&violations), ["runtime-dependency"]);
+        let workspace = ["base".to_owned(), "kernels".to_owned()];
+        let violations = check_manifest(Path::new("Cargo.toml"), manifest, &workspace);
+        assert_eq!(rules(&violations), ["runtime-dependency", "runtime-dependency"]);
         assert_eq!(violations[0].line, 7);
+        assert_eq!(violations[1].line, 8);
     }
 
     // Goal: build-dependencies and target-specific dependencies count as runtime.
@@ -191,7 +201,7 @@ mod tests {
     fn build_and_target_dependencies_are_runtime() {
         let manifest =
             "[build-dependencies]\ncc = \"1\"\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n";
-        assert_eq!(rules(&check_manifest(Path::new("Cargo.toml"), manifest)).len(), 2);
+        assert_eq!(rules(&check_manifest(Path::new("Cargo.toml"), manifest, &[])).len(), 2);
     }
 
     // Goal: an ADR must be indexed, have a status and have every section.

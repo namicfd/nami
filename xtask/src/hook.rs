@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn workspace_root_is_found_from_a_file() {
         let root = crate::workspace_root();
-        let file = root.join("crates/nami-core/src/lib.rs");
+        let file = root.join("crates/base/src/lib.rs");
         assert_eq!(super::workspace_root_of(&file), Some(root));
         assert_eq!(super::workspace_root_of(std::path::Path::new("/")), None);
     }

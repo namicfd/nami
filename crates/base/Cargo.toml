@@ -1,14 +1,11 @@
 [package]
-name = "nami-kernels"
-description = "Numerical kernels: no_std, no allocation, bitwise deterministic."
+name = "base"
+description = "Typed indices and field views shared by every nami crate."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-
-[dependencies]
-libm.workspace = true
 
 [lints]
 workspace = true

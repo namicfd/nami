@@ -22,9 +22,9 @@ ADR-0003 and ADR-0006 proposed a lint table before any code existed. Compiling t
    - It flags float literals even where the type is fully determined, for example `value >= 0.0` with `value: f64`. In numerical code that is nearly every comparison.
    - Integer width is enforced instead by `as_conversions`, the cast lints and typed indices (ADR-0002).
 4. **Do not ban `Vec::push`, `Extend::extend` or `vec!` with `disallowed-*` lists.**
-   - Clippy cannot scope a ban to code that runs after init, and the init code in `nami-solver` legitimately allocates.
+   - Clippy cannot scope a ban to code that runs after init, and the init code in `solver` legitimately allocates.
    - Allocation after init is enforced instead by:
-     - the compiler: `nami-kernels` and `nami-core` are `no_std` without `alloc`;
+     - the compiler: `kernels` and `base` are `no_std` without `alloc`;
      - the counting-allocator test (ADR-0003);
      - the `Box<[T]>` storage rule (`TIGER_STYLE.md`).
 

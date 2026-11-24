@@ -24,7 +24,7 @@ Measurements on nami-style kernels show the cost depends on **where** an asserti
 | Length and range checks before loops | `assert!` | all builds |
 | Per-step invariants (dt > 0, CFL, conservation totals, finite totals) | `assert!` | all builds |
 | Per-pencil backstop (e.g. "all finite and density > 0" over the pencil, written as a vectorisable reduction) | `assert!` | all builds |
-| Per-cell checks inside hot loops in `nami-kernels` | `debug_assert!` | `dev`, `test`, `release-checked` |
+| Per-cell checks inside hot loops in `kernels` | `debug_assert!` | `dev`, `test`, `release-checked` |
 | Compile-time relations between constants and sizes | `const _: () = assert!(..);` | compile time |
 
 ### Further rules
@@ -52,7 +52,7 @@ debug-assertions = true
 
 - Clippy: `missing_assert_message = "warn"` (denied in CI through `-D warnings`). `unsafe_code = "forbid"`.
 - Tidy (ADR-0006):
-  - `debug_assert!` is rejected outside `nami-kernels`.
+  - `debug_assert!` is rejected outside `kernels`.
   - Assertion density: the average per non-trivial function in each crate must be ≥ 2, and any function longer than 10 lines with zero assertions is rejected. These thresholds are initial values, to be tuned when the tidy check is implemented.
 - CI builds and tests both `release` and `release-checked`.
 

@@ -11,7 +11,7 @@ TigerStyle says to use explicitly sized types like `u32` and to avoid the archit
 ## Decision
 
 1. **Index and count types are newtypes over `u32`** (or a smaller type where the range is small). Examples are `CellIndex(u32)`, `FaceIndex(u32)`, `NodeIndex(u32)`, `CellCount(u32)` and `VarIndex(u8)`. Each index space gets its own type, and they are not interchangeable.
-2. **`usize` appears only inside one module, `nami_core::index`.** That module implements `Index`/`IndexMut` for nami's field and slice wrappers and owns every `u32` ↔ `usize` conversion:
+2. **`usize` appears only inside one module, `base::index`.** That module implements `Index`/`IndexMut` for nami's field and slice wrappers and owns every `u32` ↔ `usize` conversion:
    - `CellIndex::to_usize(self) -> usize` is a lossless widening.
    - `CellIndex::from_usize(n: usize) -> CellIndex` asserts that `n <= u32::MAX`.
    - A compile-time check `const _: () = assert!(usize::BITS >= 32);` guarantees the widening is lossless.
@@ -22,7 +22,7 @@ TigerStyle says to use explicitly sized types like `u32` and to avoid the archit
 ## Enforcement
 
 - Clippy: `as_conversions`, `cast_possible_truncation`, `cast_sign_loss` and `cast_possible_wrap` are set to `deny`. Each `disallowed-*` reason string names the fix (for example "use `CellIndex::to_usize()`").
-- Tidy (ADR-0006): rejects `usize` in `pub` function signatures, struct fields and consts outside `nami_core::index`.
+- Tidy (ADR-0006): rejects `usize` in `pub` function signatures, struct fields and consts outside `base::index`.
 - Dylint (ADR-0006): later an alias-aware version of the same rule, so a `type Idx = usize;` alias cannot get around it.
 
 ## Consequences

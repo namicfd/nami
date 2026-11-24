@@ -25,6 +25,6 @@
 /docs/design/              @cxkoda
 /docs/TIGER_STYLE.md       @cxkoda
 
-# Numerical oracles, generators and reference data (ADR-0007).
-/crates/nami-oracle/       @cxkoda
+# Reference solutions, their generators and reference data (ADR-0007).
+/crates/reference/         @cxkoda
 /tools/                    @cxkoda

@@ -1,6 +1,6 @@
 [package]
-name = "nami-core"
-description = "Typed indices and field views shared by every nami crate."
+name = "reference"
+description = "Numerical references: exact solutions, manufactured solutions, convergence harness."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

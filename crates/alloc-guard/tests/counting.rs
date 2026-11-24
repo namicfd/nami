@@ -1,6 +1,6 @@
 //! The counting allocator sees allocations, and the guard rejects them.
 
-use nami_alloc_guard::{CountingAllocator, allocations_on_this_thread, assert_no_allocations};
+use alloc_guard::{CountingAllocator, allocations_on_this_thread, assert_no_allocations};
 use std::hint::black_box;
 
 #[global_allocator]

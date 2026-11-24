@@ -24,7 +24,7 @@ Orchestration happens in two phases.
 
 ### Phase 1 (now): interactive lead with worktree subagents
 
-**Scope:** building the guardrails (P0), the oracle crate and the first equation system.
+**Scope:** building the guardrails (P0), the reference crate and the first equation system.
 
 - The maintainer works with one interactive Claude Code lead session.
 - The lead dispatches one subagent per task with `isolation: worktree`. Each subagent opens a PR; nothing is committed directly to `main`.
@@ -52,7 +52,7 @@ Orchestration happens in two phases.
 **Exit criteria for phase 1:**
 
 - every P0 guardrail exists and passes its fixture tests;
-- the oracle crate covers the first equation system;
+- the reference crate covers the first equation system;
 - the blocking gate runs in about 5 minutes;
 - two consecutive weeks of phase 1 work where no regression reached `main`.
 

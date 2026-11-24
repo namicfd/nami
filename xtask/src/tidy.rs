@@ -31,7 +31,7 @@ const DIRECTORIES_MAX: u32 = 100_000;
 const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "docs"];
 
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
-const INDEX_MODULE: &str = "crates/nami-core/src/index.rs";
+const INDEX_MODULE: &str = "crates/base/src/index.rs";
 
 /// One rule violation at one place in the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,7 @@ impl fmt::Display for Violation {
 pub enum Scope {
     /// A nami crate under `crates/`, other than the two special cases below.
     Crate,
-    /// `crates/nami-kernels`: additionally no `dyn` and no function pointers (ADR-0003).
+    /// `crates/kernels`: additionally no `dyn` and no function pointers (ADR-0003).
     Kernels,
     /// The index module: the only place where `usize` may appear in signatures (ADR-0002).
     IndexModule,
@@ -83,7 +83,7 @@ impl Scope {
     pub fn of(relative: &Path) -> Self {
         if relative == Path::new(INDEX_MODULE) {
             Self::IndexModule
-        } else if relative.starts_with("crates/nami-kernels") {
+        } else if relative.starts_with("crates/kernels") {
             Self::Kernels
         } else if relative.starts_with("crates") {
             Self::Crate
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn check_reports_violations_in_a_fixture_workspace() {
         let root = std::env::temp_dir().join(format!("nami-tidy-fixture-{}", std::process::id()));
-        let source = root.join("crates/nami-demo/src");
+        let source = root.join("crates/demo/src");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(root.join("xtask")).unwrap();
         std::fs::create_dir_all(root.join("docs/design")).unwrap();
@@ -216,7 +216,7 @@ mod tests {
         std::fs::write(root.join("xtask/expect-budget.txt"), "1\n").unwrap();
         std::fs::write(root.join("docs/design/README.md"), "").unwrap();
         std::fs::write(root.join("docs/design/0001-x.md"), "- Status: Accepted\n").unwrap();
-        std::fs::write(root.join("crates/nami-demo/Cargo.toml"), "[dependencies]\nserde = \"1\"\n")
+        std::fs::write(root.join("crates/demo/Cargo.toml"), "[dependencies]\nserde = \"1\"\n")
             .unwrap();
         let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
         std::fs::write(source.join("lib.rs"), unasserted).unwrap();
@@ -234,8 +234,8 @@ mod tests {
                 .chain(["expect-budget"])
                 .collect::<Vec<_>>()
         );
-        assert_eq!(violations[0].path, Path::new("crates/nami-demo"));
-        assert_eq!(violations[0].to_string().split(':').next(), Some("crates/nami-demo"));
+        assert_eq!(violations[0].path, Path::new("crates/demo"));
+        assert_eq!(violations[0].to_string().split(':').next(), Some("crates/demo"));
     }
 
     // Goal: a violation prints as `path:line: error[rule]: message`.
@@ -248,8 +248,8 @@ mod tests {
     // Goal: crate roots and skipped directories are recognised from paths alone.
     #[test]
     fn path_helpers_classify_paths() {
-        let lib = Path::new("crates/nami-core/src/lib.rs");
-        assert_eq!(super::crate_root(lib).as_deref(), Some(Path::new("crates/nami-core")));
+        let lib = Path::new("crates/base/src/lib.rs");
+        assert_eq!(super::crate_root(lib).as_deref(), Some(Path::new("crates/base")));
         assert_eq!(super::crate_root(Path::new("xtask/src/tidy.rs")), None);
         assert!(super::is_skipped(Path::new("/repo/target")), "build output is skipped");
         assert!(!super::is_skipped(Path::new("/repo/crates")), "sources are walked");
@@ -258,9 +258,9 @@ mod tests {
     // Goal: paths map to the scopes whose rules apply to them.
     #[test]
     fn scopes_follow_the_crate_layout() {
-        assert_eq!(Scope::of(Path::new("crates/nami-core/src/index.rs")), Scope::IndexModule);
-        assert_eq!(Scope::of(Path::new("crates/nami-core/src/lib.rs")), Scope::Crate);
-        assert_eq!(Scope::of(Path::new("crates/nami-kernels/src/reduce.rs")), Scope::Kernels);
+        assert_eq!(Scope::of(Path::new("crates/base/src/index.rs")), Scope::IndexModule);
+        assert_eq!(Scope::of(Path::new("crates/base/src/lib.rs")), Scope::Crate);
+        assert_eq!(Scope::of(Path::new("crates/kernels/src/reduce.rs")), Scope::Kernels);
         assert_eq!(Scope::of(Path::new("xtask/src/tidy.rs")), Scope::Tooling);
     }
 }

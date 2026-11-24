@@ -32,7 +32,7 @@ debug-assertions = true
 # Warnings are denied in `just` and CI through `-D warnings`, never in source.
 [workspace.lints.rust]
 # `deny`, not `forbid`, so that the allocation guard can carry the one allowed `#[expect]`.
-# Tidy confines `unsafe` to crates/nami-alloc-guard (ADR-0014).
+# Tidy confines `unsafe` to crates/alloc-guard (ADR-0014).
 unsafe_code = "deny"
 missing_docs = "warn"
 unused_results = "warn"

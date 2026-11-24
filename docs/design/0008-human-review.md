@@ -20,7 +20,7 @@ These are enforced through CODEOWNERS and required reviews.
   - `xtask/` (tidy and fixtures), `lints/` (dylint) and the expect-budget file;
   - `justfile`, `.github/` and `.claude/` (hooks, settings, agents, skills);
   - `AGENTS.md` and `CLAUDE.md`.
-- **Oracles:** `nami-oracle/`, `thresholds.toml`, reference data and `tools/oracle-gen/` (ADR-0007).
+- **References:** `reference/`, `thresholds.toml`, reference data and `tools/reference-gen/` (ADR-0007).
 - **Decisions:** `docs/design/` (ADR-0000).
 - **Output changes:** any PR that changes output bits. The determinism hash (ADR-0005) changes, CI labels the PR `changes-results`, and CI posts before/after convergence and error numbers. The PR waits for a human, whatever paths it touches.
 
@@ -28,7 +28,7 @@ These are enforced through CODEOWNERS and required reviews.
 
 The merge queue merges every other PR once all blocking gates pass (ADR-0009) and an AI review has run.
 
-- **AI review:** a separate session with fresh context, made up of a `tigerstyle-reviewer` subagent and a `numerics-verifier` subagent. Their blocking comments must be resolved before the PR enters the queue. They complement the oracles and do not replace them.
+- **AI review:** a separate session with fresh context, made up of a `tigerstyle-reviewer` subagent and a `numerics-verifier` subagent. Their blocking comments must be resolved before the PR enters the queue. They complement the references and do not replace them.
 
 ### Sampled audits
 
@@ -39,7 +39,7 @@ The merge queue merges every other PR once all blocking gates pass (ADR-0009) an
 
 - surviving mutants;
 - `#[expect]` count;
-- oracle failures caught per merged PR;
+- reference failures caught per merged PR;
 - revert rate;
 - janitor-PR volume;
 - cost per merged PR (ADR-0012).
@@ -56,8 +56,8 @@ Agents act through their own identity, a GitHub App (ADR-0009). This is required
 
 ## Consequences
 
-- Human attention goes where agents are weakest (oracles, guardrails, result changes) and nowhere else.
-- A subtle bug that changes no output bits and passes every oracle can merge unseen. The sampled audits and mutation testing are the defence against that.
+- Human attention goes where agents are weakest (references, guardrails, result changes) and nowhere else.
+- A subtle bug that changes no output bits and passes every reference can merge unseen. The sampled audits and mutation testing are the defence against that.
 
 ## Alternatives considered
 

@@ -22,7 +22,7 @@ Until the P0 tooling exists, the tags describe the intended mechanism.
 | `[dylint]` | the project dylint library (ADR-0006) |
 | `[fmt]` | `cargo fmt --check` |
 | `[deny]` | `cargo-deny` (ADR-0001) |
-| `[oracle]` | numerical oracle tests (ADR-0007) |
+| `[reference]` | numerical reference tests (ADR-0007) |
 | `[hook]` | Claude Code hooks: defence in depth only; the server-side gates are authoritative (ADR-0008) |
 | `[review]` | judgement: AI reviewer and human review (ADR-0008) |
 
@@ -93,7 +93,7 @@ TigerStyle starts from NASA's [Power of Ten](https://spinroot.com/gerard/pdf/P10
 - **Use only simple, explicit control flow.** `[review]`
 - **Do not use recursion,** direct or mutual. This guarantees that everything that should be
   bounded is bounded. `[dylint]`
-- **No `dyn Trait` and no function pointers in `nami-kernels`.** Static dispatch keeps the call
+- **No `dyn Trait` and no function pointers in `kernels`.** Static dispatch keeps the call
   graph fully resolvable for the recursion check and keeps inner loops free of indirect calls.
   `[tidy]`
 - **No `async`.** Functions run to completion, so precondition assertions hold for the whole
@@ -145,7 +145,7 @@ instead of hanging.
 ### Integer types
 
 - **Use explicitly sized types.** Indices and counts are `u32` newtypes (`CellIndex`, `FaceIndex`,
-  `CellCount`). `usize` appears only inside `nami_core::index` (ADR-0002). `[tidy]` `[dylint]`
+  `CellCount`). `usize` appears only inside `base::index` (ADR-0002). `[tidy]` `[dylint]`
 - **No `as` casts.** Conversions go through named functions (`CellIndex::to_usize()`) or
   `try_from(..)` with an assertion. `[clippy]`
 
@@ -186,7 +186,7 @@ multiply the bug-finding power of fuzzing and seeded simulation.
 - **Place assertions by cost** (ADR-0004):
   - `assert!` at function boundaries, before loops and once per step. Length and range asserts
     before a loop are free or faster, because they let the compiler drop bounds checks.
-  - `debug_assert!` only for per-cell checks inside hot loops in `nami-kernels`.
+  - `debug_assert!` only for per-cell checks inside hot loops in `kernels`.
   - A per-pencil `assert!` backstop, such as "all finite, density > 0", written as a vectorisable
     reduction.
 
@@ -194,13 +194,13 @@ multiply the bug-finding power of fuzzing and seeded simulation.
 - **No unchecked hints.** `assert_unchecked`, `unreachable_unchecked` and `get_unchecked` are
   unsafe, and `unsafe` exists only in the test allocator crate (ADR-0014). If the optimiser
   needs a fact, a real `assert!` provides it. `[clippy]` `[tidy]`
-- **Assertions are a safety net, not a substitute for understanding.** Oracles and fuzzers can show
+- **Assertions are a safety net, not a substitute for understanding.** References and fuzzers can show
   that bugs are present, never that they are absent. So:
   1. Build a precise mental model of the numerics first: the equations, the discretisation, the
      stability limit.
   2. Encode that model as assertions.
   3. Write code and comments that explain and justify the model to your reviewer.
-  4. Let the oracles and the seeded simulation be the final line of defence.
+  4. Let the references and the seeded simulation be the final line of defence.
 
 ### Errors
 
@@ -222,11 +222,11 @@ multiply the bug-finding power of fuzzing and seeded simulation.
 
 - **All memory is allocated during initialisation. Nothing is allocated, freed or reallocated
   afterwards** (ADR-0003).
-  - `nami-kernels` is `#![no_std]` without `alloc`, so allocation there is a compile error.
+  - `kernels` is `#![no_std]` without `alloc`, so allocation there is a compile error.
     `[compiler]`
   - Elsewhere, `Solver::init()` sizes every field, ghost layer, scratch pencil and output buffer
     once. `[clippy]`
-  - A counting allocator aborts any allocation after init in test builds. `[oracle]`
+  - A counting allocator aborts any allocation after init in test builds. `[reference]`
 - **Storage that must not grow is `Box<[T]>`, not `Vec<T>`.** A boxed slice has no `push`, so the
   type itself documents and enforces the fixed size. `[tidy]`
 - **No hidden allocation in the data plane.** That means no `collect()`, `clone()` of buffers,
@@ -283,8 +283,8 @@ finite-volume codes, and especially in agent-written ones.
 
 - **Updates are written in conservative flux-difference form**:
   `u_next = u - (dt/dx) · (F_right − F_left)`, with exactly one flux per face, shared by its two
-  neighbouring cells. Discrete conservation then holds to round-off, and the oracles assert it.
-  `[oracle]`
+  neighbouring cells. Discrete conservation then holds to round-off, and the references assert it.
+  `[reference]`
 
   ```rust
   /// Applies the conservative update `u_next = u - (dt/dx) (F_right - F_left)` to one pencil.
@@ -336,7 +336,7 @@ finite-volume codes, and especially in agent-written ones.
   value.
 - **No magic tolerances.** Every epsilon is a named constant whose doc comment says where it comes
   from (for example "relative change below round-off for 64-bit pressure"). Test tolerances live in
-  `nami-oracle/thresholds.toml`. `f64::EPSILON` is not a tolerance: it is the spacing at 1.0, not
+  `reference/thresholds.toml`. `f64::EPSILON` is not a tolerance: it is the spacing at 1.0, not
   at your value. `[clippy]` `[review]`
 - **Do not compare floats with `==`** except against exact sentinels or in bitwise determinism
   tests, and say which one it is. `[clippy]` `[tidy]`
@@ -353,9 +353,9 @@ finite-volume codes, and especially in agent-written ones.
   - be configured explicitly (see *Pass options explicitly at the call site* above);
   - **count every activation** and report the count per step.
 
-  An unexpected activation count is a test failure. `[review]` `[oracle]`
+  An unexpected activation count is a test failure. `[review]` `[reference]`
 - **A wave speed must bound the true maximum eigenvalue.** A time-step controller that
-  underestimates it is a stability bug even when the tests pass. Assert the bound. `[oracle]`
+  underestimates it is a stability bug even when the tests pass. Assert the bound. `[reference]`
 
 ### Ghost cells and buffer bleeds
 
@@ -363,9 +363,9 @@ finite-volume codes, and especially in agent-written ones.
   `release-checked` builds, fill new and scratch buffers with NaN, so that reading a cell that was
   never written trips the finite-state assertion. This is nami's version of TigerStyle's "buffer
   bleed" rule: an under-filled buffer is a silent wrong answer, and it can also break determinism.
-  `[oracle]`
-- **Each boundary-condition type has its own oracle.** In the literature, boundary conditions were
-  where agents were weakest (ADR-0007). `[oracle]`
+  `[reference]`
+- **Each boundary-condition type has its own reference.** In the literature, boundary conditions were
+  where agents were weakest (ADR-0007). `[reference]`
 
 ## Performance
 
@@ -449,7 +449,7 @@ finite-volume codes, and especially in agent-written ones.
 
 - **Say why.** Code alone is not documentation. Comments explain why the code is the way it is, and
   in numerical code they cite their sources. `[review]`
-- **Say how.** Every test starts with a comment stating its goal and method. For oracle tests this
+- **Say how.** Every test starts with a comment stating its goal and method. For reference tests this
   includes the tier (ADR-0007), the expected order of accuracy and its source. `[tidy]`
 - **Every public item has a doc comment** (`missing_docs`). Doc comments put identifiers and
   formulas in backticks (`doc_markdown`). `[clippy]`
@@ -504,7 +504,7 @@ finite-volume codes, and especially in agent-written ones.
   - Our primary tool is Rust, so project scripts are `cargo xtask` subcommands, not shell scripts.
     That makes them portable, typed and testable.
   - `justfile` recipes are one-line entry points.
-  - The only planned exceptions are the offline Python oracle generators (ADR-0007).
+  - The only planned exceptions are the offline Python reference generators (ADR-0007).
 
   `[review]`
 
@@ -513,5 +513,5 @@ finite-volume codes, and especially in agent-written ones.
 
 ## The last stage
 
-Keep trying things out, keep the oracles honest, and remember the point of all this: a small,
+Keep trying things out, keep the references honest, and remember the point of all this: a small,
 fast solver whose answers you can trust.

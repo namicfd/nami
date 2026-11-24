@@ -1,5 +1,5 @@
 [package]
-name = "nami-alloc-guard"
+name = "alloc-guard"
 description = "Test-only counting allocator: proves that nothing allocates after init (ADR-0003)."
 version.workspace = true
 edition.workspace = true

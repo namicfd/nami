@@ -25,7 +25,7 @@ Agents also pick dependencies freely. In Cursor's FastRender, agents chose almos
 **Binaries, installed at pinned versions and never in `Cargo.lock`.**
 - `cargo-nextest`, `cargo-deny`, `cargo-mutants`, `cargo-dylint`/`dylint-link`, `just`, and the Gungraun runner.
 
-**Python tooling for oracle generation only (ADR-0007).**
+**Python tooling for reference generation only (ADR-0007).**
 - SymPy and Clawpack/PyClaw in a `uv`-locked environment under `tools/`. Its output is committed, so building or testing nami never needs Python.
 
 **Adding anything to any of these lists requires a new ADR approved by a human.**
