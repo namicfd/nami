@@ -7,9 +7,9 @@
 //! - `post-edit`: formats an edited Rust file and runs the single-file tidy rules on it.
 //! - `stop`: runs `just check` before an agent or subagent may finish, if anything changed.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 /// Exit code that makes Claude Code show stderr to the agent.
 const EXIT_FEEDBACK: u8 = 2;
@@ -51,15 +51,22 @@ fn post_edit(payload: &str) -> ExitCode {
     if !is_rust || !file.is_file() {
         return ExitCode::SUCCESS;
     }
-    let formatted = Command::new("rustfmt").arg("--edition").arg("2024").arg(&file).status();
-    if !formatted.is_ok_and(|status| status.success()) {
-        eprintln!("rustfmt failed on {}; fix the syntax error first", file.display());
-        return ExitCode::from(EXIT_FEEDBACK);
-    }
-    let relative = file.strip_prefix(&root).expect("root is an ancestor of the file");
-    let Ok(text) = std::fs::read_to_string(&file) else {
+    let Ok(original) = std::fs::read_to_string(&file) else {
         return ExitCode::SUCCESS;
     };
+    let text = match format_source(&root, &original) {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            eprintln!("rustfmt cannot format {}; fix the syntax error first:", file.display());
+            eprintln!("{error}");
+            return ExitCode::from(EXIT_FEEDBACK);
+        }
+    };
+    if text != original && std::fs::write(&file, &text).is_err() {
+        eprintln!("cannot write the formatted {}", file.display());
+        return ExitCode::FAILURE;
+    }
+    let relative = file.strip_prefix(&root).expect("root is an ancestor of the file");
     let (violations, _stats) = crate::tidy::check_rust_source(relative, &text);
     if violations.is_empty() {
         return ExitCode::SUCCESS;
@@ -103,6 +110,28 @@ fn stop(payload: &str) -> ExitCode {
         eprintln!("{line}");
     }
     ExitCode::from(EXIT_FEEDBACK)
+}
+
+/// Formats one file's source through stdin, so that rustfmt does not follow `mod` declarations
+/// into sibling files, which may not exist yet. Runs in `root` to pick up `rustfmt.toml`.
+fn format_source(root: &Path, source: &str) -> Result<String, String> {
+    let mut child = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run rustfmt: {error}"))?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    stdin.write_all(source.as_bytes()).map_err(|error| error.to_string())?;
+    drop(stdin);
+    let output = child.wait_with_output().map_err(|error| error.to_string())?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
 }
 
 /// True if the working tree differs from `HEAD` (tracked or untracked files).

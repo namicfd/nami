@@ -9,7 +9,8 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 
 - `just check`: run before every commit, and make sure it passes. It runs fmt-check, tidy, clippy
   with warnings denied, the tests and the doctests.
-- `just check-full`: `just check` plus `cargo deny` and the tests in the `release-checked` profile.
+- `just check-full`: `just check` plus `cargo deny`, the dylint lints (no recursion) and the tests
+  in the `release-checked` profile.
 - `just fmt`: format everything.
 - `cargo nextest run -p <crate> <filter>`: run some tests while iterating.
 - `cargo xtask tidy`: style rules that clippy cannot express.
@@ -31,7 +32,8 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
 | `crates/nami-solver` | Control plane: `Solver::init` (all allocation), the time loop, boundaries, I/O. |
 | `crates/nami-alloc-guard` | Test-only counting allocator: `assert_no_allocations` around everything after init. The only crate with `unsafe` (ADR-0014). |
 | `crates/nami-oracle` | Numerical oracles: exact solutions, manufactured solutions, convergence harness. **Protected.** |
-| `xtask/` | Project tooling (`cargo xtask tidy`). |
+| `xtask/` | Project tooling (`cargo xtask tidy`, Claude Code hooks). |
+| `lints/` | dylint library on a pinned nightly: compiler-level lints such as `nami_recursion`. |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
 | `docs/TIGER_STYLE.md` | The full style guide. |
 | `docs/exec-plans/` | Plans and `tasks.json` task lists (ADR-0011). |

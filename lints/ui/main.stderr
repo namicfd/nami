@@ -1,0 +1,45 @@
+warning: function cannot return without recursing
+  --> $DIR/main.rs:48:5
+   |
+LL |     fn flux(&self) -> f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^ cannot return without recursing
+LL |         Looping.flux()
+   |         -------------- recursive call site
+   |
+   = help: a `loop` may express intention better if this is on purpose
+   = note: `#[warn(unconditional_recursion)]` on by default
+
+error: `direct` is recursive: direct -> direct. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:4:1
+   |
+LL | fn direct(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(nami_recursion)]` on by default
+
+error: `mutual_a` is recursive: mutual_a -> mutual_b -> mutual_a. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:8:1
+   |
+LL | fn mutual_a(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `mutual_b` is recursive: mutual_b -> mutual_a -> mutual_b. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:12:1
+   |
+LL | fn mutual_b(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `via_closure` is recursive: via_closure -> via_closure. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:16:1
+   |
+LL | fn via_closure(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Looping as Flux>::flux` is recursive: <Looping as Flux>::flux -> <Looping as Flux>::flux. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:48:5
+   |
+LL |     fn flux(&self) -> f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 5 previous errors; 1 warning emitted
+

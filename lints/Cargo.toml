@@ -1,0 +1,24 @@
+# nami's dylint library (ADR-0006). Its own workspace, pinned to one nightly in
+# rust-toolchain.toml, because dylint libraries link against compiler internals.
+[package]
+name = "nami_lints"
+version = "0.0.0"
+description = "Lints that clippy does not have: no recursion (ADR-0006)."
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clippy_utils = { git = "https://github.com/rust-lang/rust-clippy", rev = "21baba9c10c5d179915cae82e6247bc2337872fb" }
+dylint_linting = "=6.4.0"
+
+[dev-dependencies]
+dylint_testing = "=6.4.0"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[workspace]

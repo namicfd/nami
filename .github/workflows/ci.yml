@@ -29,6 +29,18 @@ jobs:
       - name: just check-full
         run: just check-full
 
+  # The dylint library's own UI tests: each lint fires where it must and stays silent elsewhere.
+  lints:
+    name: lints (UI tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: cargo test (lints/)
+        working-directory: lints
+        run: cargo test --locked
+
   # Mutation testing of the PR's changed lines. Advisory until it reliably fits the time budget;
   # then it becomes a required check with zero surviving mutants (ADR-0009).
   mutants-diff:

@@ -10,8 +10,8 @@ default:
 # Fast gate, run before every commit (target: under 60 s).
 check: fmt-check tidy clippy test
 
-# Full gate: the fast gate plus supply-chain checks and release-checked tests.
-check-full: check deny test-checked
+# Full gate: the fast gate plus supply-chain checks, compiler-level lints and release-checked tests.
+check-full: check deny dylint test-checked
 
 # Format all code.
 fmt:
@@ -37,6 +37,10 @@ test:
 # Tests with optimisations and debug assertions on (ADR-0004).
 test-checked:
     cargo nextest run --workspace --locked --no-tests=pass --cargo-profile release-checked
+
+# Lints that need the compiler: no recursion (ADR-0006). Uses the nightly pinned in lints/.
+dylint:
+    cargo dylint --all -- --workspace --all-targets --locked
 
 # Licenses, advisories, bans and sources (ADR-0001).
 deny:
