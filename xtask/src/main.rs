@@ -6,13 +6,15 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if let [command] = arguments.as_slice()
-        && command == "tidy"
-    {
-        return run_tidy();
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    match arguments.as_slice() {
+        ["tidy"] => run_tidy(),
+        ["hook", event] => xtask::hook::run(event),
+        _ => {
+            eprintln!("usage: cargo xtask tidy | cargo xtask hook <post-edit|stop>");
+            ExitCode::FAILURE
+        }
     }
-    eprintln!("usage: cargo xtask tidy");
-    ExitCode::FAILURE
 }
 
 fn run_tidy() -> ExitCode {

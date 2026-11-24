@@ -16,6 +16,12 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 
 The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 
+Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
+
+- After every edit of a `.rs` file, the file is formatted and checked against the single-file
+  tidy rules. Fix what they report straight away.
+- Before you stop, `just check` runs if anything changed. You cannot finish while it fails.
+
 ## Repository map
 
 | Path | What it is |
