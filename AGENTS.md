@@ -23,6 +23,7 @@ The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 | `crates/nami-core` | Typed indices (`CellIndex`, `CellCount`) and field views. The only place `usize` is allowed. `no_std`. |
 | `crates/nami-kernels` | Numerical kernels. `no_std` without `alloc`. `math` is the single entry point for `libm`; `reduce` holds the deterministic sums. |
 | `crates/nami-solver` | Control plane: `Solver::init` (all allocation), the time loop, boundaries, I/O. |
+| `crates/nami-alloc-guard` | Test-only counting allocator: `assert_no_allocations` around everything after init. The only crate with `unsafe` (ADR-0014). |
 | `crates/nami-oracle` | Numerical oracles: exact solutions, manufactured solutions, convergence harness. **Protected.** |
 | `xtask/` | Project tooling (`cargo xtask tidy`). |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |

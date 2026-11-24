@@ -20,6 +20,9 @@ const FUNCTION_LINES_TRIVIAL_MAX: u32 = 5;
 /// Functions longer than this must contain at least one assertion (ADR-0004).
 const FUNCTION_LINES_UNASSERTED_MAX: u32 = 10;
 
+/// The only crate that may contain `unsafe` code (ADR-0014).
+const UNSAFE_ALLOWED_CRATE: &str = "crates/nami-alloc-guard";
+
 /// Macros that count as assertions.
 const ASSERTION_MACROS: [&str; 6] =
     ["assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne"];
@@ -123,6 +126,9 @@ impl Visitor<'_> {
             );
             self.report(function.signature.fn_token.span, "function-length", message);
         }
+        if let syn::Safety::Unsafe(unsafety) = &function.signature.safety {
+            self.report_unsafe(unsafety.span);
+        }
         if let Some(asyncness) = &function.signature.asyncness {
             let message =
                 "async functions are banned; functions run to completion (TIGER_STYLE.md)";
@@ -188,6 +194,14 @@ impl Visitor<'_> {
             let message = "`usize` in a public constant, static or alias; use a typed index or \
                            count, or `u32` (ADR-0002)";
             self.report(item_type.span(), "usize", message);
+        }
+    }
+
+    fn report_unsafe(&mut self, span: Span) {
+        if !self.path.starts_with(UNSAFE_ALLOWED_CRATE) {
+            let message = "`unsafe` outside crates/nami-alloc-guard; nami has no other unsafe \
+                           code. Find a safe formulation, or propose an ADR (ADR-0014)";
+            self.report(span, "unsafe", message);
         }
     }
 
@@ -268,7 +282,22 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         visit::visit_item_enum(self, node);
     }
 
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        self.report_unsafe(node.unsafe_token.span);
+        visit::visit_expr_unsafe(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if let Some(unsafety) = &node.unsafety {
+            self.report_unsafe(unsafety.span);
+        }
+        visit::visit_item_trait(self, node);
+    }
+
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if let Some(unsafety) = &node.unsafety {
+            self.report_unsafe(unsafety.span);
+        }
         let implements_default =
             node.trait_.as_ref().is_some_and(|(path, _)| last_segment_is(path, "Default"));
         if self.scope.is_nami() && implements_default {
@@ -494,6 +523,21 @@ mod tests {
         assert_eq!(rules("fn a(f: &dyn Fn()) {}", Scope::Crate), Vec::<&str>::new());
         let in_tests = "#[cfg(test)]\nmod tests { fn a(f: &dyn Fn()) {} }";
         assert_eq!(rules(in_tests, Scope::Kernels), Vec::<&str>::new());
+    }
+
+    // Goal: `unsafe` is rejected everywhere except in the allocation guard crate.
+    #[test]
+    fn unsafe_rule_fires() {
+        assert_eq!(rules("fn a() { unsafe {} }", Scope::Tooling), ["unsafe"]);
+        assert_eq!(rules("unsafe fn a() {}", Scope::Crate), ["unsafe"]);
+        assert_eq!(rules("unsafe impl Send for S {}", Scope::Crate), ["unsafe"]);
+        assert_eq!(rules("unsafe trait T {}", Scope::Crate), ["unsafe"]);
+        let guard = check(
+            Path::new("crates/nami-alloc-guard/src/lib.rs"),
+            "unsafe fn a() {}",
+            Scope::Crate,
+        );
+        assert_eq!(guard.violations, Vec::new());
     }
 
     // Goal: `#[ignore]` needs a reason.

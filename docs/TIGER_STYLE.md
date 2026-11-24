@@ -16,7 +16,7 @@ Until the P0 tooling exists, the tags describe the intended mechanism.
 
 | Tag | Mechanism |
 |---|---|
-| `[compiler]` | rustc itself (types, `no_std`, `unsafe_code = "forbid"`) |
+| `[compiler]` | rustc itself (types, `no_std`) |
 | `[clippy]` | workspace lint table and `clippy.toml` (ADR-0006) |
 | `[tidy]` | `cargo xtask tidy` (ADR-0006) |
 | `[dylint]` | the project dylint library (ADR-0006) |
@@ -192,8 +192,8 @@ multiply the bug-finding power of fuzzing and seeded simulation.
 
   `[tidy]`
 - **No unchecked hints.** `assert_unchecked`, `unreachable_unchecked` and `get_unchecked` are
-  unsafe and therefore unavailable. If the optimiser needs a fact, a real `assert!` provides it.
-  `[compiler]`
+  unsafe, and `unsafe` exists only in the test allocator crate (ADR-0014). If the optimiser
+  needs a fact, a real `assert!` provides it. `[clippy]` `[tidy]`
 - **Assertions are a safety net, not a substitute for understanding.** Oracles and fuzzers can show
   that bugs are present, never that they are absent. So:
   1. Build a precise mental model of the numerics first: the equations, the discretisation, the

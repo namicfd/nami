@@ -25,13 +25,18 @@ debug-assertions = true
 # Lint table (ADR-0006, amended by ADR-0013). Every crate opts in with `[lints] workspace = true`.
 # Warnings are denied in `just` and CI through `-D warnings`, never in source.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`, so that the allocation guard can carry the one allowed `#[expect]`.
+# Tidy confines `unsafe` to crates/nami-alloc-guard (ADR-0014).
+unsafe_code = "deny"
 missing_docs = "warn"
 unused_results = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(kani)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+
+# Unsafe code must document why it is sound (ADR-0014).
+undocumented_unsafe_blocks = "deny"
 
 # Panics and error handling.
 unwrap_used = "deny"
