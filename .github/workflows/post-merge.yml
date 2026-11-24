@@ -1,0 +1,42 @@
+# Slow and cross-platform checks that do not block merging (ADR-0009).
+# They run on every push to main and nightly. A failure here means main regressed: the offending
+# merge is reverted, not fixed forward. (The automatic bisect-and-revert bot is still to be built.)
+name: post-merge
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Cross-platform: the same gate on Apple Silicon. Once the solver exists, this job also
+  # compares output hashes with the Linux job (ADR-0005).
+  macos:
+    name: gate (macOS arm64)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: just check-full
+        run: just check-full
+
+  # Full mutation testing, nightly only.
+  mutants-full:
+    name: mutants (full)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: cargo mutants
+        run: cargo mutants --test-tool nextest --timeout 120 --no-shuffle

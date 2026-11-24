@@ -1,0 +1,39 @@
+name: setup
+description: Install the pinned Rust toolchain and the pinned cargo tools, with caching.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the toolchain from rust-toolchain.toml
+      shell: bash
+      run: rustup toolchain install
+
+    - name: Cache tool binaries
+      id: tools-cache
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/bin/just
+          ~/.cargo/bin/cargo-nextest
+          ~/.cargo/bin/cargo-deny
+          ~/.cargo/bin/cargo-mutants
+        key: tools-${{ runner.os }}-${{ runner.arch }}-just1.59.0-nextest0.9.152-deny0.22.1-mutants27.1.0
+
+    - name: Install pinned tools
+      if: steps.tools-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cargo install --locked just@1.59.0
+        cargo install --locked cargo-nextest@0.9.152
+        cargo install --locked cargo-deny@0.22.1
+        cargo install --locked cargo-mutants@27.1.0
+
+    - name: Cache dependencies and build output
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          target/
+        key: build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: build-${{ runner.os }}-${{ runner.arch }}-

@@ -210,6 +210,15 @@ mod tests {
         assert_eq!(json_bool_field(r#"{"stop_hook_active":"x"}"#, "stop_hook_active"), None);
     }
 
+    // Goal: the workspace root is found from any file inside it, and nothing is found outside.
+    #[test]
+    fn workspace_root_is_found_from_a_file() {
+        let root = crate::workspace_root();
+        let file = root.join("crates/nami-core/src/lib.rs");
+        assert_eq!(super::workspace_root_of(&file), Some(root));
+        assert_eq!(super::workspace_root_of(std::path::Path::new("/")), None);
+    }
+
     // Goal: malformed or unterminated strings yield None instead of a partial value.
     #[test]
     fn malformed_strings_are_rejected() {

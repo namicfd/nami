@@ -540,6 +540,33 @@ mod tests {
         assert_eq!(guard.violations, Vec::new());
     }
 
+    // Goal: every kind of function body is visited, so its rules apply.
+    #[test]
+    fn all_function_kinds_are_visited() {
+        assert_eq!(rules("impl S { fn a() { loop {} } }", Scope::Tooling), ["unbounded-loop"]);
+        assert_eq!(rules("trait T { fn a() { loop {} } }", Scope::Tooling), ["unbounded-loop"]);
+        assert_eq!(rules("fn a() { let _f = async {}; }", Scope::Tooling), ["async"]);
+        assert_eq!(rules("pub static N: usize = 1;", Scope::Crate), ["usize"]);
+        let enum_default = "#[derive(Default)]\nenum E { #[default] A }";
+        assert_eq!(rules(enum_default, Scope::Crate), ["default"]);
+    }
+
+    // Goal: only `#[cfg(test)]` modules are exempt, and the exemption ends with the module.
+    #[test]
+    fn test_module_exemption_is_scoped() {
+        let after_tests = "#[cfg(test)]\nmod t {}\nfn a(f: &dyn Fn()) {}";
+        assert_eq!(rules(after_tests, Scope::Kernels), ["kernel-indirection"]);
+        let other_cfg = "#[cfg(unix)]\nmod m { fn a(f: &dyn Fn()) {} }";
+        assert_eq!(rules(other_cfg, Scope::Kernels), ["kernel-indirection"]);
+    }
+
+    // Goal: the density threshold is exactly two assertions per function.
+    #[test]
+    fn density_threshold_is_two() {
+        assert!(AssertionStats { functions: 2, assertions: 4 }.meets_density(), "4 / 2 meets");
+        assert!(!AssertionStats { functions: 2, assertions: 3 }.meets_density(), "3 / 2 fails");
+    }
+
     // Goal: `#[ignore]` needs a reason.
     #[test]
     fn ignore_reason_rule_fires() {

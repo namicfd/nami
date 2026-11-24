@@ -211,11 +211,21 @@ mod tests {
         assert_eq!(violations.len(), 7, "index, status and five missing sections");
     }
 
+    // Goal: unreviewed insta snapshots are recognised by their extension.
+    #[test]
+    fn snapshot_drafts_are_recognised() {
+        assert!(super::is_snapshot_draft(Path::new("tests/snapshots/a.snap.new")));
+        assert!(!super::is_snapshot_draft(Path::new("tests/snapshots/a.snap")));
+    }
+
     // Goal: ADR files are recognised by their four-digit prefix.
     #[test]
     fn adr_file_names_are_recognised() {
         assert!(is_adr_file_name("0013-lint-table-refinements.md"));
         assert!(!is_adr_file_name("README.md"));
         assert!(!is_adr_file_name("13-x.md"));
+        assert!(!is_adr_file_name("0013_x.md"), "the number must be followed by a dash");
+        assert!(!is_adr_file_name("abcd-x.md"), "the prefix must be digits");
+        assert!(!is_adr_file_name("0013-x.txt"), "ADRs are Markdown");
     }
 }

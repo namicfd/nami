@@ -172,7 +172,9 @@ mod tests {
     #[test]
     fn index_and_count_conversions() {
         let count = CellCount::new(4);
+        assert_eq!(count.value(), 4);
         assert_eq!(count.to_usize(), 4);
+        assert_eq!(CellCount::from_usize(7).value(), 7);
         assert_eq!(CellIndex::from_usize(3).value(), 3);
         assert!(count.contains(CellIndex::new(3)));
         assert!(!count.contains(CellIndex::new(4)));

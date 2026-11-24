@@ -1,0 +1,50 @@
+# Blocking gate for pull requests and the merge queue (ADR-0009). Target: about 5 minutes.
+# `just check-full` runs exactly what developers and agents run locally.
+name: ci
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: just check-full
+        run: just check-full
+
+  # Mutation testing of the PR's changed lines. Advisory until it reliably fits the time budget;
+  # then it becomes a required check with zero surviving mutants (ADR-0009).
+  mutants-diff:
+    name: mutants (diff, advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - name: Diff against the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff "origin/${BASE_REF}...HEAD" > pr.diff
+      - name: cargo mutants --in-diff
+        run: cargo mutants --in-diff pr.diff --test-tool nextest --timeout 120 --no-shuffle

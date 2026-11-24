@@ -204,6 +204,57 @@ mod tests {
         assert_eq!(report.join("\n"), "", "tidy found violations");
     }
 
+    // Goal: a workspace with violations reports them, through every layer of the walk.
+    #[test]
+    fn check_reports_violations_in_a_fixture_workspace() {
+        let root = std::env::temp_dir().join(format!("nami-tidy-fixture-{}", std::process::id()));
+        let source = root.join("crates/nami-demo/src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(root.join("xtask")).unwrap();
+        std::fs::create_dir_all(root.join("docs/design")).unwrap();
+        std::fs::create_dir_all(root.join("target/ignored")).unwrap();
+        std::fs::write(root.join("xtask/expect-budget.txt"), "1\n").unwrap();
+        std::fs::write(root.join("docs/design/README.md"), "").unwrap();
+        std::fs::write(root.join("docs/design/0001-x.md"), "- Status: Accepted\n").unwrap();
+        std::fs::write(root.join("crates/nami-demo/Cargo.toml"), "[dependencies]\nserde = \"1\"\n")
+            .unwrap();
+        let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
+        std::fs::write(source.join("lib.rs"), unasserted).unwrap();
+        std::fs::write(root.join("target/ignored/skipped.rs"), "fn a() { loop {} }").unwrap();
+        std::fs::write(source.join("a.snap.new"), "").unwrap();
+        let violations = check(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let rules: Vec<&str> = violations.iter().map(|violation| violation.rule).collect();
+        assert_eq!(
+            rules,
+            ["assertion-density", "runtime-dependency", "snapshot-draft", "unasserted-function"]
+                .into_iter()
+                .chain(["adr-index"])
+                .chain(["adr-section"; 6])
+                .chain(["expect-budget"])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(violations[0].path, Path::new("crates/nami-demo"));
+        assert_eq!(violations[0].to_string().split(':').next(), Some("crates/nami-demo"));
+    }
+
+    // Goal: a violation prints as `path:line: error[rule]: message`.
+    #[test]
+    fn violations_print_in_compiler_style() {
+        let violation = super::Violation::new(Path::new("a.rs"), 3, "rule", "what; fix");
+        assert_eq!(violation.to_string(), "a.rs:3: error[rule]: what; fix");
+    }
+
+    // Goal: crate roots and skipped directories are recognised from paths alone.
+    #[test]
+    fn path_helpers_classify_paths() {
+        let lib = Path::new("crates/nami-core/src/lib.rs");
+        assert_eq!(super::crate_root(lib).as_deref(), Some(Path::new("crates/nami-core")));
+        assert_eq!(super::crate_root(Path::new("xtask/src/tidy.rs")), None);
+        assert!(super::is_skipped(Path::new("/repo/target")), "build output is skipped");
+        assert!(!super::is_skipped(Path::new("/repo/crates")), "sources are walked");
+    }
+
     // Goal: paths map to the scopes whose rules apply to them.
     #[test]
     fn scopes_follow_the_crate_layout() {

@@ -1,0 +1,5 @@
+# cargo-mutants configuration (ADR-0009).
+# Process glue is excluded: it reads stdin, spawns processes and maps exit codes, and is exercised
+# end to end by the hooks themselves. Everything it calls is unit tested.
+exclude_globs = ["xtask/src/main.rs"]
+exclude_re = ["hook\\.rs.*(replace|in) (run|post_edit|stop|has_changes)\\b"]
