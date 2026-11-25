@@ -8,7 +8,7 @@
 | § | Topic | State | ADR |
 |---|---|---|---|
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
-| 2 | Scope and roadmap | Open | |
+| 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Open | |
 | 4 | Core architecture | Open | |
 | 5 | Performance and parallelism | Open | |
@@ -18,11 +18,13 @@
 ## 1. Purpose, users and success criteria
 
 **nami is a production solver** for compressible magnetohydrodynamics and its sub-systems. It has
-three goals:
+four goals:
 
 - **Safety:** results you can trust. Rust's type system, TigerStyle assertions, bitwise
   determinism (ADR-0005) and references anchored outside the agent swarm (ADR-0007) make it so.
 - **Speed:** at least as fast as Athena++ and AthenaK on the same problem and hardware.
+- **Flexibility:** future features fit in naturally, through named extension points. The aim
+  is to exceed AthenaK's feature set eventually.
 - **A swarm-first demonstration:** agents write the code, and humans own the references, the
   thresholds and the ADRs. The project shows how far that approach goes.
 
@@ -88,3 +90,80 @@ The project has failed if:
   Voronoi mesh needs typed gathers as a first-class path, not as an exception.
 - **Agents are users (§ 6).** Configuration, errors and output must be usable by an agent:
   explicit configuration, terse greppable errors, machine-readable diagnostics.
+
+## 2. Scope and roadmap
+
+### One data model from the first slice
+
+1D is 3D with one cell in y and z, as in Athena++. The mesh is made of blocks from day one, and a
+uniform grid is a single block. Coordinates are part of the model from the start: the update
+uses face areas and cell volumes,
+
+  ū ← ū − (Δt/V) (A_R F_R − A_L F_L) + Δt S_geom,
+
+with non-uniform spacing allowed. Cartesian coordinates are the special case with constant areas
+and volumes and no geometric source. So no milestone rewrites the data model, and every slice,
+the first one included, exercises the real architecture.
+
+### Flexibility through named extension points
+
+Flexibility (§ 1) comes from a small, fixed set of extension points, not from a general framework.
+They are:
+
+- equation system and equation of state;
+- Riemann solver and reconstruction;
+- time integrator;
+- coordinates;
+- source terms;
+- boundary conditions;
+- refinement criteria;
+- outputs.
+
+Each is resolved at compile time, so hot loops have no `dyn` and no indirection (ADR-0003). The
+run configuration picks one compiled combination once, at init. § 4 designs the interfaces. Two
+risks: abstraction layers that make the code hard to read (§ 1, Failure), and compile time or
+code size growing with the number of combinations. Keeping the set of extension points small and
+fixed guards against both.
+
+### Equation systems and physics
+
+- **Equation systems, in order:** linear advection, Burgers, Euler, shallow water, ideal MHD.
+  - Burgers and shallow water are not on the path to MHD. They exist to get the abstractions
+    right, because an interface designed from one example is a guess.
+  - The four systems before MHD differ in their number of variables (1, 1, 3, 2), in
+    nonlinearity, and in having source terms.
+  - Shallow water includes bathymetry and is well-balanced (lake at rest), which tests the
+    source-term interface the way a hydrostatic atmosphere will in Euler and MHD. Wet/dry fronts
+    are deferred.
+- **Core physics:** adiabatic and isothermal equations of state, passive scalars, and static
+  gravity and user-defined source terms.
+- **Next:** resistivity, viscosity and thermal conduction, explicit first and with
+  super-time-stepping later.
+- **Deferred:** self-gravity, the shearing box and cooling.
+- **Deferred, but the architecture must not rule them out:** relativity, radiation and particles.
+  The aim to exceed AthenaK (§ 1) includes them eventually.
+- **Coordinates:** Cartesian, cylindrical and spherical.
+
+### Milestones
+
+Each milestone is a complete vertical slice, with references first (ADR-0007).
+
+| M | Slice | Grid | What it adds |
+|---|---|---|---|
+| 0 | Linear advection: the walking skeleton | 1D, one block, Cartesian | The pipeline end to end: references, kernels, time loop, boundaries, output. It also exercises the task, claim and review process. |
+| 1 | Burgers | 1D | Nonlinearity: a Riemann solution that is physical at a transonic rarefaction, shocks with known speeds |
+| 2 | Euler | 1D | A system: equation of state, HLLE and HLLC, Toro's tests 1–5, Sod, Shu–Osher |
+| 3 | Shallow water | 1D | Source terms and well-balancing. **Then a review of the equation-system interface** across all four systems, before it is frozen. |
+| 4 | Euler and shallow water | 2D/3D, many blocks, threads | Unsplit multi-dimensional integration, block boundary exchange, the first performance comparison with Athena++ |
+| 5 | Ideal MHD | 1D → 3D, constrained transport | HLLD, ∇·B = 0, Brio–Wu, linear waves, Orszag–Tang, field-loop advection |
+| 6 | Curvilinear coordinates | cylindrical, spherical | Geometric source terms, CT on curvilinear grids |
+| 7 | Multiple nodes | uniform grid | The communication layer: shared memory and TCP, then InfiniBand |
+| 8 | Static mesh refinement | | Prolongation and restriction, flux correction, CT across refinement levels |
+| 9 | Adaptive mesh refinement | | Refinement criteria, block pools, load balancing |
+| 10 | Unstructured and moving (Voronoi) mesh, stretch goal | | Its own design pass first |
+
+- Threads come at M4, because they decide the data layout.
+- Curvilinear coordinates come before mesh refinement, so that prolongation, restriction and
+  flux correction are written for every coordinate system from the start.
+- Multiple nodes come before mesh refinement, because load balancing under AMR depends on the
+  communication layer.
