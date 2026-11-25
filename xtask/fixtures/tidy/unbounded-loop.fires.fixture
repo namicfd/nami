@@ -26,6 +26,10 @@ fn cycle_forever(values: &[f64]) {
     for _value in values.iter().cycle() {}
 }
 
+fn cycle_through_the_trait(values: &[f64]) {
+    for _value in Iterator::cycle(values.iter()) {}
+}
+
 fn chain_forever(values: &[f64]) {
     for _value in values.iter().chain(core::iter::repeat(&1.0_f64)) {}
 }
