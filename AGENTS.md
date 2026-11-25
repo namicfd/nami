@@ -17,7 +17,8 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 - `cargo xtask doctor`: compare your tools with the pinned versions.
 - `cargo xtask protected`: list the protected paths your branch changes, for the PR description.
 - `cargo xtask issue file` and `cargo xtask issue show <n>`: file a finding outside your task as
-  a GitHub issue, and read an issue (ADR-0021).
+  a GitHub issue, and read an issue (ADR-0021). They run gh, so prefix them with
+  `GH_TOKEN=$(xtask/agent-token.sh)`, like `cargo xtask task ready` and `claim`.
 
 The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 
