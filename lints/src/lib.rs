@@ -46,10 +46,11 @@ dylint_linting::declare_lint! {
     ///
     /// Reports `sum` and `product` with a float result, also inside `Option` or `Result`, and
     /// `fold`, `rfold`, `try_fold`, `try_rfold` and `reduce` with a float accumulator whose
-    /// function adds to or subtracts from it: a closure that applies `+`, `-`, `+=`, `-=`,
-    /// `Add::add` or `Sub::sub` to the accumulator, or a `mul_add` with the accumulator as the
-    /// addend, anywhere but in a condition, a match guard or a comparison; or a path to
-    /// `Add::add` or `Sub::sub` such as `f64::add`. Test code is exempt.
+    /// function adds to or subtracts from it: a closure that updates the accumulator with `+=`,
+    /// `-=`, `add_assign` or `sub_assign`, or applies `+`, `-`, `Add::add`, `Sub::sub` or a
+    /// `mul_add` (as the addend) to it anywhere but in the value of a condition, a match guard
+    /// or a comparison; or a path to `Add::add` or `Sub::sub` such as `f64::add`. Test code is
+    /// exempt.
     ///
     /// ### Why is this bad?
     ///

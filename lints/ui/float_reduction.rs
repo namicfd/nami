@@ -2,7 +2,7 @@
 // UI test for `nami_float_reduction`: every naive float sum the lint must catch, and the code it
 // must leave alone. It is compiled as a test harness, so that the test code at the end exists.
 
-use std::ops::{Add, Sub};
+use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 fn sum_f64(values: &[f64]) -> f64 {
     values.iter().sum()
@@ -200,6 +200,204 @@ fn fold_add_in_a_discarded_statement(values: &[f64]) -> f64 {
     })
 }
 
+// Reported: an accumulator update inside a condition, a guard or a compared operand. Only the
+// value there is excluded, not its side effects.
+fn fold_add_assign_in_a_compared_block(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        let _positive = {
+            total += value;
+            total
+        } > 0.0;
+        total
+    })
+}
+
+fn fold_assign_sum_in_a_compared_block(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        let _ = 0.0 < {
+            total = total + value;
+            total
+        };
+        total
+    })
+}
+
+fn fold_add_assign_in_an_if_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        if {
+            total += value;
+            true
+        } {
+            total
+        } else {
+            total
+        }
+    })
+}
+
+fn fold_assign_sum_in_an_if_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        if {
+            total = total + value;
+            total > 0.0
+        } {}
+        total
+    })
+}
+
+fn fold_add_assign_in_a_guard(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| match value {
+        x if {
+            total += x;
+            true
+        } =>
+        {
+            total
+        }
+        _ => total,
+    })
+}
+
+fn fold_add_assign_in_an_and(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        let _ = value > 0.0 && {
+            total += value;
+            true
+        };
+        total
+    })
+}
+
+fn fold_add_assign_in_an_or(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        let _ = value > 0.0 || {
+            total += value;
+            true
+        };
+        total
+    })
+}
+
+fn fold_sum_assigned_to_a_local_in_a_compared_block(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let sum;
+        let _ = {
+            sum = total + value;
+            sum
+        } > 0.0;
+        sum
+    })
+}
+
+fn fold_sum_assigned_to_a_local_in_an_if_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let sum;
+        if {
+            sum = total + value;
+            sum > 0.0
+        } {
+            sum
+        } else {
+            sum
+        }
+    })
+}
+
+// Reported: `add_assign` and `sub_assign`, the methods behind `+=` and `-=`.
+fn fold_add_assign_method_call(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        total.add_assign(value);
+        total
+    })
+}
+
+fn fold_sub_assign_path_call(values: &[f32]) -> f32 {
+    values.iter().fold(0.0, |mut total, &value| {
+        SubAssign::sub_assign(&mut total, value);
+        total
+    })
+}
+
+// Reported: a sum inside a closure nested in the fold's closure.
+fn fold_add_in_a_nested_closure(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| (|| total + value)())
+}
+
+// Reported: more shapes that a sum reaches the result through.
+struct Total {
+    value: f64,
+}
+
+fn fold_add_shadowed(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let total = total + value;
+        total
+    })
+}
+
+fn fold_add_as_a_receiver(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| (total + value).abs())
+}
+
+fn fold_add_as_an_argument(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| total.max(total + value))
+}
+
+fn fold_add_in_a_break(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| 'sum: {
+        break 'sum total + value;
+    })
+}
+
+fn fold_add_in_a_return(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        return total + value;
+    })
+}
+
+fn fold_add_in_a_cast(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| (total + value) as f64)
+}
+
+fn fold_add_behind_a_reference(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| *&(total + value))
+}
+
+fn fold_add_in_a_struct_field(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| Total { value: total + value }.value)
+}
+
+fn fold_add_in_a_let_else(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let Some(sum) = Some(total + value) else {
+            return total;
+        };
+        sum
+    })
+}
+
+fn fold_add_tested_and_returned(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let sum = total + value;
+        if sum > 0.0 { sum } else { total }
+    })
+}
+
+fn fold_add_in_an_unused_local(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let _unused = total + value;
+        value
+    })
+}
+
+fn fold_add_assigned_later(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let sum;
+        sum = total + value;
+        sum
+    })
+}
+
 // Reported as too complex: more expressions than the lint traces, even though it is a maximum.
 macro_rules! times_four {
     ($e:expr) => {
@@ -261,6 +459,18 @@ fn rfold_min_shifted(values: &[f64], shift: f64) -> f64 {
 
 fn try_rfold_max(values: &[f64]) -> Option<f64> {
     values.iter().try_rfold(f64::NEG_INFINITY, |greatest, &value| Some(greatest.max(value)))
+}
+
+// Not reported, by design: a sum used only as a condition, a guard or a compared value.
+fn fold_sum_only_compared(values: &[f64], limit: f64) -> f64 {
+    values.iter().fold(0.0, |total, &value| if total + value > limit { total } else { value })
+}
+
+fn fold_sum_only_in_a_guard(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| match value {
+        x if total + x > 0.0 => x,
+        _ => total,
+    })
 }
 
 // Not reported: an argmin or argmax, where the accumulator is subtracted only in the condition,
