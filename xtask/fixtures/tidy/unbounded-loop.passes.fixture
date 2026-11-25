@@ -1,5 +1,5 @@
 // path: crates/solver/src/example.rs
-//! Loops with a fixed upper bound. `take` and `zip` bound a range without an end.
+//! Loops with a fixed upper bound. `take` and `zip` bound a range or an iterator without an end.
 
 /// Upper bound on time steps.
 const STEPS_MAX: u32 = 8;
@@ -9,4 +9,7 @@ fn run(cells: &[f64]) {
     for _step in 0..=STEPS_MAX {}
     for _step in (0_u32..).take(3) {}
     for (_position, _cell) in (0_u32..).zip(cells) {}
+    for _value in core::iter::repeat(1.0_f64).take(3) {}
+    for _value in cells.iter().cycle().take(6) {}
+    for (_cell, _weight) in cells.iter().zip(core::iter::repeat(0.5_f64)) {}
 }

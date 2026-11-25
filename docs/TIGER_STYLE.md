@@ -109,8 +109,10 @@ Every loop, every iteration and every buffer has a fixed upper bound. Violations
 instead of hanging.
 
 - **Prefer `for` over a bounded range or a slice iterator.** `loop` and `while` are banned, and so
-  is `for` over a range without an end. A `for _ in 0..LIMIT` with an assertion after the loop is
-  almost always clearer anyway. `[tidy:unbounded-loop]`
+  is `for` over a range without an end or over an iterator that never ends (`repeat`,
+  `repeat_with`, `from_fn`, `successors`, `cycle`), unless `take` or `zip` bounds it. A
+  `for _ in 0..LIMIT` with an assertion after the loop is almost always clearer anyway.
+  `[tidy:unbounded-loop]`
 - **Iterative methods name their limit and assert convergence.** This applies to Newton for the
   exact Riemann solver, fixed-point iterations and implicit sources. Running out of iterations is a
   crash, not a silent "best effort":
