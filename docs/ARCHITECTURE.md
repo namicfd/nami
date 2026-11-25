@@ -1,7 +1,7 @@
 # nami architecture
 
-> Status: **being written, one topic at a time,** in a discussion between the maintainer and an
-> agent. Each section says whether it is agreed, proposed or open. The decisions themselves are
+> Status: **all seven topics agreed** in a discussion between the maintainer and an agent
+> (2026-11-26). Each section says whether it is agreed, proposed or open. The decisions themselves are
 > ADRs in `docs/design/`, status Proposed until the maintainer accepts them. Where this file and an
 > ADR disagree, the ADR wins.
 
@@ -13,7 +13,7 @@
 | 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) agreed | [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
 | 5 | Performance and parallelism | Agreed (problem sizes open until M7) | [0027](design/0027-parallelism-and-communication.md), [0028](design/0028-infiniband-binding-crate.md) |
 | 6 | Interface, output and determinism guarantees | Agreed | [0029](design/0029-interface-output-and-guarantees.md) |
-| 7 | Verification strategy | Open | |
+| 7 | Verification strategy | Agreed | [0030](design/0030-verification-strategy.md) |
 
 ## 1. Purpose, users and success criteria
 
@@ -543,3 +543,70 @@ upgrades. Each such change is labelled `changes-results` and explained (ADR-0005
 
 There are no Python bindings: `pyo3` is a crate, so ADR-0001 rules it out. Python only reads
 output.
+
+## 7. Verification strategy
+
+ADR-0007 sets the rules: references live in a code-owned crate, land before the feature, are
+anchored outside the swarm, and are sorted into tiers. This section scales those rules to many
+combinations, multi-D, AMR and ranks.
+
+### 7.1 Check suites are chosen by declared properties
+
+- `reference` defines one contract per equation system: a scheme is something that runs a
+  problem and returns cell averages.
+- Each combination declares its properties (formal order, TVD, positivity-preserving,
+  well-balanced) and is wired in with one line.
+- `reference` maps the declared properties to the checks they imply. The implementer cannot pick
+  or skip checks. This is how every selectable combination gets verified (§ 3.3, ADR-0024).
+
+### 7.2 An outside anchor for every system
+
+| System | Anchor |
+|---|---|
+| Advection | Exact solution |
+| Burgers | Exact Riemann solution; Rankine–Hugoniot shock speeds |
+| Euler | Toro's published star states for tests 1–5 (ADR-0007) |
+| Shallow water | Exact dam-break solution; lake at rest preserved bitwise |
+| MHD | Published Ryu–Jones Riemann problems; linear waves with analytic eigenvectors, against Athena++'s published error thresholds |
+| Source terms, curvilinear coordinates, diffusion | Manufactured solutions generated with SymPy (ADR-0007) |
+
+### 7.3 Reference data from PyClaw and from Athena++
+
+Pinned Athena++ is built anyway for benchmarking (ADR-0022), and it is an independent
+implementation. For MHD and constrained transport (Orszag–Tang, rotor, field loop, MHD blast) it
+is a better source of reference data than PyClaw. Its data is committed with a provenance file
+(tool version, commit, input, command, date), and only a PR the maintainer approves may
+regenerate it, as for PyClaw.
+
+### 7.4 Bitwise tests that come with the architecture
+
+- **1D embedded in 3D:** a 1D problem on a 3D grid that is uniform in y and z gives exactly the 1D
+  bits, because the transverse fluxes cancel exactly.
+- **Rotation:** the same problem along x, y and z gives identical bits (exact permutations,
+  § 4(b)).
+- **Full refinement:** a mesh refined everywhere to level L gives the bits of a uniform mesh at
+  level L.
+- **Decomposition and restart** (§ 5.4, § 6.6).
+- **Conservation across refinement levels** to round-off, measured with the exact accumulator.
+
+### 7.5 Benchmark problems as regression tests
+
+They are compared through norms and probe values against their reference data:
+
+- **Hydrodynamics:** Sod, Shu–Osher, Woodward–Colella blast, double Mach reflection,
+  Kelvin–Helmholtz, and the isentropic vortex for convergence.
+- **MHD:** Brio–Wu, Orszag–Tang, rotor, MHD blast, field loop, oblique linear waves in 3D.
+
+### 7.6 The split gate
+
+- **Before merging** (ADR-0009's budget of about five minutes): a fixed, deterministic sample of
+  combinations at coarse resolution.
+- **After merging:** the full matrix, and mutation testing of the solver code against the
+  references, with automatic revert on failure (ADR-0009).
+
+### 7.7 Thresholds are Rust constants
+
+Thresholds live in `crates/reference/src/thresholds.rs`, not in `thresholds.toml`. Each one is a
+typed constant whose doc comment derives its value, and the file is as code-owned as any other
+reference. There is no parser on the trust path: the configuration parser of § 6.2 belongs to the
+solver, and the references do not depend on the code they check.
