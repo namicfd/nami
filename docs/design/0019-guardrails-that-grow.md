@@ -105,6 +105,7 @@ Every guardrail PR still waits for the code owner (ADR-0015). The two signals sa
 - A guardrail gap costs an agent one file, and a ban costs one row. The backlog of gaps is in the repo, where the planner and the janitors can read it.
 - The code owner sees at a glance whether a guardrail PR loosens anything, and what a new rule would have caught.
 - **The base gate replays tidy only.** A loosened clippy level, `clippy.toml` entry, `deny.toml` list, dylint lint or `justfile` recipe shows only in the diff. The doc-tag check (ADR-0017) covers part of this: a lint that the style guide names cannot be removed without tidy failing.
+- **`pr-body` reads `.github/CODEOWNERS` from the PR's own tree.** A PR that deletes a pattern shortens the list it has to write. GitHub applies the base branch's file, so the review itself is not bypassed.
 - **The first PR after this ADR has no base gate,** because the base branch's tidy cannot check another tree yet. The job skips itself in that case.
 - More small PRs touch protected paths. That is intended (ADR-0015): they are quick to review, and the alternative is that the gap stays open.
 

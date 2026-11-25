@@ -24,10 +24,10 @@ Two smaller problems slowed every session down:
 
 The hook fingerprints the working state: the git tree of every tracked file and every untracked file that is not ignored, computed with a scratch index so that the real index is untouched. It skips the gate only when that fingerprint equals:
 
-- the tree of the merge base with `main` (nothing differs from `main`), or
+- the tree of the merge base with `main` (nothing differs from `main`); on the branch `main` itself the base is `origin/main`, so that commits made directly on `main` are still checked; or
 - the fingerprint of the last run that passed (nothing changed since).
 
-Otherwise it runs. Committing no longer hides work, and an unchanged green tree is not checked twice.
+Otherwise it runs. Committing no longer hides work, and an unchanged green tree is not checked twice. If git cannot produce a fingerprint, the gate runs.
 
 ### 2. What it runs
 
@@ -37,7 +37,7 @@ Otherwise it runs. Committing no longer hides work, and an unchanged green tree 
 
 - A failing gate blocks the stop and returns the tail of the output to the agent, up to **three times in a row** per session.
 - On the next failure the hook stops blocking. It tells the human, in a non-blocking hook error, that the gate still fails, that the work is not done and that CI will reject it.
-- A passing run resets the count.
+- A passing run resets the count, and so does a stop that needs no gate. The count is kept per session, so it means failed stops in a row.
 
 The limit exists because an agent can face a failure it cannot fix, for example a broken toolchain, and a hook that never lets go wastes the session's budget (ADR-0012).
 
@@ -45,7 +45,7 @@ The limit exists because an agent can face a failure it cannot fix, for example 
 
 A `SessionStart` hook:
 
-- adds `$HOME/.cargo/bin` to the session's `PATH` when it is missing;
+- adds `$HOME/.cargo/bin` to the session's `PATH` when it is missing, by appending one `export` line to the file that `CLAUDE_ENV_FILE` names;
 - runs `cargo xtask doctor` and prints what it finds into the agent's context.
 
 `cargo xtask doctor` compares each installed tool with the version pinned in `.github/actions/setup/action.yml`, and checks that the nightly pinned in `lints/rust-toolchain.toml` is installed. The CI action stays the only place where versions are written down.
@@ -66,7 +66,7 @@ Edits made through the shell are not seen by this hook. The stop gate catches th
 ## Consequences
 
 - `AGENTS.md` can say truthfully what happens at stop: the gate runs unless the tree equals `main` or the last green run, and it blocks three times.
-- A stop after real work costs the gate's run time: a few seconds warm, and about 25 seconds in a fresh worktree, where the dylint library is built once.
+- A stop after real work costs the gate's run time: about 2 seconds on a warm tree today, and about half a minute in a fresh worktree, where the lint library is built once. Under load, a cold run in a fresh clone took 114 seconds; the hook's timeout is 600 seconds.
 - A session that only reads a branch with someone else's failing commits is blocked three times for work it did not do. This is accepted: the alternative is guessing whose changes they are.
 - The fingerprint writes loose objects into the git object store. `git gc` removes them.
 - The state lives in `target/stop-gate/`, which is ignored by git and local to each worktree.
@@ -90,6 +90,18 @@ Review of 2026-11-25, run against a scratch clone:
 | Dirty tree with a `while` loop, first stop | exit 2 (blocked) |
 | The same tree, second stop (`stop_hook_active`) | exit 0 |
 | Clean tree after a commit | skipped (`has_changes` read `git status --porcelain`) |
+
+The new hook, run by hand against a scratch clone with one session id:
+
+| Case | New hook |
+|---|---|
+| Clean tree at the base | exit 0, gate not run |
+| A directly recursive function, committed, tree clean | exit 2, "blocked stop 1 of 3": `just check` passes and `cargo dylint` fails |
+| The same tree, second and third stop | exit 2, "2 of 3" and "3 of 3" |
+| The same tree, fourth stop | exit 1, "STOP GATE STILL FAILING", count cleared |
+| The function removed, committed | exit 0, gate run, fingerprint stored |
+| The same tree again | exit 0, gate not run |
+| A new untracked file | gate run again |
 
 - `command -v just` and `command -v cargo` printed nothing in the agent's shell. Both are in `$HOME/.cargo/bin`.
 - Claude Code hooks: exit code 2 blocks and returns stderr to the agent; `SessionStart` hooks can extend the session's environment through `CLAUDE_ENV_FILE` ([hooks guide](https://code.claude.com/docs/en/hooks-guide)).
