@@ -121,7 +121,7 @@ If it needs more than one small PR, release the claim, comment why, and add `nee
 
 ## Setting `passes`
 
-ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet. ADR-0017 (Proposed) covers the gap until it does: the maintainer sets `passes` by hand, and agents never do.
+ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet. ADR-0017 covers the gap until it does: the maintainer sets `passes` by hand, and agents never do.
 
 ## Writing a plan
 
