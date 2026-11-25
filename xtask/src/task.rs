@@ -13,6 +13,7 @@
 pub mod claims;
 pub mod plan;
 
+use crate::tidy::LEARNING_DIRECTORY;
 use claims::Claim;
 use plan::Task;
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,7 +266,8 @@ pub fn passes_flips(head: &[Task], base_passing: &BTreeSet<String>) -> Vec<Strin
 
 /// Advisory: changed files that lie outside task `id`'s owner paths, as defined in `tasks`.
 /// The task's `plan.md` is exempt, so that a task may record notes there; its `tasks.json` is
-/// not, so that a change to the task's own definition is always reported.
+/// not, so that a change to the task's own definition is always reported. Learnings are exempt
+/// too: any task may add one (ADR-0020).
 #[must_use]
 pub fn outside_owner_paths(tasks: &[Task], id: &str, changed: &[&str]) -> Vec<String> {
     let Some(task) = tasks.iter().find(|task| task.id == id) else {
@@ -276,6 +278,7 @@ pub fn outside_owner_paths(tasks: &[Task], id: &str, changed: &[&str]) -> Vec<St
         .iter()
         .filter(|file| !task.owner_paths.iter().any(|owned| plan::overlaps(file, owned)))
         .filter(|file| **file != plan_file)
+        .filter(|file| !plan::overlaps(file, LEARNING_DIRECTORY))
         .map(|file| format!("`{file}` is outside the owner_paths of `{id}` (ADR-0011)"))
         .collect();
     assert!(outside.len() <= changed.len(), "at most every changed file is outside");
@@ -343,8 +346,8 @@ mod tests {
         );
     }
 
-    // Goal: files outside the task's owner paths are listed, except the plan's own files; an
-    // unknown task is reported.
+    // Goal: files outside the task's owner paths are listed, except the plan's own file and
+    // learnings; an unknown task is reported.
     #[test]
     fn owner_path_warnings() {
         let tasks = [task("a", &[], false)];
@@ -353,6 +356,7 @@ mod tests {
             "crates/b/src/lib.rs",
             "docs/exec-plans/active/p/plan.md",
             "docs/exec-plans/active/p/tasks.json",
+            "docs/learnings/2026-01-01-a-gap.md",
         ];
         let warnings = outside_owner_paths(&tasks, "a", &changed);
         assert_eq!(warnings.len(), 2, "{warnings:?}");

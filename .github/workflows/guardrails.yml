@@ -1,0 +1,75 @@
+# Checks on what a pull request does to the guardrails themselves (ADR-0020).
+# Neither job is a required check: a guardrail change waits for the code owner anyway
+# (ADR-0015). These jobs tell the code owner where to look first.
+name: guardrails
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guardrails-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The description lists every protected file the PR changes and records guardrail gaps.
+  pr-body:
+    name: pr body
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - name: cargo xtask pr-body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+        run: cargo xtask pr-body --base "origin/${BASE_REF}"
+
+  # CI runs a PR's own checks, so a PR that weakens tidy passes its own gate. This job runs the
+  # base branch's tidy on the PR's tree. Red means: this PR passes only because it changed a
+  # rule. It then runs the PR's tidy on the base tree and reports what the PR tightened.
+  base-gate:
+    name: base gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - name: Check out the base branch next to the PR
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git worktree add "${RUNNER_TEMP}/base" "origin/${BASE_REF}"
+      - name: Base tidy on the PR tree (red means the PR loosened a rule it needed)
+        working-directory: ${{ runner.temp }}/base
+        run: |
+          if ! grep --quiet -- '--policy' xtask/src/main.rs; then
+            echo "The base branch's tidy cannot check another tree yet; skipped." \
+              >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          cargo xtask tidy --root "${GITHUB_WORKSPACE}" --policy .
+      - name: PR tidy on the base tree (reports what the PR tightened)
+        if: always()
+        run: |
+          if cargo xtask tidy --root "${RUNNER_TEMP}/base" --policy "${RUNNER_TEMP}/base" \
+            > tightened.txt 2>&1; then
+            echo "This PR's tidy finds nothing new in the base tree." >> "${GITHUB_STEP_SUMMARY}"
+          else
+            {
+              echo "### This PR tightens tidy: the base tree breaks these rules"
+              echo '```'
+              cat tightened.txt
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi

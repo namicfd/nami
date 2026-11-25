@@ -1,0 +1,9 @@
+// path: crates/kernels/src/math.rs
+//! `kernels::math` is the one module that may call `libm`: each wrapper asserts its domain.
+
+/// Square root of a non-negative, finite value.
+pub fn sqrt(value: f64) -> f64 {
+    assert!(value.is_finite(), "sqrt argument must be finite");
+    assert!(value >= 0.0, "sqrt argument must be non-negative");
+    libm::sqrt(value)
+}

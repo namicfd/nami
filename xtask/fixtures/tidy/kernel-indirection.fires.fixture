@@ -1,0 +1,10 @@
+// path: crates/kernels/src/example.rs
+//! Calls that the compiler cannot resolve statically.
+
+fn limit_dynamic(limiter: &dyn Fn(f64) -> f64, slope: f64) -> f64 {
+    limiter(slope)
+}
+
+fn limit_pointer(limiter: fn(f64) -> f64, slope: f64) -> f64 {
+    limiter(slope)
+}

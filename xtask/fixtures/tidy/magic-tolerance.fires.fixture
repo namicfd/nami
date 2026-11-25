@@ -1,0 +1,17 @@
+// path: crates/kernels/src/example.rs
+//! Small numbers that nobody named: a silent floor, an inline epsilon, an epsilon inside an
+//! assertion, and a constant that does not say where its value comes from.
+
+const PRESSURE_FLOOR: f64 = 1.0e-10;
+
+fn density_floored(density: f64) -> f64 {
+    density.max(1.0e-12)
+}
+
+fn is_converged(change_relative: f64) -> bool {
+    change_relative < 1e-9
+}
+
+fn check_wave_speed(wave_speed: f64) {
+    assert!(wave_speed > 1.0e-14, "wave speed must not vanish");
+}

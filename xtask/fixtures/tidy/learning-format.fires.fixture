@@ -1,0 +1,10 @@
+<!-- path: docs/learnings/tidy-missed-direct-libm.md -->
+# Tidy missed a direct libm call
+
+The name has no date, the status is not one of the three, and the guardrail section is missing.
+
+- Status: Done
+
+## What happened
+
+A kernel called `libm::sqrt` directly and every check passed.

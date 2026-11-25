@@ -1,0 +1,14 @@
+<!-- path: docs/TIGER_STYLE.md -->
+# A style guide whose tags claim more than the tooling does
+
+## Rules
+
+- A tag without a rule id says nothing that can be checked. `[tidy]`
+- A tidy rule that does not exist. `[tidy:no-such-rule]`
+- A clippy lint that the workspace lint table does not switch on. `[clippy:no_such_lint]`
+- A rustc lint that the workspace lint table does not switch on. `[rustc:no_such_lint]`
+- A dylint lint that nobody declared. `[dylint:nami_no_such_lint]`
+- A planned mechanism that is not in the registry. `[planned:no-such-plan]`
+- Hooks only give feedback. `[hook]`
+- The reference suite does not exist yet. `[reference]`
+- A misspelt tag. `[reveiw]`

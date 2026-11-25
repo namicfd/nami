@@ -38,13 +38,18 @@ test:
 test-checked:
     cargo nextest run --workspace --locked --no-tests=pass --cargo-profile release-checked
 
-# Lints that need the compiler: no recursion (ADR-0006). Uses the nightly pinned in lints/.
+# Lints that need the compiler: no recursion, no naive float sums (ADR-0006, ADR-0018).
+# Uses the nightly pinned in lints/. The wrapper makes cargo re-lint after a lint changes.
 dylint:
-    cargo dylint --all -- --workspace --all-targets --locked
+    cargo xtask dylint
 
 # Licenses, advisories, bans and sources (ADR-0001).
 deny:
     cargo deny --locked check
+
+# Check that the installed tools are the versions that CI pins.
+doctor:
+    cargo xtask doctor
 
 # Task tracking (ADR-0011): status, ready, claim <id>, release <id>, validate.
 task *arguments:

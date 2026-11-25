@@ -1,0 +1,15 @@
+# path: crates/demo/Cargo.toml
+[package]
+name = "demo"
+
+# A crate that is not allowed, and an allowed name that resolves to another crate.
+[dependencies]
+serde = "1"
+libm = { package = "serde_json", version = "1" }
+
+# A crate that is not allowed, written as its own table.
+[dependencies.rand]
+version = "0.9"
+
+[target.'cfg(unix)'.build-dependencies.cc]
+version = "1"

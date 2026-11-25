@@ -1,0 +1,13 @@
+// path: crates/kernels/src/example.rs
+//! `libm` used directly, outside `kernels::math`: an import, a call, and a call inside the
+//! arguments of a macro.
+
+use libm::cbrt;
+
+fn sound_speed(pressure: f64, density: f64) -> f64 {
+    libm::sqrt(1.4 * pressure / density)
+}
+
+fn check_root(value: f64) {
+    assert!(libm::sqrt(value) >= 0.0, "a root is non-negative");
+}

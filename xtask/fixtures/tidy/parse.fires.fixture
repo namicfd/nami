@@ -1,0 +1,4 @@
+// path: crates/solver/src/example.rs
+//! A file that is not Rust: the parameter list never closes.
+
+fn broken( {

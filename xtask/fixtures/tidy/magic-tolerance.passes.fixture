@@ -1,0 +1,26 @@
+// path: crates/kernels/src/example.rs
+//! A tolerance with a name and an origin. Larger literals and zero are not tolerances, and
+//! test code may write small numbers inline.
+
+/// Relative change in pressure below which the Newton iteration has converged: round-off for
+/// a 64-bit pressure of order one, with two digits to spare.
+const PRESSURE_TOLERANCE_RELATIVE: f64 = 1.0e-12;
+
+fn is_converged(change_relative: f64) -> bool {
+    change_relative < PRESSURE_TOLERANCE_RELATIVE
+}
+
+fn is_subsonic(mach: f64) -> bool {
+    mach > 0.0 && mach < 0.999
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_converged;
+
+    // Goal: a change below the tolerance counts as converged.
+    #[test]
+    fn small_changes_converge() {
+        assert!(is_converged(1.0e-13), "below the tolerance");
+    }
+}

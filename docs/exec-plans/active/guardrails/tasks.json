@@ -1,0 +1,234 @@
+{
+  "tasks": [
+    {
+      "id": "float-eq-in-eq-fn",
+      "title": "Tidy rule: float == and != in functions whose name contains eq, which clippy float_cmp skips (ADR-0006)",
+      "depends_on": [],
+      "owner_paths": [
+        "xtask/src/tidy/rust_source.rs",
+        "xtask/fixtures/tidy/float-eq-in-eq-fn.fires.fixture",
+        "xtask/fixtures/tidy/float-eq-in-eq-fn.passes.fixture",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::rust_source::tests::float_eq_in_eq_fn_rule_fires",
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture"
+      ],
+      "passes": false
+    },
+    {
+      "id": "clippy-fixtures",
+      "title": "Planted violations prove that every clippy ban and configured lint still fires (ADR-0006)",
+      "depends_on": [
+        "float-eq-in-eq-fn"
+      ],
+      "owner_paths": [
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "doc-example-sync",
+      "title": "Compile and lint the code blocks of docs/TIGER_STYLE.md, so the examples cannot drift from the rules (ADR-0013)",
+      "depends_on": [
+        "clippy-fixtures"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/style_guide.rs",
+        "xtask/tests/style_guide_examples.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::style_guide_examples::every_code_block_passes_the_gate"
+      ],
+      "passes": false
+    },
+    {
+      "id": "usize-alias",
+      "title": "Dylint lint: a type-aware usize rule, so that an alias or a local variable cannot get around tidy (ADR-0002)",
+      "depends_on": [
+        "doc-example-sync"
+      ],
+      "owner_paths": [
+        "lints/src/usize_alias.rs",
+        "lints/src/lib.rs",
+        "lints/ui/usize_alias.rs",
+        "lints/ui/usize_alias.stderr",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "nami_lints::ui"
+      ],
+      "passes": false
+    },
+    {
+      "id": "recursion-cross-crate",
+      "title": "Dylint lint: call cycles that cross crates through a generic callback, which nami_recursion does not see (ADR-0006)",
+      "depends_on": [
+        "usize-alias"
+      ],
+      "owner_paths": [
+        "lints/src/recursion.rs",
+        "lints/ui/recursion_cross_crate.rs",
+        "lints/ui/recursion_cross_crate.stderr",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "nami_lints::ui"
+      ],
+      "passes": false
+    },
+    {
+      "id": "glossary",
+      "title": "docs/glossary.md records the one meaning of each word that could be overloaded, and tidy checks that it exists (TIGER_STYLE.md, Naming)",
+      "depends_on": [
+        "recursion-cross-crate"
+      ],
+      "owner_paths": [
+        "docs/glossary.md",
+        "xtask/src/tidy/docs.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::docs::tests::glossary_defines_each_term_once"
+      ],
+      "passes": false
+    },
+    {
+      "id": "thresholds-file",
+      "title": "crates/reference/thresholds.toml: the one human-owned file that holds every test tolerance (ADR-0007)",
+      "depends_on": [
+        "glossary"
+      ],
+      "owner_paths": [
+        "crates/reference/thresholds.toml",
+        "crates/reference/src/thresholds.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "reference::thresholds::tests::every_threshold_comes_from_the_file"
+      ],
+      "passes": false
+    },
+    {
+      "id": "reference-suite",
+      "title": "Tiered reference tests in crates/reference: invariants, symmetry, convergence order, exact solutions, one reference per boundary-condition type (ADR-0007)",
+      "depends_on": [
+        "thresholds-file"
+      ],
+      "owner_paths": [
+        "crates/reference/src",
+        "crates/reference/tests",
+        "crates/reference/Cargo.toml",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "reference::invariants::conservation_holds_to_round_off",
+        "reference::invariants::wave_speed_bounds_the_maximum_eigenvalue",
+        "reference::invariants::ghost_cells_are_written_before_they_are_read",
+        "reference::boundaries::each_boundary_type_has_a_reference"
+      ],
+      "passes": false
+    },
+    {
+      "id": "tier-tag",
+      "title": "Tidy rule: every test under tests/ carries its reference tier (ADR-0007)",
+      "depends_on": [
+        "reference-suite"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/text.rs",
+        "xtask/fixtures/tidy/tier-tag.fires.fixture",
+        "xtask/fixtures/tidy/tier-tag.passes.fixture",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::text::tests::tier_tag_rule_fires",
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture"
+      ],
+      "passes": false
+    },
+    {
+      "id": "floor-activation-count",
+      "title": "A floor or limiter that is part of a scheme counts its activations, and a reference test fails on an unexpected count (TIGER_STYLE.md, Physical admissibility)",
+      "depends_on": [
+        "tier-tag"
+      ],
+      "owner_paths": [
+        "crates/reference/src/invariants/floor_activations.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "reference::invariants::floor_activations::unexpected_count_fails"
+      ],
+      "passes": false
+    },
+    {
+      "id": "alloc-after-init",
+      "title": "Counting-allocator test around the time loop: nothing allocates after init (ADR-0003)",
+      "depends_on": [
+        "floor-activation-count"
+      ],
+      "owner_paths": [
+        "crates/solver/tests/no_alloc_after_init.rs",
+        "crates/solver/Cargo.toml",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "solver::no_alloc_after_init::time_loop_does_not_allocate"
+      ],
+      "passes": false
+    },
+    {
+      "id": "determinism-hash",
+      "title": "CI hashes the output of a canonical problem set and compares Linux, macOS and a same-seed rerun (ADR-0005)",
+      "depends_on": [
+        "alloc-after-init"
+      ],
+      "owner_paths": [
+        "xtask/src/determinism.rs",
+        "xtask/src/main.rs",
+        ".github/workflows/ci.yml",
+        ".github/workflows/post-merge.yml",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::determinism::tests::same_seed_rerun_gives_the_same_hash",
+        "ci::gate::determinism_rerun",
+        "post-merge::macos::determinism_cross_platform"
+      ],
+      "passes": false
+    }
+  ]
+}

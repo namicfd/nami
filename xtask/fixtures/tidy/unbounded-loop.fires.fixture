@@ -1,0 +1,18 @@
+// path: crates/solver/src/example.rs
+//! Loops without a fixed upper bound: `loop`, `while`, and `for` over a range without an end.
+
+fn wait_forever() {
+    loop {}
+}
+
+fn wait_until(done: bool) {
+    while !done {}
+}
+
+fn count_steps() {
+    for _step in 0_u32.. {}
+}
+
+fn count_even_steps() {
+    for _step in (0_u32..).step_by(2) {}
+}

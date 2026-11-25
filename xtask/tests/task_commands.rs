@@ -26,7 +26,9 @@ fn tasks_json(a_passes: bool) -> String {
 /// A bare remote and one clone holding a committed plan with tasks `a` and `b` (b needs a).
 fn setup(name: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("nami-task-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("a stale temporary directory is removable");
+    }
     std::fs::create_dir_all(&root).expect("temporary directory is writable");
     let _ = git(&root, &["init", "--quiet", "--bare", "remote.git"]);
     let _ = git(&root, &["clone", "--quiet", "remote.git", "clone"]);

@@ -187,7 +187,7 @@ mod tests {
     #[should_panic(expected = "cell index must fit in u32")]
     fn from_usize_rejects_values_beyond_u32() {
         let position = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
-        let _ = CellIndex::from_usize(position);
+        let _index = CellIndex::from_usize(position);
     }
 
     // Goal: typed gathers read and write the addressed cell.

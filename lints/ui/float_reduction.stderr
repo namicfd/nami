@@ -1,0 +1,56 @@
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:6:19
+   |
+LL |     values.iter().sum()
+   |                   ^^^^^
+   |
+   = note: `#[deny(nami_float_reduction)]` on by default
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:10:28
+   |
+LL |     values.iter().copied().sum::<f32>()
+   |                            ^^^^^^^^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:14:48
+   |
+LL |     left.iter().zip(right).map(|(a, b)| a * b).sum()
+   |                                                ^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:18:5
+   |
+LL |     Iterator::sum(values.iter())
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:22:19
+   |
+LL |     values.iter().fold(0.0, |total, value| total + value)
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:26:19
+   |
+LL |     values.iter().fold(0.0, |total, &value| value * value + total)
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:30:19
+   |
+LL |       values.iter().fold(0.0, |mut total, value| {
+   |  ___________________^
+LL | |         total += value;
+LL | |         total
+LL | |     })
+   | |______^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:37:5
+   |
+LL |     Iterator::fold(values.iter(), 0.0, |total, value| total + value)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 8 previous errors
+

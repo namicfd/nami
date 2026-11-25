@@ -1,0 +1,4 @@
+// path: crates/solver/src/example.rs
+//! A function that runs to completion.
+
+fn advance() {}

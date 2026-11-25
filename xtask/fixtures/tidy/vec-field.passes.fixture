@@ -1,0 +1,10 @@
+// path: crates/solver/src/example.rs
+//! Storage whose type says that it cannot grow.
+
+struct Field {
+    values: Box<[f64]>,
+}
+
+struct Scratch {
+    pencil: Option<Box<[f64]>>,
+}

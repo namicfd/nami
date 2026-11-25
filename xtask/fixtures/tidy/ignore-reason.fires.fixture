@@ -1,0 +1,7 @@
+// path: crates/solver/src/example.rs
+//! An ignored test that does not say why.
+
+// Goal: the long run conserves mass.
+#[test]
+#[ignore]
+fn long_run_conserves_mass() {}

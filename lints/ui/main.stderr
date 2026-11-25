@@ -41,5 +41,47 @@ error: `<Looping as Flux>::flux` is recursive: <Looping as Flux>::flux -> <Loopi
 LL |     fn flux(&self) -> f64 {
    |     ^^^^^^^^^^^^^^^^^^^^^
 
-error: aborting due to 5 previous errors; 1 warning emitted
+error: `<Cycle as Probe>::value` is recursive: <Cycle as Probe>::value -> through_generic::<Cycle> -> <Cycle as Probe>::value. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:75:5
+   |
+LL |     fn value(&self, depth: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `generic_direct` is recursive: generic_direct -> generic_direct. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:81:1
+   |
+LL | fn generic_direct<T: Copy>(x: T, n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `generic_other` is recursive: generic_other -> generic_other::<u32>. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:86:1
+   |
+LL | fn generic_other<T: Copy>(x: T, n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Countdown::count` is recursive: Countdown::count -> Countdown::count. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:92:5
+   |
+LL |     fn count(&self, n: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Square as Shape>::area` is recursive: <Square as Shape>::area -> <Square as Shape>::doubled -> <Square as Shape>::area. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:114:5
+   |
+LL |     fn area(&self, n: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Leaf as Probe>::value` is recursive: <Leaf as Probe>::value -> <Nest<Leaf> as Probe>::value -> <Leaf as Probe>::value. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:144:5
+   |
+LL |     fn value(&self, depth: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Spoke as Probe>::value` is recursive: <Spoke as Probe>::value -> through_inner::<Hub> -> <Spoke as Probe>::value. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/main.rs:187:5
+   |
+LL |     fn value(&self, depth: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 12 previous errors; 1 warning emitted
 

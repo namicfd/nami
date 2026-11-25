@@ -2,14 +2,20 @@
 //!
 //! The visitor walks the syntax tree recursively through `syn::visit`. That is the tooling
 //! exception to the no-recursion rule: the depth is bounded by the nesting of one source file,
-//! and the rule's checker (dylint, ADR-0006) applies to nami's crates, not to `xtask`.
+//! and the recursion happens inside `syn`, not in a function of this crate. Everything written
+//! here is a loop over a bounded range.
+//!
+//! `syn` does not parse the arguments of a macro invocation, so the rules that can be decided on
+//! tokens (the bans and `magic-tolerance`) also read macro bodies through [`super::tokens`].
 
+use super::registry::{self, MACRO_BANS, PATH_BANS};
+use super::tokens;
 use super::{Scope, Violation};
-use proc_macro2::Span;
+use proc_macro2::{Ident, Span, TokenTree};
 use std::path::Path;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, Block, Signature, Type, Visibility};
+use syn::{Attribute, Block, Expr, Signature, Type, UseTree, Visibility};
 
 /// Hard limit on physical lines per function, closures included (`TIGER_STYLE.md`).
 const FUNCTION_LINES_MAX: u32 = 70;
@@ -26,6 +32,23 @@ const UNSAFE_ALLOWED_CRATE: &str = "crates/alloc-guard";
 /// Macros that count as assertions.
 const ASSERTION_MACROS: [&str; 6] =
     ["assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne"];
+
+/// Largest float literal that is taken for a tolerance, epsilon or floor. A literal in
+/// `(0, MAGIC_TOLERANCE_MAX]` must be a documented constant (`TIGER_STYLE.md`, Floating point).
+/// Physical values this small are rare in nami's units; a real one is named as a constant too.
+const MAGIC_TOLERANCE_MAX: f64 = 1.0e-6;
+
+/// Iterator adaptors that bound a range without an end: `(0..).take(n)`, `(0..).zip(cells)`.
+const BOUNDING_METHODS: [&str; 2] = ["take", "zip"];
+
+/// Upper bound on the wrappers peeled off the iterable of a `for` loop.
+const ITERABLE_WRAPPERS_MAX: u32 = 64;
+
+/// Upper bound on the subtrees of one `use` item, so the walk is bounded.
+const USE_TREES_MAX: u32 = 100_000;
+
+/// The directory of a crate's integration tests, which are test code as a whole.
+const TESTS_DIRECTORY: &str = "tests";
 
 /// Assertion counts over the non-trivial, non-test functions of a file or crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,10 +100,17 @@ pub fn check(path: &Path, text: &str, scope: Scope) -> Report {
         path,
         scope,
         test_depth: 0,
+        test_function_depth: 0,
+        is_test_file: path.components().any(|part| part.as_os_str() == TESTS_DIRECTORY),
+        in_trait_impl: false,
+        const_depth: 0,
+        const_holds_tolerance: false,
         violations: Vec::new(),
         stats: AssertionStats::zero(),
     };
     visitor.visit_file(&file);
+    assert_eq!(visitor.test_depth, 0, "every test module that was entered was left");
+    assert_eq!(visitor.const_depth, 0, "every constant that was entered was left");
     Report { violations: visitor.violations, stats: visitor.stats }
 }
 
@@ -89,16 +119,25 @@ struct Visitor<'a> {
     scope: Scope,
     /// Depth of `#[cfg(test)]` modules around the current item.
     test_depth: u32,
+    /// Depth of `#[test]` functions around the current item.
+    test_function_depth: u32,
+    /// True if the file lies under a `tests/` directory.
+    is_test_file: bool,
+    /// True while visiting the items of an `impl Trait for Type` block.
+    in_trait_impl: bool,
+    /// Depth of `const` items around the current expression.
+    const_depth: u32,
+    /// True once the innermost `const` item around the current expression holds a tolerance.
+    const_holds_tolerance: bool,
     violations: Vec<Violation>,
     stats: AssertionStats,
 }
 
-/// The parts of any function item that the rules look at.
+/// The parts of a function with a body that the rules look at.
 struct Function<'a> {
     attributes: &'a [Attribute],
     signature: &'a Signature,
     block: &'a Block,
-    public: bool,
 }
 
 impl Visitor<'_> {
@@ -110,14 +149,42 @@ impl Visitor<'_> {
         self.test_depth > 0
     }
 
+    /// Test code: `#[cfg(test)]` modules, `#[test]` functions and files under `tests/`.
+    fn in_test_code(&self) -> bool {
+        self.in_tests() || self.test_function_depth > 0 || self.is_test_file
+    }
+
     fn usize_restricted(&self) -> bool {
         self.scope.is_nami() && self.scope != Scope::IndexModule
     }
 
-    fn check_function(&mut self, function: &Function<'_>) {
+    /// Rules about a signature. `dictated_by_trait` is true for a method of an
+    /// `impl Trait for Type` block, whose parameter types the trait decides.
+    fn check_signature(&mut self, signature: &Signature, dictated_by_trait: bool) {
+        let name = &signature.ident;
+        if let syn::Safety::Unsafe(unsafety) = &signature.safety {
+            self.report_unsafe(unsafety.span);
+        }
+        if let Some(asyncness) = &signature.asyncness {
+            let message =
+                "async functions are banned; functions run to completion (TIGER_STYLE.md)";
+            self.report(asyncness.span, "async", message);
+        }
+        if self.usize_restricted() && !dictated_by_trait && signature_mentions_usize(signature) {
+            let message = format!(
+                "`usize` in the signature of function `{name}`; use a typed index or count such \
+                 as `CellIndex` or `CellCount` (ADR-0002)"
+            );
+            self.report(signature.fn_token.span, "usize", message);
+        }
+    }
+
+    /// Rules about a function body: its length and its assertions.
+    fn check_body(&mut self, function: &Function<'_>) {
         let name = &function.signature.ident;
         let first = line_of(function.signature.fn_token.span);
         let last = line_of_end(function.block.brace_token.span.close());
+        assert!(last >= first, "a function ends after it starts");
         let lines = last - first + 1;
         if lines > FUNCTION_LINES_MAX {
             let message = format!(
@@ -125,24 +192,6 @@ impl Visitor<'_> {
                  fors down, keep leaf functions pure (TIGER_STYLE.md)"
             );
             self.report(function.signature.fn_token.span, "function-length", message);
-        }
-        if let syn::Safety::Unsafe(unsafety) = &function.signature.safety {
-            self.report_unsafe(unsafety.span);
-        }
-        if let Some(asyncness) = &function.signature.asyncness {
-            let message =
-                "async functions are banned; functions run to completion (TIGER_STYLE.md)";
-            self.report(asyncness.span, "async", message);
-        }
-        if function.public
-            && self.usize_restricted()
-            && signature_mentions_usize(function.signature)
-        {
-            let message = format!(
-                "`usize` in the signature of public function `{name}`; use a typed index or count \
-                 such as `CellIndex` or `CellCount` (ADR-0002)"
-            );
-            self.report(function.signature.fn_token.span, "usize", message);
         }
         let is_test = self.in_tests() || has_attribute(function.attributes, "test");
         if self.scope.is_nami() && !is_test {
@@ -179,11 +228,11 @@ impl Visitor<'_> {
 
     fn check_field_type(&mut self, field_type: &Type) {
         if self.usize_restricted() && type_mentions_usize(field_type) {
-            let message = "`usize` in a struct field; use a typed index or count (ADR-0002)";
+            let message = "`usize` in a field; use a typed index or count (ADR-0002)";
             self.report(field_type.span(), "usize", message);
         }
-        if self.scope.is_nami() && is_vec(field_type) {
-            let message = "`Vec` in a struct field; storage that must not grow is `Box<[T]>`, \
+        if self.scope.is_nami() && type_mentions_vec(field_type) {
+            let message = "`Vec` in a field type; storage that must not grow is `Box<[T]>`, \
                            allocated once in init (ADR-0003, TIGER_STYLE.md)";
             self.report(field_type.span(), "vec-field", message);
         }
@@ -194,6 +243,87 @@ impl Visitor<'_> {
             let message = "`usize` in a public constant, static or alias; use a typed index or \
                            count, or `u32` (ADR-0002)";
             self.report(item_type.span(), "usize", message);
+        }
+    }
+
+    /// Applies [`PATH_BANS`] to the first segment of a path, a `use` or an `extern crate`.
+    fn check_path_start(&mut self, segment: &Ident) {
+        for ban in PATH_BANS {
+            let applies = ban.scope.includes(self.scope);
+            if segment == ban.segment && applies && !registry::is_allowed(ban.allowed, self.path) {
+                self.report(segment.span(), ban.id, ban.message);
+            }
+        }
+    }
+
+    /// Applies [`MACRO_BANS`] to the name of an invoked macro.
+    fn check_macro_name(&mut self, name: &Ident) {
+        for ban in MACRO_BANS {
+            let is_banned = ban.names.iter().any(|banned| name == banned);
+            if is_banned && !registry::is_allowed(ban.allowed, self.path) {
+                self.report(name.span(), ban.id, ban.message);
+            }
+        }
+    }
+
+    /// A small float literal is a tolerance, an epsilon or a floor. It must be a named,
+    /// documented constant, so that its origin is written down exactly once.
+    fn check_tolerance(&mut self, literal: &syn::LitFloat) {
+        if !self.scope.is_nami() || self.in_test_code() {
+            return;
+        }
+        let Ok(value) = literal.base10_parse::<f64>() else {
+            return;
+        };
+        if !is_tolerance(value) {
+            return;
+        }
+        if self.const_depth > 0 {
+            self.const_holds_tolerance = true;
+            return;
+        }
+        let message = format!(
+            "magic tolerance `{literal}`; name it as a documented constant that says where it \
+             comes from. If it floors or clamps a state, that is banned outright \
+             (TIGER_STYLE.md, Floating point; Physical admissibility)"
+        );
+        self.report(literal.span(), "magic-tolerance", message);
+    }
+
+    /// Enters a `const` item. Returns the state to hand back to [`Self::leave_const`].
+    fn enter_const(&mut self) -> bool {
+        self.const_depth += 1;
+        std::mem::replace(&mut self.const_holds_tolerance, false)
+    }
+
+    /// Leaves a `const` item: a constant that holds a tolerance must say where it comes from.
+    fn leave_const(&mut self, outer_holds_tolerance: bool, name: &Ident, attributes: &[Attribute]) {
+        assert!(self.const_depth > 0, "a constant is left only after it was entered");
+        self.const_depth -= 1;
+        if self.const_holds_tolerance && !has_doc_comment(attributes) {
+            let message = format!(
+                "constant `{name}` holds a tolerance but has no doc comment; add one that says \
+                 where the value comes from (TIGER_STYLE.md, Floating point)"
+            );
+            self.report(name.span(), "magic-tolerance", message);
+        }
+        self.const_holds_tolerance = outer_holds_tolerance;
+    }
+
+    /// Applies the rules that can be decided on tokens to one token sequence of a macro body.
+    fn check_macro_tokens(&mut self, sequence: &[TokenTree]) {
+        let found = tokens::findings(sequence);
+        for segment in found.path_starts {
+            self.check_path_start(segment);
+        }
+        for name in found.macro_calls {
+            self.check_macro_name(name);
+        }
+        let literals = found.literals.into_iter().cloned().map(syn::Lit::new);
+        for literal in literals {
+            if let syn::Lit::Float(float) = literal {
+                self.check_tolerance(&float);
+            }
         }
     }
 
@@ -225,26 +355,32 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        let public = is_public(&node.vis);
-        let function =
-            Function { attributes: &node.attrs, signature: &node.sig, block: &node.block, public };
-        self.check_function(&function);
+        self.check_signature(&node.sig, false);
+        self.check_body(&Function {
+            attributes: &node.attrs,
+            signature: &node.sig,
+            block: &node.block,
+        });
+        let is_test = has_attribute(&node.attrs, "test");
+        self.test_function_depth += u32::from(is_test);
         visit::visit_item_fn(self, node);
+        self.test_function_depth -= u32::from(is_test);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let public = is_public(&node.vis);
-        let function =
-            Function { attributes: &node.attrs, signature: &node.sig, block: &node.block, public };
-        self.check_function(&function);
+        self.check_signature(&node.sig, self.in_trait_impl);
+        self.check_body(&Function {
+            attributes: &node.attrs,
+            signature: &node.sig,
+            block: &node.block,
+        });
         visit::visit_impl_item_fn(self, node);
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        self.check_signature(&node.sig, false);
         if let Some(block) = &node.default {
-            let function =
-                Function { attributes: &node.attrs, signature: &node.sig, block, public: false };
-            self.check_function(&function);
+            self.check_body(&Function { attributes: &node.attrs, signature: &node.sig, block });
         }
         visit::visit_trait_item_fn(self, node);
     }
@@ -263,6 +399,16 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         visit::visit_expr_while(self, node);
     }
 
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        if iterates_open_range(&node.expr) {
+            let message = "`for` over a range without an end is unbounded; give the range an end \
+                           (`0..LIMIT`), or bound it with `take` or `zip`, and assert after the \
+                           loop (TIGER_STYLE.md, Put a limit on everything)";
+            self.report(node.for_token.span, "unbounded-loop", message);
+        }
+        visit::visit_expr_for_loop(self, node);
+    }
+
     fn visit_expr_async(&mut self, node: &'ast syn::ExprAsync) {
         let message = "async blocks are banned; functions run to completion (TIGER_STYLE.md)";
         self.report(node.async_token.span, "async", message);
@@ -271,15 +417,18 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         self.check_derives(&node.attrs);
-        for field in &node.fields {
-            self.check_field_type(&field.ty);
-        }
         visit::visit_item_struct(self, node);
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
         self.check_derives(&node.attrs);
         visit::visit_item_enum(self, node);
+    }
+
+    // Fields of structs, enum variants and unions.
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        self.check_field_type(&node.ty);
+        visit::visit_field(self, node);
     }
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
@@ -305,12 +454,28 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
                            call site (TIGER_STYLE.md)";
             self.report(node.impl_token.span, "default", message);
         }
+        let outer = std::mem::replace(&mut self.in_trait_impl, node.trait_.is_some());
         visit::visit_item_impl(self, node);
+        self.in_trait_impl = outer;
     }
 
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
         self.check_public_item_type(&node.vis, &node.ty);
+        let outer = self.enter_const();
         visit::visit_item_const(self, node);
+        self.leave_const(outer, &node.ident, &node.attrs);
+    }
+
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        let outer = self.enter_const();
+        visit::visit_impl_item_const(self, node);
+        self.leave_const(outer, &node.ident, &node.attrs);
+    }
+
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        let outer = self.enter_const();
+        visit::visit_trait_item_const(self, node);
+        self.leave_const(outer, &node.ident, &node.attrs);
     }
 
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
@@ -344,6 +509,45 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         }
         visit::visit_attribute(self, node);
     }
+
+    // Every path in expressions, types, patterns and macro names. A lone identifier is not a
+    // path into a crate, so only paths of two or more segments are checked.
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if node.segments.len() > 1
+            && let Some(first) = node.segments.first()
+        {
+            self.check_path_start(&first.ident);
+        }
+        visit::visit_path(self, node);
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        for root in use_roots(&node.tree) {
+            self.check_path_start(root);
+        }
+        visit::visit_item_use(self, node);
+    }
+
+    fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
+        self.check_path_start(&node.ident);
+        visit::visit_item_extern_crate(self, node);
+    }
+
+    fn visit_lit_float(&mut self, node: &'ast syn::LitFloat) {
+        self.check_tolerance(node);
+        visit::visit_lit_float(self, node);
+    }
+
+    // `syn` keeps macro arguments as tokens, so the token rules read them here.
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if let Some(name) = node.path.segments.last() {
+            self.check_macro_name(&name.ident);
+        }
+        for sequence in tokens::sequences(node.tokens.clone()) {
+            self.check_macro_tokens(&sequence);
+        }
+        visit::visit_macro(self, node);
+    }
 }
 
 /// Counts assertion macros inside one function body.
@@ -361,20 +565,36 @@ impl<'ast> Visit<'ast> for AssertionCounter {
     }
 }
 
-/// Finds `usize` anywhere inside a type.
-struct UsizeFinder {
+/// Finds a path that satisfies `matches` anywhere inside a type or signature.
+struct PathFinder {
+    matches: fn(&syn::Path) -> bool,
     found: bool,
 }
 
-impl<'ast> Visit<'ast> for UsizeFinder {
-    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
-        self.found |= node.path.is_ident("usize");
-        visit::visit_type_path(self, node);
+impl<'ast> Visit<'ast> for PathFinder {
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        self.found |= (self.matches)(node);
+        visit::visit_path(self, node);
     }
 }
 
+fn is_usize(path: &syn::Path) -> bool {
+    path.is_ident("usize")
+}
+
+fn is_vec(path: &syn::Path) -> bool {
+    last_segment_is(path, "Vec")
+}
+
 fn type_mentions_usize(node: &Type) -> bool {
-    let mut finder = UsizeFinder { found: false };
+    let mut finder = PathFinder { matches: is_usize, found: false };
+    finder.visit_type(node);
+    finder.found
+}
+
+/// True for `Vec` anywhere inside the type: `Vec<f64>`, `Option<Vec<f64>>`, `[Vec<f64>; 3]`.
+fn type_mentions_vec(node: &Type) -> bool {
+    let mut finder = PathFinder { matches: is_vec, found: false };
     finder.visit_type(node);
     finder.found
 }
@@ -382,7 +602,7 @@ fn type_mentions_usize(node: &Type) -> bool {
 /// Checks parameters and the return type. Const generic parameters may be `usize`, because
 /// array lengths have to be.
 fn signature_mentions_usize(signature: &Signature) -> bool {
-    let mut finder = UsizeFinder { found: false };
+    let mut finder = PathFinder { matches: is_usize, found: false };
     for input in &signature.inputs {
         finder.visit_fn_arg(input);
     }
@@ -390,8 +610,55 @@ fn signature_mentions_usize(signature: &Signature) -> bool {
     finder.found
 }
 
-fn is_vec(node: &Type) -> bool {
-    matches!(node, Type::Path(path) if last_segment_is(&path.path, "Vec"))
+/// True if a `for` loop over `iterable` has no upper bound: under parentheses, references and
+/// method calls, the iterable is a range without an end (`start..`), and none of the method
+/// calls is one of [`BOUNDING_METHODS`].
+fn iterates_open_range(iterable: &Expr) -> bool {
+    let mut expression = iterable;
+    for _ in 0..ITERABLE_WRAPPERS_MAX {
+        if let Expr::Paren(paren) = expression {
+            expression = &paren.expr;
+        } else if let Expr::Group(group) = expression {
+            expression = &group.expr;
+        } else if let Expr::Reference(reference) = expression {
+            expression = &reference.expr;
+        } else if let Expr::MethodCall(call) = expression {
+            if BOUNDING_METHODS.iter().any(|method| call.method == method) {
+                return false;
+            }
+            expression = &call.receiver;
+        } else {
+            return matches!(expression, Expr::Range(range) if range.end.is_none());
+        }
+    }
+    // Deeper than any real iterable: it cannot be shown to be bounded, so it is reported.
+    true
+}
+
+/// The first segment of every path that a `use` item imports: `a` and `c` in
+/// `use {a::b, c as d};`.
+fn use_roots(tree: &UseTree) -> Vec<&Ident> {
+    let mut pending = vec![tree];
+    let mut roots = Vec::new();
+    for _ in 0..USE_TREES_MAX {
+        let Some(subtree) = pending.pop() else {
+            return roots;
+        };
+        match subtree {
+            UseTree::Path(path) => roots.push(&path.ident),
+            UseTree::Name(name) => roots.push(&name.ident),
+            UseTree::Rename(rename) => roots.push(&rename.ident),
+            UseTree::Glob(_) => {}
+            UseTree::Group(group) => pending.extend(&group.items),
+        }
+    }
+    panic!("a `use` item has more than {USE_TREES_MAX} subtrees");
+}
+
+/// True for a value in `(0, MAGIC_TOLERANCE_MAX]`. A literal carries no sign, so `-1.0e-12` is
+/// seen as `1.0e-12`, and zero is exempt.
+fn is_tolerance(value: f64) -> bool {
+    value > 0.0 && value <= MAGIC_TOLERANCE_MAX
 }
 
 fn is_public(visibility: &Visibility) -> bool {
@@ -404,6 +671,13 @@ fn last_segment_is(path: &syn::Path, name: &str) -> bool {
 
 fn has_attribute(attributes: &[Attribute], name: &str) -> bool {
     attributes.iter().any(|attribute| attribute.path().is_ident(name))
+}
+
+/// True for `/// ...` or `#[doc = "..."]`. `#[doc(hidden)]` documents nothing.
+fn has_doc_comment(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("doc") && attribute.meta.require_name_value().is_ok()
+    })
 }
 
 fn is_cfg_test(attributes: &[Attribute]) -> bool {
@@ -443,9 +717,23 @@ mod tests {
     use crate::tidy::Scope;
     use std::path::Path;
 
+    const NONE: [&str; 0] = [];
+
     fn rules(text: &str, scope: Scope) -> Vec<&'static str> {
         let report = check(Path::new("fixture.rs"), text, scope);
         report.violations.iter().map(|violation| violation.rule).collect()
+    }
+
+    /// The rules that fire on `text` in a file at `path`. The scope follows from the path.
+    fn rules_at(path: &str, text: &str) -> Vec<&'static str> {
+        let path = Path::new(path);
+        let report = check(path, text, Scope::of(path));
+        report.violations.iter().map(|violation| violation.rule).collect()
+    }
+
+    /// The rules that fire on `text` in an ordinary nami crate.
+    fn rules_in_crate(text: &str) -> Vec<&'static str> {
+        rules_at("crates/solver/src/example.rs", text)
     }
 
     fn function_with_lines(name: &str, body_lines: u32, assertions: u32) -> String {
@@ -464,7 +752,7 @@ mod tests {
     #[test]
     fn function_length_rule_fires() {
         let at_limit = function_with_lines("a", 68, 2);
-        assert_eq!(rules(&at_limit, Scope::Tooling), Vec::<&str>::new());
+        assert_eq!(rules(&at_limit, Scope::Tooling), NONE);
         let over_limit = function_with_lines("a", 69, 2);
         assert_eq!(rules(&over_limit, Scope::Tooling), ["function-length"]);
     }
@@ -478,7 +766,7 @@ mod tests {
         assert_eq!(dense.stats, AssertionStats { functions: 1, assertions: 2 });
         assert!(dense.stats.meets_density(), "two assertions meet the density");
         assert_eq!(rules(&function_with_lines("a", 9, 0), Scope::Crate), ["unasserted-function"]);
-        assert_eq!(rules(&function_with_lines("a", 9, 0), Scope::Tooling), Vec::<&str>::new());
+        assert_eq!(rules(&function_with_lines("a", 9, 0), Scope::Tooling), NONE);
     }
 
     // Goal: `loop`, `while` and `async` are rejected everywhere.
@@ -487,32 +775,113 @@ mod tests {
         assert_eq!(rules("fn a() { loop {} }", Scope::Tooling), ["unbounded-loop"]);
         assert_eq!(rules("fn a() { while true {} }", Scope::Tooling), ["unbounded-loop"]);
         assert_eq!(rules("async fn a() {}", Scope::Tooling), ["async"]);
-        assert_eq!(rules("fn a() { for _ in 0..3 {} }", Scope::Tooling), Vec::<&str>::new());
+        assert_eq!(rules("trait T { async fn a(); }", Scope::Tooling), ["async"]);
+        assert_eq!(rules("fn a() { for _ in 0..3 {} }", Scope::Tooling), NONE);
     }
 
-    // Goal: `usize` is rejected in public signatures, fields and public items, except in the
-    // index module; private helpers and const generics stay allowed.
+    // Goal: a `for` over a range without an end is unbounded, however the range is wrapped.
+    #[test]
+    fn open_ranges_are_unbounded() {
+        let unbounded = [
+            "for step in 0_u32.. {}",
+            "for step in (0_u32..) {}",
+            "for step in start.. {}",
+            "for step in (0..).step_by(2) {}",
+            "for step in (0..).map(|i| i * 2).filter(|i| *i > 2) {}",
+            "for step in &mut (0..) {}",
+            "for step in (0..).take_while(|i| *i < 3) {}",
+            "for step in (0..).skip(3) {}",
+        ];
+        for body in unbounded {
+            let text = format!("fn a() {{ {body} }}");
+            assert_eq!(rules(&text, Scope::Tooling), ["unbounded-loop"], "{body}");
+        }
+    }
+
+    // Goal: a range with an end is bounded, and `take` or `zip` bound a range without one. A
+    // range passed as an argument is not the iterable.
+    #[test]
+    fn bounded_ranges_pass() {
+        let bounded = [
+            "for step in 0..10 {}",
+            "for step in 0..=10 {}",
+            "for step in (0..10).rev() {}",
+            "for step in (0..).take(3) {}",
+            "for step in (0..).step_by(2).take(3) {}",
+            "for step in (0..).take(3).map(|i| i * 2) {}",
+            "for (step, cell) in (0_u32..).zip(cells) {}",
+            "for (cell, step) in cells.iter().zip(0..) {}",
+            "for cell in cells {}",
+            "for cell in cells.iter().skip(1) {}",
+        ];
+        for body in bounded {
+            let text = format!("fn a() {{ {body} }}");
+            assert_eq!(rules(&text, Scope::Tooling), NONE, "{body}");
+        }
+    }
+
+    // Goal: `usize` is rejected in signatures, fields, public items and aliases, except in the
+    // index module and in tooling. Private constants and const generics stay allowed.
     #[test]
     fn usize_rule_fires() {
         assert_eq!(rules("pub fn a(n: usize) {}", Scope::Crate), ["usize"]);
+        assert_eq!(rules("fn a(n: usize) {}", Scope::Crate), ["usize"], "private functions too");
+        assert_eq!(rules("fn a() -> usize { 0 }", Scope::Crate), ["usize"], "return types too");
+        assert_eq!(rules("fn a(n: &[usize]) {}", Scope::Crate), ["usize"], "nested in a type");
         assert_eq!(rules("struct S { n: usize }", Scope::Crate), ["usize"]);
+        assert_eq!(rules("enum E { A(usize) }", Scope::Crate), ["usize"], "variant fields too");
         assert_eq!(rules("pub const N: usize = 1;", Scope::Crate), ["usize"]);
         assert_eq!(rules("type I = usize;", Scope::Crate), ["usize"]);
-        assert_eq!(rules("pub fn a(n: usize) {}", Scope::IndexModule), Vec::<&str>::new());
-        assert_eq!(rules("fn a(n: usize) {}", Scope::Crate), Vec::<&str>::new());
-        assert_eq!(rules("const N: usize = 1;", Scope::Crate), Vec::<&str>::new());
-        assert_eq!(rules("pub fn a<const N: usize>() {}", Scope::Crate), Vec::<&str>::new());
-        assert_eq!(rules("pub fn a(n: usize) {}", Scope::Tooling), Vec::<&str>::new());
+        assert_eq!(rules("pub fn a(n: usize) {}", Scope::IndexModule), NONE);
+        assert_eq!(rules("fn a(n: usize) {}", Scope::IndexModule), NONE);
+        assert_eq!(rules("const N: usize = 1;", Scope::Crate), NONE);
+        assert_eq!(rules("pub fn a<const N: usize>() {}", Scope::Crate), NONE);
+        assert_eq!(rules("fn a() { let _n: usize = 1; }", Scope::Crate), NONE, "not a signature");
+        assert_eq!(rules("pub fn a(n: usize) {}", Scope::Tooling), NONE);
+        assert_eq!(rules("fn a(n: usize) {}", Scope::Tooling), NONE);
     }
 
-    // Goal: `Default` derives and impls, and `Vec` fields, are rejected in nami crates.
+    // Goal: a trait dictates the signatures of its impls, so those are exempt from the `usize`
+    // rule. The trait's own declaration, inherent methods and functions nested in an impl are
+    // not.
     #[test]
-    fn default_and_vec_rules_fire() {
+    fn usize_rule_exempts_trait_impls_only() {
+        assert_eq!(rules("impl T for S { fn a(&self, n: usize) {} }", Scope::Crate), NONE);
+        assert_eq!(rules("impl S { fn a(&self, n: usize) {} }", Scope::Crate), ["usize"]);
+        assert_eq!(rules("trait T { fn a(&self, n: usize); }", Scope::Crate), ["usize"]);
+        assert_eq!(rules("trait T { fn a(&self, n: usize) {} }", Scope::Crate), ["usize"]);
+        let nested = "impl T for S { fn a(&self) { fn b(n: usize) {} } }";
+        assert_eq!(rules(nested, Scope::Crate), ["usize"], "a nested function is not dictated");
+        let inherent_inside = "impl T for S { fn a(&self) { impl R { fn b(n: usize) {} } } }";
+        assert_eq!(rules(inherent_inside, Scope::Crate), ["usize"], "nor a nested inherent impl");
+        let after = "impl T for S { fn a(&self) {} }\nimpl S { fn b(n: usize) {} }";
+        assert_eq!(rules(after, Scope::Crate), ["usize"], "the exemption ends with the impl");
+    }
+
+    // Goal: `Default` derives and impls are rejected in nami crates.
+    #[test]
+    fn default_rule_fires() {
         assert_eq!(rules("#[derive(Debug, Default)]\nstruct S;", Scope::Crate), ["default"]);
         assert_eq!(rules("impl Default for S {}", Scope::Crate), ["default"]);
+        assert_eq!(rules("#[derive(Default)]\nstruct S;", Scope::Tooling), NONE);
+    }
+
+    // Goal: `Vec` is rejected anywhere inside a field type, in structs, tuple structs and enum
+    // variants. Types that merely contain the letters are not `Vec`.
+    #[test]
+    fn vec_field_rule_fires() {
         assert_eq!(rules("struct S { v: Vec<f64> }", Scope::Crate), ["vec-field"]);
-        assert_eq!(rules("struct S { v: Box<[f64]> }", Scope::Crate), Vec::<&str>::new());
-        assert_eq!(rules("#[derive(Default)]\nstruct S;", Scope::Tooling), Vec::<&str>::new());
+        assert_eq!(rules("struct S { v: Option<Vec<f64>> }", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("struct S { v: [Vec<f64>; 2] }", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("struct S { v: Box<[Vec<f64>]> }", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("struct S { v: (u32, std::vec::Vec<f64>) }", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("struct S(Vec<f64>);", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("enum E { A(Vec<f64>) }", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("enum E { A { v: Option<Vec<f64>> } }", Scope::Crate), ["vec-field"]);
+        assert_eq!(rules("struct S { v: Box<[f64]> }", Scope::Crate), NONE);
+        assert_eq!(rules("struct S { v: Option<Box<[f64]>> }", Scope::Crate), NONE);
+        assert_eq!(rules("struct S { v: VecDeque<f64> }", Scope::Crate), NONE);
+        assert_eq!(rules("struct S { v: Vec<f64> }", Scope::Tooling), NONE);
     }
 
     // Goal: kernels reject `dyn` and function pointers, outside tests only.
@@ -520,9 +889,9 @@ mod tests {
     fn kernel_indirection_rule_fires() {
         assert_eq!(rules("fn a(f: &dyn Fn()) {}", Scope::Kernels), ["kernel-indirection"]);
         assert_eq!(rules("fn a(f: fn(f64) -> f64) {}", Scope::Kernels), ["kernel-indirection"]);
-        assert_eq!(rules("fn a(f: &dyn Fn()) {}", Scope::Crate), Vec::<&str>::new());
+        assert_eq!(rules("fn a(f: &dyn Fn()) {}", Scope::Crate), NONE);
         let in_tests = "#[cfg(test)]\nmod tests { fn a(f: &dyn Fn()) {} }";
-        assert_eq!(rules(in_tests, Scope::Kernels), Vec::<&str>::new());
+        assert_eq!(rules(in_tests, Scope::Kernels), NONE);
     }
 
     // Goal: `unsafe` is rejected everywhere except in the allocation guard crate.
@@ -532,9 +901,8 @@ mod tests {
         assert_eq!(rules("unsafe fn a() {}", Scope::Crate), ["unsafe"]);
         assert_eq!(rules("unsafe impl Send for S {}", Scope::Crate), ["unsafe"]);
         assert_eq!(rules("unsafe trait T {}", Scope::Crate), ["unsafe"]);
-        let guard =
-            check(Path::new("crates/alloc-guard/src/lib.rs"), "unsafe fn a() {}", Scope::Crate);
-        assert_eq!(guard.violations, Vec::new());
+        assert_eq!(rules("trait T { unsafe fn a(); }", Scope::Crate), ["unsafe"]);
+        assert_eq!(rules_at("crates/alloc-guard/src/lib.rs", "unsafe fn a() {}"), NONE);
     }
 
     // Goal: every kind of function body is visited, so its rules apply.
@@ -568,6 +936,140 @@ mod tests {
     #[test]
     fn ignore_reason_rule_fires() {
         assert_eq!(rules("#[ignore]\nfn a() {}", Scope::Tooling), ["ignore-reason"]);
-        assert_eq!(rules("#[ignore = \"slow\"]\nfn a() {}", Scope::Tooling), Vec::<&str>::new());
+        assert_eq!(rules("#[ignore = \"slow\"]\nfn a() {}", Scope::Tooling), NONE);
+    }
+
+    // Goal: a small float literal outside a constant is a magic tolerance, in plain code and
+    // in macro arguments; the threshold is exactly 1e-6, and zero and larger values pass.
+    #[test]
+    fn magic_tolerance_rule_fires() {
+        let fires = [
+            "fn a(rho: f64) -> f64 { rho.max(1.0e-12) }",
+            "fn a(x: f64) -> bool { x < 1e-9 }",
+            "fn a(x: f64) -> bool { x > -1.0e-12 }",
+            "fn a(x: f64) -> bool { x < 1.0e-12_f64 }",
+            "fn a(x: f64) -> bool { x < 0.000_000_5 }",
+            "fn a(x: f64) -> bool { x < 1.0e-6 }",
+            "fn a(x: f64) { assert!(x > 1.0e-12, \"positive\"); }",
+            "fn a(x: f64) { assert!(f(x, [1.0e-12]), \"nested in a macro\"); }",
+            "static FLOOR: f64 = 1.0e-12;",
+            "fn a() -> f64 { const { 1.0e-12 } }",
+        ];
+        for text in fires {
+            assert_eq!(rules_in_crate(text), ["magic-tolerance"], "{text}");
+        }
+        let passes = [
+            "fn a(x: f64) -> bool { x < 1.0e-5 }",
+            "fn a(x: f64) -> bool { x < 1.000_001e-6 }",
+            "fn a(x: f64) -> bool { x > 0.0 && x < 1.0 }",
+            "fn a(x: f64) -> bool { x < 1.0e12 }",
+            "fn a(x: u32) -> bool { x < 1 }",
+            "fn a(x: f64) { assert!(x > 0.5, \"large\"); }",
+        ];
+        for text in passes {
+            assert_eq!(rules_in_crate(text), NONE, "{text}");
+        }
+    }
+
+    // Goal: a tolerance is allowed in the initialiser of a `const` item, and that constant
+    // must have a doc comment. `#[doc(hidden)]` is not one.
+    #[test]
+    fn tolerances_live_in_documented_constants() {
+        let documented = "/// Relative change below round-off.\nconst TOLERANCE: f64 = 1.0e-12;";
+        assert_eq!(rules_in_crate(documented), NONE);
+        let derived = "/// Twice the round-off.\nconst TOLERANCE: f64 = 2.0 * (1.0e-12);";
+        assert_eq!(rules_in_crate(derived), NONE);
+        let associated = "impl S {\n    /// Floor of the scheme.\n    const FLOOR: f64 = 1e-9;\n}";
+        assert_eq!(rules_in_crate(associated), NONE);
+        let in_trait = "trait T {\n    /// Floor of the scheme.\n    const FLOOR: f64 = 1e-9;\n}";
+        assert_eq!(rules_in_crate(in_trait), NONE);
+        assert_eq!(rules_in_crate("const TOLERANCE: f64 = 1.0e-12;"), ["magic-tolerance"]);
+        assert_eq!(rules_in_crate("impl S { const FLOOR: f64 = 1e-9; }"), ["magic-tolerance"]);
+        assert_eq!(rules_in_crate("trait T { const FLOOR: f64 = 1e-9; }"), ["magic-tolerance"]);
+        let hidden = "#[doc(hidden)]\nconst TOLERANCE: f64 = 1.0e-12;";
+        assert_eq!(rules_in_crate(hidden), ["magic-tolerance"]);
+        let large = "const CFL: f64 = 0.5;";
+        assert_eq!(rules_in_crate(large), NONE, "a constant without a tolerance needs no doc");
+        let after = "/// Documented.\nconst A: f64 = 1e-9;\nfn a(x: f64) -> bool { x < 1e-9 }";
+        assert_eq!(rules_in_crate(after), ["magic-tolerance"], "the exemption ends with the item");
+        let nested = "/// Outer.\nconst A: f64 = {\n    const B: f64 = 1e-9;\n    B\n};";
+        assert_eq!(rules_in_crate(nested), ["magic-tolerance"], "the inner constant needs a doc");
+    }
+
+    // Goal: test code and tooling are exempt from the tolerance rule: `#[cfg(test)]` modules,
+    // `#[test]` functions and files under `tests/`. The exemption ends with the test.
+    #[test]
+    fn tolerance_rule_exempts_test_code() {
+        let literal = "fn a(x: f64) -> bool { x < 1e-9 }";
+        assert_eq!(rules_in_crate(&format!("#[cfg(test)]\nmod tests {{ {literal} }}")), NONE);
+        assert_eq!(rules_in_crate("#[test]\nfn a() { let _x = 1e-9; }"), NONE);
+        assert_eq!(rules_at("crates/solver/tests/sod.rs", literal), NONE);
+        assert_eq!(rules_at("xtask/src/example.rs", literal), NONE);
+        let after = format!("#[test]\nfn t() {{}}\n{literal}");
+        assert_eq!(rules_in_crate(&after), ["magic-tolerance"]);
+        assert_eq!(rules_at("crates/solver/src/tests_helper.rs", literal), ["magic-tolerance"]);
+    }
+
+    // Goal: every way of naming `libm` is rejected outside `kernels::math`: a call, a type, a
+    // `use` in each form, an `extern crate`, and a call inside macro arguments.
+    #[test]
+    fn direct_libm_ban_fires() {
+        let fires = [
+            "fn a(x: f64) -> f64 { libm::sqrt(x) }",
+            "fn a(x: f64) -> f64 { ::libm::sqrt(x) }",
+            "fn a(x: libm::Libm<f64>) {}",
+            "use libm::sqrt;",
+            "use libm;",
+            "use libm as m;",
+            "use ::libm::sqrt;",
+            "use {core::f64::consts::PI, libm::sqrt};",
+            "extern crate libm;",
+            "fn a(x: f64) { assert!(libm::sqrt(x) >= 0.0, \"non-negative\"); }",
+            "fn a(x: f64) -> f64 { f(&[libm::sqrt(x)]) }",
+            "fn a(x: f64) -> f64 { g!(1.0, (h![libm::cbrt(x)])) }",
+        ];
+        for text in fires {
+            assert_eq!(rules_in_crate(text), ["direct-libm"], "{text}");
+            assert_eq!(rules_at("crates/kernels/src/reduce.rs", text), ["direct-libm"], "{text}");
+            assert_eq!(rules_at("xtask/src/example.rs", text), ["direct-libm"], "{text}");
+            assert_eq!(rules_at("crates/kernels/src/math.rs", text), NONE, "{text}");
+        }
+    }
+
+    // Goal: the ban is on paths that start with `libm`, not on the letters.
+    #[test]
+    fn direct_libm_ban_is_exact() {
+        let passes = [
+            "fn a(x: f64) -> f64 { kernels::math::sqrt(x) }",
+            "fn a(x: f64) -> f64 { crate::libm::sqrt(x) }",
+            "fn a(libm: f64) -> f64 { libm + 1.0 }",
+            "fn a(x: f64) -> f64 { libm_like::sqrt(x) }",
+            "use kernels::math::sqrt;",
+            "fn a(x: f64) { assert!(math::sqrt(x) >= 0.0, \"libm::sqrt is wrapped\"); }",
+        ];
+        for text in passes {
+            assert_eq!(rules_in_crate(text), NONE, "{text}");
+        }
+    }
+
+    // Goal: the `debug_assert!` family is rejected everywhere outside `crates/kernels`,
+    // including in tests and nested inside another macro.
+    #[test]
+    fn debug_assert_ban_fires() {
+        let fires = [
+            "fn a(x: f64) { debug_assert!(x > 0.0, \"positive\"); }",
+            "fn a(x: u32) { debug_assert_eq!(x, 1, \"one\"); }",
+            "fn a(x: u32) { debug_assert_ne!(x, 1, \"not one\"); }",
+            "fn a(x: f64) { core::debug_assert!(x > 0.0, \"positive\"); }",
+            "fn a(x: f64) { assert!({ debug_assert!(x > 0.0, \"nested\"); true }, \"outer\"); }",
+            "#[cfg(test)]\nmod tests { fn a(x: f64) { debug_assert!(x > 0.0, \"positive\"); } }",
+        ];
+        for text in fires {
+            assert_eq!(rules_in_crate(text), ["debug-assert-placement"], "{text}");
+            assert_eq!(rules_at("xtask/src/example.rs", text), ["debug-assert-placement"]);
+            assert_eq!(rules_at("crates/kernels/src/update.rs", text), NONE, "{text}");
+        }
+        let passes = "fn a(x: f64) { assert!(x > 0.0, \"debug_assert! is for kernels\"); }";
+        assert_eq!(rules_in_crate(passes), NONE);
     }
 }

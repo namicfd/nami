@@ -59,7 +59,7 @@ The JSON holds only what tools read. That gives agents little reason to edit it,
 - **Disjoint owner paths:** two unfinished tasks that may run at the same time own disjoint paths. Neither depends on the other, so the PRs would otherwise conflict. Make one depend on the other, or split the path. A directory overlaps everything inside it.
 - **Completed plans:** a plan under `completed/` has no unfinished task.
 
-In pull requests and the merge queue, `cargo xtask task check-pr` fails if the change sets `passes` on any task. On a branch named `task/<id>`, it also lists changed files outside that task's `owner_paths`. The task's own plan directory is exempt, so the task can note findings there. That list is advisory for now, and becomes blocking later (ADR-0011).
+In pull requests and the merge queue, `cargo xtask task check-pr` fails if the change sets `passes` on any task. On a branch named `task/<id>`, it also lists changed files outside that task's `owner_paths`. The task's own plan directory is exempt, so the task can note findings there. So is `docs/learnings/`: any task may add a learning (ADR-0020). That list is advisory for now, and becomes blocking later (ADR-0011).
 
 ## Commands
 

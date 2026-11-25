@@ -57,9 +57,28 @@ pub fn sum_compensated(values: &[f64]) -> f64 {
     result
 }
 
+/// Returns true if every value is finite: neither NaN nor infinite.
+///
+/// This is the per-pencil backstop of ADR-0004: assert it once after a kernel's loop, not per
+/// cell. It visits every value without an early exit, so the compiler can vectorise it.
+#[must_use]
+pub fn all_finite(values: &[f64]) -> bool {
+    values.iter().fold(true, |finite, value| finite & value.is_finite())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sum_compensated, sum_fixed};
+    use super::{all_finite, sum_compensated, sum_fixed};
+
+    // Goal: one NaN or infinity anywhere in the slice is found; an empty slice is finite.
+    #[test]
+    fn all_finite_finds_a_single_bad_value() {
+        assert!(all_finite(&[]), "an empty pencil has no bad value");
+        assert!(all_finite(&[0.0, -1.0e300, f64::MIN_POSITIVE]), "extreme values are finite");
+        assert!(!all_finite(&[1.0, f64::NAN, 2.0]), "NaN in the middle is found");
+        assert!(!all_finite(&[f64::INFINITY, 1.0]), "infinity at the start is found");
+        assert!(!all_finite(&[1.0, f64::NEG_INFINITY]), "infinity at the end is found");
+    }
 
     // Goal: integers below 2^53 sum exactly, whatever the order, including a remainder that
     // does not fill a whole chunk.
@@ -90,6 +109,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "sum must be finite")]
     fn sum_fixed_rejects_nan() {
-        let _ = sum_fixed(&[1.0, f64::NAN]);
+        let _sum = sum_fixed(&[1.0, f64::NAN]);
     }
 }

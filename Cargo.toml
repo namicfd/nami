@@ -46,6 +46,7 @@ undocumented_unsafe_blocks = "deny"
 
 # Panics and error handling.
 unwrap_used = "deny"
+let_underscore_must_use = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"

@@ -1,0 +1,11 @@
+# path: crates/demo/Cargo.toml
+[package]
+name = "demo"
+
+[dependencies]
+libm.workspace = true
+kernels = { path = "../kernels" }
+
+# Dev-dependencies are governed by the cargo-deny allow-list, not by tidy.
+[dev-dependencies]
+proptest = "1"

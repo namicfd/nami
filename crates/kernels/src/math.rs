@@ -33,13 +33,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "sqrt argument must be non-negative")]
     fn sqrt_rejects_negative_arguments() {
-        let _ = sqrt(-1.0);
+        let _root = sqrt(-1.0);
     }
 
     // Goal: a NaN argument fails at the call, not three kernels later.
     #[test]
     #[should_panic(expected = "sqrt argument must be finite")]
     fn sqrt_rejects_nan() {
-        let _ = sqrt(f64::NAN);
+        let _root = sqrt(f64::NAN);
     }
 }

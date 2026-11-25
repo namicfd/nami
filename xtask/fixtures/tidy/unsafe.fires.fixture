@@ -1,0 +1,15 @@
+// path: crates/solver/src/example.rs
+//! Unsafe code outside the allocation guard: a block, a function, an impl and a trait.
+
+struct Field;
+
+fn first(values: &[f64]) -> f64 {
+    // SAFETY: none; this is the violation.
+    unsafe { *values.get_unchecked(0) }
+}
+
+unsafe fn unchecked() {}
+
+unsafe impl Send for Field {}
+
+unsafe trait Trusted {}

@@ -1,0 +1,14 @@
+// path: crates/solver/src/example.rs
+//! Storage that could grow after init: directly, wrapped in another type, and in a variant.
+
+struct Field {
+    values: Vec<f64>,
+}
+
+struct Scratch {
+    pencil: Option<Vec<f64>>,
+}
+
+enum Output {
+    Buffered(Vec<u8>),
+}

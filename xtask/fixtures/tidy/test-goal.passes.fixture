@@ -1,0 +1,9 @@
+// path: crates/solver/src/example.rs
+//! A test that starts with its goal. Other attributes may sit between the comment and the test.
+
+// Goal: small integers add exactly, checked against the literal sum.
+#[cfg(not(miri))]
+#[test]
+fn addition_is_exact() {
+    assert_eq!(1 + 1, 2, "small integers add exactly");
+}

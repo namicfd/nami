@@ -14,7 +14,9 @@ fn git(directory: &Path, arguments: &[&str]) {
 /// A bare remote and `clones` clones of it, in a fresh temporary directory.
 fn setup(name: &str, clones: u32) -> (PathBuf, Vec<PathBuf>) {
     let root = std::env::temp_dir().join(format!("nami-claims-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("a stale temporary directory is removable");
+    }
     std::fs::create_dir_all(&root).expect("temporary directory is writable");
     git(&root, &["init", "--quiet", "--bare", "remote.git"]);
     let mut directories = Vec::new();

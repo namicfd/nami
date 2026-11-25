@@ -9,26 +9,33 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 
 - `just check`: run before every commit, and make sure it passes. It runs fmt-check, tidy, clippy
   with warnings denied, the tests and the doctests.
-- `just check-full`: `just check` plus `cargo deny`, the dylint lints (no recursion) and the tests
-  in the `release-checked` profile.
+- `just check-full`: `just check` plus `cargo deny`, the dylint lints (no recursion, no naive
+  float sums) and the tests in the `release-checked` profile. This is what CI runs.
 - `just fmt`: format everything.
 - `cargo nextest run -p <crate> <filter>`: run some tests while iterating.
-- `cargo xtask tidy`: style rules that clippy cannot express.
+- `cargo xtask tidy`: style rules that clippy cannot express. `docs/RULES.md` lists them.
+- `cargo xtask doctor`: compare your tools with the pinned versions.
+- `cargo xtask protected`: list the protected paths your branch changes, for the PR description.
 
 The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 
-Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
+Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0019):
 
-- After every edit of a `.rs` file, the file is formatted and checked against the single-file
-  tidy rules. Fix what they report straight away.
-- Before you stop, `just check` runs if anything changed. You cannot finish while it fails.
+- **At session start,** `$HOME/.cargo/bin` is put on `PATH`, and `cargo xtask doctor` reports any
+  tool whose version is wrong.
+- **After every edit,** a `.rs` file is formatted, and the edited file is checked against the tidy
+  rules that need only that file. Manifests, ADRs, learnings and `TIGER_STYLE.md` are checked
+  too. Fix what is reported straight away.
+- **Before you stop,** `just check` and `just dylint` run, unless your tree equals `main` or the
+  last tree that passed. A failure sends you back to work, up to three times in a row. After that
+  the hook lets you stop and tells the human that the work is not done.
 
 ## Repository map
 
 | Path | What it is |
 |---|---|
 | `crates/base` | Typed indices (`CellIndex`, `CellCount`) and field views. The only place `usize` is allowed. `no_std`. |
-| `crates/kernels` | Numerical kernels. `no_std` without `alloc`. `math` is the single entry point for `libm`; `reduce` holds the deterministic sums. |
+| `crates/kernels` | Numerical kernels. `no_std` without `alloc`. `math` is the single entry point for `libm`; `reduce` holds the deterministic sums; `update` is the template to copy for a new kernel. |
 | `crates/solver` | Control plane: `Solver::init` (all allocation), the time loop, boundaries, I/O. |
 | `crates/alloc-guard` | Test-only counting allocator: `assert_no_allocations` around everything after init. The only crate with `unsafe` (ADR-0014). |
 | `crates/reference` | Numerical references: exact solutions, manufactured solutions, convergence harness. **Protected.** |
@@ -37,13 +44,17 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
 | `.claude/` | Claude Code configuration: hooks, the reviewer agents and the `review-pr` skill (ADR-0008). |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
 | `docs/operations/` | Runbooks: how GitHub and the `nami-agent` bot are set up, and how to set them up again. |
-| `docs/TIGER_STYLE.md` | The full style guide. |
+| `docs/TIGER_STYLE.md` | The full style guide. Each rule ends with a tag that names its check; tidy verifies the tags. |
+| `docs/RULES.md` | Generated: every tidy rule and dylint lint, and the mechanisms that are planned but not built. |
+| `docs/learnings/` | What a check should have caught and did not, one file per learning. Any task may add one. |
+| `docs/playbooks/` | Steps for recurring jobs, such as adding a guardrail. |
 | `docs/exec-plans/` | Plans and `tasks.json` task lists (ADR-0011). |
 | `docs/research/` | Background research. |
 
 ## Non-negotiables
 
-Each rule is checked mechanically or in review. The reference says where the reason is written down.
+Each rule is checked mechanically or in review; the tags in `docs/TIGER_STYLE.md` say which. The
+reference says where the reason is written down.
 
 1. **No recursion.** Loops are `for` over bounded ranges or iterators. Iterative methods name their
    iteration limit and assert convergence. (ADR-0006)
@@ -83,7 +94,29 @@ Each rule is checked mechanically or in review. The reference says where the rea
 - **If a rule is wrong for your case, change it openly. Never work around it.**
   - Change the check or configuration in the same PR.
   - Add an ADR in `docs/design/` with status `Proposed` that explains why.
-  - Say so at the top of the PR description. A human decides at review.
+  - Say so under `Rule changes` in the PR description. A human decides at review.
+
+## When a check is missing
+
+Leave the guardrails stricter than you found them (ADR-0020). Act when a check would have caught
+your bug, when a reviewer tells you something that no check enforces, or when an error message did
+not say how to fix the problem.
+
+- **Codify it, if your task needs it.** Use the lowest rung that works:
+  1. a type, or the compiler;
+  2. a clippy lint, or a ban in `clippy.toml` with a reason;
+  3. a row in a tidy ban table;
+  4. a tidy rule;
+  5. a dylint lint;
+  6. a reference test.
+
+  `docs/playbooks/add-a-guardrail.md` has the steps. A check for a rule that is already written
+  down needs no ADR.
+- **Otherwise record it.** Add `docs/learnings/YYYY-MM-DD-<slug>.md`; the README there gives the
+  format. You may always do this, whatever your task's `owner_paths` say.
+- **Do not add a line to this file** when a check can do the job.
+- **If your new rule fires on existing code,** fix that code in the same PR. Never narrow the rule
+  to make it pass.
 
 ## Protected paths
 
@@ -93,7 +126,8 @@ instead of merging automatically, so:
 
 - change them only as far as the task needs;
 - put those changes in a commit of their own;
-- list every protected file you changed in the PR description, with the reason.
+- list every protected file you changed in the PR description, with the reason
+  (`cargo xtask protected` prints them).
 
 The protected paths are:
 
@@ -116,7 +150,8 @@ The authoritative list is `.github/CODEOWNERS`.
   - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
     failed claim means someone else holds the task: pick another.
   - Read the task's `### <id>` section in its `plan.md` before you start.
-  - Work on a branch named `task/<id>`. Touch only the task's `owner_paths`.
+  - Work on a branch named `task/<id>`. Touch only the task's `owner_paths`, plus
+    `docs/learnings/`.
   - Never set `passes`. CI sets it, or for now the maintainer (ADR-0017).
   - If you give up on a task, `cargo xtask task release <id>` and say why in the plan.
 - **A reference lands before the feature it tests.** Never write the reference for code you also
@@ -124,8 +159,10 @@ The authoritative list is `.github/CODEOWNERS`.
 - **A change that alters output bits** is labelled `changes-results` and waits for a human. Explain
   the change and include before/after convergence numbers.
 - **Commit messages say what changed and why.**
+- **The PR description follows `.github/pull_request_template.md`.** `cargo xtask pr-body` checks
+  that it lists the protected files and fills in `Guardrail gaps`.
 - **Done means all of these hold:**
-  - `just check` passes;
+  - `just check-full` passes;
   - the task's acceptance tests pass;
   - no new `#[expect]` without a real reason;
   - the AI review has run, and its blocking threads are resolved. The review is `/review-pr <n>`,

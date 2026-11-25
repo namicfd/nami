@@ -9,10 +9,22 @@ fn main() -> ExitCode {
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match arguments.as_slice() {
         ["tidy"] => run_tidy(),
+        ["tidy", "--root", root] => xtask::tidy::cli::tidy(root, None),
+        ["tidy", "--root", root, "--policy", policy] => xtask::tidy::cli::tidy(root, Some(policy)),
+        ["rules"] => xtask::tidy::cli::rules(false),
+        ["rules", "--write"] => xtask::tidy::cli::rules(true),
+        ["doctor"] => xtask::doctor::run(),
+        ["dylint"] => xtask::dylint::run(&xtask::workspace_root()),
+        ["protected", options @ ..] => xtask::pr::run_protected(options),
+        ["pr-body", options @ ..] => xtask::pr::run_body(options),
         ["hook", event] => xtask::hook::run(event),
         ["task", rest @ ..] => xtask::task::run(rest),
         _ => {
-            eprintln!("usage: cargo xtask tidy | hook <post-edit|stop> | task <command>");
+            eprintln!("usage: cargo xtask tidy [--root <dir> [--policy <dir>]] | rules [--write]");
+            eprintln!(
+                "       | doctor | dylint | protected [--base <ref>] | pr-body [--base <ref>]"
+            );
+            eprintln!("       | hook <post-edit|stop|session-start> | task <command>");
             ExitCode::FAILURE
         }
     }
