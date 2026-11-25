@@ -67,7 +67,7 @@ pub fn execute(
         ["status"] => status(root, remote, github),
         ["ready"] => ready(root, remote, github),
         ["claim", id] => claim(root, remote, github, id),
-        ["release", id] => claims::release(root, remote, id)
+        ["release", id] => claims::release(root, remote, &[], id)
             .map(|()| format!("released {id}\n"))
             .map_err(|error| format!("cannot release `{id}`: {error}")),
         ["validate"] => valid_tasks(root).map(|_| "tasks are valid\n".to_owned()),
@@ -250,7 +250,7 @@ fn claim(root: &Path, remote: &str, github: &dyn GitHub, id: &str) -> Result<Str
         }
     }
     let holder = holder(root);
-    claims::claim(root, remote, id, &holder)
+    claims::claim(root, remote, &[], id, &holder)
         .map_err(|error| format!("cannot claim `{id}`: {error}"))?;
     Ok(format!("claimed {id}\n"))
 }
@@ -275,7 +275,7 @@ fn claim_issue(
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
     let holder = holder(root);
-    claims::claim(root, remote, id, &holder)
+    claims::claim(root, remote, &[], id, &holder)
         .map_err(|error| format!("cannot claim `{id}`: {error}"))?;
     Ok(format!(
         "claimed {id}\nread it with `cargo xtask issue show {number}`, work on the branch \
