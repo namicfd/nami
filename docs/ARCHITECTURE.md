@@ -7,7 +7,7 @@
 
 | § | Topic | State | ADR |
 |---|---|---|---|
-| 1 | Purpose, users and success criteria | Proposed | [0022](design/0022-purpose-users-and-success-criteria.md) |
+| 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Open | |
 | 3 | Numerics | Open | |
 | 4 | Core architecture | Open | |
@@ -34,9 +34,15 @@ public release and no promise of a stable interface yet.
 unstructured and moving grids, such as a moving Voronoi mesh. The feature set draws heavily on
 existing codes, Athena++ and AthenaK first.
 
+**Hardware.** nami is developed on a workstation, and production runs use several nodes
+connected by InfiniBand. It targets CPUs only. GPUs are out of scope until a later ADR brings them
+in.
+
 **nami builds its own infrastructure.** The only runtime dependency is `libm` (ADR-0001), so there
 is no MPI and no HDF5. That is deliberate: nami designs its own communication layer and output
-format and tunes them to its needs.
+format and tunes them to its needs. Reaching InfiniBand and similar fabrics takes a C system
+library (libibverbs, libfabric or UCX). A small binding crate, with its `unsafe` confined the way
+`alloc-guard`'s is (ADR-0014), is acceptable for that. § 5 decides its shape in its own ADR.
 
 ### Failure
 
@@ -48,30 +54,31 @@ The project has failed if:
 ### Success criteria
 
 1. **Performance.** The measure is zone-cycles per second: cell updates per second, per core and
-   per node. It is measured on the same machine and the same problem as Athena++ and AthenaK's
+   per node. It is measured on the same CPUs and the same problem as Athena++ and AthenaK's
    CPU backend, with the same algorithm (for example PLM, HLLD, VL2 and constrained transport),
    each code built as its documentation recommends. The target is at least 1.0× per core and per
    node, and below 0.8× counts as failure. The scaling targets come with § 5.
 2. **Correctness.** Every capability claim, such as "3D MHD on AMR works", is backed by
    references at every tier of ADR-0007. That includes the problems and published thresholds of
    Athena++'s regression suite, where they exist.
-3. **Readability.** At each milestone, a human who neither wrote nor reviewed the code reads a
-   sampled module together with its plan. They must be able to explain what it computes and why.
-   Each finding becomes a guardrail (ADR-0020).
+3. **Readability, with no human in the loop.** At each milestone, an agent session with no
+   context reads a sampled module **without** its plan, and writes down what the module computes:
+   its equations, its inputs, its assumptions. A second session compares that reconstruction with
+   the plan. Each mismatch, and each place where the reader had to guess, becomes a finding, and
+   each finding becomes a guardrail (ADR-0020). An agent reading agent-written code is a weaker
+   test than a human reader. The maintainer reads code when they choose to, but nothing waits for
+   it. TigerStyle's mechanical limits (function length, line length, naming, assertions) also
+   apply.
 4. **The swarm demonstration is recorded.** For each merged PR we record the cost, the
    maintainer's minutes, whether a human changed the code, and every defect that escaped and was
    found later.
 
 ### Tensions that later topics must resolve
 
-- **GPUs (§ 5).** AthenaK's headline performance is on GPUs, through Kokkos. nami has no GPU path
-  under ADR-0001 and ADR-0014, and CPU code will not beat a GPU node. Until § 5 decides, the
-  comparison is CPU against CPU.
-- **Fast interconnects (§ 5).** InfiniBand and Slingshot are reached through C libraries
-  (libibverbs, libfabric, UCX). With `std` alone, nami reaches other nodes only over TCP, whose
-  latency is about ten times higher than RDMA's. That is fine on one node and a few nodes, and a
-  risk at large scale. One option is a small crate that binds a system library, with its `unsafe`
-  confined like `alloc-guard`'s (ADR-0014).
+- **Fast interconnects (§ 5).** With `std` alone, nami reaches other nodes only over TCP, whose
+  latency is about ten times higher than RDMA's. The binding crate for InfiniBand amends
+  ADR-0001 (it links a system library) and ADR-0014 (a second place with `unsafe`). § 5 writes
+  that ADR, and also decides how the layer works over TCP and shared memory on the workstation.
 - **Determinism costs speed.** ADR-0005 estimates 5–15% per step, and nami pays it against the
   performance target. In return, nami can offer what Athena++ does not: results that are
   bitwise the same for any decomposition and thread count, if § 5 and § 6 choose to.
