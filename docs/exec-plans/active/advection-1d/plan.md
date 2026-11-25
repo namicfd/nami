@@ -34,6 +34,16 @@ There is exactly one flux per interface, shared by both neighbours.
     Here minmod is zero unless all its arguments have the same sign. If they do, it is the argument of smallest magnitude.
   - Time integration is the SSP-RK2 (Heun) method of Gottlieb, Shu and Tadmor (2001): u⁽¹⁾ = uⁿ + Δt L(uⁿ), then uⁿ⁺¹ = ½ uⁿ + ½ (u⁽¹⁾ + Δt L(u⁽¹⁾)). Ghost cells are refilled before each stage.
 - **Time step.** Δt = ν Δx / |a|, where ν is the configured Courant number. The last step is shortened so that the run ends exactly at the requested time, and no step is ever longer than ν Δx / |a|.
+- **Courant limits.** Each scheme has a largest ν for which it is stable, and for the limited schemes also TVD:
+
+  | Scheme | Limit | Why |
+  |---|---|---|
+  | upwind with forward Euler | ν ≤ 1 | LeVeque §4.4 |
+  | Fromm with SSP-RK2 | ν ≤ 1 | von Neumann analysis |
+  | minmod with SSP-RK2 | ν ≤ 2/3 | Harten's incremental form: C = ν(1 + ψ_i/2 − ψ_{i−1}/2) with ψ ∈ [0, 1]. Forward Euler is TVD when ν(1 + ψ_max/2) ≤ 1, and SSP-RK2 inherits that limit. |
+  | MC with SSP-RK2 | ν ≤ 1/2 | the same argument, with ψ ∈ [0, 2] |
+
+  `Config` rejects a Courant number above its scheme's limit.
 - **Ghost cells.** Two per side, filled periodically before every stage. That is enough for the MUSCL stencil: a cell's slope needs its neighbours, and an interface needs the slopes of both its cells.
 
 ### Data layout
@@ -64,8 +74,8 @@ The reference task defines a contract that any 1D advection scheme can implement
 /// What the checks need from a scheme (defined in `reference::advection1d`).
 pub trait Scheme {
     /// A periodic run on [0, 1) with `cells` cells, wave speed `speed` and Courant number
-    /// `courant`, starting from the given cell averages.
-    fn new(cells: CellCount, speed: f64, courant: f64, initial: &[f64]) -> Self;
+    /// `courant`, starting from `initial`.
+    fn new(cells: CellCount, speed: f64, courant: f64, initial: &Initial) -> Self;
     /// Advances to exactly `time` (≥ the current time).
     fn advance_to(&mut self, time: f64);
     /// The current cell averages, `cells` values.
@@ -73,6 +83,11 @@ pub trait Scheme {
     /// Time steps taken so far.
     fn steps(&self) -> u32;
 }
+
+/// Initial data. Schemes may read only `cell_averages()`. The profile it was built from is
+/// private to the reference crate, so that only the reference's own exact scheme can use it,
+/// and a solver cannot cheat by evaluating the exact solution.
+pub struct Initial { /* cell averages, and a crate-private profile */ }
 
 /// Runs every check that applies to a scheme of the given kind; panics on the first failure,
 /// with one `ERROR …` line.
@@ -97,29 +112,44 @@ Write `reference::advection1d`: exact solutions, the `Scheme` contract and the c
   - **sine** sin(2πk x), with integer k ≥ 1. Its cell average over [x_l, x_r] is (cos 2πk x_l − cos 2πk x_r) / (2πk Δx), evaluated at the shifted positions x − a t taken modulo 1.
   - **square pulse** that is 1 on [p, q) and 0 elsewhere, periodic. Its cell average is the overlap length of the cell with the shifted pulse, divided by Δx.
   - Use `libm` directly for sin/cos, not the solver's `kernels::math`, so that the reference shares no numerical code with what it checks.
-- **Checks** each return `Result<(), String>`, and `check_scheme` panics with the first error. Every check uses at least two resolutions and both signs of a, unless noted.
-  - **Conservation.** Σ ū Δx after a run equals the initial value, within a few ULP of the total. Compare with `kernels::reduce::sum_compensated`, or an equivalent compensated sum written in this crate.
+- **Checks** each return `Result<(), String>`, and `check_scheme` panics with the first error. Every check uses both signs of a, at least two resolutions (none coarser than N = 32), and **ν = 0.45** unless noted.
+  - **Why ν = 0.45:** it is below every scheme's limit in the table above. It also makes t|a|/(νΔx) a non-integer at every tested N for t = 0.25 and t = 0.3. With a dyadic ν such as 0.5, the step counts come out as whole numbers, and a solver that never shortens its last step would pass.
+  - **Why ν < 1:** at ν = 1, upwind is an exact shift, and its observed order and error ceiling both collapse to zero.
+  - **Conservation.**
+    - The mass is M = Σ ū Δx, and the scale is Σ|ū⁰| Δx.
+    - Required: |M_end − M_0| ≤ C_mass · ε · scale · steps, where ε is `f64::EPSILON`. Each step can change M by a few roundings per cell, so the bound is linear in the number of steps.
+    - C_mass is derived and documented in the thresholds.
+    - A tolerance in ULP of M itself is wrong: on zero-mean data such as the sine, M is about 1e-18, and correct schemes drift by about 1e-16.
+    - Use compensated sums (`kernels::reduce::sum_compensated`, or an equivalent written in this crate). Test on both the sine and the pulse.
   - **Moved correctly.**
-    - Setup: a square pulse advanced by a shift that is not a multiple of the period (for example a t = 0.3).
-    - The L1 distance to the exact solution must be at most half the L1 distance from the initial data to the exact solution. A scheme that does nothing therefore fails.
-    - The distance must also be under an absolute ceiling.
-  - **Order of accuracy** (smooth data only).
+    - Setup: the square pulse on [0.3, 0.45), advanced by |a| t = 0.3. The shift is not a multiple of the period, and it is twice the pulse width.
+    - Required: the L1 distance to the exact solution is at most half the L1 distance from the initial data to the exact solution, and under an absolute ceiling.
+    - With this width, correct schemes stay at or below a ratio of 0.36, while the no-op, the reversed scheme and ±50% speed errors reach 0.78 or more (measured in the review prototype). A narrower pulse fails correct schemes at coarse N; a pulse as wide as the shift lets speed errors through.
+  - **Order of accuracy** (smooth data only, for every kind).
     - Setup: sine with k = 1, t = 0.25 (not a full period, so a no-op fails), N = 32, 64 and 128.
-    - The observed L1 order on the finest pair must be at least p − δ, with δ = 0.1 (ADR-0007): p = 1 for first order, p = 2 for unlimited second order.
-    - The finest error must be under a ceiling.
-    - Only for first order and for second order unlimited. Limiters clip smooth extrema, so the limited schemes get the maximum-principle and moved-correctly checks instead.
+    - The observed L1 order on the finest pair must be at least:
+      - first order: p ≥ 1 − δ;
+      - second order unlimited: p ≥ 2 − δ, with δ = 0.1 (ADR-0007);
+      - second order TVD: p ≥ 1.5. Limiters clip the smooth extrema, which costs some accuracy but not first order.
+
+      That lower bound for TVD is what separates a working minmod or MC from a slope that is always zero or a dropped σ/2. For reference, the review prototype measured minmod 1.87, MC 2.02 and σ ≡ 0 0.99 on this data. Record that bound and its reasoning in the thresholds.
+    - The finest error must also be under a ceiling, one per kind.
   - **Maximum principle** (first order and TVD only). From square-pulse data, every cell average stays within [min ū⁰, max ū⁰], up to round-off.
-  - **Mirror symmetry.** Run with a and initial data ū_i, and again with −a and the mirrored data ū_{N−1−i}. The results are mirrors of each other, **bitwise** (ADR-0007, symmetry tier).
+  - **Mirror symmetry.** Run with a and initial data ū_i, then with −a and the mirrored data ū_{N−1−i}. The results must be mirrors of each other, **bitwise** (ADR-0007, symmetry tier). The review prototype matched bitwise in all 648 cases it tried, across every scheme.
   - **Determinism.** Two identical runs give bitwise-identical results.
-  - **Step count.** `steps()` is at least ⌈t |a| / (ν Δx)⌉ for t, ν and Δx as configured. A scheme cannot take steps longer than the CFL limit and still pass.
+  - **Step count.** `steps()` must be at least ⌈(t |a| / (ν Δx)) · (1 − 4ε)⌉. The factor keeps a correct solver from failing when the exact quotient is an integer. This bounds the number of steps, so a scheme that covers the run in fewer, longer steps fails. It does not bound the longest single step.
 - **Thresholds** (see the open question above). Derive every error ceiling from theory, never from a solver's output, and document the derivation next to the constant.
-  - For first-order upwind, the modified equation gives the numerical diffusion a Δx (1 − ν)/2 (LeVeque §8.6). The ceiling is about twice the resulting amplitude error.
+  - For first-order upwind, the modified equation gives the numerical diffusion |a| Δx (1 − ν)/2 (LeVeque §8.6). The ceiling is **at most 1.5 times** the resulting amplitude error, so a scheme with twice the diffusion fails. The review prototype predicted 1.215e-2 and measured 1.216e-2 at N = 128, ν = 0.5.
   - For the other schemes, use the leading truncation-error term, or a published measurement with its citation.
   - Margins are generous enough to tolerate round-off and tight enough that a factor-of-two error in the scheme fails.
 - **Self-tests**, which are this task's acceptance tests:
-  - An *exact scheme* (it returns `exact_cell_averages` at the current time) passes every check of every kind.
+  - An *exact scheme* reads the private profile in `Initial` and returns `exact_cell_averages` at the current time. It passes every check of every kind except mirror symmetry. Exact cell averages of the mirrored problem are equal only up to rounding, not bitwise.
+  - The mirror check gets its own two self-tests:
+    - a *shift scheme*, upwind at ν = 1, which moves every average by exactly one cell per step and is mirror-symmetric by construction, passes it;
+    - a *one-sided scheme*, upwind that always takes the left state whatever the sign of a, fails it.
   - A *no-op scheme* fails the moved-correctly and order checks.
   - A *reversed scheme* (one that advects with −a) fails the moved-correctly check.
+  - A *flat-slope scheme* (MUSCL with σ ≡ 0) fails the second-order TVD order check.
   - A *leaky scheme* (it multiplies every average by 1 − 10⁻⁶ each step) fails conservation.
   - A *large-step scheme* (it takes one step to the end) fails the step-count check.
 - `crates/reference/Cargo.toml` may depend on `base`, `kernels` and `libm`. That is within ADR-0001, but it changes the lockfile.
@@ -136,7 +166,11 @@ First-order upwind with forward Euler, as the first vertical slice through `kern
   No allocation, no indexing.
 - **`solver::advection1d`:**
   - `Config` holds the cell count, speed, Courant number and scheme, all required, with no `Default`.
-  - `Config` validation returns an error for each of: zero cells, a non-finite or zero speed, a Courant number outside (0, 1], and an unsupported scheme.
+  - `Config` validation returns an error for each of:
+    - zero cells;
+    - a non-finite or zero speed;
+    - a Courant number outside (0, limit], where the limit comes from the table in "Discretisation";
+    - an unsupported scheme.
   - `Solver::init` allocates every buffer.
   - The solver provides periodic ghost filling, the time step that lands exactly on the target time, `advance_to`, `cell_averages` and `steps`.
 - **Wiring.**
@@ -155,7 +189,7 @@ Second-order MUSCL with SSP-RK2, with the three slopes from the discretisation s
   - `Kind::SecondOrderTvd` for minmod and MC.
 - Unit tests in `kernels` for each slope:
   - the zero slope at an extremum;
-  - the slope on linear data (for MC and Fromm, equal to the exact difference);
+  - the slope on integer-valued linear data, which equals the exact difference for all three slopes and is compared bitwise;
   - the minmod sign cases.
 
 ### advection1d-no-allocation
