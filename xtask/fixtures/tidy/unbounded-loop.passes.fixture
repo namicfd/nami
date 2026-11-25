@@ -13,3 +13,8 @@ fn run(cells: &[f64]) {
     for _value in cells.iter().cycle().take(6) {}
     for (_cell, _weight) in cells.iter().zip(core::iter::repeat(0.5_f64)) {}
 }
+
+fn combine(cells: &[f64]) {
+    for _value in cells.iter().chain(core::iter::once(&0.5_f64)) {}
+    for _state in core::array::from_fn::<[f64; 3], 2, _>(|_| [0.0; 3]) {}
+}

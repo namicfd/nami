@@ -176,9 +176,9 @@ pub const RULES: &[Rule] = &[
     ),
     source(
         "unbounded-loop",
-        "No `loop`, no `while`, and no `for` over a range without an end or over `repeat`, \
-         `repeat_with`, `from_fn`, `successors` or `cycle` unless `take` or `zip` bounds it: \
-         every loop has a fixed upper bound.",
+        "No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, \
+         `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, unless \
+         `take` or `zip` bounds it: every loop has a fixed upper bound.",
         "TIGER_STYLE.md, Put a limit on everything",
     ),
     source("unsafe", "`unsafe` appears only in `crates/alloc-guard`.", "ADR-0014"),

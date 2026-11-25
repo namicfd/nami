@@ -26,6 +26,10 @@ fn cycle_forever(values: &[f64]) {
     for _value in values.iter().cycle() {}
 }
 
+fn chain_forever(values: &[f64]) {
+    for _value in values.iter().chain(core::iter::repeat(&1.0_f64)) {}
+}
+
 fn count_successors() {
     for _step in core::iter::successors(Some(0_u32), |step| step.checked_add(1)) {}
 }

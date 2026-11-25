@@ -44,8 +44,8 @@ const UNBOUNDED_SOURCES: [&str; 4] = ["from_fn", "repeat", "repeat_with", "succe
 /// The iterator method that repeats its receiver forever.
 const UNBOUNDED_METHOD: &str = "cycle";
 
-/// Upper bound on the wrappers peeled off the iterable of a `for` loop.
-const ITERABLE_WRAPPERS_MAX: u32 = 64;
+/// Upper bound on the steps of the walk over the iterable of a `for` loop.
+const ITERABLE_STEPS_MAX: u32 = 256;
 
 /// Upper bound on the subtrees of one `use` item, so the walk is bounded.
 const USE_TREES_MAX: u32 = 100_000;
@@ -405,10 +405,10 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
         if iterates_without_bound(&node.expr) {
             let message = "`for` over an iterator without an end (`start..`, `repeat`, \
-                           `repeat_with`, `from_fn`, `successors`, `cycle`) is unbounded; give \
-                           the range an end (`0..LIMIT`), or bound the iterator with `take` or \
-                           `zip`, and assert after the loop (TIGER_STYLE.md, Put a limit on \
-                           everything)";
+                           `repeat_with`, `from_fn`, `successors`, `cycle`) is unbounded; bound \
+                           it with `.take(LIMIT)`, `zip` it with a bounded iterator, use \
+                           `repeat_n(x, LIMIT)`, or give a range an end (`0..LIMIT`), and assert \
+                           after the loop (TIGER_STYLE.md, Put a limit on everything)";
             self.report(node.for_token.span, "unbounded-loop", message);
         }
         visit::visit_expr_for_loop(self, node);
@@ -615,65 +615,144 @@ fn signature_mentions_usize(signature: &Signature) -> bool {
     finder.found
 }
 
-/// True if a `for` loop over `iterable` has no upper bound. Under parentheses, references and
-/// method calls, the iterable starts from an unbounded source: a range without an end
-/// (`start..`), a call to one of [`UNBOUNDED_SOURCES`], or a call of [`UNBOUNDED_METHOD`]. No
-/// `take` may follow the source, and `zip` bounds the chain unless its argument is unbounded too.
+/// How two iterators combine: `zip` ends with the shorter, `chain` runs both.
+#[derive(Clone, Copy)]
+enum Combine {
+    /// `a.zip(b)` or `iter::zip(a, b)`: unbounded only if both are.
+    Zip,
+    /// `a.chain(b)` or `iter::chain(a, b)`: unbounded if either is.
+    Chain,
+}
+
+/// One step of the walk over an iterable.
+enum Step<'ast> {
+    /// The iterable is known: unbounded (`true`) or not.
+    Known(bool),
+    /// The iterable is bounded exactly when this expression is: a wrapper or an adaptor.
+    Through(&'ast Expr),
+    /// The iterable combines two iterators.
+    Pair(Combine, &'ast Expr, &'ast Expr),
+}
+
+/// Work left in [`iterates_without_bound`]: an expression to look at, or two results to combine.
+enum Pending<'ast> {
+    Visit(&'ast Expr),
+    Combine(Combine),
+}
+
+/// True if a `for` loop over `iterable` has no upper bound. The iterable starts from an
+/// unbounded source (see [`step`]) under parentheses, references and adaptors, and no `take`
+/// follows it. A `zip` is unbounded only if both sides are, a `chain` if either side is.
 fn iterates_without_bound(iterable: &Expr) -> bool {
-    // The chains still to walk after this one: the argument of every `zip` on the way. The loop
-    // is unbounded only if every chain is.
-    let mut pending = Vec::new();
-    let mut expression = iterable;
-    for _ in 0..ITERABLE_WRAPPERS_MAX {
-        if let Expr::Paren(paren) = expression {
-            expression = &paren.expr;
-        } else if let Expr::Group(group) = expression {
-            expression = &group.expr;
-        } else if let Expr::Reference(reference) = expression {
-            expression = &reference.expr;
-        } else if let Expr::MethodCall(call) = expression
-            && call.method != UNBOUNDED_METHOD
-        {
-            if call.method == "take" {
-                return false;
+    // An explicit stack instead of recursion: expressions to visit, and results to combine.
+    let mut pending = vec![Pending::Visit(iterable)];
+    let mut results: Vec<bool> = Vec::new();
+    for _ in 0..ITERABLE_STEPS_MAX {
+        let Some(work) = pending.pop() else {
+            assert_eq!(results.len(), 1, "the walk leaves exactly one result");
+            return results.pop().is_some_and(|unbounded| unbounded);
+        };
+        match work {
+            Pending::Visit(expression) => match step(expression) {
+                Step::Known(unbounded) => results.push(unbounded),
+                Step::Through(inner) => pending.push(Pending::Visit(inner)),
+                Step::Pair(combine, left, right) => {
+                    pending.push(Pending::Combine(combine));
+                    pending.push(Pending::Visit(left));
+                    pending.push(Pending::Visit(right));
+                }
+            },
+            Pending::Combine(combine) => {
+                let right = results.pop().expect("a pair visits its right side");
+                let left = results.pop().expect("a pair visits its left side");
+                results.push(match combine {
+                    Combine::Zip => left && right,
+                    Combine::Chain => left || right,
+                });
             }
-            if call.method == "zip" {
-                pending.extend(call.args.first());
-            }
-            expression = &call.receiver;
-        } else if is_unbounded_source(expression) {
-            let Some(next) = pending.pop() else {
-                return true;
-            };
-            expression = next;
-        } else {
-            return false;
         }
     }
     // Deeper than any real iterable: it cannot be shown to be bounded, so it is reported.
     true
 }
 
-/// True for the start of an iterator chain that never ends: `start..`, `iter::repeat(x)` and
-/// the other [`UNBOUNDED_SOURCES`], and `iterator.cycle()`.
-fn is_unbounded_source(expression: &Expr) -> bool {
+/// Classifies one expression of an iterable. The unbounded sources are a range without an end
+/// (`start..`), `iterator.cycle()`, and a call to one of [`UNBOUNDED_SOURCES`] in `core::iter`
+/// (see [`is_iter_function`]).
+fn step(expression: &Expr) -> Step<'_> {
+    if let Expr::Paren(paren) = expression {
+        return Step::Through(&paren.expr);
+    }
+    if let Expr::Group(group) = expression {
+        return Step::Through(&group.expr);
+    }
+    if let Expr::Reference(reference) = expression {
+        return Step::Through(&reference.expr);
+    }
     if let Expr::Range(range) = expression {
-        return range.end.is_none();
+        return Step::Known(range.end.is_none());
     }
     if let Expr::MethodCall(call) = expression {
-        return call.method == UNBOUNDED_METHOD;
+        return method_step(call);
     }
-    let Expr::Call(call) = expression else {
-        return false;
-    };
-    let Expr::Path(function) = &*call.func else {
-        return false;
-    };
-    function
-        .path
-        .segments
-        .last()
-        .is_some_and(|segment| UNBOUNDED_SOURCES.iter().any(|source| segment.ident == source))
+    if let Expr::Call(call) = expression
+        && let Expr::Path(function) = &*call.func
+    {
+        return function_step(&function.path, call);
+    }
+    Step::Known(false)
+}
+
+/// [`step`] for `receiver.method(..)`: `cycle` never ends, `take` ends, `zip` and `chain`
+/// combine the receiver with their argument, and any other adaptor passes the receiver through.
+fn method_step(call: &syn::ExprMethodCall) -> Step<'_> {
+    if call.method == UNBOUNDED_METHOD {
+        return Step::Known(true);
+    }
+    if call.method == "take" {
+        return Step::Known(false);
+    }
+    match (combine_of(&call.method), call.args.first()) {
+        (Some(combine), Some(argument)) => Step::Pair(combine, &call.receiver, argument),
+        _ => Step::Through(&call.receiver),
+    }
+}
+
+/// [`step`] for a call of the function at `path`: `iter::zip(a, b)` and `iter::chain(a, b)`
+/// combine their arguments, and the [`UNBOUNDED_SOURCES`] never end. Only functions that can
+/// be in `core::iter` count (see [`is_iter_function`]).
+fn function_step<'ast>(path: &syn::Path, call: &'ast syn::ExprCall) -> Step<'ast> {
+    if !is_iter_function(path) {
+        return Step::Known(false);
+    }
+    let combine = path.segments.last().and_then(|segment| combine_of(&segment.ident));
+    let mut arguments = call.args.iter();
+    match (combine, arguments.next(), arguments.next(), arguments.next()) {
+        (Some(combine), Some(left), Some(right), None) => Step::Pair(combine, left, right),
+        _ => Step::Known(UNBOUNDED_SOURCES.iter().any(|name| last_segment_is(path, name))),
+    }
+}
+
+/// `zip` and `chain`, by name.
+fn combine_of(name: &Ident) -> Option<Combine> {
+    if name == "zip" {
+        Some(Combine::Zip)
+    } else if name == "chain" {
+        Some(Combine::Chain)
+    } else {
+        None
+    }
+}
+
+/// True for a function path that can name `core::iter`: a bare name as imported from it
+/// (`repeat`), or a path whose last qualifier is `iter` (`iter::repeat`, `std::iter::repeat`).
+/// Any other qualifier names something else: `array::from_fn`, `Self::repeat`.
+fn is_iter_function(path: &syn::Path) -> bool {
+    let mut qualifiers = path.segments.iter().rev().skip(1);
+    match qualifiers.next() {
+        None => path.leading_colon.is_none(),
+        Some(qualifier) => qualifier.ident == "iter",
+    }
 }
 
 /// The first segment of every path that a `use` item imports: `a` and `c` in
@@ -821,7 +900,8 @@ mod tests {
     }
 
     // Goal: a `for` over a range without an end, or over `repeat`, `repeat_with`, `from_fn`,
-    // `successors` or `cycle`, is unbounded, however it is wrapped.
+    // `successors` or `cycle`, is unbounded, however it is wrapped, zipped with another unbounded
+    // iterator, or chained.
     #[test]
     fn unbounded_iterators_are_reported() {
         let unbounded = [
@@ -843,6 +923,12 @@ mod tests {
             "for value in &mut values.iter().cycle() {}",
             "for (step, value) in (0..).zip(repeat(1.0)) {}",
             "for (value, step) in values.iter().cycle().zip((0..).skip(1)) {}",
+            "for value in ::core::iter::repeat(1.0) {}",
+            "for value in cells.iter().chain(repeat(&1.0)) {}",
+            "for value in (0..).chain(cells) {}",
+            "for value in cells.iter().chain(other.iter().cycle()).take_while(|v| **v > 0.0) {}",
+            "for (step, value) in iter::zip(0.., repeat(1.0)) {}",
+            "for value in core::iter::chain(cells, repeat(&1.0)) {}",
         ];
         for body in unbounded {
             let text = format!("fn a() {{ {body} }}");
@@ -851,8 +937,8 @@ mod tests {
     }
 
     // Goal: a range with an end is bounded, and `take` or `zip` bound a range or an iterator
-    // without one. A range passed as an argument is not the iterable, unless `zip` pairs two
-    // unbounded iterators.
+    // without one, unless `zip` pairs two unbounded iterators. `chain` is bounded when both
+    // sides are. A function that is not in `core::iter` (`array::from_fn`) is not a source.
     #[test]
     fn bounded_iterators_pass() {
         let bounded = [
@@ -875,6 +961,14 @@ mod tests {
             "for value in core::iter::repeat_n(1.0, 3) {}",
             "for value in core::iter::once(1.0) {}",
             "for value in text.repeat(3).chars() {}",
+            "for value in core::array::from_fn::<f64, 3, _>(|i| 1.0) {}",
+            "for value in array::from_fn::<f64, 3, _>(|i| 1.0) {}",
+            "for value in Self::repeat(1.0) {}",
+            "for step in my_mod::successors(0) {}",
+            "for value in cells.iter().chain(other) {}",
+            "for value in cells.iter().chain(repeat(&1.0)).take(3) {}",
+            "for (step, value) in iter::zip(0.., cells) {}",
+            "for (cell, value) in zip(cells, repeat(1.0)) {}",
         ];
         for body in bounded {
             let text = format!("fn a() {{ {body} }}");
