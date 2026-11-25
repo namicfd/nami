@@ -4,3 +4,7 @@
 struct Field {
     values: Box<[f64]>,
 }
+
+struct Scratch {
+    pencil: Option<Box<[f64]>>,
+}

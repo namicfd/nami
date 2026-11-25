@@ -1,12 +1,26 @@
-//! Rules about documents: the ADRs (ADR-0000).
+//! Rules about documents: the ADRs (ADR-0000) and the learnings.
 
 use super::Violation;
 use std::fs;
 use std::io;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// Directory of the ADRs and their index (ADR-0000).
 pub const ADR_DIRECTORY: &str = "docs/design";
+
+/// Directory of the learnings: what went wrong in a session, and the guardrail it suggests.
+pub const LEARNING_DIRECTORY: &str = "docs/learnings";
+
+/// The one file in the learnings directory that is not a learning. It describes the format.
+pub const LEARNING_README: &str = "README.md";
+
+/// Valid beginnings of a learning's status line.
+const LEARNING_STATUSES: [&str; 3] =
+    ["- Status: Open", "- Status: Codified in ", "- Status: Rejected"];
+
+/// Sections every learning must have.
+const LEARNING_SECTIONS: [&str; 2] = ["## What happened", "## Proposed guardrail"];
 
 /// Sections every ADR must have (ADR-0000).
 const ADR_SECTIONS: [&str; 6] = [
@@ -76,9 +90,66 @@ pub fn is_adr_file_name(name: &str) -> bool {
     has_number && bytes.get(4) == Some(&b'-') && is_markdown
 }
 
+/// Checks one learning: its name is dated, and it has a status and both sections.
+pub fn check_learning(relative: &Path, text: &str) -> Vec<Violation> {
+    assert!(relative.starts_with(LEARNING_DIRECTORY), "check_learning is called on learnings only");
+    let name = relative.file_name().map_or_default(|name| name.to_string_lossy());
+    let mut violations = Vec::new();
+    let mut report = |message: String| {
+        violations.push(Violation::new(relative, 0, "learning-format", message));
+    };
+    if !is_learning_file_name(&name) {
+        report(format!(
+            "learning `{name}` must be named `YYYY-MM-DD-<lowercase-slug>.md`, after the day it \
+             happened; rename it ({LEARNING_DIRECTORY}/{LEARNING_README})"
+        ));
+    }
+    let has_status =
+        text.lines().any(|line| LEARNING_STATUSES.iter().any(|status| line.starts_with(status)));
+    if !has_status {
+        report(format!(
+            "learning has no valid status line; use `- Status: Open`, `- Status: Codified in \
+             <rule, lint or ADR>` or `- Status: Rejected` ({LEARNING_DIRECTORY}/{LEARNING_README})"
+        ));
+    }
+    let is_missing = |section: &&&str| !text.lines().any(|line| line == **section);
+    for section in LEARNING_SECTIONS.iter().filter(is_missing) {
+        report(format!(
+            "learning is missing the `{section}` section; add it \
+             ({LEARNING_DIRECTORY}/{LEARNING_README})"
+        ));
+    }
+    violations
+}
+
+/// True for `YYYY-MM-DD-<slug>.md`, where the slug is lowercase words and numbers joined by
+/// single dashes.
+fn is_learning_file_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let mut parts = stem.splitn(4, '-');
+    let (Some(year), Some(month), Some(day), Some(slug)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let is_number = |part: &str, digits: usize, values: RangeInclusive<u32>| {
+        let is_digits = part.len() == digits && part.bytes().all(|byte| byte.is_ascii_digit());
+        is_digits && part.parse::<u32>().is_ok_and(|value| values.contains(&value))
+    };
+    let is_word = |word: &str| {
+        !word.is_empty()
+            && word.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    };
+    let is_dated =
+        is_number(year, 4, 1..=9999) && is_number(month, 2, 1..=12) && is_number(day, 2, 1..=31);
+    is_dated && slug.split('-').all(is_word)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_adr, entries_of, is_adr_file_name};
+    use super::{check_adr, check_learning, entries_of, is_adr_file_name, is_learning_file_name};
     use std::path::Path;
 
     fn rules(violations: &[super::Violation]) -> Vec<&'static str> {
@@ -109,6 +180,48 @@ mod tests {
         assert!(!is_adr_file_name("0013_x.md"), "the number must be followed by a dash");
         assert!(!is_adr_file_name("abcd-x.md"), "the prefix must be digits");
         assert!(!is_adr_file_name("0013-x.txt"), "ADRs are Markdown");
+    }
+
+    // Goal: a learning needs a dated name, a status line and both sections; each missing part
+    // is one violation.
+    #[test]
+    fn learning_rule_fires() {
+        let good = "# A title\n\n- Status: Open\n\n## What happened\n\n## Proposed guardrail\n";
+        let path = Path::new("docs/learnings/2026-11-25-tidy-missed-libm.md");
+        assert_eq!(check_learning(path, good), Vec::new());
+        let codified = good.replace("- Status: Open", "- Status: Codified in tidy `direct-libm`");
+        assert_eq!(check_learning(path, &codified), Vec::new());
+        let rejected = good.replace("- Status: Open", "- Status: Rejected");
+        assert_eq!(check_learning(path, &rejected), Vec::new());
+        let no_status = good.replace("- Status: Open", "- Status: Done");
+        assert_eq!(rules(&check_learning(path, &no_status)), ["learning-format"]);
+        let indented = good.replace("- Status: Open", "  - Status: Open");
+        assert_eq!(check_learning(path, &indented).len(), 1, "the status starts its line");
+        let no_guardrail = good.replace("## Proposed guardrail", "## Guardrail");
+        assert_eq!(check_learning(path, &no_guardrail).len(), 1);
+        let badly_named = Path::new("docs/learnings/tidy-missed-libm.md");
+        assert_eq!(rules(&check_learning(badly_named, good)), ["learning-format"]);
+        assert_eq!(check_learning(badly_named, "").len(), 4, "name, status and two sections");
+    }
+
+    // Goal: a learning is named by its date and a lowercase slug, and nothing else.
+    #[test]
+    fn learning_file_names_are_recognised() {
+        assert!(is_learning_file_name("2026-11-25-tidy-missed-libm.md"));
+        assert!(is_learning_file_name("2026-01-31-run2.md"));
+        assert!(!is_learning_file_name("2026-11-25.md"), "the slug is required");
+        assert!(!is_learning_file_name("2026-11-25-.md"), "the slug is not empty");
+        assert!(!is_learning_file_name("2026-11-25-Tidy.md"), "the slug is lowercase");
+        assert!(!is_learning_file_name("2026-11-25-tidy_missed.md"), "words join by dashes");
+        assert!(!is_learning_file_name("2026-11-25-tidy--missed.md"), "single dashes");
+        assert!(!is_learning_file_name("2026-13-25-tidy.md"), "there is no month 13");
+        assert!(!is_learning_file_name("2026-00-25-tidy.md"), "there is no month 0");
+        assert!(!is_learning_file_name("2026-11-32-tidy.md"), "there is no day 32");
+        assert!(!is_learning_file_name("2026-11-00-tidy.md"), "there is no day 0");
+        assert!(!is_learning_file_name("26-11-25-tidy.md"), "the year has four digits");
+        assert!(!is_learning_file_name("2026-1-25-tidy.md"), "the month has two digits");
+        assert!(!is_learning_file_name("2026-11-25-tidy.txt"), "learnings are Markdown");
+        assert!(!is_learning_file_name("notes.md"), "the date is required");
     }
 
     // Goal: a directory lists as sorted relative paths, and a missing directory is an error.

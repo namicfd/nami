@@ -1,12 +1,21 @@
-//! The rule registry: every tidy rule, in one table.
+//! The rule registry: every tidy rule, in one place.
 //!
 //! A rule exists once it has a row here. [`super::Violation::new`] refuses an id that is not
 //! registered, and the fixture tests refuse a registered rule that has no firing and no passing
 //! example (`xtask/fixtures/tidy/`). So a rule cannot be added without a description, and it
 //! cannot go silent without a test failing.
 //!
+//! There are three tables:
+//!
+//! - [`RULES`]: rules written as code somewhere in `tidy`;
+//! - [`PATH_BANS`] and [`MACRO_BANS`]: declarative bans. A new ban is one row plus two fixtures,
+//!   with no other code.
+//!
 //! The tables are plain Rust constants, so that adding a rule needs no parser and the compiler
 //! checks the rows.
+
+use super::Scope;
+use std::path::Path;
 
 /// How much of the tree a rule needs to see before it can decide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +36,7 @@ pub struct Rule {
     pub kind: RuleKind,
     /// One line that says what the rule requires.
     pub summary: &'static str,
-    /// Where the reason is written down: an ADR or a `TIGER_STYLE.md` section.
+    /// Where the reason is written down: an ADR, a `TIGER_STYLE.md` section or a document.
     pub reference: &'static str,
 }
 
@@ -66,7 +75,8 @@ pub const RULES: &[Rule] = &[
     ),
     workspace(
         "expect-budget",
-        "The number of `#[expect]` attributes equals `xtask/expect-budget.txt`.",
+        "The number of `expect(...)` lint suppressions, counted on tokens so that `cfg_attr` and \
+         macro bodies are included, equals `xtask/expect-budget.txt`.",
         "ADR-0006",
     ),
     source(
@@ -81,14 +91,27 @@ pub const RULES: &[Rule] = &[
         "ADR-0003",
     ),
     source(
+        "learning-format",
+        "Every file in `docs/learnings/` is named `YYYY-MM-DD-<slug>.md` and has a status line \
+         and the sections `## What happened` and `## Proposed guardrail`.",
+        "docs/learnings/README.md",
+    ),
+    source(
         "line-length",
         "Lines in Rust sources are at most 100 columns.",
         "TIGER_STYLE.md, Style by the numbers",
     ),
+    source(
+        "magic-tolerance",
+        "In nami crates outside tests, a float literal in (0, 1e-6] appears only in the \
+         initialiser of a `const` item that has a doc comment.",
+        "TIGER_STYLE.md, Floating point",
+    ),
     source("parse", "Every Rust source file parses.", "ADR-0006"),
     source(
         "runtime-dependency",
-        "Runtime and build dependencies of nami crates are `libm` and workspace crates only.",
+        "Runtime and build dependencies of nami crates are `libm` and workspace crates only, \
+         and none is renamed with `package = \"...\"`.",
         "ADR-0001",
     ),
     source("snapshot-draft", "No unreviewed insta snapshots (`*.snap.new`).", "ADR-0006"),
@@ -104,21 +127,95 @@ pub const RULES: &[Rule] = &[
     ),
     source(
         "unbounded-loop",
-        "No `loop` and no `while`: every loop has a fixed upper bound.",
+        "No `loop`, no `while`, and no `for` over a range without an end unless `take` or `zip` \
+         bounds it: every loop has a fixed upper bound.",
         "TIGER_STYLE.md, Put a limit on everything",
     ),
     source("unsafe", "`unsafe` appears only in `crates/alloc-guard`.", "ADR-0014"),
     source(
         "usize",
-        "`usize` appears in public signatures, fields and public items only in `base::index`.",
+        "In nami crates, `usize` appears in function signatures, fields, public constants and \
+         statics, and type aliases only in `base::index`. Trait impls and const generics are \
+         exempt.",
         "ADR-0002",
     ),
     source(
         "vec-field",
-        "No `Vec` struct fields in nami crates: fixed-size storage is `Box<[T]>`.",
+        "No `Vec` anywhere inside a field type in nami crates: fixed-size storage is `Box<[T]>`.",
         "ADR-0003",
     ),
 ];
+
+/// Which files a ban applies to, before its `allowed` list is consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BanScope {
+    /// Every Rust source file that tidy walks, tooling included.
+    Everywhere,
+    /// Only nami's own crates under `crates/`.
+    NamiCrates,
+}
+
+impl BanScope {
+    /// True if a ban with this scope applies to a file in `scope`.
+    #[must_use]
+    pub fn includes(self, scope: Scope) -> bool {
+        self == Self::Everywhere || scope.is_nami()
+    }
+}
+
+/// A ban on every path that starts with one segment: `libm::sqrt(x)`, `use libm::sqrt;`, a type
+/// `libm::Foo`. It also applies inside macro invocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathBan {
+    /// Rule identifier, as for [`Rule::id`].
+    pub id: &'static str,
+    /// The banned leading path segment.
+    pub segment: &'static str,
+    /// Files or directories, relative to the root, where the path is allowed.
+    pub allowed: &'static [&'static str],
+    /// Which files the ban applies to.
+    pub scope: BanScope,
+    /// The violation message: what is wrong, how to fix it, and where the reason is.
+    pub message: &'static str,
+}
+
+/// A ban on invoking macros by name. It also applies inside other macro invocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MacroBan {
+    /// Rule identifier, as for [`Rule::id`].
+    pub id: &'static str,
+    /// The banned macro names, without the `!`.
+    pub names: &'static [&'static str],
+    /// Files or directories, relative to the root, where the macros are allowed.
+    pub allowed: &'static [&'static str],
+    /// The violation message: what is wrong, how to fix it, and where the reason is.
+    pub message: &'static str,
+}
+
+/// Banned leading path segments. Keep the rows sorted by id.
+pub const PATH_BANS: &[PathBan] = &[PathBan {
+    id: "direct-libm",
+    segment: "libm",
+    allowed: &["crates/kernels/src/math.rs"],
+    scope: BanScope::Everywhere,
+    message: "direct use of `libm`; call a wrapper in `kernels::math`, or add one there: the \
+              wrapper asserts the domain, so an invalid argument fails loudly (ADR-0005)",
+}];
+
+/// Banned macros. Keep the rows sorted by id.
+pub const MACRO_BANS: &[MacroBan] = &[MacroBan {
+    id: "debug-assert-placement",
+    names: &["debug_assert", "debug_assert_eq", "debug_assert_ne"],
+    allowed: &["crates/kernels"],
+    message: "`debug_assert!` outside `kernels`; use `assert!`. `debug_assert!` is only for \
+              per-cell checks inside hot loops in `kernels` (ADR-0004)",
+}];
+
+/// True if `relative` is one of the `allowed` files or lies inside one of the directories.
+#[must_use]
+pub fn is_allowed(allowed: &[&str], relative: &Path) -> bool {
+    allowed.iter().any(|prefix| relative.starts_with(prefix))
+}
 
 /// True if some table in this registry defines the tidy rule `id`.
 #[must_use]
@@ -128,58 +225,114 @@ pub fn is_registered(id: &str) -> bool {
 
 /// The id of every tidy rule, from every table.
 pub fn rule_ids() -> impl Iterator<Item = &'static str> {
-    RULES.iter().map(|rule| rule.id)
+    RULES.iter().map(|rule| rule.id).chain(ban_ids())
 }
 
-/// The ids of the rules of one kind.
+/// The ids of the rules of one kind. Bans are source rules.
 pub fn rule_ids_of(kind: RuleKind) -> impl Iterator<Item = &'static str> {
-    RULES.iter().filter(move |rule| rule.kind == kind).map(|rule| rule.id)
+    let coded = RULES.iter().filter(move |rule| rule.kind == kind).map(|rule| rule.id);
+    coded.chain(ban_ids().filter(move |_| kind == RuleKind::Source))
+}
+
+fn ban_ids() -> impl Iterator<Item = &'static str> {
+    PATH_BANS.iter().map(|ban| ban.id).chain(MACRO_BANS.iter().map(|ban| ban.id))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RULES, RuleKind, is_registered, rule_ids, rule_ids_of};
+    use super::{BanScope, MACRO_BANS, PATH_BANS, RULES, RuleKind};
+    use super::{is_allowed, is_registered, rule_ids, rule_ids_of};
+    use crate::tidy::Scope;
+    use std::path::Path;
 
-    // Goal: ids are unique and sorted, so that a rule has one row and the table reads like an
-    // index.
+    fn is_sorted_and_unique(ids: &[&str]) -> bool {
+        ids.is_sorted_by(|a, b| a < b)
+    }
+
+    fn is_dashed(id: &str) -> bool {
+        !id.is_empty()
+            && id.chars().all(|character| character.is_ascii_lowercase() || character == '-')
+    }
+
+    // Goal: ids are unique across the tables and sorted within each, so that a rule has one row
+    // and each table reads like an index.
     #[test]
     fn rule_ids_are_sorted_and_unique() {
-        let ids: Vec<&str> = RULES.iter().map(|rule| rule.id).collect();
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(ids, sorted, "RULES must be sorted by id, without duplicates");
+        let coded: Vec<&str> = RULES.iter().map(|rule| rule.id).collect();
+        assert!(is_sorted_and_unique(&coded), "RULES must be sorted by id, without duplicates");
+        let paths: Vec<&str> = PATH_BANS.iter().map(|ban| ban.id).collect();
+        assert!(is_sorted_and_unique(&paths), "PATH_BANS must be sorted by id");
+        let macros: Vec<&str> = MACRO_BANS.iter().map(|ban| ban.id).collect();
+        assert!(is_sorted_and_unique(&macros), "MACRO_BANS must be sorted by id");
         let mut all: Vec<&str> = rule_ids().collect();
-        let count = all.len();
+        assert_eq!(all.len(), coded.len() + paths.len() + macros.len());
         all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), count, "a rule id appears in two tables");
+        assert!(is_sorted_and_unique(&all), "a rule id appears in two tables");
+        assert!(!is_sorted_and_unique(&["b", "a"]), "unsorted ids are detected");
+        assert!(!is_sorted_and_unique(&["a", "a"]), "duplicate ids are detected");
     }
 
     // Goal: every row is complete: a lowercase dashed id, a summary sentence and a reference.
     #[test]
-    fn rows_are_complete() {
+    fn rule_rows_are_complete() {
         for rule in RULES {
-            let is_dashed =
-                rule.id.chars().all(|character| character.is_ascii_lowercase() || character == '-');
-            assert!(is_dashed && !rule.id.is_empty(), "id `{}` must be lowercase-dashed", rule.id);
+            assert!(is_dashed(rule.id), "id `{}` must be lowercase-dashed", rule.id);
             assert!(rule.summary.ends_with('.'), "summary of `{}` must be a sentence", rule.id);
-            let cites = rule.reference.starts_with("ADR-")
-                || rule.reference.starts_with("TIGER_STYLE.md, ");
-            assert!(cites, "reference of `{}` must be an ADR or a TIGER_STYLE section", rule.id);
+            let cites = ["ADR-", "TIGER_STYLE.md, ", "docs/"]
+                .iter()
+                .any(|prefix| rule.reference.starts_with(prefix));
+            assert!(cites, "reference of `{}` must be an ADR, a section or a document", rule.id);
+        }
+        assert!(is_dashed("line-length") && !is_dashed("Line_Length") && !is_dashed(""));
+    }
+
+    // Goal: every ban row is complete: its message says what to do and cites its reason, and it
+    // names something to ban and somewhere it is allowed.
+    #[test]
+    fn ban_rows_are_complete() {
+        for ban in PATH_BANS {
+            assert!(is_dashed(ban.id), "id `{}` must be lowercase-dashed", ban.id);
+            assert!(!ban.segment.is_empty(), "`{}` must ban a segment", ban.id);
+            assert!(ban.message.contains("; "), "message of `{}` must name the fix", ban.id);
+            assert!(ban.message.ends_with(')'), "message of `{}` must cite its reason", ban.id);
+        }
+        for ban in MACRO_BANS {
+            assert!(is_dashed(ban.id), "id `{}` must be lowercase-dashed", ban.id);
+            assert!(!ban.names.is_empty(), "`{}` must ban a macro", ban.id);
+            assert!(ban.message.contains("; "), "message of `{}` must name the fix", ban.id);
+            assert!(ban.message.ends_with(')'), "message of `{}` must cite its reason", ban.id);
         }
     }
 
-    // Goal: lookups see exactly the registered ids, and kinds partition the table.
+    // Goal: lookups see exactly the registered ids, and bans count as source rules.
     #[test]
-    fn lookups_follow_the_table() {
-        assert!(is_registered("line-length"), "a registered rule is found");
+    fn lookups_follow_the_tables() {
+        assert!(is_registered("line-length"), "a coded rule is found");
+        assert!(is_registered("direct-libm"), "a path ban is found");
+        assert!(is_registered("debug-assert-placement"), "a macro ban is found");
         assert!(!is_registered("no-such-rule"), "an unknown id is rejected");
         assert!(!is_registered(""), "the empty id is rejected");
-        let source = rule_ids_of(RuleKind::Source).count();
-        let workspace = rule_ids_of(RuleKind::Workspace).count();
-        assert_eq!(source + workspace, RULES.len());
-        assert!(rule_ids_of(RuleKind::Workspace).any(|id| id == "expect-budget"));
-        assert!(!rule_ids_of(RuleKind::Source).any(|id| id == "expect-budget"));
+        let source: Vec<&str> = rule_ids_of(RuleKind::Source).collect();
+        let workspace: Vec<&str> = rule_ids_of(RuleKind::Workspace).collect();
+        assert_eq!(source.len() + workspace.len(), rule_ids().count());
+        assert!(workspace.contains(&"expect-budget") && !source.contains(&"expect-budget"));
+        assert!(source.contains(&"direct-libm") && !workspace.contains(&"direct-libm"));
+        assert!(source.contains(&"debug-assert-placement"), "macro bans are source rules");
+    }
+
+    // Goal: a ban's scope and its allowed list decide where it applies: files and whole
+    // directories match by path component, not by text prefix.
+    #[test]
+    fn ban_scopes_and_allowed_paths() {
+        assert!(BanScope::Everywhere.includes(Scope::Tooling), "everywhere includes tooling");
+        assert!(BanScope::Everywhere.includes(Scope::Kernels), "everywhere includes crates");
+        assert!(BanScope::NamiCrates.includes(Scope::Crate), "nami crates are included");
+        assert!(!BanScope::NamiCrates.includes(Scope::Tooling), "tooling is not a nami crate");
+        let allowed = ["crates/kernels", "crates/base/src/index.rs"];
+        assert!(is_allowed(&allowed, Path::new("crates/kernels/src/math.rs")), "inside");
+        assert!(is_allowed(&allowed, Path::new("crates/base/src/index.rs")), "the file itself");
+        assert!(!is_allowed(&allowed, Path::new("crates/kernels-extra/src/lib.rs")), "a sibling");
+        assert!(!is_allowed(&allowed, Path::new("crates/base/src/lib.rs")), "another file");
+        assert!(!is_allowed(&[], Path::new("crates/kernels/src/math.rs")), "nothing is allowed");
     }
 }

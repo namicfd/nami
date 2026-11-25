@@ -3,10 +3,13 @@
 //! Each rule lives in exactly one tool, so tidy only checks what clippy and rustfmt do not. Every
 //! rule has a row in [`registry`], and a firing and a passing example in `xtask/fixtures/tidy/`:
 //!
-//! - source rules are decided from one file ([`check_single_file`]): Rust sources, crate
-//!   manifests and ADRs;
+//! - source rules are decided from one file ([`check_single_file`]): Rust sources, manifests,
+//!   ADRs and learnings;
 //! - workspace rules need the whole tree ([`check`]): the `#[expect]` budget and the assertion
 //!   density of each crate.
+//!
+//! Most new guardrails are a ban: one row in [`registry::PATH_BANS`] or
+//! [`registry::MACRO_BANS`] plus two fixtures.
 //!
 //! Every violation reads `path:line: error[rule]: what; fix (reference)`, so the message tells
 //! the reader how to fix it.
@@ -20,6 +23,7 @@ mod rust_source;
 #[cfg(test)]
 mod scratch;
 mod text;
+mod tokens;
 mod workspace;
 
 use std::fmt;
@@ -117,8 +121,12 @@ enum FileKind {
     RustSource,
     /// `crates/<name>/Cargo.toml`.
     CrateManifest,
+    /// The root `Cargo.toml`.
+    WorkspaceManifest,
     /// `docs/design/NNNN-<title>.md`.
     Adr,
+    /// A file in `docs/learnings/`, other than its `README.md`.
+    Learning,
     /// `*.snap.new`: an insta snapshot that nobody reviewed.
     SnapshotDraft,
     /// Anything else: no rule applies.
@@ -135,8 +143,13 @@ impl FileKind {
             Self::RustSource
         } else if name == "Cargo.toml" && directory.parent() == Some(Path::new("crates")) {
             Self::CrateManifest
+        } else if relative == Path::new("Cargo.toml") {
+            Self::WorkspaceManifest
         } else if directory == Path::new(docs::ADR_DIRECTORY) && docs::is_adr_file_name(&name) {
             Self::Adr
+        } else if directory == Path::new(docs::LEARNING_DIRECTORY) && name != docs::LEARNING_README
+        {
+            Self::Learning
         } else {
             Self::Other
         }
@@ -186,9 +199,9 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
 /// Runs every source rule on one file: every rule that can be decided from that file alone.
 ///
 /// `relative` is the file's path below `root` and decides which rules apply: a Rust source, a
-/// crate manifest or an ADR. Any other file has no rules and yields nothing. `text` is the
-/// file's content, which need not be on disk yet. Context that a rule needs, such as the ADR
-/// index or the names of the workspace crates, is read from `root`.
+/// crate or workspace manifest, an ADR or a learning. Any other file has no rules and yields
+/// nothing. `text` is the file's content, which need not be on disk yet. Context that a rule
+/// needs, such as the ADR index or the names of the workspace crates, is read from `root`.
 ///
 /// # Errors
 ///
@@ -204,15 +217,19 @@ fn check_file(root: &Path, relative: &Path, text: &str) -> io::Result<FileReport
     match FileKind::of(relative) {
         FileKind::RustSource => {
             (report.violations, report.stats) = check_rust_source(relative, text);
-            report.expect_count = text::expect_count(text);
+            report.expect_count = tokens::expect_count(text);
         }
         FileKind::CrateManifest => {
             let crates = manifest::workspace_crates(root)?;
             report.violations = manifest::check_manifest(relative, text, &crates);
         }
+        FileKind::WorkspaceManifest => {
+            report.violations = manifest::check_workspace_manifest(relative, text);
+        }
         FileKind::Adr => {
             report.violations = docs::check_adr(relative, text, &docs::adr_index(root)?);
         }
+        FileKind::Learning => report.violations = docs::check_learning(relative, text),
         FileKind::SnapshotDraft => {
             report.violations.push(workspace::snapshot_draft_violation(relative));
         }
@@ -231,9 +248,15 @@ pub fn check_rust_source(relative: &Path, text: &str) -> (Vec<Violation>, Assert
     (violations, report.stats)
 }
 
-/// The documents that have rules. They live under `docs/`, which the source walk skips.
+/// The documents that have rules. They live under `docs/`, which the source walk skips. The
+/// ADR directory must exist; a tree without learnings is fine.
 fn document_files(root: &Path) -> io::Result<Vec<PathBuf>> {
-    docs::entries_of(root, docs::ADR_DIRECTORY)
+    let mut paths = docs::entries_of(root, docs::ADR_DIRECTORY)?;
+    if root.join(docs::LEARNING_DIRECTORY).is_dir() {
+        paths.extend(docs::entries_of(root, docs::LEARNING_DIRECTORY)?);
+    }
+    paths.retain(|relative| root.join(relative).is_file());
+    Ok(paths)
 }
 
 /// Lists every file below `root` as a path relative to it, in sorted order. Skips build output,
@@ -292,6 +315,10 @@ mod tests {
         let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
         scratch.write("crates/demo/src/lib.rs", &unasserted);
         scratch.write("crates/demo/src/a.snap.new", "");
+        scratch.write("Cargo.toml", "[workspace.dependencies]\nlibm = { package = \"serde\" }\n");
+        scratch.write("docs/learnings/README.md", "How to write a learning.\n");
+        scratch.write("docs/learnings/notes.md", "- Status: Open\n## What happened\n");
+        scratch.write("docs/learnings/archive/old.md", "A directory is not a learning.\n");
         scratch.write("target/ignored/skipped.rs", "fn a() { loop {} }");
         scratch.write("xtask/fixtures/tidy/skipped.rs", "fn a() { loop {} }");
         scratch.write(".claude/worktrees/other/.git", "gitdir: elsewhere\n");
@@ -308,15 +335,17 @@ mod tests {
         let rules: Vec<&str> = violations.iter().map(|violation| violation.rule).collect();
         assert_eq!(
             rules,
-            ["assertion-density", "runtime-dependency", "snapshot-draft", "unasserted-function"]
+            ["runtime-dependency", "assertion-density", "runtime-dependency"]
                 .into_iter()
-                .chain(["adr-index"])
+                .chain(["snapshot-draft", "unasserted-function", "adr-index"])
                 .chain(["adr-section"; 6])
+                .chain(["learning-format"; 2])
                 .chain(["expect-budget"])
                 .collect::<Vec<_>>()
         );
-        assert_eq!(violations[0].path, Path::new("crates/demo"));
-        assert_eq!(violations[0].to_string().split(':').next(), Some("crates/demo"));
+        assert_eq!(violations[0].path, Path::new("Cargo.toml"));
+        assert_eq!(violations[1].path, Path::new("crates/demo"));
+        assert_eq!(violations[1].to_string().split(':').next(), Some("crates/demo"));
     }
 
     // Goal: every workspace rule in the registry fires on the broken workspace, and no workspace
@@ -350,6 +379,12 @@ mod tests {
         assert_eq!(rules("crates/demo/src/lib.rs", "fn a() { loop {} }"), ["unbounded-loop"]);
         assert_eq!(rules("docs/design/0001-x.md", "- Status: Accepted\n").len(), 7);
         assert_eq!(rules("crates/demo/src/a.snap.new", ""), ["snapshot-draft"]);
+        assert_eq!(
+            rules("Cargo.toml", "[workspace.dependencies.libm]\npackage = \"a\"\n").len(),
+            1
+        );
+        assert_eq!(rules("docs/learnings/notes.md", "- Status: Open\n").len(), 3);
+        assert_eq!(rules("docs/learnings/README.md", ""), Vec::<&str>::new());
         assert_eq!(rules("README.md", "loop {}"), Vec::<&str>::new());
     }
 
@@ -393,11 +428,16 @@ mod tests {
         assert_eq!(kind("crates/base/src/lib.rs"), FileKind::RustSource);
         assert_eq!(kind("build.rs"), FileKind::RustSource);
         assert_eq!(kind("crates/base/Cargo.toml"), FileKind::CrateManifest);
-        assert_eq!(kind("Cargo.toml"), FileKind::Other);
+        assert_eq!(kind("Cargo.toml"), FileKind::WorkspaceManifest);
+        assert_eq!(kind("xtask/Cargo.toml"), FileKind::Other);
         assert_eq!(kind("crates/base/sub/Cargo.toml"), FileKind::Other);
         assert_eq!(kind("docs/design/0001-dependency-policy.md"), FileKind::Adr);
         assert_eq!(kind("docs/design/README.md"), FileKind::Other);
         assert_eq!(kind("docs/0001-dependency-policy.md"), FileKind::Other);
+        assert_eq!(kind("docs/learnings/2026-11-25-a.md"), FileKind::Learning);
+        assert_eq!(kind("docs/learnings/notes.txt"), FileKind::Learning);
+        assert_eq!(kind("docs/learnings/README.md"), FileKind::Other);
+        assert_eq!(kind("docs/learnings/archive/2026-11-25-a.md"), FileKind::Other);
         assert_eq!(kind("crates/a/tests/snapshots/a.snap.new"), FileKind::SnapshotDraft);
         assert_eq!(kind("crates/a/tests/snapshots/a.snap"), FileKind::Other);
         assert!(FileKind::RustSource.reads_text(), "source rules read the text");

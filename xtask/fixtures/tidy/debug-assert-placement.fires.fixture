@@ -1,0 +1,8 @@
+// path: crates/solver/src/example.rs
+//! Checks that vanish in release builds, outside the kernels' hot loops.
+
+fn check_time_step(dt: f64, steps: u32, steps_max: u32) {
+    debug_assert!(dt > 0.0, "time step must be positive");
+    debug_assert_eq!(steps, steps_max, "the run must use every step");
+    debug_assert_ne!(steps, 0, "the run must take a step");
+}

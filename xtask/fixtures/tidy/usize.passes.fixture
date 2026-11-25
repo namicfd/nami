@@ -1,8 +1,9 @@
 // path: crates/solver/src/example.rs
 //! Typed counts in signatures and fields. A const generic parameter may be `usize`, because
-//! array lengths have to be.
+//! array lengths have to be, and a trait dictates the signatures of its impls.
 
 use base::index::CellCount;
+use core::ops::Index;
 
 pub fn cell_count(cells: CellCount) -> CellCount {
     cells
@@ -10,8 +11,17 @@ pub fn cell_count(cells: CellCount) -> CellCount {
 
 struct Mesh {
     cells: CellCount,
+    widths: Box<[f64]>,
 }
 
 pub fn zeros<const N: usize>() -> [f64; N] {
     [0.0; N]
+}
+
+impl Index<usize> for Mesh {
+    type Output = f64;
+
+    fn index(&self, position: usize) -> &f64 {
+        self.widths.get(position).expect("position is inside the mesh")
+    }
 }

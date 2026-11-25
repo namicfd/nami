@@ -1,0 +1,10 @@
+// path: crates/kernels/src/example.rs
+//! A per-cell check inside a hot loop in `kernels`, where `debug_assert!` belongs, behind a
+//! per-pencil `assert!` that stays on in release builds.
+
+fn check_densities(densities: &[f64]) {
+    assert!(!densities.is_empty(), "a pencil has cells");
+    for &density in densities {
+        debug_assert!(density > 0.0, "density must be positive");
+    }
+}

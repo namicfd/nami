@@ -1,12 +1,35 @@
-//! Rules about crate manifests: runtime dependencies (ADR-0001).
+//! Rules about manifests: runtime dependencies (ADR-0001).
 //!
 //! xtask has no TOML parser (ADR-0001), so manifests are read line by line. That is enough for
-//! the way manifests are written here, and where a line is ambiguous the rule reports it.
+//! the way manifests are written here. Where a line is ambiguous the rule reports it, so that an
+//! unusual spelling cannot hide a dependency.
 
 use super::Violation;
 use std::fs;
 use std::io;
 use std::path::Path;
+
+/// The rule that every violation in this module belongs to.
+const RULE: &str = "runtime-dependency";
+
+/// Tables whose entries are linked into the crate or its build script. Dev-dependencies are
+/// governed by the cargo-deny allow-list instead.
+const RUNTIME_TABLES: [&str; 2] = ["dependencies", "build-dependencies"];
+
+/// The key that makes a dependency resolve to a crate other than the one its name says.
+const RENAME_KEY: &str = "package";
+
+/// What a `[header]` says about the lines that follow it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Section {
+    /// `[dependencies]`, `[build-dependencies]` and their `[target.<x>.…]` forms: every key
+    /// names a dependency.
+    Table,
+    /// `[dependencies.NAME]` and its build and target forms: the keys describe `NAME`.
+    Entry(String),
+    /// Anything else, dev-dependencies included.
+    Other,
+}
 
 /// The names of the crates under `crates/`, sorted. A workspace crate is named after its
 /// directory (ADR-0015).
@@ -19,52 +42,185 @@ pub fn workspace_crates(root: &Path) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Checks the normal and build dependencies of one manifest. Dev-dependencies are governed by
-/// the cargo-deny allow-list instead.
+/// Checks the normal and build dependencies of one crate manifest: each is `libm` or a
+/// workspace crate, and none is renamed.
 pub fn check_manifest(relative: &Path, text: &str, workspace_crates: &[String]) -> Vec<Violation> {
+    let is_allowed = |name: &str| name == "libm" || workspace_crates.iter().any(|ok| ok == name);
     let mut violations = Vec::new();
-    let mut in_runtime_section = false;
+    let mut section = Section::Other;
     for (line_index, line) in text.lines().enumerate() {
+        let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
         let line = line.trim();
+        let mut report = |message: String| {
+            violations.push(Violation::new(relative, line_number, RULE, message));
+        };
         if line.starts_with('[') {
-            in_runtime_section = is_runtime_dependency_section(line);
-            continue;
-        }
-        let key = line.split(['=', '.']).next().unwrap_or_default().trim();
-        if in_runtime_section
-            && !key.is_empty()
-            && !key.starts_with('#')
-            && !is_allowed_runtime(key, workspace_crates)
+            section = section_of(line, &RUNTIME_TABLES);
+            if let Section::Entry(name) = &section
+                && !is_allowed(name)
+            {
+                report(disallowed(name));
+            }
+        } else if line.is_empty() || line.starts_with('#') {
+            // Blank lines and comments say nothing about dependencies.
+        } else if section == Section::Table {
+            report_table_line(line, &is_allowed, &mut report);
+        } else if let Section::Entry(name) = &section
+            && key_of(line).is_some_and(|key| key.first().is_some_and(|key| key == RENAME_KEY))
         {
-            let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
-            let message = format!(
-                "runtime dependency `{key}`; the only runtime dependency allowed is `libm`. \
-                 Adding a crate needs an ADR approved by a human (ADR-0001)"
-            );
-            violations.push(Violation::new(relative, line_number, "runtime-dependency", message));
+            report(renamed(name));
         }
     }
     violations
 }
 
-fn is_runtime_dependency_section(header: &str) -> bool {
-    let name = header.trim_start_matches('[').trim_end_matches(']');
-    let is_dependencies = name == "dependencies" || name.ends_with(".dependencies");
-    let is_build = name == "build-dependencies" || name.ends_with(".build-dependencies");
-    is_dependencies || is_build
+/// Checks the workspace manifest. Crates inherit `[workspace.dependencies]` with
+/// `name.workspace = true`, so a rename there would hide a crate from [`check_manifest`].
+pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut section = Section::Other;
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
+        let line = line.trim();
+        let mut report = |message: String| {
+            violations.push(Violation::new(relative, line_number, RULE, message));
+        };
+        if line.starts_with('[') {
+            let segments = header_segments(line);
+            let is_workspace = segments.first().is_some_and(|first| first == "workspace");
+            section =
+                if is_workspace { section_of(line, &["dependencies"]) } else { Section::Other };
+        } else if line.is_empty() || line.starts_with('#') {
+            // Blank lines and comments say nothing about dependencies.
+        } else if section == Section::Table {
+            report_table_line(line, &|_name: &str| true, &mut report);
+        } else if let Section::Entry(name) = &section
+            && key_of(line).is_some_and(|key| key.first().is_some_and(|key| key == RENAME_KEY))
+        {
+            report(renamed(name));
+        }
+    }
+    violations
 }
 
-fn is_allowed_runtime(key: &str, workspace_crates: &[String]) -> bool {
-    key == "libm" || workspace_crates.iter().any(|name| name == key)
+/// Reports what is wrong with one `name = ...` line of a dependency table.
+fn report_table_line(
+    line: &str,
+    is_allowed: &impl Fn(&str) -> bool,
+    report: &mut impl FnMut(String),
+) {
+    let Some((key, value)) = line.split_once('=') else {
+        report(format!(
+            "cannot read `{line}` as `name = ...`; write each dependency on one line, so that \
+             tidy can check it (ADR-0001)"
+        ));
+        return;
+    };
+    let segments = key_segments(key);
+    let name = segments.first().map_or("", String::as_str);
+    if !is_allowed(name) {
+        report(disallowed(name));
+    }
+    let renamed_by_dotted_key = segments.get(1).is_some_and(|sub_key| sub_key == RENAME_KEY);
+    if renamed_by_dotted_key
+        || inline_table_keys(value).iter().any(|inline_key| inline_key == RENAME_KEY)
+    {
+        report(renamed(name));
+    }
+}
+
+fn disallowed(name: &str) -> String {
+    format!(
+        "runtime dependency `{name}`; the only runtime dependency allowed is `libm`. Adding a \
+         crate needs an ADR approved by a human (ADR-0001)"
+    )
+}
+
+fn renamed(name: &str) -> String {
+    format!(
+        "dependency `{name}` is renamed with `{RENAME_KEY} = \"...\"`; a rename hides the real \
+         crate behind an allowed name. Depend on the crate under its own name (ADR-0001)"
+    )
+}
+
+/// Classifies a `[header]` line. `tables` are the table names that hold dependencies.
+fn section_of(header: &str, tables: &[&str]) -> Section {
+    let segments = header_segments(header);
+    let mut after_table = segments.iter().skip_while(|segment| !tables.contains(&segment.as_str()));
+    match (after_table.next(), after_table.next()) {
+        (Some(_table), Some(name)) => Section::Entry(name.clone()),
+        (Some(_table), None) => Section::Table,
+        (None, _) => Section::Other,
+    }
+}
+
+/// The dotted key inside a `[header]` or `[[header]]`, split into its segments.
+fn header_segments(header: &str) -> Vec<String> {
+    let inner = header.trim_start_matches('[');
+    let mut quote: Option<char> = None;
+    let mut end = inner.len();
+    for (index, character) in inner.char_indices() {
+        if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && (character == '"' || character == '\'') {
+            quote = Some(character);
+        } else if quote.is_none() && character == ']' {
+            end = index;
+            break;
+        }
+    }
+    key_segments(inner.get(..end).unwrap_or(inner))
+}
+
+/// The dotted key of a `key = value` line, split into its segments.
+fn key_of(line: &str) -> Option<Vec<String>> {
+    line.split_once('=').map(|(key, _value)| key_segments(key))
+}
+
+/// Splits a dotted TOML key at the dots outside quotes, and strips whitespace and quotes from
+/// each segment: `target.'cfg(unix)'.dependencies` has three segments.
+fn key_segments(key: &str) -> Vec<String> {
+    let mut segments = vec![String::new()];
+    let mut quote: Option<char> = None;
+    for character in key.chars() {
+        if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && (character == '"' || character == '\'') {
+            quote = Some(character);
+        } else if quote.is_none() && character == '.' {
+            segments.push(String::new());
+        } else if let Some(segment) = segments.last_mut() {
+            segment.push(character);
+        }
+    }
+    segments.iter().map(|segment| segment.trim().to_owned()).collect()
+}
+
+/// The keys of an inline table `{ a = 1, b.c = 2 }`: here `a` and `b`. The split is on commas
+/// and braces wherever they are, so a value may add keys that are not there; the rule that
+/// reads them is a ban, which makes that the safe direction.
+fn inline_table_keys(value: &str) -> Vec<String> {
+    let pieces = value.split(['{', ',']);
+    let keys = pieces.filter_map(key_of);
+    keys.filter_map(|segments| segments.first().cloned()).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check_manifest, workspace_crates};
+    use super::{Section, check_manifest, check_workspace_manifest, workspace_crates};
+    use super::{header_segments, inline_table_keys, key_segments, section_of};
     use std::path::Path;
 
-    fn rules(violations: &[super::Violation]) -> Vec<&'static str> {
-        violations.iter().map(|violation| violation.rule).collect()
+    /// No line is reported.
+    const NONE: [u32; 0] = [];
+
+    /// The line numbers that the rule reports in a crate manifest. `base` and `kernels` are
+    /// the workspace crates.
+    fn lines(manifest: &str) -> Vec<u32> {
+        let workspace = ["base".to_owned(), "kernels".to_owned()];
+        let violations = check_manifest(Path::new("crates/a/Cargo.toml"), manifest, &workspace);
+        assert!(violations.iter().all(|violation| violation.rule == "runtime-dependency"));
+        violations.iter().map(|violation| violation.line).collect()
     }
 
     // Goal: only libm and workspace crates may be runtime dependencies; dev-dependencies are
@@ -74,19 +230,105 @@ mod tests {
         let manifest = "[package]\nname = \"x\"\n\n[dependencies]\nlibm.workspace = true\n\
                         base = { path = \"../base\" }\nserde = \"1\"\nbase-extra = \"1\"\n\n\
                         [dev-dependencies]\nproptest = \"1\"\n";
-        let workspace = ["base".to_owned(), "kernels".to_owned()];
-        let violations = check_manifest(Path::new("Cargo.toml"), manifest, &workspace);
-        assert_eq!(rules(&violations), ["runtime-dependency", "runtime-dependency"]);
-        assert_eq!(violations[0].line, 7);
-        assert_eq!(violations[1].line, 8);
+        assert_eq!(lines(manifest), [7, 8]);
     }
 
-    // Goal: build-dependencies and target-specific dependencies count as runtime.
+    // Goal: build-dependencies and target-specific dependencies count as runtime, and a
+    // comment after the header does not hide the section.
     #[test]
     fn build_and_target_dependencies_are_runtime() {
         let manifest =
             "[build-dependencies]\ncc = \"1\"\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n";
-        assert_eq!(rules(&check_manifest(Path::new("Cargo.toml"), manifest, &[])).len(), 2);
+        assert_eq!(lines(manifest), [2, 4]);
+        assert_eq!(
+            lines("[target.x86_64-unknown-linux-gnu.build-dependencies]\ncc = \"1\"\n"),
+            [2]
+        );
+        assert_eq!(lines("[dependencies] # the runtime ones\nserde = \"1\"\n"), [2]);
+        assert_eq!(lines("[ dependencies ]\nserde = \"1\"\n"), [2]);
+    }
+
+    // Goal: a dependency written as its own table is recognised in every form: plain, build
+    // and target-specific, with or without quotes. Dev-dependencies stay exempt.
+    #[test]
+    fn dependency_tables_are_recognised() {
+        assert_eq!(lines("[dependencies.serde]\nversion = \"1\"\n"), [1]);
+        assert_eq!(lines("[build-dependencies.cc]\nversion = \"1\"\n"), [1]);
+        assert_eq!(lines("[target.'cfg(unix)'.dependencies.libc]\nversion = \"0.2\"\n"), [1]);
+        assert_eq!(lines("[target.\"cfg(a.b)\".build-dependencies.cc]\nversion = \"1\"\n"), [1]);
+        assert_eq!(lines("[dependencies.\"serde\"]\nversion = \"1\"\n"), [1]);
+        assert_eq!(lines("[dependencies.libm]\nworkspace = true\n"), NONE);
+        assert_eq!(lines("[dependencies.kernels]\npath = \"../kernels\"\n"), NONE);
+        assert_eq!(lines("[dev-dependencies.proptest]\nversion = \"1\"\n"), NONE);
+        assert_eq!(lines("[target.'cfg(unix)'.dev-dependencies.a]\nversion = \"1\"\n"), NONE);
+    }
+
+    // Goal: a rename is reported in every spelling, because the key then says nothing about
+    // the crate that is linked. Dev-dependencies and other keys are not affected.
+    #[test]
+    fn renamed_dependencies_are_reported() {
+        assert_eq!(lines("[dependencies]\nlibm = { package = \"serde\", version = \"1\" }\n"), [2]);
+        assert_eq!(lines("[dependencies]\nlibm = { version = \"1\", package = \"serde\" }\n"), [2]);
+        assert_eq!(lines("[dependencies]\nlibm = {package=\"serde\"}\n"), [2]);
+        assert_eq!(lines("[dependencies]\nlibm = { \"package\" = \"serde\" }\n"), [2]);
+        assert_eq!(lines("[dependencies]\nlibm.package = \"serde\"\n"), [2]);
+        assert_eq!(lines("[dependencies.libm]\npackage = \"serde\"\nversion = \"1\"\n"), [2]);
+        assert_eq!(lines("[build-dependencies.base]\n\"package\" = \"cc\"\n"), [2]);
+        assert_eq!(lines("[dependencies]\nserde = { package = \"libm\" }\n"), [2, 2]);
+        assert_eq!(lines("[dev-dependencies]\nlibm = { package = \"serde\" }\n"), NONE);
+        assert_eq!(
+            lines("[dependencies]\nlibm = { version = \"1\", features = [\"arch\"] }\n"),
+            NONE
+        );
+        assert_eq!(lines("[package]\npackage = \"x\"\n"), NONE);
+    }
+
+    // Goal: a line that is not `name = ...` inside a dependency table is reported instead of
+    // skipped, so that a dependency cannot hide in an unusual layout.
+    #[test]
+    fn unreadable_dependency_lines_are_reported() {
+        let manifest = "[dependencies]\nlibm = { version = \"1\", features = [\n  \"arch\",\n] }\n";
+        assert_eq!(lines(manifest), [3, 4]);
+        assert_eq!(lines("[dependencies]\n\n# only libm\nlibm.workspace = true\n"), NONE);
+    }
+
+    // Goal: in the workspace manifest, a rename in `[workspace.dependencies]` is reported, in
+    // the inline and in the table form. Names are not restricted there, and other tables are
+    // not read.
+    #[test]
+    fn workspace_renames_are_reported() {
+        let lines = |manifest: &str| -> Vec<u32> {
+            let violations = check_workspace_manifest(Path::new("Cargo.toml"), manifest);
+            violations.iter().map(|violation| violation.line).collect()
+        };
+        let good = "[workspace.dependencies]\nlibm = { version = \"=0.2.16\" }\nproptest = \"1\"\n";
+        assert_eq!(lines(good), NONE);
+        assert_eq!(lines("[workspace.dependencies]\nlibm = { package = \"serde\" }\n"), [2]);
+        assert_eq!(lines("[workspace.dependencies.libm]\npackage = \"serde\"\n"), [2]);
+        assert_eq!(lines("[workspace.package]\npackage = \"x\"\n"), NONE);
+        assert_eq!(lines("[workspace.metadata.x]\nlibm = { package = \"serde\" }\n"), NONE);
+        assert_eq!(lines("[dependencies]\nlibm = { package = \"serde\" }\n"), NONE);
+    }
+
+    // Goal: headers and keys split at dots outside quotes; sections follow from the segments.
+    #[test]
+    fn headers_and_keys_are_split() {
+        assert_eq!(key_segments("libm.workspace "), ["libm", "workspace"]);
+        assert_eq!(key_segments(" \"a.b\" . c"), ["a.b", "c"]);
+        assert_eq!(
+            header_segments("[target.'cfg(a.b)'.dependencies]"),
+            ["target", "cfg(a.b)", "dependencies"]
+        );
+        assert_eq!(header_segments("[[bin]]"), ["bin"]);
+        assert_eq!(header_segments("[a.']'.b] # ]"), ["a", "]", "b"]);
+        let tables = ["dependencies", "build-dependencies"];
+        assert_eq!(section_of("[dependencies]", &tables), Section::Table);
+        assert_eq!(section_of("[dependencies.a]", &tables), Section::Entry("a".to_owned()));
+        assert_eq!(section_of("[package.metadata.dependencies]", &tables), Section::Table);
+        assert_eq!(section_of("[dev-dependencies]", &tables), Section::Other);
+        assert_eq!(section_of("[package]", &tables), Section::Other);
+        assert_eq!(inline_table_keys(" { a = 1, b.c = 2, \"d\" = 3 }"), ["a", "b", "d"]);
+        assert_eq!(inline_table_keys(" \"1\""), Vec::<String>::new());
     }
 
     // Goal: the workspace crates are the directory names under `crates/`, in sorted order.
