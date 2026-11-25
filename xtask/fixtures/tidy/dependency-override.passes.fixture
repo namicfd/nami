@@ -1,0 +1,11 @@
+# path: Cargo.toml
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.dependencies]
+libm = { version = "=0.2.16", default-features = false }
+
+# A key that is only named like an override.
+[workspace.metadata.patch]
+replace = "nothing"

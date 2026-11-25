@@ -521,6 +521,9 @@ finite-volume codes, and especially in agent-written ones.
   anything new requires an ADR (ADR-0001). Every dependency is a supply-chain, safety and
   performance risk, and for foundational code those costs compound. `[tidy:runtime-dependency]`
   `[deny]`
+- **No `patch` or `replace` table in the workspace manifest.** An override swaps a dependency's
+  source code while its name and version stay the same, so it would replace `libm` unnoticed.
+  `cargo deny` rejects a git override but not a path override. `[tidy:dependency-override]`
 
 ### Tooling
 

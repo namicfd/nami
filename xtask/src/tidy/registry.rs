@@ -84,6 +84,12 @@ pub const RULES: &[Rule] = &[
         "TIGER_STYLE.md, External events and control flow",
     ),
     source(
+        "dependency-override",
+        "The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped for \
+         other source code under its own name.",
+        "ADR-0001",
+    ),
+    source(
         "doc-tag",
         "Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a \
          lint that is switched on, or a planned mechanism that exists.",

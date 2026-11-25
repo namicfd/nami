@@ -1,0 +1,15 @@
+# path: Cargo.toml
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.dependencies]
+libm = { version = "=0.2.16", default-features = false }
+
+# A path override: cargo deny accepts it, because a path has no source to check.
+[patch.crates-io]
+libm = { path = "../libm-fork" }
+
+# The older form of the same thing.
+[replace]
+"libm:0.2.16" = { git = "https://example.com/libm-fork" }

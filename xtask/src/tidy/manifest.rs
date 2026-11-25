@@ -1,4 +1,4 @@
-//! Rules about manifests: runtime dependencies (ADR-0001).
+//! Rules about manifests: runtime dependencies and their overrides (ADR-0001).
 //!
 //! xtask has no TOML parser (ADR-0001), so manifests are read line by line. That is enough for
 //! the way manifests are written here. Where a line is ambiguous the rule reports it, so that an
@@ -9,8 +9,15 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// The rule that every violation in this module belongs to.
+/// The rule that the dependency tables are checked against.
 const RULE: &str = "runtime-dependency";
+
+/// The rule that reports `[patch]` and `[replace]` in the workspace manifest.
+const OVERRIDE_RULE: &str = "dependency-override";
+
+/// Top-level keys of the workspace manifest that make a dependency resolve to other source
+/// code than its name and version say.
+const OVERRIDE_KEYS: [&str; 2] = ["patch", "replace"];
 
 /// Tables whose entries are linked into the crate or its build script. Dev-dependencies are
 /// governed by the cargo-deny allow-list instead.
@@ -79,9 +86,10 @@ pub fn check_manifest(relative: &Path, text: &str, workspace_crates: &[String]) 
 }
 
 /// Checks the workspace manifest. Crates inherit `[workspace.dependencies]` with
-/// `name.workspace = true`, so a rename there would hide a crate from [`check_manifest`].
+/// `name.workspace = true`, so a rename there would hide a crate from [`check_manifest`]. A
+/// `[patch]` or `[replace]` there would swap the source of `libm` under its own name.
 pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
-    let mut violations = Vec::new();
+    let mut violations = check_overrides(relative, text);
     let mut section = Section::Other;
     for (line_index, line) in text.lines().enumerate() {
         let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
@@ -105,6 +113,47 @@ pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
         }
     }
     violations
+}
+
+/// Reports every `[patch.<source>]` and `[replace]` table of the workspace manifest, and the
+/// same keys written as dotted or inline keys in its root table. Cargo applies only the root
+/// manifest's overrides, so crate manifests are not read.
+///
+/// `cargo deny check sources` rejects a git override but accepts a path override, because a
+/// path dependency has no source to check. So the rule bans both, and does not rely on it.
+fn check_overrides(relative: &Path, text: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut in_root_table = true;
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
+        let line = line.trim();
+        let key = if line.starts_with('[') {
+            in_root_table = false;
+            header_segments(line).into_iter().next()
+        } else if in_root_table && !line.starts_with('#') {
+            key_of(line).and_then(|segments| segments.into_iter().next())
+        } else {
+            None
+        };
+        if let Some(key) = key
+            && OVERRIDE_KEYS.contains(&key.as_str())
+        {
+            violations.push(Violation::new(relative, line_number, OVERRIDE_RULE, overridden(&key)));
+        }
+    }
+    assert!(
+        violations.iter().all(|violation| violation.rule == OVERRIDE_RULE),
+        "only overrides are reported here"
+    );
+    violations
+}
+
+fn overridden(key: &str) -> String {
+    format!(
+        "`[{key}]` in the workspace manifest swaps a dependency's source under its own name, \
+         and `cargo deny` does not see a path override; remove it and depend on the released \
+         crate. Changing `libm` needs an ADR approved by a human (ADR-0001)"
+    )
 }
 
 /// The lints that the table `[<table>]` of a manifest switches on: those set to `warn`, `deny`
@@ -372,6 +421,32 @@ mod tests {
         assert_eq!(lines("[workspace.package]\npackage = \"x\"\n"), NONE);
         assert_eq!(lines("[workspace.metadata.x]\nlibm = { package = \"serde\" }\n"), NONE);
         assert_eq!(lines("[dependencies]\nlibm = { package = \"serde\" }\n"), NONE);
+    }
+
+    // Goal: a `[patch]` or `[replace]` in the workspace manifest is reported in every spelling,
+    // path and git alike, because cargo deny does not see a path override. Keys of the same
+    // name inside other tables are not overrides.
+    #[test]
+    fn dependency_overrides_are_reported() {
+        let lines = |manifest: &str| -> Vec<u32> {
+            let violations = check_workspace_manifest(Path::new("Cargo.toml"), manifest);
+            assert!(violations.iter().all(|violation| violation.rule == "dependency-override"));
+            violations.iter().map(|violation| violation.line).collect()
+        };
+        assert_eq!(lines("[patch.crates-io]\nlibm = { path = \"../libm\" }\n"), [1]);
+        assert_eq!(lines("[patch.'https://github.com/a/b']\nlibm = { git = \"x\" }\n"), [1]);
+        assert_eq!(lines("[patch.crates-io.libm]\npath = \"../libm\"\n"), [1]);
+        assert_eq!(lines("[replace]\n\"libm:0.2.16\" = { path = \"../libm\" }\n"), [1]);
+        assert_eq!(lines("[ \"patch\" . crates-io ] # fork\nlibm = { path = \"x\" }\n"), [1]);
+        assert_eq!(lines("patch.crates-io.libm = { path = \"x\" }\n[workspace]\n"), [1]);
+        assert_eq!(lines("replace = { \"libm:0.2.16\" = { path = \"x\" } }\n"), [1]);
+        assert_eq!(lines("# [patch.crates-io]\n[workspace]\nmembers = []\n"), NONE);
+        assert_eq!(lines("[workspace.metadata.patch]\npatch = 1\nreplace = 2\n"), NONE);
+        assert_eq!(lines("[workspace]\npatch.crates-io.libm = { path = \"x\" }\n"), NONE);
+        let violations = check_workspace_manifest(Path::new("Cargo.toml"), "[replace]\n");
+        let message = violations.first().map_or("", |violation| violation.message.as_str());
+        assert!(message.starts_with("`[replace]` in the workspace manifest swaps"), "{message}");
+        assert!(message.ends_with("(ADR-0001)"), "the message cites the reason");
     }
 
     // Goal: headers and keys split at dots outside quotes; sections follow from the segments.

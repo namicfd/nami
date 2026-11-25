@@ -18,6 +18,7 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `async` | source | No `async` functions or blocks: functions run to completion. | TIGER_STYLE.md, Control flow |
 | `debt-marker` | source | No unfinished-work markers in Rust sources; unfinished work is a task. | TIGER_STYLE.md, Zero technical debt |
 | `default` | source | No `Default` derives or impls in nami crates: every field is spelled out. | TIGER_STYLE.md, External events and control flow |
+| `dependency-override` | source | The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped for other source code under its own name. | ADR-0001 |
 | `doc-tag` | source | Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a lint that is switched on, or a planned mechanism that exists. | TIGER_STYLE.md, How rules are enforced |
 | `expect-budget` | workspace | The number of `expect(...)` lint suppressions, counted on tokens so that `cfg_attr` and macro bodies are included, equals `xtask/expect-budget.txt`. | ADR-0006 |
 | `function-length` | source | Functions are at most 70 physical lines, closures included. | TIGER_STYLE.md, Scope and size |
