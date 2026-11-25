@@ -45,3 +45,7 @@ dylint:
 # Licenses, advisories, bans and sources (ADR-0001).
 deny:
     cargo deny --locked check
+
+# Check that the installed tools are the versions that CI pins.
+doctor:
+    cargo xtask doctor

@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod doctor;
 pub mod hook;
+pub mod pr;
 pub mod tidy;
 
 /// Returns the workspace root: the parent of this crate's directory.
