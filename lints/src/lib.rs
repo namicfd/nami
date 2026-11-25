@@ -48,9 +48,9 @@ dylint_linting::declare_lint! {
     /// `fold`, `rfold`, `try_fold`, `try_rfold` and `reduce` with a float accumulator whose
     /// function adds to or subtracts from it: a path to `Add::add` or `Sub::sub` such as
     /// `f64::add`, or a closure in which the accumulator is an operand of `+`, `-`, `+=`, `-=`,
-    /// `add`, `sub`, `add_assign`, `sub_assign`, or the addend of a `mul_add`. A closure that
-    /// only selects one of its parameters (a max, min, argmin or argmax) and only compares its
-    /// sums is exempt. Test code is exempt.
+    /// `add`, `sub`, `add_assign`, `sub_assign`, or the addend of a `mul_add`. An argmin or
+    /// argmax closure, which only compares differences with the accumulator and returns its
+    /// parameters unchanged, is exempt; an addition never is. Test code is exempt.
     ///
     /// ### Why is this bad?
     ///

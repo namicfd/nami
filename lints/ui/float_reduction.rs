@@ -604,6 +604,139 @@ fn fold_sum_in_a_guard_returning_a_binding(values: &[f64]) -> f64 {
     })
 }
 
+// Reported: an addition with the accumulator, even in a fold that only selects a parameter.
+// Only differences are exempt, as in an argmin.
+fn fold_sum_only_compared(values: &[f64], limit: f64) -> f64 {
+    values.iter().fold(0.0, |total, &value| if total + value > limit { total } else { value })
+}
+
+// Reported: a discarded difference with the accumulator, which is not only compared.
+fn fold_sub_in_a_discarded_statement(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        total - value;
+        value
+    })
+}
+
+// Reported: a sum into another parameter than the accumulator.
+fn fold_add_assign_into_the_item(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, |total, mut value| {
+        value += total;
+        value
+    })
+}
+
+// Reported: a difference fold that returns a parameter changed through a `&mut` borrow, an
+// autoref or a call that takes `&mut`. Only `parameter = parameter` may change a selection.
+struct Point {
+    x: f64,
+}
+
+trait Lower {
+    fn lower(&mut self, by: f64);
+}
+
+impl Lower for f64 {
+    fn lower(&mut self, by: f64) {
+        *self -= by;
+    }
+}
+
+fn fold_sub_assign_through_a_reborrow(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        if total - value > 1.0e300 {}
+        let place = &mut total;
+        place.sub_assign(value);
+        total
+    })
+}
+
+fn fold_sub_assign_into_a_mut_parameter(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, |total, mut value| {
+        if total - value > 1.0e300 {}
+        value.sub_assign(total);
+        value
+    })
+}
+
+fn fold_sub_assign_into_an_item_field(points: &mut [Point]) -> f64 {
+    points.iter_mut().fold(0.0, |total, item: &mut Point| {
+        if total - item.x > 1.0e300 {}
+        item.x.sub_assign(total);
+        item.x
+    })
+}
+
+fn fold_sub_through_mem_replace(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, |mut total, value| {
+        if total - value > 1.0e300 {}
+        let _old = std::mem::replace(&mut total, value);
+        total
+    })
+}
+
+fn fold_sub_assign_path_call_on_a_borrow(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, |total, mut value| {
+        if total - value > 1.0e300 {}
+        SubAssign::sub_assign(&mut value, total);
+        value
+    })
+}
+
+fn fold_sub_through_a_mut_self_method(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        if total - value > 1.0e300 {}
+        total.lower(value);
+        total
+    })
+}
+
+fn reduce_sub_assign_through_a_reborrow(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(|mut total, value| {
+        if total - value > 1.0e300 {}
+        let place = &mut total;
+        place.sub_assign(value);
+        total
+    })
+}
+
+// Reported: a difference fold with more return positions than the exemption checks, although
+// every one of them is a parameter.
+macro_rules! branch_four {
+    ($condition:expr, $value:expr) => {
+        if $condition {
+            if $condition { $value } else { $value }
+        } else {
+            if $condition { $value } else { $value }
+        }
+    };
+}
+
+fn fold_selection_past_the_limit(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |best, &value| {
+        if value - best < 0.0 {
+            value
+        } else {
+            branch_four!(
+                value < 0.0,
+                branch_four!(
+                    value < 0.0,
+                    branch_four!(
+                        value < 0.0,
+                        branch_four!(
+                            value < 0.0,
+                            branch_four!(
+                                value < 0.0,
+                                branch_four!(value < 0.0, branch_four!(value < 0.0, best))
+                            )
+                        )
+                    )
+                )
+            )
+        }
+    })
+}
+
 // Not reported: integer sums.
 fn sum_integers(values: &[u32]) -> u32 {
     values.iter().sum()
@@ -650,11 +783,6 @@ fn rfold_min_shifted(values: &[f64], shift: f64) -> f64 {
 
 fn try_rfold_max(values: &[f64]) -> Option<f64> {
     values.iter().try_rfold(f64::NEG_INFINITY, |greatest, &value| Some(greatest.max(value)))
-}
-
-// Not reported, by design: a selection whose sum with the accumulator is only compared.
-fn fold_sum_only_compared(values: &[f64], limit: f64) -> f64 {
-    values.iter().fold(0.0, |total, &value| if total + value > limit { total } else { value })
 }
 
 // Not reported: an argmin or argmax, where the accumulator is subtracted only in the condition,

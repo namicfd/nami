@@ -15,29 +15,35 @@
 //! **Operand rule.** The closure is reported if anywhere in its body, closures nested in it
 //! included, its first parameter, the accumulator, is an operand of a sum or difference:
 //!
-//! - a `+` or `-` with the accumulator as an operand, or a `+=` or `-=` on it;
-//! - a call of `Add::add` or `Sub::sub` with the accumulator as an operand, in any spelling
-//!   (`total.add(value)`, `f64::sub(total, value)`);
-//! - a call of `AddAssign::add_assign` or `SubAssign::sub_assign` on it, in any spelling;
+//! - a `+` or `-` with the accumulator as an operand;
+//! - a `+=` or `-=` with the accumulator as the target or the value (`value += total`);
+//! - a call of `Add::add`, `Sub::sub`, `AddAssign::add_assign` or `SubAssign::sub_assign` with
+//!   the accumulator as one of the two operands, in any spelling (`total.add(value)`,
+//!   `f64::sub(total, value)`, `value.add_assign(total)`);
 //! - a `mul_add` with the accumulator as the addend (`a.mul_add(b, total)`).
 //!
-//! **Selection exemption.** A closure that the operand rule reports is still silent if it
-//! only selects one of its inputs, as a maximum, minimum, argmin or argmax does. All of these
-//! must hold (see `is_selection` and `is_compared_sum`):
+//! **Selection exemption, for differences only.** An argmin or argmax compares a difference
+//! with the accumulator (`if value - best < 0.0 { value } else { best }`). A closure that the
+//! operand rule reports is silent only if all of these hold (see `is_exempt_selection`):
 //!
-//! - every value it can return is a path to a binding of one of its parameters, a field of
-//!   one, or a tuple, struct or enum variant (`Some(best)`) built only from those. The values
-//!   it can return are its body, every `return` and `break` value, and from each of these the
-//!   tail of a block and every branch of an `if` or `match`;
-//! - its body contains no nested closure, no compound assignment (`+=`, `*=`, ..), and no
-//!   assignment other than of a parameter binding to a parameter binding (`best = value`);
-//! - every sum or difference that the operand rule found is only compared: it is an operand of
-//!   `==`, `!=`, `<`, `<=`, `>` or `>=`, or it initialises a `let` with one binding that is
-//!   read, and read only as such an operand.
+//! - every sum the operand rule found is a difference: `-`, `-=`, `sub` or `sub_assign`. An
+//!   addition (`+`, `+=`, `add`, `add_assign`, `mul_add`) is always reported, so everything
+//!   the base lint reported (only additions) is still reported;
+//! - every such difference is only compared: it is a direct operand of `==`, `!=`, `<`, `<=`,
+//!   `>` or `>=`, or it initialises a `let` with one binding that is read, and read only as
+//!   such an operand;
+//! - every value the closure can return is a path to a binding of one of its parameters, a
+//!   field of one, or a tuple, struct or enum variant (`Some(best)`) built only from those. The
+//!   values it can return are its body, every `return` and `break` value, and from each of
+//!   these the tail of a block and every branch of an `if` or `match`, up to 10 000 of them;
+//! - the closure changes nothing except by `parameter = parameter` (`best = value`): its body
+//!   contains no nested closure, no compound assignment, no other assignment, no `&mut` borrow
+//!   (written, or added by autoref as in `value.sub_assign(total)`), and no call of a function
+//!   or method that takes a `&mut` argument or receiver.
 //!
 //! So `if value - best < 0.0 { value } else { best }` is silent, and
-//! `if total + value > limit { total + value } else { total }` or `{ total + value; value }`
-//! is reported.
+//! `if total + value > limit { total } else { value }` or `{ total - value; value }` is
+//! reported.
 //!
 //! A fold that takes a maximum or a minimum is not reported, and neither is a fold such as
 //! Horner's rule (`|acc, c| acc * x + c`), where the accumulator is not itself an addend: the
@@ -56,10 +62,9 @@
 //!   accumulator, a function or closure bound to a name first, an accumulator copied to another
 //!   variable before the addition, a call of a helper function that adds, and a fold that
 //!   multiplies (`fold(1.0, f64::mul)`) are not seen.
-//! - By design, the selection exemption: a closure that only returns its parameters and only
-//!   compares its sums with the accumulator passes, such as
-//!   `if total + value > limit { total } else { value }`. Such a closure never carries a sum
-//!   into the accumulator.
+//! - The selection exemption, by design: a closure that only compares differences with the
+//!   accumulator and returns only its parameters, without changing them, passes. It takes the
+//!   difference only to choose a parameter, so it carries no sum into the accumulator.
 //! - `Sum::sum` and `Product::product` called directly, and a `sum` whose result type is a
 //!   generic parameter, are not seen.
 //! - An integration test is recognised by its path, `tests/` below the package root. A test
@@ -71,8 +76,13 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{AssignOpKind, BinOpKind, Body, Expr, ExprKind, HirId, Node, Pat, PatKind, QPath};
+use rustc_hir::{
+    AssignOpKind, BinOpKind, Body, Expr, ExprKind, HirId, Mutability, Node, Pat, PatKind, QPath,
+};
 use rustc_lint::{LateContext, Lint};
+use rustc_middle::ty::adjustment::{
+    Adjust, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, OverloadedDeref,
+};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::{Symbol, sym};
 use std::path::Path;
@@ -179,38 +189,40 @@ fn combines<'tcx>(cx: &LateContext<'tcx>, arguments: &'tcx [Expr<'tcx>]) -> bool
         ExprKind::Closure(closure) => {
             let body = cx.tcx.hir_body(closure.body);
             let sums = sums_with_accumulator(cx, body);
-            let exempt =
-                is_selection(cx, body) && sums.iter().all(|sum| is_compared_sum(cx.tcx, body, sum));
-            !sums.is_empty() && !exempt
+            !sums.is_empty() && !is_exempt_selection(cx, body, &sums)
         }
         ExprKind::Path(ref path) => match cx.qpath_res(path, function.hir_id) {
-            Res::Def(DefKind::AssocFn, method) => is_add_or_sub_method(cx.tcx, method),
+            Res::Def(DefKind::AssocFn, method) => {
+                matches!(arithmetic_method(cx.tcx, method), Some(Arithmetic::Add | Arithmetic::Sub))
+            }
             _ => false,
         },
         _ => false,
     }
 }
 
-/// The trait that `method` belongs to, as a trait item or as an item of a trait impl.
-fn trait_of_method(tcx: TyCtxt<'_>, method: DefId) -> Option<DefId> {
-    tcx.trait_of_assoc(method)
-        .or_else(|| tcx.trait_impl_of_assoc(method).map(|block| tcx.impl_trait_id(block)))
+/// The method of an arithmetic trait that a call can resolve to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arithmetic {
+    Add,
+    Sub,
+    AddAssign,
+    SubAssign,
 }
 
-/// True if `method` is the method of `Add` or `Sub`, in the trait or in an implementation.
-fn is_add_or_sub_method(tcx: TyCtxt<'_>, method: DefId) -> bool {
-    let owner = trait_of_method(tcx, method);
+/// Which arithmetic trait `method` is the method of, in the trait or in an implementation.
+fn arithmetic_method(tcx: TyCtxt<'_>, method: DefId) -> Option<Arithmetic> {
+    let owner = tcx
+        .trait_of_assoc(method)
+        .or_else(|| tcx.trait_impl_of_assoc(method).map(|block| tcx.impl_trait_id(block)))?;
     let lang_items = tcx.lang_items();
-    owner.is_some() && (owner == lang_items.add_trait() || owner == lang_items.sub_trait())
-}
-
-/// True if `method` is the method of `AddAssign` or `SubAssign`, the methods behind `+=`
-/// and `-=`.
-fn is_add_or_sub_assign_method(tcx: TyCtxt<'_>, method: DefId) -> bool {
-    let owner = trait_of_method(tcx, method);
-    let lang_items = tcx.lang_items();
-    owner.is_some()
-        && (owner == lang_items.add_assign_trait() || owner == lang_items.sub_assign_trait())
+    let traits = [
+        (lang_items.add_trait(), Arithmetic::Add),
+        (lang_items.sub_trait(), Arithmetic::Sub),
+        (lang_items.add_assign_trait(), Arithmetic::AddAssign),
+        (lang_items.sub_assign_trait(), Arithmetic::SubAssign),
+    ];
+    traits.into_iter().find(|(trait_id, _)| *trait_id == Some(owner)).map(|(_, kind)| kind)
 }
 
 /// True if `method` is the inherent `mul_add` of `f32` or `f64`.
@@ -241,32 +253,53 @@ fn is_path_to(locals: &FxHashSet<HirId>, expression: &Expr<'_>) -> bool {
     )
 }
 
+/// Whether a sum that the operand rule found adds or subtracts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Combination {
+    /// `+`, `+=`, `add`, `add_assign` or `mul_add`: always reported, as the base lint did.
+    Addition,
+    /// `-`, `-=`, `sub` or `sub_assign`: reported unless the selection exemption applies.
+    Difference,
+}
+
+/// A sum or difference with the accumulator as an operand.
+struct Found<'tcx> {
+    expression: &'tcx Expr<'tcx>,
+    combination: Combination,
+}
+
 /// The operand rule: every sum or difference in `body`, closures nested in it included, that
 /// has the accumulator (a binding of the first parameter) as an operand.
-fn sums_with_accumulator<'tcx>(
-    cx: &LateContext<'tcx>,
-    body: &'tcx Body<'tcx>,
-) -> Vec<&'tcx Expr<'tcx>> {
+fn sums_with_accumulator<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) -> Vec<Found<'tcx>> {
     let Some(accumulator) = body.params.first() else {
         return Vec::new();
     };
-    let mut finder =
-        AdditionFinder { cx, accumulators: bindings(accumulator.pat), sums: Vec::new() };
+    let accumulators = bindings(accumulator.pat);
+    assert!(
+        accumulators.iter().all(|binding| binding.owner == body.value.hir_id.owner),
+        "the accumulator is a binding of the fold's closure"
+    );
+    let mut finder = AdditionFinder { cx, accumulators, sums: Vec::new() };
     finder.visit_expr(body.value);
+    assert!(
+        finder.sums.iter().all(|sum| sum.expression.hir_id.owner == body.value.hir_id.owner),
+        "every sum found lies in the body of the fold's closure"
+    );
     finder.sums
 }
 
 /// Looks for the accumulator as an operand of a sum or difference:
 ///
-/// - `accumulator ± _`, `_ ± accumulator`, `accumulator += _`, `accumulator -= _`;
-/// - `Add::add` or `Sub::sub` with the accumulator as one of the two operands;
-/// - `AddAssign::add_assign` or `SubAssign::sub_assign` on the accumulator;
+/// - `accumulator ± _`, `_ ± accumulator`;
+/// - `accumulator ±= _` and `_ ±= accumulator`;
+/// - `Add::add`, `Sub::sub`, `AddAssign::add_assign` or `SubAssign::sub_assign` with the
+///   accumulator as one of the two operands, in any spelling;
 /// - `mul_add` with the accumulator as the addend.
 struct AdditionFinder<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     /// The bindings of the closure's first parameter.
     accumulators: FxHashSet<HirId>,
-    sums: Vec<&'tcx Expr<'tcx>>,
+    sums: Vec<Found<'tcx>>,
 }
 
 impl<'tcx> AdditionFinder<'_, 'tcx> {
@@ -274,58 +307,66 @@ impl<'tcx> AdditionFinder<'_, 'tcx> {
         is_path_to(&self.accumulators, operand)
     }
 
-    /// True if `expression` is a sum or difference with the accumulator as an operand.
-    fn is_sum(&self, expression: &'tcx Expr<'tcx>) -> bool {
-        match expression.kind {
-            ExprKind::Binary(operator, left, right) => {
-                matches!(operator.node, BinOpKind::Add | BinOpKind::Sub)
-                    && (self.is_accumulator(left) || self.is_accumulator(right))
-            }
-            ExprKind::AssignOp(operator, target, _) => {
-                matches!(operator.node, AssignOpKind::AddAssign | AssignOpKind::SubAssign)
-                    && self.is_accumulator(target)
-            }
+    /// Whether `expression` adds or subtracts with the accumulator as an operand.
+    fn combination(&self, expression: &'tcx Expr<'tcx>) -> Option<Combination> {
+        let (combination, left, right) = match expression.kind {
+            ExprKind::Binary(operator, left, right) => match operator.node {
+                BinOpKind::Add => (Combination::Addition, left, right),
+                BinOpKind::Sub => (Combination::Difference, left, right),
+                _ => return None,
+            },
+            ExprKind::AssignOp(operator, target, value) => match operator.node {
+                AssignOpKind::AddAssign => (Combination::Addition, target, value),
+                AssignOpKind::SubAssign => (Combination::Difference, target, value),
+                _ => return None,
+            },
             ExprKind::Call(function, arguments) => {
                 let method = match function.kind {
                     ExprKind::Path(ref path) => callee_def_id(self.cx, path, function.hir_id),
                     _ => None,
                 };
-                self.is_sum_call(method, arguments.iter())
+                return self.call_combination(method?, arguments.iter().collect());
             }
             ExprKind::MethodCall(_, receiver, arguments, _) => {
                 let method = self.cx.typeck_results().type_dependent_def_id(expression.hir_id);
-                self.is_sum_call(method, std::iter::once(receiver).chain(arguments))
+                let operands = std::iter::once(receiver).chain(arguments).collect();
+                return self.call_combination(method?, operands);
             }
-            _ => false,
-        }
+            _ => return None,
+        };
+        (self.is_accumulator(left) || self.is_accumulator(right)).then_some(combination)
     }
 
-    /// True if a call of `method` with `operands`, the receiver first, is a sum or difference
-    /// with the accumulator as an operand.
-    fn is_sum_call(
+    /// Whether a call of `method` with `operands`, the receiver first, adds or subtracts with
+    /// the accumulator as an operand.
+    fn call_combination(
         &self,
-        method: Option<DefId>,
-        mut operands: impl Iterator<Item = &'tcx Expr<'tcx>>,
-    ) -> bool {
-        let Some(method) = method else {
-            return false;
-        };
+        method: DefId,
+        operands: Vec<&'tcx Expr<'tcx>>,
+    ) -> Option<Combination> {
         let tcx = self.cx.tcx;
-        if is_add_or_sub_method(tcx, method) {
-            return operands.take(2).any(|operand| self.is_accumulator(operand));
+        let has_accumulator =
+            |count: usize| operands.iter().take(count).any(|operand| self.is_accumulator(operand));
+        match arithmetic_method(tcx, method) {
+            Some(Arithmetic::Add | Arithmetic::AddAssign) => {
+                has_accumulator(2).then_some(Combination::Addition)
+            }
+            Some(Arithmetic::Sub | Arithmetic::SubAssign) => {
+                has_accumulator(2).then_some(Combination::Difference)
+            }
+            None if is_float_mul_add(tcx, method) => operands
+                .get(2)
+                .is_some_and(|addend| self.is_accumulator(addend))
+                .then_some(Combination::Addition),
+            None => None,
         }
-        if is_add_or_sub_assign_method(tcx, method) {
-            return operands.next().is_some_and(|target| self.is_accumulator(target));
-        }
-        is_float_mul_add(tcx, method)
-            && operands.nth(2).is_some_and(|addend| self.is_accumulator(addend))
     }
 }
 
 impl<'tcx> Visitor<'tcx> for AdditionFinder<'_, 'tcx> {
     fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
-        if self.is_sum(expression) {
-            self.sums.push(expression);
+        if let Some(combination) = self.combination(expression) {
+            self.sums.push(Found { expression, combination });
         }
         if let ExprKind::Closure(closure) = expression.kind {
             // A nested closure shares the typeck results of the fold's closure.
@@ -336,26 +377,43 @@ impl<'tcx> Visitor<'tcx> for AdditionFinder<'_, 'tcx> {
     }
 }
 
+/// The selection exemption, for argmin and argmax folds such as
+/// `if value - best < 0.0 { value } else { best }`. True if every one of `sums`, the sums the
+/// operand rule found in `body`, is a difference that is only compared, and the closure only
+/// selects one of its inputs (`is_selection`). An addition is never exempt.
+fn is_exempt_selection<'tcx>(
+    cx: &LateContext<'tcx>,
+    body: &'tcx Body<'tcx>,
+    sums: &[Found<'tcx>],
+) -> bool {
+    assert!(!sums.is_empty(), "the exemption applies only to a closure the operand rule reports");
+    sums.iter().all(|sum| {
+        sum.combination == Combination::Difference && is_compared_sum(cx.tcx, body, sum.expression)
+    }) && is_selection(cx, body)
+}
+
 /// Upper bound on the return positions that `is_selection` checks. A closure past it is not a
 /// selection, so it is reported.
 const SELECTION_EXPRESSIONS_MAX: u32 = 10_000;
 
-/// The selection exemption: true if the closure with body `body` only selects one of its
-/// inputs, as a maximum, minimum, argmin or argmax does, and so carries no sum.
+/// True if the closure with body `body` only selects one of its inputs, as a maximum,
+/// minimum, argmin or argmax does.
 ///
 /// Every value the closure can return must be a selection: a path to a binding of one of its
 /// parameters, a field of a selection, or a tuple, struct or enum variant built only from
 /// selections. The values the closure can return are its body, every `return` value and every
 /// `break` value in it, and, from each of these, the tail of a block and every branch of an
-/// `if` or a `match`. And the body must contain no nested closure, no compound assignment,
-/// and no assignment other than of a parameter binding to a parameter binding (`best = value`).
-/// The caller also checks that every sum with the accumulator is only compared.
+/// `if` or a `match`. And the body must change nothing except by assigning a parameter binding
+/// to a parameter binding (`best = value`): it contains no nested closure, no compound
+/// assignment, no other assignment, no `&mut` borrow (written or added by autoref), and no
+/// call of a function or method that takes a `&mut` argument.
 fn is_selection<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) -> bool {
+    assert!(!body.params.is_empty(), "the function of a fold takes at least the accumulator");
     let mut parameters = FxHashSet::default();
     for parameter in body.params {
         parameters.extend(bindings(parameter.pat));
     }
-    let mut exits = ExitFinder { parameters: &parameters, exits: Vec::new(), clean: true };
+    let mut exits = ExitFinder { cx, parameters: &parameters, exits: Vec::new(), clean: true };
     exits.visit_expr(body.value);
     if !exits.clean {
         return false;
@@ -399,38 +457,90 @@ fn is_constructor(cx: &LateContext<'_>, function: &Expr<'_>) -> bool {
     )
 }
 
-/// Collects the `return` and `break` values of a closure, and finds assignments that a
-/// selection may not contain.
+/// True if `function` takes a `&mut` argument (or receiver), or one containing a `&mut`.
+fn takes_mutable_reference(tcx: TyCtxt<'_>, function: DefId) -> bool {
+    let signature = tcx.fn_sig(function).skip_binder().skip_binder();
+    signature.inputs().iter().any(|input| {
+        input.walk().any(|part| part.as_type().is_some_and(|part| part.is_mutable_ptr()))
+    })
+}
+
+/// True if typeck adds a mutable borrow to `expression`, as autoref does for
+/// `value.sub_assign(total)`.
+fn is_mutably_adjusted(cx: &LateContext<'_>, expression: &Expr<'_>) -> bool {
+    cx.typeck_results().expr_adjustments(expression).iter().any(|adjustment| {
+        matches!(
+            adjustment.kind,
+            Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. }))
+                | Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Mut))
+                | Adjust::Borrow(AutoBorrow::Pin(Mutability::Mut))
+                | Adjust::Deref(DerefAdjustKind::Overloaded(OverloadedDeref {
+                    mutbl: Mutability::Mut,
+                    ..
+                }))
+        )
+    })
+}
+
+/// Collects the `return` and `break` values of a closure, and finds what a selection may not
+/// contain: anything that can change a value other than `parameter = parameter`.
 struct ExitFinder<'a, 'tcx> {
+    cx: &'a LateContext<'tcx>,
     parameters: &'a FxHashSet<HirId>,
     exits: Vec<&'tcx Expr<'tcx>>,
-    /// False once a nested closure, a compound assignment, or an assignment other than of a
-    /// parameter binding to a parameter binding, was found.
+    /// False once a nested closure, a compound assignment, an assignment other than of a
+    /// parameter binding to a parameter binding, a `&mut` borrow, or a call that takes a
+    /// `&mut` argument was found.
     clean: bool,
+}
+
+impl<'tcx> ExitFinder<'_, 'tcx> {
+    /// True if `expression` may change a value in a way a selection may not.
+    fn mutates(&self, expression: &'tcx Expr<'tcx>) -> bool {
+        let cx = self.cx;
+        let changes = match expression.kind {
+            ExprKind::AssignOp(..)
+            | ExprKind::Closure(..)
+            | ExprKind::AddrOf(_, Mutability::Mut, _) => true,
+            ExprKind::Assign(target, value, _) => {
+                !(is_path_to(self.parameters, target) && is_path_to(self.parameters, value))
+            }
+            ExprKind::Call(function, _) => match function.kind {
+                ExprKind::Path(ref path) => match cx.qpath_res(path, function.hir_id) {
+                    Res::Def(DefKind::Ctor(..), _) => false,
+                    Res::Def(DefKind::AssocFn | DefKind::Fn, callee) => {
+                        takes_mutable_reference(cx.tcx, callee)
+                    }
+                    // A call of a local closure or of anything else unresolved may change
+                    // anything.
+                    _ => true,
+                },
+                _ => true,
+            },
+            ExprKind::MethodCall(..) => cx
+                .typeck_results()
+                .type_dependent_def_id(expression.hir_id)
+                .is_none_or(|method| takes_mutable_reference(cx.tcx, method)),
+            _ => false,
+        };
+        changes || is_mutably_adjusted(cx, expression)
+    }
 }
 
 impl<'tcx> Visitor<'tcx> for ExitFinder<'_, 'tcx> {
     fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
-        match expression.kind {
-            ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) => self.exits.push(value),
-            ExprKind::AssignOp(..) => self.clean = false,
-            ExprKind::Assign(target, value, _) => {
-                self.clean &=
-                    is_path_to(self.parameters, target) && is_path_to(self.parameters, value);
-            }
-            _ => {}
+        if let ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) = expression.kind {
+            self.exits.push(value);
         }
-        if let ExprKind::Closure(..) = expression.kind {
-            // A selection has no reason to nest a closure, whose exits are not the fold's.
+        if self.mutates(expression) {
             self.clean = false;
-        } else {
+        }
+        // A nested closure is not entered: it already rules the selection out.
+        if !matches!(expression.kind, ExprKind::Closure(..)) {
             intravisit::walk_expr(self, expression);
         }
     }
 }
-
-/// Upper bound on the `DropTemps` wrappers looked through to find an expression's parent.
-const WRAPPERS_MAX: u32 = 64;
 
 /// True if `operator` compares its operands.
 fn is_comparison(operator: BinOpKind) -> bool {
@@ -445,38 +555,44 @@ fn is_comparison(operator: BinOpKind) -> bool {
     )
 }
 
-/// True if `expression` is an operand of a comparison, past `DropTemps` wrappers.
+/// True if `expression` is a direct operand of a comparison.
 fn is_compared(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> bool {
-    let mut id = expression.hir_id;
-    for _ in 0..WRAPPERS_MAX {
-        let Node::Expr(parent) = tcx.parent_hir_node(id) else {
-            return false;
-        };
-        match parent.kind {
-            ExprKind::DropTemps(_) => id = parent.hir_id,
-            ExprKind::Binary(operator, _, _) => return is_comparison(operator.node),
-            _ => return false,
-        }
+    match tcx.parent_hir_node(expression.hir_id) {
+        Node::Expr(parent) => match parent.kind {
+            ExprKind::Binary(operator, left, right) => {
+                assert!(
+                    left.hir_id == expression.hir_id || right.hir_id == expression.hir_id,
+                    "an expression whose parent is a binary operation is one of its operands"
+                );
+                is_comparison(operator.node)
+            }
+            _ => false,
+        },
+        _ => false,
     }
-    false
 }
 
-/// True if `sum`, a sum with the accumulator in `body`, is only compared: an operand of a
-/// comparison, or the initialiser of a `let` with a single binding that is read at least once
-/// and only as an operand of a comparison (`let gain = value - best; if gain > 0.0 ..`).
+/// True if `sum`, a sum with the accumulator in `body`, is only compared: a direct operand of
+/// a comparison, or the initialiser of a `let` with a single binding that is read at least
+/// once and only as a direct operand of a comparison (`let gain = value - best; if gain > ..`).
 fn is_compared_sum<'tcx>(tcx: TyCtxt<'tcx>, body: &'tcx Body<'tcx>, sum: &Expr<'_>) -> bool {
+    assert!(
+        sum.hir_id.owner == body.value.hir_id.owner,
+        "the sum lies in the body of the fold's closure"
+    );
     if is_compared(tcx, sum) {
         return true;
     }
     let Node::LetStmt(local) = tcx.parent_hir_node(sum.hir_id) else {
         return false;
     };
+    assert!(
+        local.init.is_some_and(|initialiser| initialiser.hir_id == sum.hir_id),
+        "an expression whose parent is a `let` is its initialiser"
+    );
     let PatKind::Binding(_, binding, _, None) = local.pat.kind else {
         return false;
     };
-    if local.init.is_none_or(|initialiser| initialiser.hir_id != sum.hir_id) {
-        return false;
-    }
     let mut reads = ReadFinder { binding, reads: Vec::new() };
     reads.visit_expr(body.value);
     !reads.reads.is_empty() && reads.reads.iter().all(|read| is_compared(tcx, read))
