@@ -1,6 +1,6 @@
 # A changed lint does not run on unchanged crates
 
-- Status: Codified in `cargo xtask dylint` (ADR-0016)
+- Status: Codified in `cargo xtask dylint` (ADR-0017)
 - Found in: the guardrail review of 2026-11-25, while merging `nami_float_reduction`
 
 ## What happened

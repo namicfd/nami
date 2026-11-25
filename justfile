@@ -38,7 +38,7 @@ test:
 test-checked:
     cargo nextest run --workspace --locked --no-tests=pass --cargo-profile release-checked
 
-# Lints that need the compiler: no recursion, no naive float sums (ADR-0006, ADR-0016).
+# Lints that need the compiler: no recursion, no naive float sums (ADR-0006, ADR-0017).
 # Uses the nightly pinned in lints/. The wrapper makes cargo re-lint after a lint changes.
 dylint:
     cargo xtask dylint
