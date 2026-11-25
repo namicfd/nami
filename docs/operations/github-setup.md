@@ -144,7 +144,20 @@ claude -p "..."
 - **gh.** It uses `GH_TOKEN`, which expires after an hour. Run `env` again for longer sessions.
 - **Other commands.** `xtask/agent-token.sh` alone prints one token, and `jwt` prints the app's own JWT for debugging.
 
-## 7. Check that it works
+## 7. Issue labels
+
+Agents file what they find outside their task as issues, and work on the ones that `cargo xtask task ready` lists (ADR-0021). The labels are the kinds and the maintainer's flag. `--force` updates a label that exists already.
+
+```sh
+gh label create guardrail-gap  --repo "$REPO" --force --color d93f0b --description "A check should have caught it (ADR-0020)"
+gh label create bug            --repo "$REPO" --force --color b60205 --description "Something is broken"
+gh label create docs           --repo "$REPO" --force --color 0075ca --description "A document is wrong or missing"
+gh label create needs-decision --repo "$REPO" --force --color fbca04 --description "Waits for the maintainer; only a code owner removes it"
+```
+
+Which issues agents act on depends on who opened them, never on labels: only the bot and the users in `.github/CODEOWNERS`. To hand an outsider's report to the agents, file it again in your own words, with one kind label.
+
+## 8. Check that it works
 
 ```sh
 GH_TOKEN=$(xtask/agent-token.sh) gh api installation/repositories --jq '[.repositories[].full_name]'

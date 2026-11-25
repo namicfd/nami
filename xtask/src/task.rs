@@ -1,19 +1,24 @@
-//! `cargo xtask task`: plans, ready tasks and claims (ADR-0011).
+//! `cargo xtask task`: plans, ready tasks and claims (ADR-0011), and issues claimed like tasks
+//! (ADR-0021).
 //!
-//! - `status`: every active task with its state.
-//! - `ready`: the tasks that can start now and nobody holds, one `id<TAB>title` per line.
-//! - `claim <id>` and `release <id>`: take or give back a task through the `claims` branch.
+//! - `status`: every active task with its state, then every claimed issue.
+//! - `ready`: what can start now and nobody holds, one `id<TAB>title` per line: the plan tasks
+//!   in plan order, then the issues that agents may work on, oldest first, as `issue-<number>`.
+//! - `claim <id>` and `release <id>`: take or give back a task or an issue through the `claims`
+//!   branch.
 //! - `validate`: the plan checks that `cargo xtask tidy` also runs.
 //! - `check-pr <base> [<branch>]`: CI's check that a change never sets `passes`, plus an
 //!   advisory list of files outside the task's `owner_paths` when the branch is `task/<id>`.
 //!
 //! The remote is `origin`, or `$NAMI_TASK_REMOTE`. A claim records `$NAMI_AGENT_ID` (default:
-//! git's `user.name`) and `$NAMI_SESSION_ID`.
+//! git's `user.name`) and `$NAMI_SESSION_ID`. Issues come from GitHub through `gh`
+//! (`crate::issue`).
 
 pub mod claims;
 pub mod plan;
 
-use crate::tidy::LEARNING_DIRECTORY;
+use crate::issue::github::{Gh, GitHub};
+use crate::issue::{self, trust};
 use claims::Claim;
 use plan::Task;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,7 +35,7 @@ const TASK_BRANCH_PREFIX: &str = "task/";
 pub fn run(arguments: &[&str]) -> ExitCode {
     let root = crate::workspace_root();
     let remote = std::env::var("NAMI_TASK_REMOTE").unwrap_or_else(|_| "origin".to_owned());
-    match execute(&root, &remote, arguments) {
+    match execute(&root, &remote, &Gh::new(&root), arguments) {
         Ok(output) => {
             print!("{output}");
             ExitCode::SUCCESS
@@ -42,21 +47,26 @@ pub fn run(arguments: &[&str]) -> ExitCode {
     }
 }
 
-/// Runs one command against the checkout at `root` and the claims on `remote`. Returns what
-/// the command prints on success, or the error to report.
+/// Runs one command against the checkout at `root`, the claims on `remote` and the issues on
+/// `github`. Returns what the command prints on success, or the error to report.
 ///
 /// # Errors
 ///
-/// Returns the reason the command failed: invalid plans, a task that cannot be claimed, a git
-/// failure, or a change that sets `passes`.
-pub fn execute(root: &Path, remote: &str, arguments: &[&str]) -> Result<String, String> {
+/// Returns the reason the command failed: invalid plans, a task or issue that cannot be
+/// claimed, a git or GitHub failure, or a change that sets `passes`.
+pub fn execute(
+    root: &Path,
+    remote: &str,
+    github: &dyn GitHub,
+    arguments: &[&str],
+) -> Result<String, String> {
     if let ["claim" | "release", id] = arguments {
         check_task_id(id)?;
     }
     match arguments {
-        ["status"] => status(root, remote),
-        ["ready"] => ready(root, remote),
-        ["claim", id] => claim(root, remote, id),
+        ["status"] => status(root, remote, github),
+        ["ready"] => ready(root, remote, github),
+        ["claim", id] => claim(root, remote, github, id),
         ["release", id] => claims::release(root, remote, id)
             .map(|()| format!("released {id}\n"))
             .map_err(|error| format!("cannot release `{id}`: {error}")),
@@ -69,11 +79,10 @@ pub fn execute(root: &Path, remote: &str, arguments: &[&str]) -> Result<String, 
 
 /// A task ID given on the command line is user input: reject what cannot be an ID.
 fn check_task_id(id: &str) -> Result<(), String> {
-    if plan::is_valid_id(id) {
-        Ok(())
-    } else {
-        Err(format!("`{id}` is not a task id (lowercase letters, digits and dashes)"))
+    if !plan::is_valid_id(id) {
+        return Err(format!("`{id}` is not a task id (lowercase letters, digits and dashes)"));
     }
+    issue::number_of_id(id).map(|_| ())
 }
 
 /// Where a task stands.
@@ -129,50 +138,105 @@ fn valid_tasks(root: &Path) -> Result<Vec<Task>, String> {
     Err(format!("{}\n{} problem(s) in the plans; fix them first", report.join("\n"), report.len()))
 }
 
-/// Every active task with its state. States are computed over all plans, so a dependency on a
-/// task in a completed plan counts as passing.
-fn snapshot(root: &Path, remote: &str) -> Result<Vec<(Task, State)>, String> {
+/// Every active task with its state, and every claim on the claims branch.
+type Snapshot = (Vec<(Task, State)>, Vec<Claim>);
+
+/// The current [`Snapshot`]. States are computed over all plans, so a dependency on a task in
+/// a completed plan counts as passing.
+fn snapshot(root: &Path, remote: &str) -> Result<Snapshot, String> {
     let tasks = valid_tasks(root)?;
     let tip = claims::fetch(root, remote).map_err(|error| error.to_string())?;
     let current = claims::list(root, tip.as_deref()).map_err(|error| error.to_string())?;
     let all_states = states(&tasks, &current);
     let active: Vec<(Task, State)> =
         tasks.into_iter().zip(all_states).filter(|(task, _)| task.active).collect();
-    Ok(active)
+    Ok((active, current))
 }
 
-fn status(root: &Path, remote: &str) -> Result<String, String> {
-    let tasks = snapshot(root, remote)?;
+fn status(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, String> {
+    let (tasks, current) = snapshot(root, remote)?;
     let mut lines = Vec::with_capacity(tasks.len());
     for (task, state) in tasks {
         let description = match state {
             State::Done => "done".to_owned(),
-            State::Claimed(claim) => format!(
-                "claimed {} ({}) by {}",
-                claim.age,
-                claim.claimed_at,
-                claim.holder.replace('\n', ", ")
-            ),
+            State::Claimed(claim) => claimed(&claim),
             State::Ready => "ready".to_owned(),
             State::Blocked(waiting) => format!("blocked on {}", waiting.join(", ")),
         };
         lines.push(format!("{:<32} {:<10} {}\n", task.id, description, task.title));
     }
+    for claim in &current {
+        let Ok(Some(number)) = issue::number_of_id(&claim.task) else {
+            continue;
+        };
+        // Titles are not printed: whether an issue is trusted is `issue show`'s business.
+        let description = match github.issue(number) {
+            Ok(found) if !found.is_open => "done: the issue is closed".to_owned(),
+            Ok(_) => claimed(claim),
+            Err(error) => format!("{}; its state is unknown: {error}", claimed(claim)),
+        };
+        lines.push(format!("{:<32} {description}\n", claim.task));
+    }
     Ok(lines.concat())
 }
 
-fn ready(root: &Path, remote: &str) -> Result<String, String> {
-    let tasks = snapshot(root, remote)?;
+fn claimed(claim: &Claim) -> String {
+    let holder = claim.holder.replace('\n', ", ");
+    format!("claimed {} ({}) by {holder}", claim.age, claim.claimed_at)
+}
+
+fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, String> {
+    let (tasks, current) = snapshot(root, remote)?;
     let ready: Vec<String> = tasks
         .iter()
         .filter(|(_, state)| *state == State::Ready)
         .map(|(task, _)| format!("{}\t{}\n", task.id, task.title))
         .collect();
-    Ok(ready.concat())
+    let ready = ready.concat();
+    match ready_issues(root, remote, github, &current) {
+        Ok(issues) => Ok(ready + &issues),
+        Err(error) => Err(format!(
+            "cannot list the issues, so this list is incomplete: {error}\nthe plan tasks that \
+             are ready:\n{ready}"
+        )),
+    }
 }
 
-fn claim(root: &Path, remote: &str, id: &str) -> Result<String, String> {
-    let tasks = snapshot(root, remote)?;
+/// The issues that agents may work on and nobody holds, oldest first, as `ready` lines.
+fn ready_issues(
+    root: &Path,
+    remote: &str,
+    github: &dyn GitHub,
+    current: &[Claim],
+) -> Result<String, String> {
+    let open = github.open_issues()?;
+    let candidates: Vec<_> = open.iter().filter(|found| !found.is_pull_request).collect();
+    if candidates.is_empty() {
+        return Ok(String::new());
+    }
+    let trust = trust::load(root, &format!("{remote}/main"))?;
+    let held: BTreeSet<&str> = current.iter().map(|claim| claim.task.as_str()).collect();
+    let mut lines = Vec::new();
+    for found in candidates {
+        let id = issue::id_of(found.number);
+        // The cheap checks first: label events cost one request per issue.
+        if held.contains(id.as_str()) || trust::unworkable(found, &[], &trust).is_some() {
+            continue;
+        }
+        let events = github.label_events(found.number)?;
+        if trust::unworkable(found, &events, &trust).is_none() {
+            lines.push(format!("{id}\t{}\n", found.title));
+        }
+    }
+    assert!(lines.len() <= open.len(), "at most every open issue is ready");
+    Ok(lines.concat())
+}
+
+fn claim(root: &Path, remote: &str, github: &dyn GitHub, id: &str) -> Result<String, String> {
+    if let Some(number) = issue::number_of_id(id)? {
+        return claim_issue(root, remote, github, id, number);
+    }
+    let (tasks, _) = snapshot(root, remote)?;
     let (_, state) = tasks
         .into_iter()
         .find(|(task, _)| task.id == id)
@@ -189,6 +253,34 @@ fn claim(root: &Path, remote: &str, id: &str) -> Result<String, String> {
     claims::claim(root, remote, id, &holder)
         .map_err(|error| format!("cannot claim `{id}`: {error}"))?;
     Ok(format!("claimed {id}\n"))
+}
+
+/// Claims issue `number`, whose claim ID is `id`, if agents may work on it (ADR-0021).
+fn claim_issue(
+    root: &Path,
+    remote: &str,
+    github: &dyn GitHub,
+    id: &str,
+    number: u32,
+) -> Result<String, String> {
+    assert_eq!(issue::id_of(number), id, "the ID names the issue");
+    let (_, current) = snapshot(root, remote)?;
+    if let Some(claim) = current.iter().find(|claim| claim.task == id) {
+        return Err(format!("`{id}` is claimed by {}", claim.holder));
+    }
+    let found = github.issue(number)?;
+    let trust = trust::load(root, &format!("{remote}/main"))?;
+    let events = github.label_events(number)?;
+    if let Some(reason) = trust::unworkable(&found, &events, &trust) {
+        return Err(format!("cannot claim `{id}`: {reason}"));
+    }
+    let holder = holder(root);
+    claims::claim(root, remote, id, &holder)
+        .map_err(|error| format!("cannot claim `{id}`: {error}"))?;
+    Ok(format!(
+        "claimed {id}\nread it with `cargo xtask issue show {number}`, work on the branch \
+         `task/{id}`, and write `Fixes #{number}` in the PR description\n"
+    ))
 }
 
 /// The text of a claim file: who holds the task and from which session.
@@ -213,7 +305,9 @@ fn check_pr(root: &Path, base: &str, branch: &str) -> Result<String, String> {
         base_tasks.iter().filter(|task| task.passes).map(|task| task.id.clone()).collect();
     let flipped = passes_flips(&head_tasks, &base_passing);
     let mut output = String::new();
-    if let Some(id) = branch.strip_prefix(TASK_BRANCH_PREFIX) {
+    // An issue has no owner paths: its PR is one small change (ADR-0021).
+    let task_id = branch.strip_prefix(TASK_BRANCH_PREFIX);
+    if let Some(id) = task_id.filter(|id| !id.starts_with(issue::ID_PREFIX)) {
         let changed = claims::git(root, &["diff", "--name-only", base, "HEAD"], &[], None)
             .map_err(|error| error.to_string())?;
         let changed: Vec<&str> = changed.lines().collect();
@@ -266,8 +360,7 @@ pub fn passes_flips(head: &[Task], base_passing: &BTreeSet<String>) -> Vec<Strin
 
 /// Advisory: changed files that lie outside task `id`'s owner paths, as defined in `tasks`.
 /// The task's `plan.md` is exempt, so that a task may record notes there; its `tasks.json` is
-/// not, so that a change to the task's own definition is always reported. Learnings are exempt
-/// too: any task may add one (ADR-0020).
+/// not, so that a change to the task's own definition is always reported.
 #[must_use]
 pub fn outside_owner_paths(tasks: &[Task], id: &str, changed: &[&str]) -> Vec<String> {
     let Some(task) = tasks.iter().find(|task| task.id == id) else {
@@ -278,7 +371,6 @@ pub fn outside_owner_paths(tasks: &[Task], id: &str, changed: &[&str]) -> Vec<St
         .iter()
         .filter(|file| !task.owner_paths.iter().any(|owned| plan::overlaps(file, owned)))
         .filter(|file| **file != plan_file)
-        .filter(|file| !plan::overlaps(file, LEARNING_DIRECTORY))
         .map(|file| format!("`{file}` is outside the owner_paths of `{id}` (ADR-0011)"))
         .collect();
     assert!(outside.len() <= changed.len(), "at most every changed file is outside");
@@ -346,8 +438,8 @@ mod tests {
         );
     }
 
-    // Goal: files outside the task's owner paths are listed, except the plan's own file and
-    // learnings; an unknown task is reported.
+    // Goal: files outside the task's owner paths are listed, except the plan's own file; an
+    // unknown task is reported.
     #[test]
     fn owner_path_warnings() {
         let tasks = [task("a", &[], false)];
@@ -356,7 +448,6 @@ mod tests {
             "crates/b/src/lib.rs",
             "docs/exec-plans/active/p/plan.md",
             "docs/exec-plans/active/p/tasks.json",
-            "docs/learnings/2026-01-01-a-gap.md",
         ];
         let warnings = outside_owner_paths(&tasks, "a", &changed);
         assert_eq!(warnings.len(), 2, "{warnings:?}");

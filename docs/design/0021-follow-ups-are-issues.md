@@ -28,7 +28,7 @@ When an agent finds something that its task does not need fixed (a guardrail gap
 - **Body.** The file's `# ` heading is the title. The body has `- Found in: <task id or PR>`, `## What happened` and `## Proposed fix`. A guardrail gap's proposal names a rung of the ladder (ADR-0020).
 - **Kind.** Exactly one label of `guardrail-gap`, `bug` and `docs`.
 - **`needs-decision`.** The filer sets it when the fix is a choice that the maintainer makes: cost, policy, or one of several designs. Only a human removes it.
-- **Duplicates.** Before filing, the command searches the open issues for the title's words and prints the matches. If there are any, it stops with exit code 2, unless `--new` says that the agent read them and none is the same finding.
+- **Duplicates.** Before filing, the command compares the title's words with those of the trusted open issues and prints the matches. If there are any, it stops, unless `--new` says that the agent read them and none is the same finding.
 - **Identity.** The command runs `gh`, so it files as whoever `GH_TOKEN` names. For agents that is `nami-agent[bot]` (`xtask/agent-token.sh`).
 - **Public.** An issue is as public as the code. It never contains credentials, personal details, or text copied from an untrusted source (point 2).
 

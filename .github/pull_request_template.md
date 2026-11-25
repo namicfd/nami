@@ -13,7 +13,9 @@
 <!-- "None", or every protected path this PR changes, each with its reason.
      `cargo xtask protected` prints the list. A directory ending in `/` covers the files in it. -->
 
-## Guardrail gaps
+## Follow-up issues
 
-<!-- "None", or the `docs/learnings/` files this PR adds: anything a check should have caught
-     and did not, review feedback that no check enforces, a rule whose message misled you. -->
+<!-- "None", or every issue this work filed with `cargo xtask issue file`, as #<number>: anything
+     a check should have caught and did not, review feedback that no check enforces, a rule whose
+     message misled you, a bug or a wrong document outside your task. On a `task/issue-<n>`
+     branch, also write `Fixes #<n>` (ADR-0021). -->

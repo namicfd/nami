@@ -89,6 +89,33 @@ pub fn parse(text: &str) -> Result<Value, Error> {
     parser.document().map_err(|message| Error { line: parser.line(), message })
 }
 
+/// `text` as a JSON string literal, quotes included: for the request bodies that xtask sends.
+#[must_use]
+pub fn quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            control if control < ' ' => {
+                let code = u32::from(control);
+                quoted.push_str("\\u00");
+                for digit in [code / 16, code % 16] {
+                    quoted.push(char::from_digit(digit, 16).expect("a nibble is a hex digit"));
+                }
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    assert!(quoted.len() >= text.len() + 2, "quoting only adds characters");
+    quoted
+}
+
 /// An array or object whose elements are still being read.
 enum Frame {
     Array(Vec<Value>),
@@ -388,10 +415,22 @@ fn store(stack: &mut [Frame], value: Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, parse};
+    use super::{Value, parse, quote};
 
     fn string(text: &str) -> Value {
         Value::String(text.to_owned())
+    }
+
+    // Goal: a quoted string parses back to itself, and each escape is the short form where JSON
+    // has one. Method: every character class that needs an escape, plus text that does not.
+    #[test]
+    fn quoted_strings_parse_back() {
+        assert_eq!(quote("plain é"), "\"plain é\"");
+        assert_eq!(quote("a\"b\\c\nd\re\tf"), r#""a\"b\\c\nd\re\tf""#);
+        assert_eq!(quote("\u{0}\u{1f}"), r#""\u0000\u001f""#);
+        for text in ["", "# Title\n\n- Found in: #5\n", "\u{7f} \u{1F600} \u{1b}[0m", "\\\"\\"] {
+            assert_eq!(parse(&quote(text)), Ok(string(text)), "{text:?}");
+        }
     }
 
     // Goal: every JSON construct parses to the expected value, nested containers included.

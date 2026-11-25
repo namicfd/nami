@@ -18,11 +18,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The description lists every protected file the PR changes and records guardrail gaps.
+  # The description lists every protected file the PR changes and the issues the work filed,
+  # and a PR from a claimed issue's branch closes that issue (ADR-0021).
   pr-body:
     name: pr body
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Reading issues lets the check confirm that each listed issue is a trusted follow-up.
+    permissions:
+      contents: read
+      issues: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,7 +36,9 @@ jobs:
       - name: cargo xtask pr-body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: cargo xtask pr-body --base "origin/${BASE_REF}"
 
   # CI runs a PR's own checks, so a PR that weakens tidy passes its own gate. This job runs the

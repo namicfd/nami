@@ -1,13 +1,17 @@
 //! `cargo xtask protected` and `cargo xtask pr-body`: what a pull request must say about itself.
 //!
 //! `AGENTS.md` requires a PR description to list every protected file that the PR changes, and
-//! to record the guardrail gaps that the work ran into. These commands check both, so that the
-//! rule does not depend on anyone remembering it.
+//! the issues that the work filed for what it found outside its task (ADR-0020, ADR-0021).
+//! These commands check both, so that the rule does not depend on anyone remembering it.
 //!
 //! - `protected` prints the changed paths that `.github/CODEOWNERS` protects, one per line.
-//! - `pr-body` checks the description in the environment variable `PR_BODY`. Every problem reads
-//!   `error[pr-body]: what; fix`, like a tidy violation.
+//! - `pr-body` checks the description in the environment variable `PR_BODY`. On the branch of
+//!   a claimed issue, `task/issue-<number>` (from `PR_BRANCH`, or git), the description must
+//!   close that issue. Every problem reads `error[pr-body]: what; fix`, like a tidy violation.
 
+use crate::issue::github::{Gh, GitHub};
+use crate::issue::trust::{self, Trust};
+use std::cell::OnceCell;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -21,11 +25,15 @@ const BASE_DEFAULT: &str = "origin/main";
 /// The section of a PR description that lists the protected files the PR changes.
 const HEADING_PROTECTED: &str = "## Protected files";
 
-/// The section of a PR description that records guardrail gaps.
-const HEADING_GAPS: &str = "## Guardrail gaps";
+/// The section of a PR description that lists the issues the work filed (ADR-0021).
+const HEADING_FOLLOW_UPS: &str = "## Follow-up issues";
 
-/// Where the learnings that record guardrail gaps live. Each is one Markdown file.
-const LEARNINGS_DIRECTORY: &str = "docs/learnings/";
+/// The prefix of a branch that works on a task or a claimed issue (ADR-0011).
+const TASK_BRANCH_PREFIX: &str = "task/";
+
+/// Words that close an issue when `#<number>` follows them in a merged PR's description.
+const CLOSING_WORDS: [&str; 9] =
+    ["close", "closed", "closes", "fix", "fixed", "fixes", "resolve", "resolved", "resolves"];
 
 /// Characters that make a CODEOWNERS pattern a glob, a negation or an escape. Outside the
 /// leading `**/`, none of them is supported.
@@ -154,41 +162,50 @@ fn without_comments(text: &str) -> String {
 
 /// Checks a PR description. Returns one line per problem, and nothing if it is complete.
 ///
-/// `protected` holds the protected paths that the PR changes. `is_file` says whether a path
-/// exists in the tree; it is asked about the learnings that the description names.
+/// `protected` holds the protected paths that the PR changes, and `branch` is the PR's branch.
+/// `issue_problem` says why an issue that the description lists is not a follow-up issue, or
+/// `None` if it is one; it is asked about each number under `## Follow-up issues`.
 #[must_use]
-pub fn check_body(body: &str, protected: &[String], is_file: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut problems = guardrail_gap_problems(section(body, HEADING_GAPS).as_deref(), is_file);
+pub fn check_body(
+    body: &str,
+    protected: &[String],
+    branch: &str,
+    issue_problem: impl Fn(u32) -> Option<String>,
+) -> Vec<String> {
+    let follow_ups = section(body, HEADING_FOLLOW_UPS);
+    let mut problems = follow_up_problems(follow_ups.as_deref(), issue_problem);
+    problems.extend(closing_problem(body, branch));
     let listed = section(body, HEADING_PROTECTED);
     problems.extend(protected_file_problems(listed.as_deref(), protected));
     problems.iter().map(|problem| format!("error[pr-body]: {problem}")).collect()
 }
 
-fn guardrail_gap_problems(
+fn follow_up_problems(
     section: Option<&[String]>,
-    is_file: impl Fn(&str) -> bool,
+    issue_problem: impl Fn(u32) -> Option<String>,
 ) -> Vec<String> {
-    let how =
-        format!("write `None`, or name the `{LEARNINGS_DIRECTORY}<file>.md` that records each gap");
+    let how = "write `None`, or list each issue that this work filed with `cargo xtask issue \
+               file`, as `#<number>`";
     let Some(lines) = section else {
-        return vec![format!("the section `{HEADING_GAPS}` is missing; add it and {how}")];
+        return vec![format!("the section `{HEADING_FOLLOW_UPS}` is missing; add it and {how}")];
     };
     if let [line] = lines
         && is_none(line)
     {
         return Vec::new();
     }
-    let learnings = learning_paths(&lines.join("\n"));
-    if learnings.is_empty() {
-        return vec![format!("the section `{HEADING_GAPS}` names no learning; {how}")];
+    let numbers = issue_numbers(&lines.join("\n"));
+    if numbers.is_empty() {
+        return vec![format!("the section `{HEADING_FOLLOW_UPS}` names no issue; {how}")];
     }
-    let missing = learnings.iter().filter(|path| !is_file(path));
-    missing
-        .map(|path| {
-            format!(
-                "`{path}`, named under `{HEADING_GAPS}`, does not exist; add the file to this \
-                 PR, or correct the path"
-            )
+    numbers
+        .iter()
+        .filter_map(|&number| {
+            let problem = issue_problem(number)?;
+            Some(format!(
+                "#{number}, listed under `{HEADING_FOLLOW_UPS}`, is not a follow-up issue: \
+                 {problem}; list only issues filed with `cargo xtask issue file`"
+            ))
         })
         .collect()
 }
@@ -199,25 +216,50 @@ fn is_none(line: &str) -> bool {
     word.strip_suffix('.').unwrap_or(word).eq_ignore_ascii_case("none")
 }
 
-/// Every `docs/learnings/<file>.md` path that `text` names, sorted and without duplicates.
-fn learning_paths(text: &str) -> Vec<String> {
-    let is_name_character =
-        |character: &char| character.is_ascii_alphanumeric() || ['.', '_', '-'].contains(character);
-    let mut paths: Vec<String> = text
-        .split(LEARNINGS_DIRECTORY)
+/// Every issue number that `text` writes as `#<number>`, sorted and without duplicates.
+fn issue_numbers(text: &str) -> Vec<u32> {
+    let mut numbers: Vec<u32> = text
+        .split('#')
         .skip(1)
         .filter_map(|after| {
-            let name: String = after.chars().take_while(is_name_character).collect();
-            // A full stop that ends the sentence is not part of the name.
-            let name = name.trim_end_matches('.');
-            let is_markdown =
-                Path::new(name).extension().is_some_and(|extension| extension == "md");
-            is_markdown.then(|| format!("{LEARNINGS_DIRECTORY}{name}"))
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            crate::issue::canonical_number(&digits)
         })
         .collect();
-    paths.sort();
-    paths.dedup();
-    paths
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+}
+
+/// On the branch of a claimed issue, `task/issue-<number>`, the description must close it, so
+/// that the merge marks the issue as done (ADR-0021).
+fn closing_problem(body: &str, branch: &str) -> Option<String> {
+    let id = branch.strip_prefix(TASK_BRANCH_PREFIX)?;
+    let number = crate::issue::number_of_id(id).ok().flatten()?;
+    let reference = format!("#{number}");
+    let visible = without_comments(body);
+    let words: Vec<&str> = visible.split_whitespace().collect();
+    let closes = words.array_windows().any(|[word, next]| {
+        let word = word.trim_end_matches(':').to_ascii_lowercase();
+        let next = next.trim_end_matches(['.', ',', ';', ')']);
+        CLOSING_WORDS.contains(&word.as_str()) && next == reference
+    });
+    (!closes).then(|| {
+        format!(
+            "the branch `{branch}` works on issue #{number}, but the description does not close \
+             it; add the line `Fixes #{number}` (ADR-0021)"
+        )
+    })
+}
+
+/// Why issue `number` is not a follow-up issue, or `None` if it is one: GitHub has it, it is
+/// an issue and not a pull request, and the bot or a code owner opened it.
+#[must_use]
+pub fn listed_issue_problem(github: &dyn GitHub, trust: &Trust, number: u32) -> Option<String> {
+    match github.issue(number) {
+        Ok(found) => trust::refused(&found, trust),
+        Err(error) => Some(format!("cannot look it up: {error}")),
+    }
 }
 
 fn protected_file_problems(section: Option<&[String]>, protected: &[String]) -> Vec<String> {
@@ -272,21 +314,35 @@ pub fn run_protected(options: &[&str]) -> ExitCode {
 }
 
 /// Checks the PR description in the environment variable `PR_BODY` and prints its problems.
+/// The branch is `PR_BRANCH`, or else git's current branch.
 pub fn run_body(options: &[&str]) -> ExitCode {
+    let root = crate::workspace_root();
     let body = std::env::var("PR_BODY").ok();
-    let problems = body_problems(&crate::workspace_root(), options, body.as_deref());
+    let branch = std::env::var("PR_BRANCH").ok().filter(|branch| !branch.is_empty());
+    let branch = branch.unwrap_or_else(|| {
+        let current = crate::task::claims::git(&root, &["branch", "--show-current"], &[], None);
+        current.map_or_else(|_| String::new(), |name| name.trim().to_owned())
+    });
+    let problems = body_problems(&root, options, body.as_deref(), &branch, &Gh::new(&root));
     for problem in &problems {
         eprintln!("{problem}");
     }
     if problems.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-/// The problems of the PR description `body` for the checkout at `root`, one line each.
+/// The problems of the PR description `body` on `branch`, for the checkout at `root`, one line
+/// each. The issues it lists are looked up on `github`, and the code owners come from the base.
 ///
 /// `options` are the options of `pr-body`. `body` is `None` if `PR_BODY` is not set. Whatever
 /// keeps the check from running is a problem too, so that a check that cannot run never passes.
 #[must_use]
-pub fn body_problems(root: &Path, options: &[&str], body: Option<&str>) -> Vec<String> {
+pub fn body_problems(
+    root: &Path,
+    options: &[&str],
+    body: Option<&str>,
+    branch: &str,
+    github: &dyn GitHub,
+) -> Vec<String> {
     let Some(body) = body else {
         return vec![
             "error[pr-body]: the environment variable PR_BODY is not set; set it to the PR \
@@ -295,10 +351,19 @@ pub fn body_problems(root: &Path, options: &[&str], body: Option<&str>) -> Vec<S
                 .to_owned(),
         ];
     };
-    match changed_protected(root, options) {
-        Ok(protected) => check_body(body, &protected, |path| root.join(path).is_file()),
-        Err(error) => vec![format!("error[pr-body]: {error}")],
-    }
+    let protected = match changed_protected(root, options) {
+        Ok(protected) => protected,
+        Err(error) => return vec![format!("error[pr-body]: {error}")],
+    };
+    let base = base_of(options).expect("changed_protected accepted the options");
+    // Loaded only when the description lists an issue: `None` needs neither git nor GitHub.
+    let trust = OnceCell::new();
+    check_body(body, &protected, branch, |number| {
+        match trust.get_or_init(|| trust::load(root, base)) {
+            Ok(trust) => listed_issue_problem(github, trust, number),
+            Err(error) => Some(error.clone()),
+        }
+    })
 }
 
 /// Reads the base ref from the options of `protected` and `pr-body`.
@@ -353,29 +418,69 @@ pub fn changed_protected(root: &Path, options: &[&str]) -> Result<Vec<String>, S
 
 #[cfg(test)]
 mod tests {
-    use super::{Pattern, base_of, check_body, parse_codeowners, protected_paths, section};
+    use super::{
+        Pattern, base_of, check_body, listed_issue_problem, parse_codeowners, protected_paths,
+        section,
+    };
+    use crate::issue::github::{Comment, GitHub, Issue, LabelEvent};
+    use crate::issue::trust::Trust;
 
     /// A description that passes when `xtask/src/hook.rs` and `justfile` are the protected
-    /// changes and `docs/learnings/stop-gate.md` exists.
+    /// changes and #12 is a follow-up issue.
     const BODY: &str = "## Summary\n\nFix the stop hook.\n\n## Rule changes\n\nNone\n\n\
                         ## Protected files\n\n- `xtask/`: the hook lives there.\n\
-                        - justfile: new recipe.\n\n## Guardrail gaps\n\n\
-                        - docs/learnings/stop-gate.md\n";
+                        - justfile: new recipe.\n\n## Follow-up issues\n\n- #12\n";
 
     fn paths(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    fn body_with_gaps(gaps: &str) -> String {
-        format!("## Summary\n\nText.\n\n## Guardrail gaps\n{gaps}\n")
+    fn body_with_follow_ups(follow_ups: &str) -> String {
+        format!("## Summary\n\nText.\n\n## Follow-up issues\n{follow_ups}\n")
     }
 
     fn body_with_protected(listed: &str) -> String {
-        format!("## Protected files\n{listed}\n\n## Guardrail gaps\n\nNone\n")
+        format!("## Protected files\n{listed}\n\n## Follow-up issues\n\nNone\n")
     }
 
-    fn exists(path: &str) -> bool {
-        path == "docs/learnings/stop-gate.md"
+    /// Issue #12 is a follow-up issue; no other number is.
+    fn exists(number: u32) -> Option<String> {
+        (number != 12).then(|| "it is not #12".to_owned())
+    }
+
+    /// GitHub holding #1, a pull request #2 and #3 by an outsider.
+    struct Issues;
+
+    impl GitHub for Issues {
+        fn issue(&self, number: u32) -> Result<Issue, String> {
+            let (author, is_pull_request) = match number {
+                1 => ("nami-agent[bot]", false),
+                2 => ("owner", true),
+                3 => ("outsider", false),
+                _ => return Err("not found".to_owned()),
+            };
+            Ok(Issue {
+                number,
+                title: String::new(),
+                author: author.to_owned(),
+                is_open: true,
+                is_pull_request,
+                labels: Vec::new(),
+                body: String::new(),
+            })
+        }
+        fn open_issues(&self) -> Result<Vec<Issue>, String> {
+            Err("not used".to_owned())
+        }
+        fn comments(&self, _number: u32) -> Result<Vec<Comment>, String> {
+            Err("not used".to_owned())
+        }
+        fn label_events(&self, _number: u32) -> Result<Vec<LabelEvent>, String> {
+            Err("not used".to_owned())
+        }
+        fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
+            Err("not used".to_owned())
+        }
     }
 
     // Goal: the real CODEOWNERS file parses, and its patterns protect what AGENTS.md says is
@@ -511,8 +616,8 @@ mod tests {
     #[test]
     fn complete_body_passes() {
         let protected = paths(&["justfile", "xtask/src/hook.rs"]);
-        assert_eq!(check_body(BODY, &protected, exists), Vec::<String>::new());
-        let problems = check_body("", &protected, exists);
+        assert_eq!(check_body(BODY, &protected, "work", exists), Vec::<String>::new());
+        let problems = check_body("", &protected, "work", exists);
         assert_eq!(problems.len(), 2, "one per missing section: {problems:?}");
         for problem in &problems {
             assert!(problem.starts_with("error[pr-body]: the section `## "), "{problem}");
@@ -522,45 +627,81 @@ mod tests {
         }
     }
 
-    // Goal: the guardrail-gaps section accepts `None` in any case with an optional full stop.
+    // Goal: the follow-up section accepts `None` in any case with an optional full stop.
     #[test]
-    fn guardrail_gaps_may_be_none() {
+    fn follow_ups_may_be_none() {
         for none in ["None", "none", "NONE.", "  None.  ", "<!-- say why -->\n\nNone\n"] {
-            let problems = check_body(&body_with_gaps(none), &[], exists);
-            assert_eq!(problems, Vec::<String>::new(), "`{none}` means no gaps");
+            let problems = check_body(&body_with_follow_ups(none), &[], "work", exists);
+            assert_eq!(problems, Vec::<String>::new(), "`{none}` means no follow-ups");
         }
     }
 
-    // Goal: anything else must name a learning that exists. Method: text without a path, a path
-    // only inside a comment, a path of the wrong kind, `None` with more text, and missing files.
+    // Goal: anything else must name follow-up issues as `#<number>`. Method: text without a
+    // number, a number only inside a comment or with a leading zero, `None` with more text, and
+    // numbers that are not follow-up issues, each reported once.
     #[test]
-    fn guardrail_gaps_must_name_existing_learnings() {
-        let no_learning = [
+    fn follow_ups_must_name_follow_up_issues() {
+        let no_issue = [
             "",
             "N/A",
             "None so far, but see below.",
             "None\nNone",
-            "<!-- docs/learnings/stop-gate.md -->",
-            "docs/learnings/",
-            "docs/learnings/stop-gate.txt",
-            "docs/learnings/md",
-            "learnings/stop-gate.md",
+            "<!-- #12 -->",
+            "#",
+            "#012",
+            "issue 12",
+            "### Details",
         ];
-        for gaps in no_learning {
-            let problems = check_body(&body_with_gaps(gaps), &[], exists);
-            assert_eq!(problems.len(), 1, "`{gaps}`: {problems:?}");
-            assert!(problems[0].contains("names no learning; write `None`, or"), "{problems:?}");
+        for follow_ups in no_issue {
+            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+            assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
+            assert!(problems[0].contains("names no issue; write `None`, or"), "{problems:?}");
         }
-        for gaps in ["See docs/learnings/stop-gate.md.", "[gate](docs/learnings/stop-gate.md)"] {
-            assert_eq!(check_body(&body_with_gaps(gaps), &[], exists), Vec::<String>::new());
+        for follow_ups in ["See #12.", "- #12 (the loop rule)", "#12#12"] {
+            let body = body_with_follow_ups(follow_ups);
+            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
         }
-        let gaps = "- docs/learnings/stop-gate.md\n- `docs/learnings/b.md`, docs/learnings/a.md\n\
-                    - docs/learnings/a.md again\n";
-        let problems = check_body(&body_with_gaps(gaps), &[], exists);
-        assert_eq!(problems.len(), 2, "one per missing file, each once: {problems:?}");
-        assert!(problems[0].contains("`docs/learnings/a.md`, named under"), "{problems:?}");
-        assert!(problems[1].contains("`docs/learnings/b.md`, named under"), "{problems:?}");
-        assert!(problems[1].contains("does not exist; add the file"), "{problems:?}");
+        let follow_ups = "- #13\n- #12, #11\n- #13 again\n";
+        let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+        assert_eq!(problems.len(), 2, "one per wrong issue, each once: {problems:?}");
+        assert!(problems[0].contains("#11, listed under"), "{problems:?}");
+        assert!(problems[1].contains("#13, listed under"), "{problems:?}");
+        assert!(problems[1].contains("is not a follow-up issue: it is not #12;"), "{problems:?}");
+    }
+
+    // Goal: on a claimed issue's branch the description closes that issue, with any of GitHub's
+    // closing words, outside a comment; other branches need nothing.
+    #[test]
+    fn issue_branches_close_their_issue() {
+        let closes = |text: &str, branch: &str| {
+            let body = format!("{text}\n\n{}", body_with_follow_ups("None"));
+            check_body(&body, &[], branch, exists).is_empty()
+        };
+        for text in ["Fixes #12", "fixes: #12.", "Work.\nCloses #12)", "RESOLVED #12,", "fix #12"] {
+            assert!(closes(text, "task/issue-12"), "`{text}` closes #12");
+        }
+        for text in ["", "#12", "Fixes 12", "Fixes #120", "<!-- Fixes #12 -->", "Fixes  issue #12"]
+        {
+            assert!(!closes(text, "task/issue-12"), "`{text}` does not close #12");
+        }
+        for branch in ["work", "task/a", "task/issue-x", "issue-12", "task/issue-012"] {
+            assert!(closes("", branch), "`{branch}` is not a claimed issue's branch");
+        }
+        let body = body_with_follow_ups("None");
+        let problems = check_body(&body, &[], "task/issue-12", exists);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("add the line `Fixes #12` (ADR-0021)"), "{problems:?}");
+    }
+
+    // Goal: a listed issue must exist, be an issue and come from the bot or a code owner.
+    #[test]
+    fn listed_issues_must_be_trusted_issues() {
+        let trust = Trust::from_codeowners("/xtask/ @owner\n");
+        assert_eq!(listed_issue_problem(&Issues, &trust, 1), None);
+        let problem = |number| listed_issue_problem(&Issues, &trust, number).expect("a problem");
+        assert!(problem(2).contains("is a pull request"), "{}", problem(2));
+        assert!(problem(3).contains("neither the bot nor a code owner"), "{}", problem(3));
+        assert!(problem(4).contains("cannot look it up: not found"), "{}", problem(4));
     }
 
     // Goal: a changed protected path must be listed, by itself or by a directory above it that
@@ -568,8 +709,9 @@ mod tests {
     #[test]
     fn protected_paths_must_be_listed() {
         let protected = paths(&["Cargo.toml", "xtask/src/hook.rs"]);
-        let is_complete =
-            |listed: &str| check_body(&body_with_protected(listed), &protected, exists).is_empty();
+        let is_complete = |listed: &str| {
+            check_body(&body_with_protected(listed), &protected, "work", exists).is_empty()
+        };
         assert!(is_complete("- `Cargo.toml`: x\n- `xtask/src/hook.rs`: y"), "each path itself");
         assert!(is_complete("Cargo.toml, xtask/."), "a directory, then a full stop");
         assert!(is_complete("Changed (Cargo.toml) and **xtask/src/**."), "inside punctuation");
@@ -580,7 +722,7 @@ mod tests {
         assert!(!is_complete("Cargo.toml and task/"), "a directory that only ends the same");
         assert!(!is_complete("Cargo.toml <!-- xtask/ -->"), "a comment lists nothing");
 
-        let problems = check_body(&body_with_protected("xtask/"), &protected, exists);
+        let problems = check_body(&body_with_protected("xtask/"), &protected, "work", exists);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0]
@@ -593,8 +735,10 @@ mod tests {
     // else, or no section at all.
     #[test]
     fn protected_section_is_free_without_protected_changes() {
-        for body in [body_with_protected("None"), body_with_protected(""), body_with_gaps("None")] {
-            assert_eq!(check_body(&body, &[], exists), Vec::<String>::new(), "{body}");
+        for body in
+            [body_with_protected("None"), body_with_protected(""), body_with_follow_ups("None")]
+        {
+            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
         }
     }
 

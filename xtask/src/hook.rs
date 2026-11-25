@@ -5,7 +5,7 @@
 //! back to the agent; any other failure is reported to the human as a hook error.
 //!
 //! - `post-edit`: formats an edited Rust file, and runs on the edited file every tidy rule that
-//!   needs only that file: Rust sources, manifests, ADRs, learnings and the style guide.
+//!   needs only that file: Rust sources, manifests, ADRs and the style guide.
 //! - `stop`: runs `just check dylint` before an agent or subagent may finish, unless the working
 //!   state is the unchanged base or has already passed.
 //! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH` and reports tools whose

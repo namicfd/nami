@@ -4,7 +4,7 @@
 //! rule has a row in [`registry`], and a firing and a passing example in `xtask/fixtures/tidy/`:
 //!
 //! - source rules are decided from one file ([`check_single_file`]): Rust sources, manifests,
-//!   ADRs, learnings and the style guide;
+//!   ADRs and the style guide;
 //! - workspace rules need the whole tree ([`check`]): the `#[expect]` budget, the assertion
 //!   density of each crate, and the documents generated from the registry.
 //!
@@ -35,7 +35,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use docs::LEARNING_DIRECTORY;
 pub use rust_source::AssertionStats;
 
 /// Upper bound on directories visited, so the walk is bounded (`TIGER_STYLE.md`, Limits).
@@ -135,8 +134,6 @@ enum FileKind {
     WorkspaceManifest,
     /// `docs/design/NNNN-<title>.md`.
     Adr,
-    /// A file in `docs/learnings/`, other than its `README.md`.
-    Learning,
     /// `docs/TIGER_STYLE.md`.
     StyleGuide,
     /// `*.snap.new`: an insta snapshot that nobody reviewed.
@@ -159,9 +156,6 @@ impl FileKind {
             Self::WorkspaceManifest
         } else if directory == Path::new(docs::ADR_DIRECTORY) && docs::is_adr_file_name(&name) {
             Self::Adr
-        } else if directory == Path::new(docs::LEARNING_DIRECTORY) && name != docs::LEARNING_README
-        {
-            Self::Learning
         } else if relative == Path::new(style_guide::STYLE_GUIDE) {
             Self::StyleGuide
         } else {
@@ -253,8 +247,8 @@ fn check_tree(root: &Path, policy_root: Option<&Path>) -> io::Result<Vec<Violati
 /// Runs every source rule on one file: every rule that can be decided from that file alone.
 ///
 /// `relative` is the file's path below `root` and decides which rules apply: a Rust source, a
-/// crate or workspace manifest, an ADR, a learning or the style guide. Any other file has no
-/// rules and yields nothing. `text` is the file's content, which need not be on disk yet.
+/// crate or workspace manifest, an ADR or the style guide. Any other file has no rules and
+/// yields nothing. `text` is the file's content, which need not be on disk yet.
 /// Context that a rule needs, such as the ADR index, the names of the workspace crates or the
 /// lint tables, is read from `root`.
 ///
@@ -286,7 +280,6 @@ fn check_file(root: &Path, relative: &Path, text: &str) -> io::Result<FileReport
             let names = docs::adr_file_names(root)?;
             report.violations.extend(docs::check_adr_number(relative, text, &names));
         }
-        FileKind::Learning => report.violations = docs::check_learning(relative, text),
         FileKind::StyleGuide => {
             let mechanisms = style_guide::Mechanisms::load(root)?;
             report.violations = style_guide::check(relative, text, &mechanisms);
@@ -310,12 +303,9 @@ pub fn check_rust_source(relative: &Path, text: &str) -> (Vec<Violation>, Assert
 }
 
 /// The documents that have rules. They live under `docs/`, which the source walk skips. The
-/// ADR directory must exist; a tree without learnings is fine.
+/// ADR directory must exist.
 fn document_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = docs::entries_of(root, docs::ADR_DIRECTORY)?;
-    if root.join(docs::LEARNING_DIRECTORY).is_dir() {
-        paths.extend(docs::entries_of(root, docs::LEARNING_DIRECTORY)?);
-    }
     paths.push(PathBuf::from(style_guide::STYLE_GUIDE));
     paths.retain(|relative| root.join(relative).is_file());
     Ok(paths)
@@ -381,9 +371,6 @@ mod tests {
         scratch.write("crates/demo/src/lib.rs", &unasserted);
         scratch.write("crates/demo/src/a.snap.new", "");
         scratch.write("Cargo.toml", "[workspace.dependencies]\nlibm = { package = \"serde\" }\n");
-        scratch.write("docs/learnings/README.md", "How to write a learning.\n");
-        scratch.write("docs/learnings/notes.md", "- Status: Open\n## What happened\n");
-        scratch.write("docs/learnings/archive/old.md", "A directory is not a learning.\n");
         scratch.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy:no-such-rule]`\n");
         scratch.write("target/ignored/skipped.rs", "fn a() { loop {} }");
         scratch.write("xtask/fixtures/tidy/skipped.rs", "fn a() { loop {} }");
@@ -454,7 +441,6 @@ mod tests {
                 .chain(["adr-section"; 6])
                 .chain(planned_tasks)
                 .chain(["plan-files", "tasks-json", "plan-section", "task-graph", "plan-stage"])
-                .chain(["learning-format"; 2])
                 .chain(["expect-budget"])
                 .collect::<Vec<_>>()
         );
@@ -571,8 +557,6 @@ mod tests {
             rules("Cargo.toml", "[workspace.dependencies.libm]\npackage = \"a\"\n").len(),
             1
         );
-        assert_eq!(rules("docs/learnings/notes.md", "- Status: Open\n").len(), 3);
-        assert_eq!(rules("docs/learnings/README.md", ""), Vec::<&str>::new());
         assert_eq!(
             rules(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy]`\n"),
             ["doc-tag"]
@@ -629,10 +613,7 @@ mod tests {
         assert_eq!(kind("docs/design/0001-dependency-policy.md"), FileKind::Adr);
         assert_eq!(kind("docs/design/README.md"), FileKind::Other);
         assert_eq!(kind("docs/0001-dependency-policy.md"), FileKind::Other);
-        assert_eq!(kind("docs/learnings/2026-11-25-a.md"), FileKind::Learning);
-        assert_eq!(kind("docs/learnings/notes.txt"), FileKind::Learning);
-        assert_eq!(kind("docs/learnings/README.md"), FileKind::Other);
-        assert_eq!(kind("docs/learnings/archive/2026-11-25-a.md"), FileKind::Other);
+        assert_eq!(kind("docs/learnings/2026-11-25-a.md"), FileKind::Other, "retired (ADR-0021)");
         assert_eq!(kind("docs/TIGER_STYLE.md"), FileKind::StyleGuide);
         assert_eq!(kind("TIGER_STYLE.md"), FileKind::Other);
         assert_eq!(kind("crates/a/tests/snapshots/a.snap.new"), FileKind::SnapshotDraft);

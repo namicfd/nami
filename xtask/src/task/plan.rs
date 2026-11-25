@@ -146,6 +146,12 @@ fn task_from_json(entry: &Value) -> Result<Task, String> {
     if !is_valid_id(&id) {
         return Err(format!("id `{id}` must be lowercase letters, digits and dashes"));
     }
+    if id.starts_with(crate::issue::ID_PREFIX) {
+        return Err(format!(
+            "id `{id}` starts with `{}`, which names GitHub issues (ADR-0021); rename the task",
+            crate::issue::ID_PREFIX
+        ));
+    }
     let task = Task {
         title: string_field(entry, "title")?,
         depends_on: string_list(entry, "depends_on")?,
@@ -399,6 +405,8 @@ mod tests {
             ("{\"tasks\": [1]}".to_owned(), "not an object"),
             (format!("{{\"tasks\": [{{\"id\": \"A\", {good}}}]}}"), "lowercase"),
             (format!("{{\"tasks\": [{{\"id\": \"-a\", {good}}}]}}"), "lowercase"),
+            (format!("{{\"tasks\": [{{\"id\": \"issue-1\", {good}}}]}}"), "names GitHub issues"),
+            (format!("{{\"tasks\": [{{\"id\": \"issue-x\", {good}}}]}}"), "names GitHub issues"),
             (format!("{{\"tasks\": [{{{good}, \"id\": \"a\"}}]}}"), "expected exactly"),
             (format!("{{\"tasks\": [{{\"id\": 1, {good}}}]}}"), "`id` must be a string"),
             (
