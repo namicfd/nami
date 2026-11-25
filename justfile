@@ -45,3 +45,7 @@ dylint:
 # Licenses, advisories, bans and sources (ADR-0001).
 deny:
     cargo deny --locked check
+
+# Task tracking (ADR-0011): status, ready, claim <id>, release <id>, validate.
+task *arguments:
+    cargo xtask task {{arguments}}

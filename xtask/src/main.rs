@@ -10,8 +10,9 @@ fn main() -> ExitCode {
     match arguments.as_slice() {
         ["tidy"] => run_tidy(),
         ["hook", event] => xtask::hook::run(event),
+        ["task", rest @ ..] => xtask::task::run(rest),
         _ => {
-            eprintln!("usage: cargo xtask tidy | cargo xtask hook <post-edit|stop>");
+            eprintln!("usage: cargo xtask tidy | hook <post-edit|stop> | task <command>");
             ExitCode::FAILURE
         }
     }

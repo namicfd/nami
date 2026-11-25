@@ -27,8 +27,13 @@ pub use rust_source::AssertionStats;
 /// Upper bound on directories visited, so the walk is bounded (`TIGER_STYLE.md`, Limits).
 const DIRECTORIES_MAX: u32 = 100_000;
 
-/// Directories that the source walk never enters. ADRs are checked separately.
+/// Directories that the source walk never enters. ADRs and plans are checked separately.
 const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "docs"];
+
+/// Skipped only at the workspace root: agent configuration and Claude Code's worktrees, which
+/// are other checkouts. Copies of the tree (cargo-mutants) drop the worktrees' `.git` files, so
+/// the nested-checkout rule alone does not catch them there.
+const ROOT_AGENT_DIRECTORY: &str = ".claude";
 
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
 const INDEX_MODULE: &str = "crates/base/src/index.rs";
@@ -127,6 +132,7 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
     violations.extend(workspace::check_expect_budget(root, expect_count)?);
     violations.extend(workspace::check_manifests(root)?);
     violations.extend(workspace::check_adrs(root)?);
+    violations.extend(crate::task::plan::check(root)?);
     violations.sort_by(|a, b| (&a.path, a.line, a.rule).cmp(&(&b.path, b.line, b.rule)));
     Ok(violations)
 }
@@ -179,7 +185,7 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
             let path = entry?.path();
             if !path.is_dir() {
                 found.push(path);
-            } else if !is_skipped(&path) {
+            } else if !is_skipped(&path) && path != root.join(ROOT_AGENT_DIRECTORY) {
                 pending.push(path);
             }
         }
@@ -215,6 +221,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(root.join("xtask")).unwrap();
         std::fs::create_dir_all(root.join("docs/design")).unwrap();
+        std::fs::create_dir_all(root.join("docs/exec-plans/active/p")).unwrap();
         std::fs::create_dir_all(root.join("target/ignored")).unwrap();
         std::fs::write(root.join("xtask/expect-budget.txt"), "1\n").unwrap();
         std::fs::write(root.join("docs/design/README.md"), "").unwrap();
@@ -224,7 +231,13 @@ mod tests {
         let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
         std::fs::write(source.join("lib.rs"), unasserted).unwrap();
         std::fs::write(root.join("target/ignored/skipped.rs"), "fn a() { loop {} }").unwrap();
-        let worktree = root.join(".claude/worktrees/other");
+        // Only the root `.claude/` is skipped; one inside a crate is checked like any source.
+        std::fs::create_dir_all(source.join(".claude")).unwrap();
+        std::fs::write(source.join(".claude/b.rs"), "fn b() { loop {} }").unwrap();
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        std::fs::write(root.join(".claude/agents/c.rs"), "fn c() { loop {} }").unwrap();
+        // A nested checkout outside `.claude/`, so that the nested-`.git` rule itself is tested.
+        let worktree = root.join("other-checkout");
         std::fs::create_dir_all(worktree.join("crates/old/src")).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
         std::fs::write(worktree.join("crates/old/src/lib.rs"), "fn a() { loop {} }").unwrap();
@@ -234,11 +247,11 @@ mod tests {
         let rules: Vec<&str> = violations.iter().map(|violation| violation.rule).collect();
         assert_eq!(
             rules,
-            ["assertion-density", "runtime-dependency", "snapshot-draft", "unasserted-function"]
+            ["assertion-density", "runtime-dependency", "unbounded-loop", "snapshot-draft"]
                 .into_iter()
-                .chain(["adr-index"])
+                .chain(["unasserted-function", "adr-index"])
                 .chain(["adr-section"; 6])
-                .chain(["expect-budget"])
+                .chain(["plan-files", "expect-budget"])
                 .collect::<Vec<_>>()
         );
         assert_eq!(violations[0].path, Path::new("crates/demo"));

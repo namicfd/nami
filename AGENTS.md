@@ -111,9 +111,14 @@ The authoritative list is `.github/CODEOWNERS`.
 
 - **One task per session.** Work on your own branch or worktree, open a PR, and never push to
   `main`.
-- **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`.**
-  - Touch only the task's `owner_paths`.
-  - Never set `passes`; only CI does.
+- **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
+  `docs/exec-plans/README.md`).
+  - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
+    failed claim means someone else holds the task: pick another.
+  - Read the task's `### <id>` section in its `plan.md` before you start.
+  - Work on a branch named `task/<id>`. Touch only the task's `owner_paths`.
+  - Never set `passes`. CI sets it, or for now the maintainer (ADR-0017).
+  - If you give up on a task, `cargo xtask task release <id>` and say why in the plan.
 - **A reference lands before the feature it tests.** Never write the reference for code you also
   implement.
 - **A change that alters output bits** is labelled `changes-results` and waits for a human. Explain
