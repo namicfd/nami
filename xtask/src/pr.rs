@@ -28,6 +28,10 @@ const HEADING_PROTECTED: &str = "## Protected files";
 /// The section of a PR description that lists the issues the work filed (ADR-0021).
 const HEADING_FOLLOW_UPS: &str = "## Follow-up issues";
 
+/// How the attribution line starts that Claude Code appends to every PR description it writes.
+/// The line is not part of the section it lands in, which is the template's last (issue #18).
+const ATTRIBUTION_PREFIX: &str = "🤖 Generated with";
+
 /// The prefix of a branch that works on a task or a claimed issue (ADR-0011).
 const TASK_BRANCH_PREFIX: &str = "task/";
 
@@ -137,15 +141,24 @@ pub fn protected_paths(patterns: &[Pattern], changed: &[String]) -> Vec<String> 
 
 /// The lines of the section of `body` under `heading`, or `None` if there is no such heading.
 ///
-/// HTML comments and blank lines are left out. The section ends at the next `#` or `##` heading.
+/// HTML comments, blank lines and the attribution line are left out. The section ends at the
+/// next `#` or `##` heading, or at a thematic break (`---`).
 #[must_use]
 pub fn section(body: &str, heading: &str) -> Option<Vec<String>> {
     let visible = without_comments(body);
     let mut lines = visible.lines().map(str::trim).skip_while(|line| *line != heading);
     let _heading = lines.next()?;
-    let is_next_section = |line: &&str| line.starts_with("# ") || line.starts_with("## ");
-    let content = lines.take_while(|line| !is_next_section(line)).filter(|line| !line.is_empty());
+    let is_end =
+        |line: &&str| line.starts_with("# ") || line.starts_with("## ") || is_thematic_break(line);
+    let content = lines
+        .take_while(|line| !is_end(line))
+        .filter(|line| !line.is_empty() && !line.starts_with(ATTRIBUTION_PREFIX));
     Some(content.map(str::to_owned).collect())
+}
+
+/// True for a line of three or more `-` and nothing else, which ends a section.
+fn is_thematic_break(line: &str) -> bool {
+    line.len() >= 3 && line.chars().all(|character| character == '-')
 }
 
 /// Removes HTML comments. A comment that is never closed runs to the end of the text.
@@ -196,6 +209,15 @@ fn follow_up_problems(
     }
     let numbers = issue_numbers(&lines.join("\n"));
     if numbers.is_empty() {
+        if let [first, second, ..] = lines
+            && is_none(first)
+        {
+            return vec![format!(
+                "the section `{HEADING_FOLLOW_UPS}` says `None` and then `{second}`; write only \
+                 `None` there and end the section with a heading or a `---` line, or list each \
+                 issue that this work filed with `cargo xtask issue file`, as `#<number>`"
+            )];
+        }
         return vec![format!("the section `{HEADING_FOLLOW_UPS}` names no issue; {how}")];
     }
     numbers
@@ -596,8 +618,9 @@ mod tests {
         assert_eq!(protected_paths(&[], &changed), Vec::<String>::new());
     }
 
-    // Goal: a section is the text between its heading and the next `#` or `##` heading, without
-    // blank lines and comments; a heading inside a comment does not count.
+    // Goal: a section is the text between its heading and the next `#` or `##` heading or `---`
+    // line, without blank lines, comments and the attribution line; a heading inside a comment
+    // does not count.
     #[test]
     fn sections_are_cut_out_of_the_body() {
         let body = "# Title\n## A\n\none\n<!-- hidden\n## B\n-->\n### Detail\n two \n## B\nthree\n";
@@ -609,6 +632,10 @@ mod tests {
         assert_eq!(section("## A\n<!-- only a comment -->\n", "## A"), Some(Vec::new()));
         assert_eq!(section("## A\none <!-- open\ntwo\n", "## A"), Some(paths(&["one"])));
         assert_eq!(section("## A and more\none\n", "## A"), None);
+        assert_eq!(section("## A\none\n---\ntwo\n", "## A"), Some(paths(&["one"])));
+        assert_eq!(section("## A\none\n--\n", "## A"), Some(paths(&["one", "--"])));
+        let attribution = "## A\n🤖 Generated with [Claude Code](x)\n";
+        assert_eq!(section(attribution, "## A"), Some(Vec::new()));
     }
 
     // Goal: a complete description has no problems, and each problem is one line in the
@@ -636,6 +663,43 @@ mod tests {
         }
     }
 
+    // Goal: the attribution line that Claude Code appends to a PR description is not part of
+    // the last section, with or without a `---` before it (issue #18), and it neither counts as
+    // content nor hides an empty section.
+    #[test]
+    fn attribution_is_not_part_of_the_section() {
+        let footer = "🤖 Generated with [Claude Code](https://claude.com/claude-code)";
+        let passing = [
+            format!("\nNone.\n\n{footer}"),
+            format!("\nNone.\n\n---\n\n{footer}"),
+            format!("\n- #12\n\n{footer}"),
+            format!("- #12\n---\n{footer}"),
+        ];
+        for follow_ups in passing {
+            let body = body_with_follow_ups(&follow_ups);
+            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+        }
+        let failing =
+            [format!("\n{footer}"), format!("\n---\n\n{footer}"), "---\n- #12".to_owned()];
+        for follow_ups in failing {
+            let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
+            assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
+            assert!(problems[0].contains("names no issue; write `None`, or"), "{problems:?}");
+        }
+    }
+
+    // Goal: `None` followed by more text is reported as such, not as a section that names no
+    // issue, and the message names the extra line.
+    #[test]
+    fn none_with_more_text_names_the_extra_line() {
+        for (follow_ups, extra) in [("None\nNone", "None"), ("None.\n\nA footer.", "A footer.")] {
+            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+            assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
+            let expected = format!("says `None` and then `{extra}`;");
+            assert!(problems[0].contains(&expected), "{problems:?}");
+        }
+    }
+
     // Goal: anything else must name follow-up issues as `#<number>`. Method: text without a
     // number, a number only inside a comment or with a leading zero, `None` with more text, and
     // numbers that are not follow-up issues, each reported once.
@@ -645,7 +709,6 @@ mod tests {
             "",
             "N/A",
             "None so far, but see below.",
-            "None\nNone",
             "<!-- #12 -->",
             "#",
             "#012",
