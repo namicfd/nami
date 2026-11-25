@@ -11,19 +11,21 @@ TigerStyle's reasoning. Where nami deviates or adds a rule, it says so and says 
 This file is the long-form reference. `AGENTS.md` carries only the one-line rules. The decisions
 behind them are in `docs/design/` (ADRs).
 
-**How rules are enforced.** Each rule ends with a tag naming the mechanism that enforces it.
-Until the P0 tooling exists, the tags describe the intended mechanism.
+**How rules are enforced.** Each rule ends with tags naming the mechanisms that enforce it.
+Tidy checks every tag (rule `doc-tag`): a tag must name a rule or a lint that exists and is
+switched on, so a tag can claim only what the tooling does today. `docs/RULES.md` lists what is
+behind the tags.
 
 | Tag | Mechanism |
 |---|---|
-| `[compiler]` | rustc itself (types, `no_std`) |
-| `[clippy]` | workspace lint table and `clippy.toml` (ADR-0006) |
-| `[tidy]` | `cargo xtask tidy` (ADR-0006) |
-| `[dylint]` | the project dylint library (ADR-0006) |
+| `[compiler]` | rustc itself: types, `no_std`, and its default lints, which `-D warnings` turns into errors |
+| `[clippy:<lint>]` | a clippy lint set to `warn` or `deny` in the workspace lint table, with `clippy.toml` (ADR-0006). `[clippy:pedantic]` stands for a lint of the pedantic group |
+| `[rustc:<lint>]` | a rustc lint set to `warn` or `deny` in the workspace lint table |
+| `[tidy:<rule-id>]` | a rule of `cargo xtask tidy` (ADR-0006) |
+| `[dylint:<lint>]` | a lint of the project dylint library (ADR-0006) |
 | `[fmt]` | `cargo fmt --check` |
 | `[deny]` | `cargo-deny` (ADR-0001) |
-| `[reference]` | numerical reference tests (ADR-0007) |
-| `[hook]` | Claude Code hooks: defence in depth only; the server-side gates are authoritative (ADR-0008) |
+| `[planned:<id>]` | a mechanism that is promised but not built yet; each has a task in `docs/exec-plans/` |
 | `[review]` | judgement: AI reviewer and human review (ADR-0008) |
 
 If a rule has no mechanism, it is marked `[review]`. A rule that keeps getting broken in review is
@@ -64,7 +66,7 @@ while it is hot. nami has a **zero technical debt** policy: do it right the firs
 second time may never come.
 
 - No `TODO`, `FIXME`, `XXX` or `dbg!` on `main`. Unfinished work lives in a task
-  (`docs/exec-plans/`), not in a comment. `[tidy]`
+  (`docs/exec-plans/`), not in a comment. `[tidy:debt-marker]` `[clippy:dbg_macro]`
 - No quadratic algorithms where linear ones exist, no hidden copies in hot loops, no "temporary"
   workarounds. `[review]`
 
@@ -72,9 +74,11 @@ second time may never come.
 around it:
 
 - **Never silence a lint.** `#[allow]` is banned. `#[expect(lint, reason = "...")]` needs a real
-  reason and counts against a budget that only humans can raise. `[clippy]` `[tidy]`
+  reason and counts against a budget that only humans can raise. `[clippy:allow_attributes]`
+  `[clippy:allow_attributes_without_reason]` `[tidy:expect-budget]`
 - **Never loosen a tolerance, threshold or reference value** to make a test pass. They are
-  human-owned (ADR-0007), and editing them is blocked. `[hook]` `[review]`
+  human-owned (ADR-0007), and edits to `crates/reference/` wait for the code owner (ADR-0015).
+  `[review]`
 - **Never clamp, floor or "sanitise" a value to make a test pass** (see *Physical admissibility*
   below).
 - If a rule is wrong for your case, stop and propose an ADR. That is the only sanctioned way to
@@ -92,21 +96,21 @@ TigerStyle starts from NASA's [Power of Ten](https://spinroot.com/gerard/pdf/P10
 
 - **Use only simple, explicit control flow.** `[review]`
 - **Do not use recursion,** direct or mutual. This guarantees that everything that should be
-  bounded is bounded. `[dylint]`
+  bounded is bounded. `[dylint:nami_recursion]` `[planned:recursion-cross-crate]`
 - **No `dyn Trait` and no function pointers in `kernels`.** Static dispatch keeps the call
   graph fully resolvable for the recursion check and keeps inner loops free of indirect calls.
-  `[tidy]`
+  `[tidy:kernel-indirection]`
 - **No `async`.** Functions run to completion, so precondition assertions hold for the whole
-  function. `[tidy]`
+  function. `[tidy:async]`
 
 ### Put a limit on everything
 
 Every loop, every iteration and every buffer has a fixed upper bound. Violations then fail fast
 instead of hanging.
 
-- **Prefer `for` over a bounded range or a slice iterator.** `loop` and `while` are banned except
-  through `bounded_loop!(max_iterations, …)`. In practice a `for _ in 0..LIMIT` with an assertion
-  after the loop is almost always clearer. `[tidy]`
+- **Prefer `for` over a bounded range or a slice iterator.** `loop` and `while` are banned, and so
+  is `for` over a range without an end. A `for _ in 0..LIMIT` with an assertion after the loop is
+  almost always clearer anyway. `[tidy:unbounded-loop]`
 - **Iterative methods name their limit and assert convergence.** This applies to Newton for the
   exact Riemann solver, fixed-point iterations and implicit sources. Running out of iterations is a
   crash, not a silent "best effort":
@@ -145,9 +149,10 @@ instead of hanging.
 ### Integer types
 
 - **Use explicitly sized types.** Indices and counts are `u32` newtypes (`CellIndex`, `FaceIndex`,
-  `CellCount`). `usize` appears only inside `base::index` (ADR-0002). `[tidy]` `[dylint]`
+  `CellCount`). `usize` appears only inside `base::index` (ADR-0002). `[tidy:usize]`
+  `[planned:usize-alias]`
 - **No `as` casts.** Conversions go through named functions (`CellIndex::to_usize()`) or
-  `try_from(..)` with an assertion. `[clippy]`
+  `try_from(..)` with an assertion. `[clippy:as_conversions]`
 
 ### Assertions
 
@@ -158,10 +163,10 @@ multiply the bug-finding power of fuzzing and seeded simulation.
 
 - **Assert all function arguments and return values, preconditions, postconditions and
   invariants.** A function must not operate blindly on data it has not checked. Assertion density
-  must average at least two per function. `[tidy]`
+  must average at least two per function. `[tidy:assertion-density]` `[tidy:unasserted-function]`
 - **Every assertion has a message** that states the expectation: `"density must be positive"`, not
-  `"bad"`. `[clippy]`
-- **Use `assert_eq!` for equality.** It prints both values on failure. `[clippy]`
+  `"bad"`. `[clippy:missing_assert_message]`
+- **Use `assert_eq!` for equality.** It prints both values on failure. `[review]`
 - **Split compound assertions.** Prefer `assert!(a, ..); assert!(b, ..);` over
   `assert!(a && b, ..)`. Separate assertions are easier to read and say exactly which condition
   failed. `[review]`
@@ -190,10 +195,10 @@ multiply the bug-finding power of fuzzing and seeded simulation.
   - A per-pencil `assert!` backstop, such as "all finite, density > 0", written as a vectorisable
     reduction.
 
-  `[tidy]`
+  `[tidy:debug-assert-placement]` `[review]`
 - **No unchecked hints.** `assert_unchecked`, `unreachable_unchecked` and `get_unchecked` are
   unsafe, and `unsafe` exists only in the test allocator crate (ADR-0014). If the optimiser
-  needs a fact, a real `assert!` provides it. `[clippy]` `[tidy]`
+  needs a fact, a real `assert!` provides it. `[rustc:unsafe_code]` `[tidy:unsafe]`
 - **Assertions are a safety net, not a substitute for understanding.** References and fuzzers can show
   that bugs are present, never that they are absent. So:
   1. Build a precise mental model of the numerics first: the equations, the discretisation, the
@@ -212,7 +217,8 @@ multiply the bug-finding power of fuzzing and seeded simulation.
     wrong. Assert.
 - **All errors are handled.** No `unwrap()`. No `let _ =` on a `Result`. No ignored
   `#[must_use]` values. `expect("...")` is allowed only where the failure is a programmer error,
-  and the message says why it cannot happen. `[clippy]`
+  and the message says why it cannot happen. `[clippy:unwrap_used]`
+  `[clippy:let_underscore_must_use]` `[rustc:unused_results]` `[review]`
 
   An analysis of production failures in distributed systems found that 92% of catastrophic failures
   came from incorrect handling of non-fatal errors
@@ -225,21 +231,23 @@ multiply the bug-finding power of fuzzing and seeded simulation.
   - `kernels` is `#![no_std]` without `alloc`, so allocation there is a compile error.
     `[compiler]`
   - Elsewhere, `Solver::init()` sizes every field, ghost layer, scratch pencil and output buffer
-    once. `[clippy]`
-  - A counting allocator aborts any allocation after init in test builds. `[reference]`
+    once. `[review]`
+  - A counting allocator aborts any allocation after init in test builds.
+    `[planned:alloc-after-init]`
 - **Storage that must not grow is `Box<[T]>`, not `Vec<T>`.** A boxed slice has no `push`, so the
-  type itself documents and enforces the fixed size. `[tidy]`
+  type itself documents and enforces the fixed size. `[tidy:vec-field]`
 - **No hidden allocation in the data plane.** That means no `collect()`, `clone()` of buffers,
   `format!` or `to_string()` after init. Formatting for output happens in the control plane, into
-  preallocated buffers. `[clippy]` `[review]`
+  preallocated buffers. `[review]` `[planned:alloc-after-init]`
 
 ### Scope and size
 
 - **Declare variables in the smallest possible scope, and keep as few in scope as possible.**
   Shadow a name only to refine the same quantity, for example a unit conversion. Never reuse a name
-  for a different quantity. `[review]`
+  for a different quantity. `[clippy:shadow_unrelated]` `[review]`
 - **Functions are at most 70 lines,** counting physical lines and including closures. There is a
-  sharp discontinuity between a function that fits on a screen and one you have to scroll. `[tidy]`
+  sharp discontinuity between a function that fits on a screen and one you have to scroll.
+  `[tidy:function-length]` `[clippy:too_many_lines]`
   When splitting a function:
   - Aim for the inverse of an hourglass: few parameters, a simple return type, and a lot of meaty
     logic between the braces.
@@ -252,7 +260,7 @@ multiply the bug-finding power of fuzzing and seeded simulation.
     return it. Keep leaf functions pure.
 - **Treat all compiler warnings at the strictest setting as errors from day one.** The workspace
   lints are pedantic plus selected restriction lints, and `-D warnings` applies in `just` and CI.
-  Never put `#![deny(warnings)]` in source. `[clippy]`
+  Never put `#![deny(warnings)]` in source. `[clippy:pedantic]` `[review]`
 
 ### External events and control flow
 
@@ -269,7 +277,7 @@ multiply the bug-finding power of fuzzing and seeded simulation.
   - Solver and scheme configuration (CFL number, limiter, Riemann solver, γ, floors, output cadence)
     lives in plain structs whose fields are all written out at construction.
   - **No `Default` implementations and no `..Default::default()` for numerical configuration.** A
-    silently defaulted γ = 1.4 or CFL = 0.9 is a latent wrong answer. `[tidy]`
+    silently defaulted γ = 1.4 or CFL = 0.9 is a latent wrong answer. `[tidy:default]`
 - **Always say why.** Explaining the reasoning helps the reader understand, makes them more likely
   to comply, and gives them the criteria to judge the decision. Every non-obvious choice gets a
   comment. In numerical code, that comment usually cites an equation or a paper. `[review]`
@@ -284,7 +292,7 @@ finite-volume codes, and especially in agent-written ones.
 - **Updates are written in conservative flux-difference form**:
   `u_next = u - (dt/dx) · (F_right − F_left)`, with exactly one flux per face, shared by its two
   neighbouring cells. Discrete conservation then holds to round-off, and the references assert it.
-  `[reference]`
+  `[planned:reference-suite]`
 
   ```rust
   /// Applies the conservative update `u_next = u - (dt/dx) (F_right - F_left)` to one pencil.
@@ -316,7 +324,7 @@ finite-volume codes, and especially in agent-written ones.
   - `[f64; NVAR]` states with named accessors;
   - `field[CellIndex]` gathers for indirect access.
 
-  Raw slice indexing is denied. `[clippy]`
+  Raw slice indexing is denied. `[clippy:indexing_slicing]`
 - **Hot loops are free functions over slices and primitives, without `self`.** The compiler then
   does not need to prove it can keep struct fields in registers, and a human reader can spot
   redundant work more easily. This is TigerStyle's rule, and it matches the pencil design. `[review]`
@@ -324,22 +332,24 @@ finite-volume codes, and especially in agent-written ones.
 ### Floating point
 
 - **Results are bitwise reproducible across platforms** (ADR-0005):
-  - Transcendental functions come only from `libm`; the std methods are banned. `[clippy]`
-  - No `algebraic_*` operations. No fast-math of any kind. `[clippy]`
+  - Transcendental functions come only from `libm`, through `kernels::math`; the std methods are
+    banned. `[clippy:disallowed_methods]` `[tidy:direct-libm]`
+  - No `algebraic_*` operations. No fast-math of any kind. `[clippy:disallowed_methods]`
   - `mul_add` is allowed where written explicitly. Never rewrite an expression into `mul_add`
     without a reason, because doing so changes results. `[review]`
   - **Sums use `sum_fixed`** (or `sum_compensated` for conservation totals), never a naive fold.
-    `[dylint]`
-  - No iteration over `HashMap` or `HashSet`. `[clippy]`
+    `[planned:float-reduction]`
+  - No iteration over `HashMap` or `HashSet`. `[clippy:iter_over_hash_type]`
+    `[clippy:disallowed_types]`
 - **NaN is always a bug.** Every state, flux and time step is finite, and that is asserted
   (per-step and per-pencil backstops, ADR-0004). Never test for NaN in order to skip or repair a
   value.
 - **No magic tolerances.** Every epsilon is a named constant whose doc comment says where it comes
   from (for example "relative change below round-off for 64-bit pressure"). Test tolerances live in
   `reference/thresholds.toml`. `f64::EPSILON` is not a tolerance: it is the spacing at 1.0, not
-  at your value. `[clippy]` `[review]`
+  at your value. `[tidy:magic-tolerance]` `[planned:thresholds-file]` `[review]`
 - **Do not compare floats with `==`** except against exact sentinels or in bitwise determinism
-  tests, and say which one it is. `[clippy]` `[tidy]`
+  tests, and say which one it is. `[clippy:float_cmp]` `[planned:float-eq-in-eq-fn]`
 - **Guard every division by a quantity that can vanish** (density, pressure, wave-speed
   differences) with an assertion that it is positive or non-zero, placed before the division.
   `[review]`
@@ -353,9 +363,11 @@ finite-volume codes, and especially in agent-written ones.
   - be configured explicitly (see *Pass options explicitly at the call site* above);
   - **count every activation** and report the count per step.
 
-  An unexpected activation count is a test failure. `[review]` `[reference]`
+  An unexpected activation count is a test failure. `[tidy:magic-tolerance]` `[review]`
+  `[planned:floor-activation-count]`
 - **A wave speed must bound the true maximum eigenvalue.** A time-step controller that
-  underestimates it is a stability bug even when the tests pass. Assert the bound. `[reference]`
+  underestimates it is a stability bug even when the tests pass. Assert the bound.
+  `[planned:reference-suite]`
 
 ### Ghost cells and buffer bleeds
 
@@ -363,9 +375,9 @@ finite-volume codes, and especially in agent-written ones.
   `release-checked` builds, fill new and scratch buffers with NaN, so that reading a cell that was
   never written trips the finite-state assertion. This is nami's version of TigerStyle's "buffer
   bleed" rule: an under-filled buffer is a silent wrong answer, and it can also break determinism.
-  `[reference]`
+  `[planned:reference-suite]`
 - **Each boundary-condition type has its own reference.** In the literature, boundary conditions were
-  where agents were weakest (ADR-0007). `[reference]`
+  where agents were weakest (ADR-0007). `[planned:reference-suite]`
 
 ## Performance
 
@@ -411,7 +423,7 @@ finite-volume codes, and especially in agent-written ones.
   `[compiler]`
 - **Acronyms are written as words: `HllcSolver`, `MhdState`, not `HLLCSolver`.** This deviates
   from TigerStyle (`VSRState`). We follow Rust's convention because the toolchain lints it and
-  every Rust reader expects it. `[clippy]`
+  every Rust reader expects it. `[clippy:upper_case_acronyms]`
 - **Do not abbreviate,** with one exception for numerical code: **the standard symbols of the
   referenced equations** (`rho`, `u`, `p`, `e`, `c` for sound speed, `q` for a state vector, `f` for
   a flux). Use them only where the function cites the equations they come from. Everything else is
@@ -436,7 +448,7 @@ finite-volume codes, and especially in agent-written ones.
   `[review]`
 - **Do not overload names.** For example, "flux" means the numerical flux at a face, while the
   physical flux function is `flux_physical`. Pick one meaning per word and record it in
-  `docs/glossary.md`. `[review]`
+  `docs/glossary.md`. `[review]` `[planned:glossary]`
 - **Prefer nouns that work in prose,** such as `solver.pencil` over `solver.sweeping`. `[review]`
 - **Make arguments impossible to mix up.**
   - A function with two or more parameters of the same type that could be swapped (two `f64`
@@ -450,9 +462,10 @@ finite-volume codes, and especially in agent-written ones.
 - **Say why.** Code alone is not documentation. Comments explain why the code is the way it is, and
   in numerical code they cite their sources. `[review]`
 - **Say how.** Every test starts with a comment stating its goal and method. For reference tests this
-  includes the tier (ADR-0007), the expected order of accuracy and its source. `[tidy]`
+  includes the tier (ADR-0007), the expected order of accuracy and its source. `[tidy:test-goal]`
+  `[planned:tier-tag]`
 - **Every public item has a doc comment** (`missing_docs`). Doc comments put identifiers and
-  formulas in backticks (`doc_markdown`). `[clippy]`
+  formulas in backticks (`doc_markdown`). `[rustc:missing_docs]` `[clippy:pedantic]`
 - **Comments are sentences,** with a capital letter and a full stop, or a colon if something follows.
   End-of-line comments can be phrases. `[review]`
 - **Commit messages are descriptive and say why.** A PR description is not stored in git and does
@@ -464,7 +477,8 @@ finite-volume codes, and especially in agent-written ones.
   conserved ones, wave speeds) are recomputed or explicitly refreshed at a single point in the step.
   They are never cached in two places. `[review]`
 - **Pass small `Copy` states (`[f64; NVAR]`) by value and anything large by reference.** Clippy's
-  `large_types_passed_by_value` and `trivially_copy_pass_by_ref` enforce the thresholds. `[clippy]`
+  `large_types_passed_by_value` and `trivially_copy_pass_by_ref` enforce the thresholds.
+  `[clippy:pedantic]`
 - **Compute or check values close to where they are used.** A gap in time or space between the
   check and the use is where bugs live. For example, assert the CFL condition in the step that
   uses the time step, not three calls earlier. `[review]`
@@ -475,7 +489,7 @@ finite-volume codes, and especially in agent-written ones.
 ### Off-by-one errors
 
 - **Indices, counts and sizes are distinct types** (ADR-0002). An index plus one is a count, and a
-  count times a unit is a size. Encode the difference in the type, or at least in the name. `[tidy]`
+  count times a unit is a size. Encode the difference in the type, or at least in the name.
   `[review]`
 - **Interior and ghost ranges come from helpers, never from arithmetic in the caller.** Per
   dimension, a pencil has `GHOST_LAYERS + interior + GHOST_LAYERS` cells and `interior + 1`
@@ -489,14 +503,15 @@ finite-volume codes, and especially in agent-written ones.
 - **Run `cargo fmt`.** Indentation is 4 spaces, the rustfmt default. `[fmt]`
 - **Lines are at most 100 columns, without exception.** That is two copies of the code side by side
   on one screen. rustfmt cannot wrap long string literals or comments, so tidy checks the limit.
-  `[tidy]`
-- **Functions are at most 70 lines.** `[tidy]`
+  `[tidy:line-length]`
+- **Functions are at most 70 lines.** `[tidy:function-length]`
 
 ### Dependencies
 
 - **Runtime dependencies are `libm` and nothing else.** Dev and tooling crates are allow-listed, and
   anything new requires an ADR (ADR-0001). Every dependency is a supply-chain, safety and
-  performance risk, and for foundational code those costs compound. `[tidy]` `[deny]`
+  performance risk, and for foundational code those costs compound. `[tidy:runtime-dependency]`
+  `[deny]`
 
 ### Tooling
 

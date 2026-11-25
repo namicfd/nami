@@ -142,7 +142,8 @@ fn starts_with_path_separator(trees: &[TokenTree]) -> bool {
     matches!(trees, [first, second, ..] if is_punct(first, ':') && is_punct(second, ':'))
 }
 
-fn is_punct(tree: &TokenTree, character: char) -> bool {
+/// True if `tree` is the punctuation `character`.
+pub fn is_punct(tree: &TokenTree, character: char) -> bool {
     matches!(tree, TokenTree::Punct(punct) if punct.as_char() == character)
 }
 

@@ -5,14 +5,18 @@
 //! example (`xtask/fixtures/tidy/`). So a rule cannot be added without a description, and it
 //! cannot go silent without a test failing.
 //!
-//! There are three tables:
+//! There are three tables of rules:
 //!
 //! - [`RULES`]: rules written as code somewhere in `tidy`;
 //! - [`PATH_BANS`] and [`MACRO_BANS`]: declarative bans. A new ban is one row plus two fixtures,
 //!   with no other code.
 //!
+//! [`PLANNED`] lists the mechanisms that the documents promise and nobody has built. The style
+//! guide tags a rule `[planned:<id>]` instead of claiming a check that does not exist, and each
+//! entry has a task, so the backlog is visible and cannot be forgotten.
+//!
 //! The tables are plain Rust constants, so that adding a rule needs no parser and the compiler
-//! checks the rows.
+//! checks the rows. `docs/RULES.md` is generated from them (`cargo xtask rules --write`).
 
 use super::Scope;
 use std::path::Path;
@@ -73,6 +77,12 @@ pub const RULES: &[Rule] = &[
         "No `Default` derives or impls in nami crates: every field is spelled out.",
         "TIGER_STYLE.md, External events and control flow",
     ),
+    source(
+        "doc-tag",
+        "Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a \
+         lint that is switched on, or a planned mechanism that exists.",
+        "TIGER_STYLE.md, How rules are enforced",
+    ),
     workspace(
         "expect-budget",
         "The number of `expect(...)` lint suppressions, counted on tokens so that `cfg_attr` and \
@@ -108,6 +118,17 @@ pub const RULES: &[Rule] = &[
         "TIGER_STYLE.md, Floating point",
     ),
     source("parse", "Every Rust source file parses.", "ADR-0006"),
+    workspace(
+        "planned-task",
+        "Every planned mechanism has a task with the same id in a `tasks.json` under \
+         `docs/exec-plans/active/`.",
+        "ADR-0011",
+    ),
+    workspace(
+        "rules-doc",
+        "`docs/RULES.md` matches what `cargo xtask rules` generates from the registry.",
+        "ADR-0006",
+    ),
     source(
         "runtime-dependency",
         "Runtime and build dependencies of nami crates are `libm` and workspace crates only, \
@@ -211,10 +232,134 @@ pub const MACRO_BANS: &[MacroBan] = &[MacroBan {
               per-cell checks inside hot loops in `kernels` (ADR-0004)",
 }];
 
+/// A mechanism that the documents promise and nobody has built yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Planned {
+    /// Identifier used in `[planned:<id>]` tags and as the id of the task that will build it.
+    pub id: &'static str,
+    /// The intended mechanism: `tidy`, `dylint`, `test`, `ci`, `codeowners` or `docs`.
+    pub mechanism: &'static str,
+    /// One line that says what the mechanism will check.
+    pub description: &'static str,
+    /// Where the promise is written down: an ADR or a `TIGER_STYLE.md` section.
+    pub reference: &'static str,
+}
+
+const fn planned(
+    id: &'static str,
+    mechanism: &'static str,
+    description: &'static str,
+    reference: &'static str,
+) -> Planned {
+    Planned { id, mechanism, description, reference }
+}
+
+/// Mechanisms that are promised but not built. Keep the rows sorted by id. When one is built,
+/// delete its row, retag the style guide and move its task to `docs/exec-plans/completed/`.
+pub const PLANNED: &[Planned] = &[
+    planned(
+        "alloc-after-init",
+        "test",
+        "A counting-allocator test around the time loop proves that nothing allocates after init.",
+        "ADR-0003",
+    ),
+    planned(
+        "determinism-hash",
+        "ci",
+        "CI hashes the output of a canonical problem set and compares Linux, macOS and a \
+         same-seed rerun.",
+        "ADR-0005",
+    ),
+    planned(
+        "doc-example-sync",
+        "test",
+        "The code blocks in `docs/TIGER_STYLE.md` are compiled and linted, so the examples cannot \
+         drift from the rules.",
+        "ADR-0013",
+    ),
+    planned(
+        "float-eq-in-eq-fn",
+        "tidy",
+        "Flag `==` and `!=` between floats in functions whose name contains `eq`, which clippy's \
+         `float_cmp` skips.",
+        "ADR-0006",
+    ),
+    planned(
+        "float-reduction",
+        "dylint",
+        "Flag naive float reductions (`.sum::<f64>()`, a `fold` with `+`) and name `sum_fixed`.",
+        "ADR-0005",
+    ),
+    planned(
+        "floor-activation-count",
+        "test",
+        "A floor or limiter that is part of a scheme counts its activations, and a reference \
+         test fails on an unexpected count.",
+        "TIGER_STYLE.md, Physical admissibility",
+    ),
+    planned(
+        "glossary",
+        "docs",
+        "`docs/glossary.md` records the one meaning of each word that could be overloaded.",
+        "TIGER_STYLE.md, Naming",
+    ),
+    planned(
+        "recursion-cross-crate",
+        "dylint",
+        "Detect call cycles that cross crate boundaries; `nami_recursion` checks each crate on \
+         its own.",
+        "ADR-0006",
+    ),
+    planned(
+        "reference-suite",
+        "test",
+        "The reference crate holds the tiered tests: invariants, symmetry, convergence order, \
+         exact solutions and one reference per boundary-condition type.",
+        "ADR-0007",
+    ),
+    planned(
+        "tasks-schema",
+        "ci",
+        "CI validates every `tasks.json` against the schema and rejects a PR in which an agent \
+         sets `passes`.",
+        "ADR-0011",
+    ),
+    planned(
+        "thresholds-file",
+        "codeowners",
+        "`reference/thresholds.toml` is the one human-owned file that holds every test tolerance.",
+        "ADR-0007",
+    ),
+    planned(
+        "tier-tag",
+        "tidy",
+        "Every test under `tests/` carries its reference tier.",
+        "ADR-0007",
+    ),
+    planned(
+        "usize-alias",
+        "dylint",
+        "A type-aware `usize` rule, so that an alias such as `type Idx = usize;` or a local \
+         variable cannot get around the tidy rule.",
+        "ADR-0002",
+    ),
+];
+
+/// The tidy rules that compare the tree's documents with this binary's own registry. A tree
+/// from another revision, whose registry differs, fails them by construction, so they are
+/// skipped when tidy judges such a tree (`cargo xtask tidy --root <dir> --policy <dir>`).
+pub const REGISTRY_BOUND_RULES: [&str; 3] = ["doc-tag", "planned-task", "rules-doc"];
+
 /// True if `relative` is one of the `allowed` files or lies inside one of the directories.
 #[must_use]
 pub fn is_allowed(allowed: &[&str], relative: &Path) -> bool {
     allowed.iter().any(|prefix| relative.starts_with(prefix))
+}
+
+/// True if `id` is a planned mechanism.
+#[must_use]
+pub fn is_planned(id: &str) -> bool {
+    PLANNED.iter().any(|planned| planned.id == id)
 }
 
 /// True if some table in this registry defines the tidy rule `id`.
@@ -240,8 +385,8 @@ fn ban_ids() -> impl Iterator<Item = &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BanScope, MACRO_BANS, PATH_BANS, RULES, RuleKind};
-    use super::{is_allowed, is_registered, rule_ids, rule_ids_of};
+    use super::{BanScope, MACRO_BANS, PATH_BANS, PLANNED, REGISTRY_BOUND_RULES, RULES, RuleKind};
+    use super::{is_allowed, is_planned, is_registered, rule_ids, rule_ids_of};
     use crate::tidy::Scope;
     use std::path::Path;
 
@@ -302,6 +447,36 @@ mod tests {
             assert!(ban.message.contains("; "), "message of `{}` must name the fix", ban.id);
             assert!(ban.message.ends_with(')'), "message of `{}` must cite its reason", ban.id);
         }
+    }
+
+    // Goal: planned mechanisms are sorted, complete, and distinct from the rules that exist: a
+    // mechanism is either planned or built, never both.
+    #[test]
+    fn planned_rows_are_complete() {
+        let ids: Vec<&str> = PLANNED.iter().map(|planned| planned.id).collect();
+        assert!(is_sorted_and_unique(&ids), "PLANNED must be sorted by id, without duplicates");
+        for planned in PLANNED {
+            assert!(is_dashed(planned.id), "id `{}` must be lowercase-dashed", planned.id);
+            assert!(!is_registered(planned.id), "`{}` is both planned and built", planned.id);
+            assert!(is_planned(planned.id), "`{}` is found by its id", planned.id);
+            assert!(is_dashed(planned.mechanism), "mechanism of `{}` is one word", planned.id);
+            assert!(planned.description.ends_with('.'), "`{}` needs a sentence", planned.id);
+            let cites = ["ADR-", "TIGER_STYLE.md, "]
+                .iter()
+                .any(|prefix| planned.reference.starts_with(prefix));
+            assert!(cites, "reference of `{}` must be an ADR or a section", planned.id);
+        }
+        assert!(!is_planned("line-length"), "a built rule is not planned");
+        assert!(!is_planned(""), "the empty id is not planned");
+    }
+
+    // Goal: the rules skipped by a foreign gate exist, so the list cannot go stale silently.
+    #[test]
+    fn registry_bound_rules_are_registered() {
+        for id in REGISTRY_BOUND_RULES {
+            assert!(is_registered(id), "`{id}` must be a registered rule");
+        }
+        assert!(REGISTRY_BOUND_RULES.is_sorted(), "keep the list sorted");
     }
 
     // Goal: lookups see exactly the registered ids, and bans count as source rules.

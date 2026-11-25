@@ -1,0 +1,20 @@
+<!-- path: docs/TIGER_STYLE.md -->
+# A style guide whose tags name what exists
+
+The legend above the first section describes the forms with placeholders, such as
+`[tidy:<rule-id>]`, and is not checked.
+
+## Rules
+
+- A tidy rule and a ban. `[tidy:line-length]` `[tidy:direct-libm]`
+- A clippy lint that is switched on, and a lint of the pedantic group. `[clippy:unwrap_used]`
+  `[clippy:pedantic]`
+- A rustc lint that is switched on. `[rustc:missing_docs]`
+- A dylint lint that is declared. `[dylint:nami_recursion]`
+- A mechanism that is planned, next to judgement. `[planned:glossary]` `[review]`
+- The plain mechanisms. `[compiler]` `[fmt]` `[deny]`
+- Code in backticks is not a tag: `[f64; NVAR]` states and `field[CellIndex]` gathers.
+
+```rust
+// A `[tidy]` inside a code block is not a tag either.
+```

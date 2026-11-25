@@ -4,9 +4,9 @@
 //! rule has a row in [`registry`], and a firing and a passing example in `xtask/fixtures/tidy/`:
 //!
 //! - source rules are decided from one file ([`check_single_file`]): Rust sources, manifests,
-//!   ADRs and learnings;
-//! - workspace rules need the whole tree ([`check`]): the `#[expect]` budget and the assertion
-//!   density of each crate.
+//!   ADRs, learnings and the style guide;
+//! - workspace rules need the whole tree ([`check`]): the `#[expect]` budget, the assertion
+//!   density of each crate, and the documents generated from the registry.
 //!
 //! Most new guardrails are a ban: one row in [`registry::PATH_BANS`] or
 //! [`registry::MACRO_BANS`] plus two fixtures.
@@ -14,14 +14,18 @@
 //! Every violation reads `path:line: error[rule]: what; fix (reference)`, so the message tells
 //! the reader how to fix it.
 
+pub mod cli;
 mod docs;
 #[cfg(test)]
 mod fixtures;
+mod lints;
 mod manifest;
 pub mod registry;
+mod rules_doc;
 mod rust_source;
 #[cfg(test)]
 mod scratch;
+mod style_guide;
 mod text;
 mod tokens;
 mod workspace;
@@ -127,6 +131,8 @@ enum FileKind {
     Adr,
     /// A file in `docs/learnings/`, other than its `README.md`.
     Learning,
+    /// `docs/TIGER_STYLE.md`.
+    StyleGuide,
     /// `*.snap.new`: an insta snapshot that nobody reviewed.
     SnapshotDraft,
     /// Anything else: no rule applies.
@@ -150,6 +156,8 @@ impl FileKind {
         } else if directory == Path::new(docs::LEARNING_DIRECTORY) && name != docs::LEARNING_README
         {
             Self::Learning
+        } else if relative == Path::new(style_guide::STYLE_GUIDE) {
+            Self::StyleGuide
         } else {
             Self::Other
         }
@@ -174,13 +182,42 @@ struct FileReport {
 ///
 /// Returns an error if a directory or file cannot be read.
 pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
+    check_tree(root, None)
+}
+
+/// Checks the tree at `root` as a foreign gate: this binary judges another revision's tree. CI
+/// runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by
+/// weakening its own gate.
+///
+/// Two things differ from [`check`]:
+///
+/// - the `#[expect]` budget is read from `policy_root`, not from the tree;
+/// - the rules in [`registry::REGISTRY_BOUND_RULES`] are skipped. They compare the tree's
+///   documents with this binary's own registry, and a tree whose registry differs fails them by
+///   construction, which would make every guardrail change look like a loosening.
+///
+/// Every other rule runs as usual.
+///
+/// # Errors
+///
+/// Returns an error if a directory or file cannot be read.
+pub fn check_with_policy(root: &Path, policy_root: &Path) -> io::Result<Vec<Violation>> {
+    assert!(policy_root.is_dir(), "tidy policy root must be a directory");
+    check_tree(root, Some(policy_root))
+}
+
+fn check_tree(root: &Path, policy_root: Option<&Path>) -> io::Result<Vec<Violation>> {
     assert!(root.is_dir(), "tidy root must be a directory");
+    let is_foreign = policy_root.is_some();
     let mut violations = Vec::new();
     let mut tally = workspace::Tally::new();
-    let mut paths = source_files(root)?;
+    let mut paths = files_below(root, Path::new(""))?;
     paths.extend(document_files(root)?);
     for relative in &paths {
         let kind = FileKind::of(relative);
+        if is_foreign && kind == FileKind::StyleGuide {
+            continue;
+        }
         let text = if kind.reads_text() {
             fs::read_to_string(root.join(relative))?
         } else {
@@ -191,7 +228,17 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
         tally.add(relative, report.expect_count, report.stats);
     }
     violations.extend(workspace::density_violations(&tally.stats_by_crate));
-    violations.extend(workspace::check_expect_budget(root, tally.expect_count)?);
+    let budget_root = policy_root.unwrap_or(root);
+    violations.extend(workspace::check_expect_budget(budget_root, tally.expect_count)?);
+    if !is_foreign {
+        violations.extend(rules_doc::check(root)?);
+        violations.extend(rules_doc::check_planned_tasks(root)?);
+    }
+    let is_registry_bound = |rule: &str| registry::REGISTRY_BOUND_RULES.contains(&rule);
+    assert!(
+        !is_foreign || !violations.iter().any(|violation| is_registry_bound(violation.rule)),
+        "a foreign gate skips the rules that are bound to the registry"
+    );
     violations.sort_by(|a, b| (&a.path, a.line, a.rule).cmp(&(&b.path, b.line, b.rule)));
     Ok(violations)
 }
@@ -199,9 +246,10 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
 /// Runs every source rule on one file: every rule that can be decided from that file alone.
 ///
 /// `relative` is the file's path below `root` and decides which rules apply: a Rust source, a
-/// crate or workspace manifest, an ADR or a learning. Any other file has no rules and yields
-/// nothing. `text` is the file's content, which need not be on disk yet. Context that a rule
-/// needs, such as the ADR index or the names of the workspace crates, is read from `root`.
+/// crate or workspace manifest, an ADR, a learning or the style guide. Any other file has no
+/// rules and yields nothing. `text` is the file's content, which need not be on disk yet.
+/// Context that a rule needs, such as the ADR index, the names of the workspace crates or the
+/// lint tables, is read from `root`.
 ///
 /// # Errors
 ///
@@ -230,6 +278,10 @@ fn check_file(root: &Path, relative: &Path, text: &str) -> io::Result<FileReport
             report.violations = docs::check_adr(relative, text, &docs::adr_index(root)?);
         }
         FileKind::Learning => report.violations = docs::check_learning(relative, text),
+        FileKind::StyleGuide => {
+            let mechanisms = style_guide::Mechanisms::load(root)?;
+            report.violations = style_guide::check(relative, text, &mechanisms);
+        }
         FileKind::SnapshotDraft => {
             report.violations.push(workspace::snapshot_draft_violation(relative));
         }
@@ -255,14 +307,16 @@ fn document_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     if root.join(docs::LEARNING_DIRECTORY).is_dir() {
         paths.extend(docs::entries_of(root, docs::LEARNING_DIRECTORY)?);
     }
+    paths.push(PathBuf::from(style_guide::STYLE_GUIDE));
     paths.retain(|relative| root.join(relative).is_file());
     Ok(paths)
 }
 
-/// Lists every file below `root` as a path relative to it, in sorted order. Skips build output,
-/// documents, tidy's fixtures and nested checkouts (git worktrees such as `.claude/worktrees/*`).
-fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut pending = vec![root.to_path_buf()];
+/// Lists every file below the directory `start` of `root` as a path relative to `root`, in
+/// sorted order. Skips build output, documents, tidy's fixtures and nested checkouts (git
+/// worktrees such as `.claude/worktrees/*`).
+fn files_below(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut pending = vec![root.join(start)];
     let mut found = Vec::new();
     for _ in 0..DIRECTORIES_MAX {
         let Some(directory) = pending.pop() else {
@@ -293,7 +347,8 @@ fn is_skipped(root: &Path, relative: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::scratch::Scratch;
-    use super::{FileKind, Scope, check, check_single_file, registry};
+    use super::{FileKind, Scope, check, check_single_file, check_with_policy, registry};
+    use super::{rules_doc, style_guide};
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -319,6 +374,7 @@ mod tests {
         scratch.write("docs/learnings/README.md", "How to write a learning.\n");
         scratch.write("docs/learnings/notes.md", "- Status: Open\n## What happened\n");
         scratch.write("docs/learnings/archive/old.md", "A directory is not a learning.\n");
+        scratch.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy:no-such-rule]`\n");
         scratch.write("target/ignored/skipped.rs", "fn a() { loop {} }");
         scratch.write("xtask/fixtures/tidy/skipped.rs", "fn a() { loop {} }");
         scratch.write(".claude/worktrees/other/.git", "gitdir: elsewhere\n");
@@ -333,12 +389,15 @@ mod tests {
         let scratch = broken_workspace("walk");
         let violations = check(scratch.root()).unwrap();
         let rules: Vec<&str> = violations.iter().map(|violation| violation.rule).collect();
+        let planned_tasks = vec!["planned-task"; registry::PLANNED.len()];
         assert_eq!(
             rules,
             ["runtime-dependency", "assertion-density", "runtime-dependency"]
                 .into_iter()
-                .chain(["snapshot-draft", "unasserted-function", "adr-index"])
+                .chain(["snapshot-draft", "unasserted-function", "rules-doc", "doc-tag"])
+                .chain(["adr-index"])
                 .chain(["adr-section"; 6])
+                .chain(planned_tasks)
                 .chain(["learning-format"; 2])
                 .chain(["expect-budget"])
                 .collect::<Vec<_>>()
@@ -365,6 +424,67 @@ mod tests {
         assert_eq!(fired, registered, "workspace rules that fired, against those registered");
     }
 
+    /// A tree on which every rule passes: one planned task per planned mechanism, a style guide
+    /// with a valid tag, the generated rules document, and a budget of zero suppressions.
+    fn clean_workspace(name: &str) -> Scratch {
+        let scratch = Scratch::new(name);
+        scratch.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        scratch.write("crates/demo/src/lib.rs", "//! A crate without violations.\n");
+        scratch.write("xtask/expect-budget.txt", "0\n");
+        scratch.write("docs/design/README.md", "No decisions yet.\n");
+        scratch.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[review]`\n");
+        let tasks: Vec<String> =
+            registry::PLANNED.iter().map(|planned| format!("\"id\": \"{}\"", planned.id)).collect();
+        scratch.write("docs/exec-plans/active/all/tasks.json", &tasks.join("\n"));
+        scratch.write(rules_doc::RULES_DOC, &rules_doc::render(scratch.root()).unwrap());
+        scratch
+    }
+
+    fn fired(violations: &[super::Violation]) -> BTreeSet<&'static str> {
+        violations.iter().map(|violation| violation.rule).collect()
+    }
+
+    // Goal: a foreign gate skips exactly the rules that are bound to the registry. A tree with a
+    // stale `docs/RULES.md`, a tag for a rule that this binary does not know and no tasks fails
+    // those three rules on its own, and passes when it is judged against a policy directory.
+    #[test]
+    fn foreign_gate_skips_the_registry_bound_rules() {
+        let tree = clean_workspace("foreign-tree");
+        let policy = Scratch::new("foreign-policy");
+        policy.write("xtask/expect-budget.txt", "0\n");
+        assert_eq!(check(tree.root()).unwrap(), Vec::new(), "the tree starts clean");
+        tree.write(rules_doc::RULES_DOC, "# Rules of another revision\n");
+        tree.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy:rule-of-the-future]`\n");
+        std::fs::remove_file(tree.root().join("docs/exec-plans/active/all/tasks.json")).unwrap();
+        let own = check(tree.root()).unwrap();
+        assert_eq!(fired(&own), BTreeSet::from(registry::REGISTRY_BOUND_RULES));
+        let foreign = check_with_policy(tree.root(), policy.root()).unwrap();
+        assert_eq!(foreign, Vec::new(), "a foreign gate does not judge another registry");
+    }
+
+    // Goal: a foreign gate still runs every other rule, and reads the `#[expect]` budget from the
+    // policy directory, not from the tree it judges.
+    #[test]
+    fn foreign_gate_runs_the_other_rules_with_the_policy_budget() {
+        let tree = clean_workspace("policy-tree");
+        let policy = Scratch::new("policy-budget");
+        policy.write("xtask/expect-budget.txt", "0\n");
+        tree.write("xtask/expect-budget.txt", "7\n");
+        let foreign = check_with_policy(tree.root(), policy.root()).unwrap();
+        assert_eq!(foreign, Vec::new(), "the tree cannot raise its own budget");
+        assert_eq!(fired(&check(tree.root()).unwrap()), BTreeSet::from(["expect-budget"]));
+        policy.write("xtask/expect-budget.txt", "1\n");
+        let over = check_with_policy(tree.root(), policy.root()).unwrap();
+        assert_eq!(fired(&over), BTreeSet::from(["expect-budget"]), "the policy's budget counts");
+        policy.write("xtask/expect-budget.txt", "0\n");
+        tree.write("crates/demo/src/lib.rs", "fn a() { loop {} }\n");
+        tree.write("crates/demo/Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        tree.write("docs/design/0001-x.md", "- Status: Accepted\n");
+        let broken = check_with_policy(tree.root(), policy.root()).unwrap();
+        let expected = ["adr-index", "adr-section", "runtime-dependency", "unbounded-loop"];
+        assert_eq!(fired(&broken), BTreeSet::from(expected), "source rules still run");
+    }
+
     // Goal: the single-file entry point reports what the whole-tree check reports for that
     // file, and nothing for files without rules.
     #[test]
@@ -385,6 +505,11 @@ mod tests {
         );
         assert_eq!(rules("docs/learnings/notes.md", "- Status: Open\n").len(), 3);
         assert_eq!(rules("docs/learnings/README.md", ""), Vec::<&str>::new());
+        assert_eq!(
+            rules(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy]`\n"),
+            ["doc-tag"]
+        );
+        assert_eq!(rules("docs/RULES.md", "stale"), Vec::<&str>::new(), "a workspace rule");
         assert_eq!(rules("README.md", "loop {}"), Vec::<&str>::new());
     }
 
@@ -438,6 +563,8 @@ mod tests {
         assert_eq!(kind("docs/learnings/notes.txt"), FileKind::Learning);
         assert_eq!(kind("docs/learnings/README.md"), FileKind::Other);
         assert_eq!(kind("docs/learnings/archive/2026-11-25-a.md"), FileKind::Other);
+        assert_eq!(kind("docs/TIGER_STYLE.md"), FileKind::StyleGuide);
+        assert_eq!(kind("TIGER_STYLE.md"), FileKind::Other);
         assert_eq!(kind("crates/a/tests/snapshots/a.snap.new"), FileKind::SnapshotDraft);
         assert_eq!(kind("crates/a/tests/snapshots/a.snap"), FileKind::Other);
         assert!(FileKind::RustSource.reads_text(), "source rules read the text");

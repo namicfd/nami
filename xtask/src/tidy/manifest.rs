@@ -19,6 +19,10 @@ const RUNTIME_TABLES: [&str; 2] = ["dependencies", "build-dependencies"];
 /// The key that makes a dependency resolve to a crate other than the one its name says.
 const RENAME_KEY: &str = "package";
 
+/// Lint levels that fail the gate. A warning counts, because `just` and CI deny warnings
+/// (ADR-0006).
+const ENFORCED_LEVELS: [&str; 3] = ["warn", "deny", "forbid"];
+
 /// What a `[header]` says about the lines that follow it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Section {
@@ -101,6 +105,52 @@ pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
         }
     }
     violations
+}
+
+/// The lints that the table `[<table>]` of a manifest switches on: those set to `warn`, `deny`
+/// or `forbid`, as a plain string or as `{ level = "..." }`. A lint set to `allow` is not listed.
+pub fn enforced_lints(manifest: &str, table: &[&str]) -> Vec<String> {
+    let mut lints = Vec::new();
+    let mut in_table = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_table = header_segments(line) == table;
+        } else if in_table
+            && !line.starts_with('#')
+            && let Some((key, value)) = line.split_once('=')
+        {
+            let segments = key_segments(key);
+            let level = match segments.get(1).map(String::as_str) {
+                None => lint_level(value),
+                Some("level") => quoted(value),
+                Some(_) => None,
+            };
+            if let Some(name) = segments.first()
+                && level.is_some_and(|level| ENFORCED_LEVELS.contains(&level))
+            {
+                lints.push(name.clone());
+            }
+        }
+    }
+    lints
+}
+
+/// The level in the value of a lint: `"deny"` or `{ level = "deny", priority = -1 }`.
+fn lint_level(value: &str) -> Option<&str> {
+    if !value.trim_start().starts_with('{') {
+        return quoted(value);
+    }
+    let mut settings = value.split(['{', ',', '}']).filter_map(|piece| piece.split_once('='));
+    settings.find(|(key, _)| key.trim() == "level").and_then(|(_, level)| quoted(level))
+}
+
+/// The content of the double-quoted string that `value` starts with.
+fn quoted(value: &str) -> Option<&str> {
+    let mut parts = value.split('"');
+    let before = parts.next()?;
+    let content = parts.next()?;
+    let _after = parts.next()?;
+    before.trim().is_empty().then_some(content)
 }
 
 /// Reports what is wrong with one `name = ...` line of a dependency table.
@@ -208,7 +258,7 @@ fn inline_table_keys(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{Section, check_manifest, check_workspace_manifest, workspace_crates};
-    use super::{header_segments, inline_table_keys, key_segments, section_of};
+    use super::{enforced_lints, header_segments, inline_table_keys, key_segments, section_of};
     use std::path::Path;
 
     /// No line is reported.
@@ -329,6 +379,24 @@ mod tests {
         assert_eq!(section_of("[package]", &tables), Section::Other);
         assert_eq!(inline_table_keys(" { a = 1, b.c = 2, \"d\" = 3 }"), ["a", "b", "d"]);
         assert_eq!(inline_table_keys(" \"1\""), Vec::<String>::new());
+    }
+
+    // Goal: a lint counts as switched on when its level is warn, deny or forbid, in the plain,
+    // inline-table and dotted forms. `allow`, other tables and comments do not count.
+    #[test]
+    fn enforced_lints_are_read_from_one_table() {
+        let manifest = "[workspace.lints.rust]\nunsafe_code = \"deny\"\n\n\
+                        [workspace.lints.clippy]\n# a_comment = \"deny\"\n\
+                        pedantic = { level = \"warn\", priority = -1 }\n\
+                        unwrap_used = \"deny\" # no unwrap\nfloat_cmp = \"forbid\"\n\
+                        similar_names = \"allow\"\nquiet = { level = \"allow\" }\n\
+                        dotted.level = \"warn\"\ndotted.priority = 1\nbare = deny\n\
+                        unlevelled = { priority = \"warn\" }\n\n[lints]\nworkspace = true\n";
+        let clippy = enforced_lints(manifest, &["workspace", "lints", "clippy"]);
+        assert_eq!(clippy, ["pedantic", "unwrap_used", "float_cmp", "dotted"]);
+        assert_eq!(enforced_lints(manifest, &["workspace", "lints", "rust"]), ["unsafe_code"]);
+        assert_eq!(enforced_lints(manifest, &["workspace", "lints"]), Vec::<String>::new());
+        assert_eq!(enforced_lints(manifest, &["lints"]), Vec::<String>::new());
     }
 
     // Goal: the workspace crates are the directory names under `crates/`, in sorted order.
