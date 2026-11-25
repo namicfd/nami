@@ -113,9 +113,11 @@ pub fn list(root: &Path, tip: Option<&str>) -> Result<Vec<Claim>, ClaimError> {
     Ok(claims)
 }
 
-/// Claims `task` for `holder`, retrying while other claims land first. `identity` is extra
-/// environment for the claim commit, such as `GIT_COMMITTER_DATE`; the CLI passes none and
-/// inherits its own.
+/// Claims `task` for `holder`, retrying while other claims land first.
+///
+/// `commit_environment` is set only for the `git commit-tree` that builds the claim commit:
+/// its author, committer and dates (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`). The CLI passes none, so
+/// the commit takes them from the process; tests pin them to make two claims look alike.
 ///
 /// # Errors
 ///
@@ -123,16 +125,16 @@ pub fn list(root: &Path, tip: Option<&str>) -> Result<Vec<Claim>, ClaimError> {
 pub fn claim(
     root: &Path,
     remote: &str,
-    identity: &[(&str, &str)],
+    commit_environment: &[(&str, &str)],
     task: &str,
     holder: &str,
 ) -> Result<(), ClaimError> {
     assert!(!task.is_empty() && !task.contains('/'), "task ids are single path components");
     assert!(!holder.trim().is_empty(), "a claim names its holder");
-    update(root, remote, identity, task, Some(holder))
+    update(root, remote, commit_environment, task, Some(holder))
 }
 
-/// Releases the claim on `task`. `identity` is as for [`claim`].
+/// Releases the claim on `task`. `commit_environment` is as for [`claim`].
 ///
 /// # Errors
 ///
@@ -140,18 +142,18 @@ pub fn claim(
 pub fn release(
     root: &Path,
     remote: &str,
-    identity: &[(&str, &str)],
+    commit_environment: &[(&str, &str)],
     task: &str,
 ) -> Result<(), ClaimError> {
     assert!(!task.is_empty() && !task.contains('/'), "task ids are single path components");
-    update(root, remote, identity, task, None)
+    update(root, remote, commit_environment, task, None)
 }
 
 /// Adds (`Some(holder)`) or removes (`None`) the claim file and pushes the result.
 fn update(
     root: &Path,
     remote: &str,
-    identity: &[(&str, &str)],
+    commit_environment: &[(&str, &str)],
     task: &str,
     holder: Option<&str>,
 ) -> Result<(), ClaimError> {
@@ -165,7 +167,7 @@ fn update(
             (None, None) => return Err(ClaimError::NotClaimed),
             (Some(_), None) | (None, Some(_)) => {}
         }
-        let commit = commit_change(root, identity, tip.as_deref(), task, holder)?;
+        let commit = commit_change(root, commit_environment, tip.as_deref(), task, holder)?;
         match push(root, remote, &commit, tip.as_deref())? {
             Pushed::Landed => return Ok(()),
             // Another claim landed first: refetch and try again.
@@ -180,57 +182,109 @@ fn update(
 /// What a push of a claim commit did.
 #[derive(Debug, PartialEq, Eq)]
 enum Pushed {
-    /// The branch moved to our commit: we won.
+    /// The remote's branch holds our commit: we won.
     Landed,
-    /// The branch had moved, or already held this commit: git's summary of why.
+    /// Another claim landed first: git's summary of why ours did not.
     Lost(String),
 }
 
+/// What `git push --porcelain` reported for our refspec, read only when the remote does not hold
+/// our commit.
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    /// The branch moved under us (non-fast-forward, stale lease, fetch first), or already held
+    /// this commit: retrying can win.
+    Lost(String),
+    /// The remote rejected the update itself: a hook, branch protection or permissions, or a
+    /// racing update that took its ref lock first.
+    RemoteRejected(String),
+    /// Nothing that explains why our commit is missing.
+    Unclear,
+}
+
 /// Pushes `commit` to the claims branch if the branch is still at `tip` (`None`: if it does not
-/// exist yet). Any failure that retrying cannot fix (no network, no permission) is an error.
+/// exist yet). Whether it landed is decided by what the remote holds afterwards, not by git's
+/// exit code: a push can land and still fail, when the remote dies after updating the branch.
+/// Any failure that retrying cannot fix is an error.
 fn push(root: &Path, remote: &str, commit: &str, tip: Option<&str>) -> Result<Pushed, ClaimError> {
-    // An empty expected value means "the branch must not exist yet".
+    // Defence in depth: git already rejects a push that is not a fast-forward. The lease names
+    // the tip the commit was built on (empty: the branch must not exist yet), and the check
+    // below decides the win.
     let lease = format!("--force-with-lease=refs/heads/{BRANCH}:{}", tip.unwrap_or_default());
     let refspec = format!("{commit}:refs/heads/{BRANCH}");
     let mut command = Command::new("git");
-    let _ = command.args(["push", "--porcelain", &lease, remote, &refspec]).current_dir(root);
-    let output = run(command, None).map_err(|error| ClaimError::Git(error.to_string()))?;
-    let porcelain = String::from_utf8_lossy(&output.stdout);
-    let pushed = push_outcome(&porcelain, &refspec);
-    assert!(
-        output.status.success() || pushed != Some(Pushed::Landed),
-        "git push exits 0 when its only ref landed"
-    );
-    pushed.ok_or_else(|| {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        ClaimError::Git(format!("git push {remote} {refspec}: {}", stderr.trim()))
-    })
+    let _ = command.args(["push", "--porcelain", &lease, remote, &refspec]);
+    let _ = command.current_dir(root).stdin(Stdio::null());
+    let output = run(command, None)
+        .map_err(|error| ClaimError::Git(format!("cannot run git push {remote}: {error}")))?;
+    let now = fetch(root, remote)?;
+    if let Some(now) = now.as_deref()
+        && is_ancestor(root, commit, now)?
+    {
+        return Ok(Pushed::Landed);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match push_report(&String::from_utf8_lossy(&output.stdout), &refspec) {
+        Report::Lost(summary) => Ok(Pushed::Lost(summary)),
+        // The remote also rejects an update that lost the race for its ref lock ("reference
+        // already exists", "cannot lock ref"). If the branch moved, that is what happened.
+        Report::RemoteRejected(summary) if now.as_deref() != tip => Ok(Pushed::Lost(summary)),
+        Report::RemoteRejected(summary) => Err(ClaimError::Git(format!(
+            "{remote} refused the claim push, and retrying will not help: {summary}; check the \
+             remote's hooks, branch protection and permissions: {}",
+            stderr.trim()
+        ))),
+        Report::Unclear => Err(ClaimError::Git(format!(
+            "git push {remote} {refspec} did not land: {}",
+            stderr.trim()
+        ))),
+    }
 }
 
-/// Reads what `git push --porcelain` did with `refspec`: the line is
-/// `<flag> TAB <refspec> TAB <summary>`. `None` if it did not report `refspec`, or reported
-/// something a claim push cannot do.
-fn push_outcome(porcelain: &str, refspec: &str) -> Option<Pushed> {
+/// Whether the remote's claims branch, fetched at `tip`, is `commit` or has it as an ancestor.
+/// The nonce makes `commit` unique, so if the branch holds it, it was our push.
+fn is_ancestor(root: &Path, commit: &str, tip: &str) -> Result<bool, ClaimError> {
+    assert!(!commit.is_empty() && !tip.is_empty(), "both commits are named");
+    let mut command = Command::new("git");
+    let _ = command.args(["merge-base", "--is-ancestor", commit, tip]);
+    let _ = command.current_dir(root).stdin(Stdio::null());
+    let output = run(command, None)
+        .map_err(|error| ClaimError::Git(format!("cannot run git merge-base: {error}")))?;
+    // Exit 0: an ancestor; exit 1: not one; anything else: git failed.
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(ClaimError::Git(format!(
+            "git merge-base --is-ancestor {commit} {tip}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// Reads what `git push --porcelain` said about `refspec`: the line is
+/// `<flag> TAB <refspec> TAB <summary>`.
+fn push_report(porcelain: &str, refspec: &str) -> Report {
     assert!(refspec.contains(':'), "a refspec names its source and destination");
-    let (flag, summary) = porcelain.lines().find_map(|line| {
+    let line = porcelain.lines().find_map(|line| {
         let mut fields = line.split('\t');
         let (flag, reference, summary) = (fields.next()?, fields.next()?, fields.next()?);
         (reference == refspec).then_some((flag, summary))
-    })?;
-    match flag {
-        // A fast-forward, or the branch's first commit.
-        " " | "*" => Some(Pushed::Landed),
-        // Rejected: the branch moved. Up to date: someone pushed this very commit first, so it
-        // is theirs, not ours. Either way, refetch.
-        "!" | "=" => Some(Pushed::Lost(summary.to_owned())),
-        _ => None,
+    });
+    match line {
+        Some(("!", summary)) if summary.starts_with("[remote rejected]") => {
+            Report::RemoteRejected(summary.to_owned())
+        }
+        // Rejected: the branch moved. Up to date: the branch already held this commit, which
+        // the nonce makes impossible unless the remote misreports; refetch either way.
+        Some(("!" | "=", summary)) => Report::Lost(summary.to_owned()),
+        Some(_) | None => Report::Unclear,
     }
 }
 
 /// Builds a commit on `tip` with the claim file added or removed, using a private index.
 fn commit_change(
     root: &Path,
-    identity: &[(&str, &str)],
+    commit_environment: &[(&str, &str)],
     tip: Option<&str>,
     task: &str,
     holder: Option<&str>,
@@ -238,7 +292,7 @@ fn commit_change(
     let index = private_index(root, task)?;
     let index_text = index.to_string_lossy().into_owned();
     let environment = [("GIT_INDEX_FILE", index_text.as_str())];
-    let result = build_commit(root, &environment, identity, tip, task, holder);
+    let result = build_commit(root, &environment, commit_environment, tip, task, holder);
     let removed = std::fs::remove_file(&index);
     // A failed build reports its own error; it may have failed before the index existed.
     let commit = result?;
@@ -250,7 +304,7 @@ fn commit_change(
 fn build_commit(
     root: &Path,
     environment: &[(&str, &str)],
-    identity: &[(&str, &str)],
+    commit_environment: &[(&str, &str)],
     tip: Option<&str>,
     task: &str,
     holder: Option<&str>,
@@ -274,7 +328,7 @@ fn build_commit(
     if let Some(tip) = tip {
         arguments.extend(["-p", tip]);
     }
-    let commit = git(root, &arguments, identity, None)?;
+    let commit = git(root, &arguments, commit_environment, None)?;
     assert!(!commit.trim().is_empty(), "commit-tree prints the new commit");
     Ok(commit.trim().to_owned())
 }
@@ -330,7 +384,7 @@ fn run(mut command: Command, stdin: Option<&str>) -> std::io::Result<Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimError, Pushed, commit_change, git, push_outcome};
+    use super::{ClaimError, Report, commit_change, git, push_report};
 
     /// The bot's identity and a fixed clock: what makes two claims look the same (#32).
     const BOT: &[(&str, &str)] = &[
@@ -369,23 +423,27 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
-    // Goal: a push wins only if git moved the branch to our commit; "up to date" means someone
-    // else pushed it, and anything unexpected is an error rather than a win. Method: porcelain
-    // output as git 2.53 prints it.
+    // Goal: when the remote does not hold our commit, the push report decides between retrying
+    // (the branch moved, or already held the commit) and an error: the remote refused the
+    // update, or nothing explains it. Method: porcelain output as git 2.53 prints it.
     #[test]
-    fn push_outcomes() {
+    fn push_reports() {
         let refspec = "abc:refs/heads/claims";
         let line =
             |flag: &str, summary: &str| format!("To r.git\n{flag}\t{refspec}\t{summary}\nDone\n");
-        assert_eq!(push_outcome(&line("*", "[new branch]"), refspec), Some(Pushed::Landed));
-        assert_eq!(push_outcome(&line(" ", "1..2"), refspec), Some(Pushed::Landed));
-        let stale = "[rejected] (stale info)";
-        assert_eq!(push_outcome(&line("!", stale), refspec), Some(Pushed::Lost(stale.to_owned())));
-        let same = "[up to date]";
-        assert_eq!(push_outcome(&line("=", same), refspec), Some(Pushed::Lost(same.to_owned())));
-        assert_eq!(push_outcome(&line("+", "1...2 (forced update)"), refspec), None);
-        assert_eq!(push_outcome(&line("*", "[new branch]"), "def:refs/heads/claims"), None);
-        assert_eq!(push_outcome("fatal: no remote\n", refspec), None);
+        let lost = |summary: &str| Report::Lost(summary.to_owned());
+        for summary in ["[rejected] (stale info)", "[rejected] (fetch first)"] {
+            assert_eq!(push_report(&line("!", summary), refspec), lost(summary), "{summary}");
+        }
+        assert_eq!(push_report(&line("=", "[up to date]"), refspec), lost("[up to date]"));
+        let declined = "[remote rejected] (pre-receive hook declined)";
+        let refused = Report::RemoteRejected(declined.to_owned());
+        assert_eq!(push_report(&line("!", declined), refspec), refused);
+        assert_eq!(push_report(&line("*", "[new branch]"), refspec), Report::Unclear);
+        assert_eq!(push_report(&line("+", "1...2 (forced update)"), refspec), Report::Unclear);
+        let other = "def:refs/heads/claims";
+        assert_eq!(push_report(&line("!", "[rejected]"), other), Report::Unclear);
+        assert_eq!(push_report("", refspec), Report::Unclear, "a push that died prints nothing");
     }
 
     // Goal: claim errors read as the CLI prints them.

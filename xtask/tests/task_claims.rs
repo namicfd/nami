@@ -129,3 +129,74 @@ fn claims_built_on_one_tip_have_one_winner() {
     assert_eq!(claimed(first), ["t1=agent: bot"], "the first claim stands");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
+
+/// Installs `script` as the remote's hook `name`.
+fn install_hook(root: &Path, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("remote.git/hooks").join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("the hook is written");
+    let executable = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(&path, executable).expect("the hook is executable");
+    assert!(path.is_file(), "the hook exists");
+}
+
+// Goal: a claim the remote accepted is held, even when git push then fails (exit 1, `*` in its
+// output): the remote's tip decides, not the exit code. Method: a post-receive hook kills
+// receive-pack after the branch moved.
+#[test]
+fn a_landed_claim_holds_when_the_push_dies_after_receiving() {
+    let (root, clones) = setup("post-receive", 1);
+    install_hook(&root, "post-receive", "kill -9 $PPID");
+    claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot").expect("the claim landed");
+    assert_eq!(claimed(&clones[0]), ["t1=agent: bot"], "the remote holds the claim");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: as above, when git push prints nothing at all and exits 128. Method: a
+// reference-transaction hook kills receive-pack once the ref update is committed.
+#[test]
+fn a_landed_claim_holds_when_the_push_dies_silently() {
+    let (root, clones) = setup("reference-transaction", 1);
+    install_hook(
+        &root,
+        "reference-transaction",
+        r#"if [ "$1" = committed ]; then kill -9 $PPID; fi"#,
+    );
+    claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot").expect("the claim landed");
+    assert_eq!(claimed(&clones[0]), ["t1=agent: bot"], "the remote holds the claim");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a remote that refuses the push (a hook, branch protection, permissions) is an error
+// that says so, after one attempt: retrying cannot help. Method: a pre-receive hook that
+// counts its runs and declines.
+#[test]
+fn a_refused_claim_push_is_an_error_without_retries() {
+    let (root, clones) = setup("pre-receive", 1);
+    install_hook(&root, "pre-receive", "echo run >> pre-receive-runs; exit 1");
+    let refused = claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot");
+    let said = matches!(&refused, Err(ClaimError::Git(message)) if message.contains("refused"));
+    assert!(said, "the error says the remote refused: {refused:?}");
+    let runs = std::fs::read_to_string(root.join("remote.git/pre-receive-runs"));
+    assert_eq!(runs.expect("the hook ran").lines().count(), 1, "one push, no retries");
+    assert_eq!(claimed(&clones[0]), Vec::<String>::new(), "nothing was claimed");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a remote rejection while the branch moved is a lost race, not a refusal: the claim
+// refetches and wins on the new tip. Method: a pre-receive hook that, the first time, creates
+// the branch itself (as a racing claim would) and declines; afterwards it accepts.
+#[test]
+fn a_remote_rejection_while_the_branch_moved_is_retried() {
+    let (root, clones) = setup("moved", 1);
+    let script = "[ -e raced ] && exit 0\ntouch raced\n\
+                  unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES\n\
+                  tree=$(git mktree </dev/null)\n\
+                  other=$(git -c user.name=o -c user.email=o@x commit-tree $tree -m other)\n\
+                  git update-ref refs/heads/claims $other\nexit 1";
+    install_hook(&root, "pre-receive", script);
+    claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot").expect("the retry wins");
+    assert!(root.join("remote.git/raced").exists(), "the first push lost the race");
+    assert_eq!(claimed(&clones[0]), ["t1=agent: bot"], "the claim sits on the racing commit");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
