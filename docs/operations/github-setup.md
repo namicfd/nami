@@ -13,11 +13,11 @@ Every command below was run against `namicfd/nami` on 2026-11-25.
 | In the repository | Only on GitHub, or on the agents' machines |
 |---|---|
 | `.github/workflows/`, `.github/actions/setup/` | Repository and Actions settings (step 1) |
-| `.github/CODEOWNERS` | The ruleset itself (step 3) |
-| `.github/rulesets/main.json`: an export of the live ruleset | The GitHub App and its installation (step 5) |
-| `xtask/agent-token.sh` | The app's private key, at `~/.config/nami/nami-agent.pem` |
+| `.github/CODEOWNERS` | The ruleset (step 3) |
+| `xtask/agent-token.sh` | The GitHub App and its installation (step 5) |
+| | The app's private key, at `~/.config/nami/nami-agent.pem` |
 
-When you change a setting on GitHub, update this file. When you change the ruleset, export it again (step 3).
+When you change a setting on GitHub, update this file.
 
 ## 1. Repository and Actions settings
 
@@ -49,13 +49,11 @@ gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" \
 
 ## 3. Ruleset on the default branch
 
-Import the exported ruleset:
+Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, and set the following:
 
-```sh
-gh api -X POST "repos/$REPO/rulesets" --input .github/rulesets/main.json
-```
-
-In the web UI, the same import is under Settings → Rules → Rulesets → New ruleset → Import a ruleset.
+- **Name:** `main`, with enforcement **Active**.
+- **Target:** the default branch.
+- **Rules:** as in the table below.
 
 | Rule | Setting | Why |
 |---|---|---|
@@ -70,18 +68,7 @@ In the web UI, the same import is under Settings → Rules → Rulesets → New 
 | Merge queue | squash; build 5; group of 1–5; wait 5 min; all green; timeout 30 min | ADR-0009. |
 | Bypass | Repository admin, **always** | The maintainer can merge their own PRs, since GitHub never allows approving your own PR, and can push in an emergency. Use `pull_request` mode instead to allow PR merges only. |
 
-Two IDs in the export carry over to other repositories unchanged:
-
-- `integration_id: 15368` is the GitHub Actions app, the source of the required checks.
-- `actor_id: 5` is the built-in repository-admin role.
-
-After changing the ruleset on GitHub, export it again:
-
-```sh
-ID=$(gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "main") | .id')
-gh api "repos/$REPO/rulesets/$ID" | jq '{name, target, enforcement, conditions, bypass_actors, rules}' \
-  > .github/rulesets/main.json
-```
+To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
 
 ## 4. CODEOWNERS
 
