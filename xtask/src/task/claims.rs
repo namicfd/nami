@@ -161,11 +161,12 @@ fn commit_change(
     let index_text = index.to_string_lossy().into_owned();
     let environment = [("GIT_INDEX_FILE", index_text.as_str())];
     let result = build_commit(root, &environment, tip, task, holder);
-    match std::fs::remove_file(&index) {
-        Ok(()) => result,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => result,
-        Err(error) => Err(ClaimError::Git(format!("cannot remove {}: {error}", index.display()))),
-    }
+    let removed = std::fs::remove_file(&index);
+    // A failed build reports its own error; it may have failed before the index existed.
+    let commit = result?;
+    removed
+        .map_err(|error| ClaimError::Git(format!("cannot remove {}: {error}", index.display())))?;
+    Ok(commit)
 }
 
 fn build_commit(
