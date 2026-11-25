@@ -1,6 +1,5 @@
 //! `agent-token.sh` signs a well-formed GitHub App JWT (ADR-0008).
 
-use std::path::Path;
 use std::process::Command;
 
 fn run(command: &mut Command) -> String {
@@ -35,7 +34,7 @@ fn jwt_is_well_formed_and_verifies() {
     std::fs::create_dir_all(&directory).expect("temporary directory is writable");
     let key = directory.join("key.pem");
     let _ = run(Command::new("openssl").args(["genrsa", "-out"]).arg(&key).arg("2048"));
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("agent-token.sh");
+    let script = xtask::workspace_root().join("xtask/agent-token.sh");
     let jwt = run(Command::new(script)
         .arg("jwt")
         .env("NAMI_AGENT_KEY", &key)
