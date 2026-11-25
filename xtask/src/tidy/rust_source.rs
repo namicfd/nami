@@ -725,15 +725,19 @@ impl Visitor<'_> {
         if !self.scope.is_nami() || is_test || !float_cmp_is_silent_in(&name) {
             return;
         }
-        let floats = float_parameters(function.signature);
-        let mut finder = FloatEqualityFinder { floats: &floats, found: Vec::new() };
+        let mut finder = FloatEqualityFinder { floats: Vec::new(), found: Vec::new() };
+        for input in &function.signature.inputs {
+            if let syn::FnArg::Typed(typed) = input {
+                finder.bind_typed(typed);
+            }
+        }
         finder.visit_block(function.block);
         for (span, operator) in finder.found {
             let message = format!(
                 "`{operator}` between floats in function `{name}`, where clippy's `float_cmp` \
-                 is silent; compare against a named tolerance, or, for an exact sentinel or a \
-                 bitwise check, compare `to_bits()` and say which it is (TIGER_STYLE.md, \
-                 Floating point)"
+                 is silent; compare against a named tolerance. Test an exact zero with \
+                 `classify() == FpCategory::Zero`, and a bitwise check with `to_bits()`, and \
+                 say which it is (TIGER_STYLE.md, Floating point)"
             );
             self.report(span, "float-eq-in-eq-fn", message);
         }
@@ -742,14 +746,106 @@ impl Visitor<'_> {
 
 /// Finds `==` and `!=` with a float operand in one function body, closures included. Nested
 /// items are left to the visitor, which checks each function under its own name.
-struct FloatEqualityFinder<'a> {
-    /// Parameters of the function that are declared as floats.
-    floats: &'a [Ident],
+struct FloatEqualityFinder {
+    /// The names in scope that are declared as floats: parameters and `let` bindings.
+    floats: Vec<Ident>,
     /// The span and spelling of every offending operator.
     found: Vec<(Span, &'static str)>,
 }
 
-impl<'ast> Visit<'ast> for FloatEqualityFinder<'_> {
+impl FloatEqualityFinder {
+    /// Binds the names of a pattern: every name it binds stops being a float, and a single name
+    /// declared `f32` or `f64` (or a reference to one) becomes one.
+    fn bind(&mut self, pattern: &syn::Pat) {
+        if let syn::Pat::Type(typed) = pattern {
+            self.bind_typed(typed);
+        } else {
+            self.unbind(pattern);
+        }
+    }
+
+    fn bind_typed(&mut self, typed: &syn::PatType) {
+        self.unbind(&typed.pat);
+        if let syn::Pat::Ident(pattern) = &*typed.pat
+            && is_float_type(&typed.ty)
+        {
+            self.floats.push(pattern.ident.clone());
+            let count = self.floats.iter().filter(|float| **float == pattern.ident).count();
+            assert_eq!(count, 1, "a name is bound as a float once, the latest binding wins");
+        }
+    }
+
+    /// Every name that `pattern` binds stops being a float.
+    fn unbind(&mut self, pattern: &syn::Pat) {
+        let mut bindings = BindingCollector { names: Vec::new() };
+        bindings.visit_pat(pattern);
+        self.floats.retain(|float| !bindings.names.contains(float));
+    }
+
+    /// Visits one statement of a block. A `let` binds after its initialiser, which still sees
+    /// the names it rebinds.
+    fn visit_statement(&mut self, statement: &syn::Stmt) {
+        if let syn::Stmt::Local(local) = statement {
+            if let Some(init) = &local.init {
+                self.visit_local_init(init);
+            }
+            self.bind(&local.pat);
+        } else {
+            self.visit_stmt(statement);
+        }
+    }
+
+    /// Visits a scope that binds `patterns`; the bindings end with the scope.
+    fn in_scope(&mut self, patterns: &[&syn::Pat], visit_scope: impl FnOnce(&mut Self)) {
+        let outer = self.floats.clone();
+        for pattern in patterns {
+            self.bind(pattern);
+        }
+        visit_scope(self);
+        self.floats = outer;
+    }
+}
+
+/// Collects every name that a pattern binds.
+struct BindingCollector {
+    names: Vec<Ident>,
+}
+
+impl<'ast> Visit<'ast> for BindingCollector {
+    fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+        self.names.push(node.ident.clone());
+        visit::visit_pat_ident(self, node);
+    }
+
+    // An expression in a pattern, such as a guard or a range bound, binds nothing.
+    fn visit_expr(&mut self, _node: &'ast Expr) {}
+}
+
+impl<'ast> Visit<'ast> for FloatEqualityFinder {
+    // A `let` binds from the next statement to the end of the block.
+    fn visit_block(&mut self, node: &'ast Block) {
+        self.in_scope(&[], |finder| {
+            for statement in &node.stmts {
+                finder.visit_statement(statement);
+            }
+        });
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        let patterns: Vec<&syn::Pat> = node.inputs.iter().collect();
+        self.in_scope(&patterns, |finder| finder.visit_expr(&node.body));
+    }
+
+    // The guard is part of the pattern (`Pat::Guard`), so it sees the arm's bindings too.
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        self.in_scope(&[&node.pat], |finder| visit::visit_arm(finder, node));
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.visit_expr(&node.expr);
+        self.in_scope(&[&node.pat], |finder| finder.visit_block(&node.body));
+    }
+
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
         let operator = if matches!(node.op, syn::BinOp::Eq(_)) {
             Some("==")
@@ -758,7 +854,7 @@ impl<'ast> Visit<'ast> for FloatEqualityFinder<'_> {
         } else {
             None
         };
-        let floats = self.floats;
+        let floats = &self.floats;
         let has_float =
             is_float_operand(&node.left, floats) || is_float_operand(&node.right, floats);
         if let Some(operator) = operator
@@ -776,24 +872,6 @@ impl<'ast> Visit<'ast> for FloatEqualityFinder<'_> {
 /// contains `eq` is included, a superset of clippy's `eq`, `eq_*` and `*_eq`.
 fn float_cmp_is_silent_in(name: &str) -> bool {
     name.contains("eq") || FLOAT_CMP_SILENT_NAMES.contains(&name)
-}
-
-/// The parameters declared as `f32` or `f64`, or as a reference to one. A receiver and a
-/// destructuring pattern name no single float.
-fn float_parameters(signature: &Signature) -> Vec<Ident> {
-    let parameters = signature.inputs.iter().filter_map(|input| {
-        if let syn::FnArg::Typed(typed) = input
-            && let syn::Pat::Ident(pattern) = &*typed.pat
-            && is_float_type(&typed.ty)
-        {
-            Some(pattern.ident.clone())
-        } else {
-            None
-        }
-    });
-    let floats: Vec<Ident> = parameters.collect();
-    assert!(floats.len() <= signature.inputs.len(), "every float parameter is a parameter");
-    floats
 }
 
 /// True for `f32` or `f64` under references and parentheses.
@@ -1235,6 +1313,14 @@ mod tests {
             "impl S { fn eq(&self, a: f64) -> bool { self.x == a } }",
             "impl PartialEq for S { fn eq(&self, other: &Self) -> bool { self.x == 0.0 } }",
             "trait T { fn eq(&self, a: f64) -> bool { a == 1.0 } }",
+            "fn eq(a: u32) -> bool { let b: f64 = f(a); b == g(a) }",
+            "fn eq(a: u32) -> bool { let c = |b: &f32| b == g(a); c(&h()) }",
+            "fn eq(a: f64) -> bool { { let a = 1_u32; } a == g() }",
+            "fn eq(a: f64) -> bool { match g() { 0 => a == g(), _ => false } }",
+            "fn eq(a: f64) -> bool { match g() { b if a == g() => b, _ => false } }",
+            "fn eq(a: f64) -> bool { for i in 0..2_u32 { h(a == g(i)); } true }",
+            "fn eq(a: f64) -> bool { let c = |a: u32| a == 1; c(1) && a == g() }",
+            "fn eq(a: f64) -> bool { let a = a.to_bits(); h(a == 0); let a: f64 = g(); a == g() }",
         ];
         for text in fires {
             assert_eq!(rules_in_crate(text), ["float-eq-in-eq-fn"], "{text}");
@@ -1257,6 +1343,12 @@ mod tests {
             "fn eq((a, b): (f64, f64)) -> bool { a.to_bits() == b.to_bits() }",
             "fn eq(a: [f64; 2], b: [f64; 2]) -> bool { a.len() == b.len() }",
             "fn eq(a: f64) -> bool { fn inner(b: f64) -> bool { b == 1.0 } inner(a) }",
+            "fn eq(a: f64) -> bool { let a = a.to_bits(); a == 0 }",
+            "fn eq(a: f64) -> bool { let (a, _) = (a.to_bits(), 1); a == 0 }",
+            "fn eq(a: f64) -> bool { let c = |a: u32| a == 1; c(2) }",
+            "fn eq(a: f64) -> bool { let c = |a| a == g(); c(2) }",
+            "fn eq(a: f64) -> bool { match a.to_bits() { a if a == 0 => true, a => a == 1 } }",
+            "fn eq(a: f64) -> bool { for a in 0..2_u32 { h(a == 1); } a < 1.0 }",
         ];
         for text in passes {
             assert_eq!(rules_in_crate(text), NONE, "{text}");

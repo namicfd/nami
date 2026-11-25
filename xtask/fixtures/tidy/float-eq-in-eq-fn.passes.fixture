@@ -1,6 +1,9 @@
 // path: crates/kernels/src/example.rs
 //! An `eq` function that compares floats bit for bit, one that compares against a named
-//! tolerance, and a test that may compare exact values.
+//! tolerance, one that tests for an exact zero of either sign, and a test that may compare
+//! exact values.
+
+use core::num::FpCategory;
 
 /// Relative difference below which two pressures are taken as equal: round-off for a 64-bit
 /// pressure of order one, with two digits to spare.
@@ -13,6 +16,11 @@ fn states_bitwise_eq(left: f64, right: f64) -> bool {
 
 fn pressures_eq(left: f64, right: f64) -> bool {
     (left - right).abs() <= PRESSURE_TOLERANCE_RELATIVE * left.abs()
+}
+
+/// Exact zero, sentinel for vacuum: `-0.0` counts too.
+fn is_vacuum_eq(density: f64) -> bool {
+    density.classify() == FpCategory::Zero
 }
 
 #[cfg(test)]

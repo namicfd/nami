@@ -99,9 +99,11 @@ pub const RULES: &[Rule] = &[
         "float-eq-in-eq-fn",
         "In nami crates outside tests, no `==` or `!=` with a float operand in a function whose \
          name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. Without \
-         types, a float operand is a float literal, a cast to `f32`/`f64`, or a parameter \
-         declared `f32`/`f64` or a reference to one; fields, locals, method results and \
-         comparisons inside macro arguments are not seen.",
+         types, a float operand is a float literal, a cast to `f32`/`f64`, or a parameter, \
+         `let` or closure parameter declared `f32`/`f64` (or a reference to one), until a \
+         `let`, closure, `match` arm or `for` rebinds the name. Not seen: fields, untyped \
+         locals, call results, macro arguments. A float parameter rebound by `if let` or \
+         `while let` is a false positive.",
         "ADR-0006",
     ),
     source(
