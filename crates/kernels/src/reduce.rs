@@ -109,6 +109,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "sum must be finite")]
     fn sum_fixed_rejects_nan() {
-        let _ = sum_fixed(&[1.0, f64::NAN]);
+        let _sum = sum_fixed(&[1.0, f64::NAN]);
     }
 }
