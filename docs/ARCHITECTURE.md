@@ -10,7 +10,7 @@
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
-| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) open | |
+| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b) proposed; (c) open | [0025](design/0025-extension-points-and-composition.md) |
 | 5 | Performance and parallelism | Open | |
 | 6 | Interface, output and determinism guarantees | Open | |
 | 7 | Verification strategy | Open | |
@@ -269,3 +269,57 @@ The topic has three parts:
   64³ and 128³). It compares structure of arrays with row stencils, array of structures, and a
   hybrid, against Athena++ built on the same workstation. The code stays on a branch, and the
   results go to `docs/research/`.
+
+### 4(b) Extension points and how they compose (proposed)
+
+**A run is a compiled combination.** A user writes a small **problem crate** that depends on nami.
+It provides the initial conditions, user boundary conditions and source terms, and names its
+combination of extension points in Rust types. The runtime configuration sets only parameters
+(resolution, CFL number, γ, end time, outputs), and init validates them and returns a `Result`.
+
+- The speed comes from monomorphisation: the Riemann solver, the equation of state and the
+  reconstruction are inlined into the row loop, constants fold, and the loop vectorises.
+  Selecting among already-compiled combinations once at init would be just as fast. Compile-time
+  selection wins on build cost: each build compiles only what it uses.
+- A problem crate may compile several combinations and select one at init.
+- nami's own test suite instantiates every supported combination, which is how "every selectable
+  combination is verified" (§ 3.3) is achieved.
+
+**The extension points:**
+
+- **Equation system.** A trait with associated types `Conserved` and `Primitive` (named-field
+  structs, § 4(a)) and `Parameters`, such as γ, always spelled out with no `Default`. It provides:
+  - conversion between conserved and primitive variables;
+  - the physical flux along a face normal;
+  - the largest signal speed, a guaranteed upper bound that is asserted.
+- **Wave-speed bounds.** A small trait, implemented per system: the smallest and largest signal
+  speeds of the Riemann fan, given the left and right states. These are guaranteed bounds
+  (§ 3.2).
+- **The face frame.** Riemann solvers only see states rotated into the face's frame, normal
+  component first.
+  - On structured grids the rotation is an exact permutation: it decides which row is loaded as
+    the normal velocity, and costs nothing.
+  - Unstructured grids add a general rotation later. Every Riemann solver works there unchanged,
+    but those results are not bitwise rotation-invariant.
+  - For MHD, the face fills the normal magnetic field from the face-centred field; it is not
+    reconstructed.
+- **Riemann solvers.** A trait `RiemannSolver<E>`.
+  - LLF and HLLE are implemented once, for every system with wave-speed bounds.
+  - HLLC (Euler, shallow water) and HLLD (MHD) are implemented per system.
+  - The compiler rejects a combination that does not exist.
+- **Reconstruction.** Works per variable over rows, so it does not depend on the equation system.
+  Characteristic reconstruction asks the system for its eigenvectors through a separate trait.
+  The ghost width is a constant of the reconstruction type.
+- **Time integrators as data.** Each integrator is a constant table of stages in the low-storage
+  3S* form (Ketcheson 2010): a few coefficients per stage, two or three registers allocated at
+  init, and the reconstruction order of each stage. One generic driver runs the table. The form
+  covers forward Euler, SSP-RK2 and SSP-RK3, RK4, SSP-RK(5,4) and VL2, whose first stage is donor
+  cell with half a step. Implicit-explicit methods and super-time-stepping get their own drivers
+  when they come.
+- **Coordinates.** A trait for face areas, cell volumes and geometric source terms. The Cartesian
+  version returns constants, which fold away. The curvilinear versions read arrays precomputed
+  per block at init.
+- **Source terms.** A trait, composed statically as a tuple, for example
+  `(Gravity, PassiveScalars)`, and applied in a fixed order every stage.
+- **Boundary conditions.** Chosen per block face at init, and dispatched once per face per stage
+  with a `match`, never per cell. User boundary conditions come from the problem crate.
