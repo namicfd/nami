@@ -15,7 +15,7 @@ Every command below was run against `namicfd/nami` on 2026-11-25.
 | `.github/workflows/`, `.github/actions/setup/` | Repository and Actions settings (step 1) |
 | `.github/CODEOWNERS` | The ruleset (step 3) |
 | `xtask/agent-token.sh` | The GitHub App and its installation (step 5) |
-| | The app's private key, at `~/.config/nami/nami-agent.pem` |
+| `.claude/settings.json` (`env`): the bot's git identity (step 6) | The app's private key on each machine, at `$NAMI_AGENT_KEY` or `~/.config/nami/nami-agent.pem` |
 
 When you change a setting on GitHub, update this file.
 
@@ -66,7 +66,7 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 | | merge methods: squash | |
 | Required status checks | `gate`, `lints (UI tests)`; "up to date" is off | The merge queue tests the combined result anyway. |
 | Merge queue | squash; build 5; group of 1–5; wait 5 min; all green; timeout 30 min | ADR-0009. |
-| Bypass | Repository admin, **always** | The maintainer can merge their own PRs, since GitHub never allows approving your own PR, and can push in an emergency. Use `pull_request` mode instead to allow PR merges only. |
+| Bypass | Repository admin, **pull requests only** | The maintainer can merge PRs past the rules: their own, since GitHub never allows approving your own PR, and `tasks.json` flips (ADR-0017). Nobody can push to `main` directly, not even with the maintainer's credentials. In an emergency, open a PR and merge it with the bypass. |
 
 To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
 
@@ -100,13 +100,15 @@ Agents act as `nami-agent[bot]`, never as the maintainer. GitHub does not let an
    | Metadata | read | Set automatically. |
 
 4. **Where can this app be installed:** only on this account. Then **Create GitHub App**.
-5. **Generate a private key** and store it on every machine that runs agents. Never put it in a repository.
+5. **Generate a private key** and store it on every machine that runs agents. Never put it in a repository. The script reads it from `$NAMI_AGENT_KEY`, or from `~/.config/nami/nami-agent.pem` when that is unset:
 
    ```sh
    mkdir -p ~/.config/nami
    mv ~/Downloads/<app>.<date>.private-key.pem ~/.config/nami/nami-agent.pem
    chmod 600 ~/.config/nami/nami-agent.pem
    ```
+
+   On a machine that manages secrets differently, such as an orchestrator, put the file wherever its secrets live and set `NAMI_AGENT_KEY` to that path in the agents' environment.
 
 6. **Install App** → the organisation → **Only select repositories** → this repository.
 7. Give the app **no** bypass in the ruleset, and do **not** make it a code owner.
@@ -121,7 +123,7 @@ gh api 'users/<app-slug>%5Bbot%5D' --jq .id         # the number in bot_email
 # NAMI_AGENT_REPO=<owner>/<name>; NAMI_AGENT_KEY=<path to the .pem>
 ```
 
-The bot's commit email is `<bot user id>+<app-slug>[bot]@users.noreply.github.com`. GitHub uses that address to attribute commits to the bot.
+The bot's commit email is `<bot user id>+<app-slug>[bot]@users.noreply.github.com`. GitHub uses that address to attribute commits to the bot. For another app, change the name and email in `.claude/settings.json` as well (step 6).
 
 ### Rotate or revoke the key
 
@@ -130,19 +132,35 @@ The bot's commit email is `<bot user id>+<app-slug>[bot]@users.noreply.github.co
 
 ## 6. Running something as the bot
 
+Agents act as the bot, never with a human's credentials. A maintainer's key reaches every repository they can access and is the ruleset's bypass actor; the bot's token reaches this repository only and expires within an hour.
+
+### Claude Code sessions
+
+The `env` block in `.claude/settings.json` makes every Claude Code session in this repository act as the bot for git, on any machine and in any worktree. Nothing is configured per clone, and nothing names a path on a particular machine. It sets:
+
+- the bot as author and committer of every commit;
+- an empty `credential.helper` first, which switches off the user's own helpers such as the macOS keychain, then `xtask/agent-token.sh git-credential`, found at run time through `git rev-parse --show-toplevel`, which hands git a fresh token for each operation;
+- a rewrite of `git@github.com:` remotes to HTTPS, so a clone made over SSH pushes as the bot too;
+- `GIT_TERMINAL_PROMPT=0`, so a missing key fails at once instead of waiting for a password.
+
+Agents therefore run plain commands: `git push origin <branch>`. Claude Code refuses git commands that inject configuration, such as `git -c credential.helper=...`, in worktree-isolated sessions, and plain commands are what it accepts. For gh, which reads no git configuration, agents prefix each command: `GH_TOKEN=$(xtask/agent-token.sh) gh ...`.
+
+The only thing a machine provides is the private key (step 5). The settings apply from the next session that starts; a running session keeps its environment. They need git 2.31 or newer for `GIT_CONFIG_COUNT`.
+
+**If a push or a token is refused, stop and ask the maintainer.** Do not retry with another spelling of the command, and never fall back to a human's SSH key or keychain.
+
+### Other launchers
+
+Agent tools other than Claude Code, or orchestrators that set their own environment, do not read `.claude/settings.json`. Give them the same variables. In a shell:
+
 ```sh
 eval "$(xtask/agent-token.sh env)"   # this shell and its children now act as nami-agent[bot]
 claude -p "..."
 ```
 
-- **Commits.** They are authored and committed by the bot.
-- **git.** It fetches and pushes over HTTPS with a fresh token for each operation:
-  - `git@github.com:` remotes are rewritten to HTTPS;
-  - the user's own credential helpers, such as the macOS keychain, are switched off in that shell.
+`env` exports the variables above, with the script's absolute path as the helper, plus a `GH_TOKEN` that expires after an hour. Run it again for longer sessions. An orchestrator that cannot run a command at launch can copy the `env` block from `.claude/settings.json` as it stands, and set `NAMI_AGENT_KEY` if the key is not at the default path.
 
-  This needs git 2.31 or newer for `GIT_CONFIG_COUNT`.
-- **gh.** It uses `GH_TOKEN`, which expires after an hour. Run `env` again for longer sessions.
-- **Other commands.** `xtask/agent-token.sh` alone prints one token, and `jwt` prints the app's own JWT for debugging.
+`xtask/agent-token.sh` alone prints one token, and `jwt` prints the app's own JWT for debugging.
 
 ## 7. Check that it works
 
@@ -150,6 +168,13 @@ claude -p "..."
 GH_TOKEN=$(xtask/agent-token.sh) gh api installation/repositories --jq '[.repositories[].full_name]'
 (eval "$(xtask/agent-token.sh env)"; gh auth status; git var GIT_AUTHOR_IDENT)
 gh api "repos/$REPO/rulesets" --jq '.[] | {name, enforcement}'
+```
+
+In a new Claude Code session, check that the settings reached the shell. The username must be `x-access-token`; anything else means a human's credentials would be used:
+
+```sh
+git var GIT_AUTHOR_IDENT
+printf 'protocol=https\nhost=github.com\n\n' | git credential fill | grep '^username'
 ```
 
 Then try the flow end to end:
