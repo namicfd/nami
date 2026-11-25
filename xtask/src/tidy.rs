@@ -27,8 +27,9 @@ pub use rust_source::AssertionStats;
 /// Upper bound on directories visited, so the walk is bounded (`TIGER_STYLE.md`, Limits).
 const DIRECTORIES_MAX: u32 = 100_000;
 
-/// Directories that the source walk never enters. ADRs are checked separately.
-const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "docs"];
+/// Directories that the source walk never enters. ADRs and plans are checked separately.
+/// `.claude` holds agent configuration and Claude Code's worktrees, which are other checkouts.
+const SKIPPED_DIRECTORIES: [&str; 4] = ["target", ".git", "docs", ".claude"];
 
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
 const INDEX_MODULE: &str = "crates/base/src/index.rs";
@@ -127,6 +128,7 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
     violations.extend(workspace::check_expect_budget(root, expect_count)?);
     violations.extend(workspace::check_manifests(root)?);
     violations.extend(workspace::check_adrs(root)?);
+    violations.extend(crate::task::plan::check(root)?);
     violations.sort_by(|a, b| (&a.path, a.line, a.rule).cmp(&(&b.path, b.line, b.rule)));
     Ok(violations)
 }
@@ -215,6 +217,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(root.join("xtask")).unwrap();
         std::fs::create_dir_all(root.join("docs/design")).unwrap();
+        std::fs::create_dir_all(root.join("docs/exec-plans/active/p")).unwrap();
         std::fs::create_dir_all(root.join("target/ignored")).unwrap();
         std::fs::write(root.join("xtask/expect-budget.txt"), "1\n").unwrap();
         std::fs::write(root.join("docs/design/README.md"), "").unwrap();
@@ -238,7 +241,7 @@ mod tests {
                 .into_iter()
                 .chain(["adr-index"])
                 .chain(["adr-section"; 6])
-                .chain(["expect-budget"])
+                .chain(["plan-files", "expect-budget"])
                 .collect::<Vec<_>>()
         );
         assert_eq!(violations[0].path, Path::new("crates/demo"));
@@ -259,6 +262,7 @@ mod tests {
         assert_eq!(super::crate_root(lib).as_deref(), Some(Path::new("crates/base")));
         assert_eq!(super::crate_root(Path::new("xtask/src/tidy.rs")), None);
         assert!(super::is_skipped(Path::new("/repo/target")), "build output is skipped");
+        assert!(super::is_skipped(Path::new("/repo/.claude")), "agent worktrees are skipped");
         assert!(!super::is_skipped(Path::new("/repo/crates")), "sources are walked");
     }
 

@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 pub mod hook;
+pub mod json;
+pub mod task;
 pub mod tidy;
 
 /// Returns the workspace root: the parent of this crate's directory.
