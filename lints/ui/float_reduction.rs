@@ -2,6 +2,7 @@
 // UI test for `nami_float_reduction`: every naive float sum the lint must catch, and the code it
 // must leave alone. It is compiled as a test harness, so that the test code at the end exists.
 
+use std::cell::Cell;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 fn sum_f64(values: &[f64]) -> f64 {
@@ -200,8 +201,8 @@ fn fold_add_in_a_discarded_statement(values: &[f64]) -> f64 {
     })
 }
 
-// Reported: an accumulator update inside a condition, a guard or a compared operand. Only the
-// value there is excluded, not its side effects.
+// Reported: an accumulator update inside a condition, a guard or a compared operand. Any
+// assignment rules out the selection exemption.
 fn fold_add_assign_in_a_compared_block(values: &[f64]) -> f64 {
     values.iter().fold(0.0, |mut total, &value| {
         let _positive = {
@@ -323,7 +324,7 @@ fn fold_add_in_a_nested_closure(values: &[f64]) -> f64 {
     values.iter().fold(0.0, |total, &value| (|| total + value)())
 }
 
-// Reported: more shapes that a sum reaches the result through.
+// Reported: more shapes that a sum reaches the result through, all reported by the base lint.
 struct Total {
     value: f64,
 }
@@ -398,18 +399,208 @@ fn fold_add_assigned_later(values: &[f64]) -> f64 {
     })
 }
 
-// Reported as too complex: more expressions than the lint traces, even though it is a maximum.
-macro_rules! times_four {
-    ($e:expr) => {
-        $e * $e * $e * $e
-    };
+// Reported: a sum that leaves the closure through a `return` or `break` written inside a
+// condition, a guard, a logical operand or a compared operand. The closure returns more than
+// its parameters, so it is no selection.
+fn fold_return_in_an_or(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        if value > 1.0 || {
+            if value > 2.0 {
+                return total + value;
+            }
+            false
+        } {
+            total
+        } else {
+            value
+        }
+    })
 }
 
-fn fold_too_complex(values: &[f64]) -> f64 {
-    values.iter().fold(f64::NEG_INFINITY, |greatest, &value| {
-        greatest.max(times_four!(times_four!(times_four!(times_four!(times_four!(times_four!(
-            times_four!(value)
-        )))))))
+fn fold_return_in_a_guard(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| match value {
+        v if {
+            if v > 0.0 {
+                return total + v;
+            }
+            false
+        } =>
+        {
+            total
+        }
+        _ => value,
+    })
+}
+
+fn fold_break_in_an_and(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| 'sum: {
+        if value > 0.0 && {
+            if value > 1.0 {
+                break 'sum total + value;
+            }
+            true
+        } {
+            total
+        } else {
+            value
+        }
+    })
+}
+
+fn fold_return_in_a_compared_operand(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        if value < (if value.is_nan() { return total + value } else { 0.0 }) {
+            value
+        } else {
+            total
+        }
+    })
+}
+
+fn try_fold_return_in_an_or(values: &[f64]) -> Option<f64> {
+    values.iter().try_fold(0.0, |total, &value| {
+        if value > 0.0 || {
+            if value < -1.0 {
+                return Some(total + value);
+            }
+            false
+        } {
+            Some(total)
+        } else {
+            None
+        }
+    })
+}
+
+fn reduce_return_in_a_condition(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(|total, value| {
+        if {
+            if value > 0.0 {
+                return total + value;
+            }
+            false
+        } {
+            total
+        } else {
+            value
+        }
+    })
+}
+
+// Reported: a sum handed on inside a condition or a guard, to a local, a cell or a place.
+fn fold_scrutinee_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let mut out = 0.0;
+        if match total + value {
+            sum => {
+                out = sum;
+                true
+            }
+        } {}
+        out
+    })
+}
+
+fn fold_call_argument_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let cell = Cell::new(0.0);
+        if {
+            cell.set(total + value);
+            true
+        } {}
+        cell.get()
+    })
+}
+
+fn fold_call_argument_in_a_guard(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let mut out = 0.0;
+        match value {
+            v if {
+                let _old = std::mem::replace(&mut out, total + v);
+                true
+            } =>
+            {
+                out
+            }
+            _ => out,
+        }
+    })
+}
+
+fn fold_mul_assign_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let mut out = 1.0;
+        if {
+            out *= total + value;
+            true
+        } {}
+        out
+    })
+}
+
+fn fold_unread_let_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        if {
+            let _sum = total + value;
+            true
+        } {
+            total
+        } else {
+            value
+        }
+    })
+}
+
+fn fold_tuple_field_assigned_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let mut pair = (0.0, 0.0);
+        if {
+            pair.0 = total + value;
+            true
+        } {}
+        pair.0
+    })
+}
+
+fn fold_deref_assigned_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let mut out = 0.0;
+        let place = &mut out;
+        if {
+            *place = total + value;
+            true
+        } {}
+        out
+    })
+}
+
+fn fold_index_assigned_in_a_condition(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let mut out = [0.0];
+        if {
+            out[0] = total + value;
+            true
+        } {}
+        out[0]
+    })
+}
+
+// Reported: a compared sum that the closure also returns, and a guard whose closure returns
+// an arm binding rather than a parameter.
+fn fold_sum_compared_and_returned(values: &[f64], limit: f64) -> f64 {
+    values.iter().fold(
+        0.0,
+        |total, &value| {
+            if total + value > limit { total + value } else { total }
+        },
+    )
+}
+
+fn fold_sum_in_a_guard_returning_a_binding(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| match value {
+        x if total + x > 0.0 => x,
+        _ => total,
     })
 }
 
@@ -461,16 +652,9 @@ fn try_rfold_max(values: &[f64]) -> Option<f64> {
     values.iter().try_rfold(f64::NEG_INFINITY, |greatest, &value| Some(greatest.max(value)))
 }
 
-// Not reported, by design: a sum used only as a condition, a guard or a compared value.
+// Not reported, by design: a selection whose sum with the accumulator is only compared.
 fn fold_sum_only_compared(values: &[f64], limit: f64) -> f64 {
     values.iter().fold(0.0, |total, &value| if total + value > limit { total } else { value })
-}
-
-fn fold_sum_only_in_a_guard(values: &[f64]) -> f64 {
-    values.iter().fold(0.0, |total, &value| match value {
-        x if total + x > 0.0 => x,
-        _ => total,
-    })
 }
 
 // Not reported: an argmin or argmax, where the accumulator is subtracted only in the condition,
@@ -492,6 +676,21 @@ fn fold_argmin_assign(values: &[f64]) -> f64 {
             best = value;
         }
         best
+    })
+}
+
+// Not reported: a large maximum. The closure has no sum with the accumulator.
+macro_rules! times_four {
+    ($e:expr) => {
+        $e * $e * $e * $e
+    };
+}
+
+fn fold_large_maximum(values: &[f64]) -> f64 {
+    values.iter().fold(f64::NEG_INFINITY, |greatest, &value| {
+        greatest.max(times_four!(times_four!(times_four!(times_four!(times_four!(times_four!(
+            times_four!(value)
+        )))))))
     })
 }
 
