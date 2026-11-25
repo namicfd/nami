@@ -2,6 +2,8 @@
 // UI test for `nami_float_reduction`: every naive float sum the lint must catch, and the code it
 // must leave alone. It is compiled as a test harness, so that the test code at the end exists.
 
+use std::ops::{Add, Sub};
+
 fn sum_f64(values: &[f64]) -> f64 {
     values.iter().sum()
 }
@@ -37,6 +39,88 @@ fn fold_path_call(values: &[f64]) -> f64 {
     Iterator::fold(values.iter(), 0.0, |total, value| total + value)
 }
 
+fn product_f64(values: &[f64]) -> f64 {
+    values.iter().product::<f64>()
+}
+
+fn product_f32(values: &[f32]) -> f32 {
+    Iterator::product(values.iter())
+}
+
+fn sum_into_option(values: &[f64]) -> Option<f64> {
+    values.iter().map(|&value| Some(value)).sum::<Option<f64>>()
+}
+
+fn sum_into_result(values: &[f32]) -> Result<f32, String> {
+    values.iter().map(|&value| Ok(value)).sum()
+}
+
+fn product_into_option(values: &[f64]) -> Option<f64> {
+    values.iter().map(|&value| Some(value)).product()
+}
+
+fn reduce_add(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(|total, value| total + value)
+}
+
+fn reduce_path_call(values: &[f32]) -> Option<f32> {
+    Iterator::reduce(values.iter().copied(), |total, value| value + total)
+}
+
+fn reduce_add_method(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(f64::add)
+}
+
+fn try_fold_add(values: &[f64]) -> Option<f64> {
+    values.iter().try_fold(0.0, |total, value| Some(total + value))
+}
+
+fn try_fold_add_assign(values: &[f32]) -> Result<f32, String> {
+    values.iter().try_fold(0.0, |mut total, value| {
+        total += value;
+        Ok(total)
+    })
+}
+
+fn rfold_add(values: &[f64]) -> f64 {
+    values.iter().rfold(0.0, |total, value| total + value)
+}
+
+fn try_rfold_add(values: &[f64]) -> Option<f64> {
+    values.iter().try_rfold(0.0, |total, value| Some(total + value))
+}
+
+fn fold_sub(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, value| total - value)
+}
+
+fn fold_sub_on_the_right(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |difference, value| value - difference)
+}
+
+fn fold_sub_assign(values: &[f32]) -> f32 {
+    values.iter().fold(0.0, |mut total, value| {
+        total -= value;
+        total
+    })
+}
+
+fn fold_add_method(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, f64::add)
+}
+
+fn fold_add_trait_method(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0, core::ops::Add::add)
+}
+
+fn fold_sub_qualified_method(values: &[f32]) -> f32 {
+    values.iter().copied().fold(0.0, <f32 as Sub>::sub)
+}
+
+fn rfold_add_reference_method(values: &[f64]) -> f64 {
+    values.iter().rfold(0.0, <f64 as Add<&f64>>::add)
+}
+
 // Not reported: integer sums.
 fn sum_integers(values: &[u32]) -> u32 {
     values.iter().sum()
@@ -64,9 +148,57 @@ fn fold_max_shifted(values: &[f64], shift: f64) -> f64 {
     values.iter().fold(f64::NEG_INFINITY, |greatest, &value| greatest.max(value + shift))
 }
 
-// Not reported: Horner's rule. The accumulator is multiplied, not added up.
+// Not reported: reductions that take a maximum or a minimum, in the other folding methods.
+fn reduce_max(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(f64::max)
+}
+
+fn reduce_min(values: &[f32]) -> Option<f32> {
+    values.iter().copied().reduce(|least, value| least.min(value))
+}
+
+fn try_fold_max(values: &[f64]) -> Option<f64> {
+    values.iter().try_fold(f64::NEG_INFINITY, |greatest, &value| Some(greatest.max(value)))
+}
+
+fn rfold_min_shifted(values: &[f64], shift: f64) -> f64 {
+    values.iter().rfold(f64::INFINITY, |least, &value| least.min(value - shift))
+}
+
+// Not reported: integer products, sums into `Option` of an integer, and integer folds that
+// subtract or add through a method path.
+fn product_integers(values: &[u64]) -> u64 {
+    values.iter().product()
+}
+
+fn sum_integers_into_option(values: &[u32]) -> Option<u32> {
+    values.iter().map(|&value| Some(value)).sum()
+}
+
+fn fold_sub_integers(values: &[i64]) -> i64 {
+    values.iter().fold(0, |total, value| total - value)
+}
+
+fn fold_add_method_integers(values: &[u32]) -> u32 {
+    values.iter().copied().fold(0, u32::add)
+}
+
+fn reduce_integers(values: &[u32]) -> Option<u32> {
+    values.iter().copied().reduce(|total, value| total + value)
+}
+
+fn try_fold_integers(values: &[u32]) -> Option<u32> {
+    values.iter().try_fold(0_u32, |total, &value| total.checked_add(value))
+}
+
+// Not reported: Horner's rule. The accumulator is multiplied, not added up, also when the
+// coefficient is subtracted.
 fn horner(coefficients: &[f64], x: f64) -> f64 {
     coefficients.iter().rev().fold(0.0, |value, &coefficient| value * x + coefficient)
+}
+
+fn horner_sub(coefficients: &[f64], x: f64) -> f64 {
+    coefficients.iter().rfold(0.0, |value, &coefficient| value * x - coefficient)
 }
 
 // Not reported: a method that is only named `sum`.
@@ -95,6 +227,10 @@ fn naive_sums_in_a_test_are_not_reported() {
     let values = [1.0_f64, 2.0, 3.0];
     let summed: f64 = values.iter().sum();
     let folded = values.iter().fold(0.0, |total, value| total + value);
+    let reduced = values.iter().copied().reduce(f64::add);
+    let product: f64 = values.iter().product();
+    assert!(reduced.map(f64::to_bits) == Some(summed.to_bits()), "reduce adds in the same order");
+    assert!(product.to_bits() == 6.0_f64.to_bits(), "a small product is exact");
     assert!(summed.to_bits() == folded.to_bits(), "both add in the same order");
     assert!(summed.to_bits() == reference::naive_sum(&values).to_bits(), "and so does this");
 }
