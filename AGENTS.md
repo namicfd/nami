@@ -32,7 +32,7 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
 | `crates/solver` | Control plane: `Solver::init` (all allocation), the time loop, boundaries, I/O. |
 | `crates/alloc-guard` | Test-only counting allocator: `assert_no_allocations` around everything after init. The only crate with `unsafe` (ADR-0014). |
 | `crates/reference` | Numerical references: exact solutions, manufactured solutions, convergence harness. **Protected.** |
-| `xtask/` | Project tooling (`cargo xtask tidy`, Claude Code hooks). |
+| `xtask/` | Project tooling: `cargo xtask tidy`, the Claude Code hooks, and `agent-token.sh`, which makes git and gh act as the `nami-agent[bot]` GitHub App. |
 | `lints/` | dylint library on a pinned nightly: compiler-level lints such as `nami_recursion`. |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
 | `docs/TIGER_STYLE.md` | The full style guide. |
