@@ -16,7 +16,9 @@ directions.
 ## Decision
 
 1. **nami is a production solver** for compressible MHD and its sub-systems. Its goals are
-   safety, speed, and a demonstration of what a swarm-first approach can build.
+   safety, speed, flexibility, and a demonstration of what a swarm-first approach can build.
+   Flexibility means that future extensions fit in naturally. The aim is to exceed AthenaK's
+   feature set eventually.
 2. **Users** are researchers, and agents working for them, who study fluid phenomena with it.
    The results are for the maintainer and a few former colleagues. There is no public release or
    interface stability promise until a later ADR makes one.
