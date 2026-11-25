@@ -15,11 +15,19 @@
 //!
 //! A subagent may work in its own git worktree, while Claude Code starts every hook command in
 //! the session's project directory. So the hooks take the checkout from the payload: the git
-//! toplevel of the edited file, or of the `cwd` at stop and session start. If that checkout is
-//! not the one this binary was built from, the hook runs `cargo xtask hook` there instead, so
-//! that new code is checked by the rules on its own branch. [`ROOT_VARIABLE`] passes the
-//! checkout on and stops the hand-over from repeating. If that xtask cannot run, this one does
-//! the work, and an edit gets feedback that says so.
+//! toplevel of the edited file, or of the `cwd` at stop and session start; a git repository
+//! nested in a checkout belongs to the checkout around it. If that checkout is another worktree
+//! of the repository this binary was built in, the hook runs `cargo xtask hook` there instead,
+//! so that new code is checked by the rules on its own branch. Any other checkout, such as a
+//! fork's review clone, is checked by this xtask: the hooks never build code the project does
+//! not hold. [`ROOT_VARIABLE`] passes the checkout on, is checked by the receiving hook, and
+//! stops the hand-over from repeating.
+//!
+//! The hand-over counts only if the other xtask ran the hook: exit 0, 2, or `EXIT_GAVE_UP` (3)
+//! from a stop that gave up. Anything else (exit 1 from rustup without the pinned toolchain,
+//! 101 from cargo, a signal, a payload it could not be given, or a run past its deadline, after
+//! which it is killed) makes this xtask do the work with its own toolchain, and say so. An edit
+//! then always gets feedback.
 //!
 //! # The stop gate
 //!
@@ -34,10 +42,23 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::time::Duration;
 
 /// Exit code that makes Claude Code show stderr to the agent.
 const EXIT_FEEDBACK: u8 = 2;
+
+/// Exit code of a delegated stop hook that gave up. The hook that handed it over exits 1.
+const EXIT_GAVE_UP: u8 = 3;
+
+/// Seconds a hand-over may take after an edit and at session start (hook timeout: 120).
+const HAND_OVER_SECONDS_MAX: u32 = 60;
+
+/// Seconds a hand-over may take at stop (hook timeout: 600). A cold gate took 114 seconds.
+const STOP_HAND_OVER_SECONDS_MAX: u32 = 300;
+
+/// Milliseconds between two polls of a hand-over for its end.
+const POLL_INTERVAL_MILLISECONDS: u32 = 20;
 
 /// Upper bound on directories walked up when looking for the workspace root.
 const ANCESTORS_MAX: u32 = 64;
@@ -134,33 +155,106 @@ pub fn run(event: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let delegated = std::env::var_os(ROOT_VARIABLE).filter(|root| !root.is_empty());
+    let is_delegated = delegated.is_some();
     let mut is_fallback = false;
     let root = if let Some(root) = delegated {
-        Some(PathBuf::from(root))
+        match delegated_root(Path::new(&root)) {
+            Ok(root) => Some(root),
+            Err(error) => {
+                eprintln!("hook {}: {error}", event.name());
+                return ExitCode::FAILURE;
+            }
+        }
     } else {
         let project = std::env::var_os(PROJECT_VARIABLE).filter(|project| !project.is_empty());
         let root = hook_root(event, &payload, project.as_deref().map(Path::new));
-        if let Some(root) = &root
-            && !is_current_checkout(root)
-        {
-            match delegate(event, root, &payload) {
-                Ok(exit) => return exit,
-                Err(error) => {
-                    eprintln!("hook {}: {error}; checking with this xtask instead", event.name());
-                    is_fallback = true;
-                }
+        if let Some(root) = &root {
+            match hand_over(event, root, &payload) {
+                HandOver::Local => {}
+                HandOver::Ran(exit) => return exit,
+                HandOver::Failed => is_fallback = true,
             }
         }
         root
     };
+    // A delegated stop that gives up says so with its own code, so that the hook that handed
+    // it over does not mistake it for an xtask that failed to run, and gate it again.
+    let gave_up = if is_delegated { EXIT_GAVE_UP } else { 1 };
     let exit = match event {
         Event::PostEdit => root.map_or(ExitCode::SUCCESS, |root| post_edit(&root, &payload)),
-        Event::Stop => root.map_or(ExitCode::SUCCESS, |root| stop(&root, &payload)),
+        Event::Stop => root.map_or(ExitCode::SUCCESS, |root| stop(&root, &payload, gave_up)),
         Event::SessionStart => session_start(root.as_deref()),
     };
-    // A checkout whose xtask does not build must hear about it after an edit; the stop gate
+    // A checkout whose xtask does not run must hear about it after an edit; the stop gate
     // fails on it by itself, and at session start the human sees it.
     if is_fallback && event == Event::PostEdit { ExitCode::from(EXIT_FEEDBACK) } else { exit }
+}
+
+/// What became of handing an event to another checkout's xtask.
+enum HandOver {
+    /// This xtask does the work: the checkout is this one, or not a worktree of its repository.
+    Local,
+    /// The other xtask ran the hook and exited with this code.
+    Ran(ExitCode),
+    /// The other xtask did not run the hook; this one does the work instead.
+    Failed,
+}
+
+/// Hands the event to the xtask of the checkout at `root`, if that is another worktree of the
+/// repository that this process runs in. Any other checkout, such as another clone or a fork's
+/// review worktree, is checked by this xtask, so that the hooks never run code that the
+/// project does not hold.
+fn hand_over(event: Event, root: &Path, payload: &str) -> HandOver {
+    assert!(root.is_absolute(), "the checkout is named by an absolute path");
+    let current = std::env::current_dir().ok().and_then(|directory| checkout_around(&directory));
+    let Some(current) = current else {
+        return HandOver::Local;
+    };
+    if current == root || !is_same_repository(&current, root) {
+        return HandOver::Local;
+    }
+    match delegate(event, root, payload) {
+        Ok(exit) => HandOver::Ran(exit),
+        Err(error) => {
+            eprintln!(
+                "hook {}: {error}; checking with the xtask and the toolchain of {} instead, so \
+                 the toolchain that {} pins was not used",
+                event.name(),
+                current.display(),
+                root.display()
+            );
+            HandOver::Failed
+        }
+    }
+}
+
+/// True if the checkouts at `first` and `second` are worktrees of one repository: git names
+/// the same common directory for both.
+fn is_same_repository(first: &Path, second: &Path) -> bool {
+    let common = |root: &Path| {
+        let arguments = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        git(root, None, &arguments).and_then(|directory| fs::canonicalize(directory).ok())
+    };
+    let first = common(first);
+    first.is_some() && first == common(second)
+}
+
+/// Checks the checkout that [`ROOT_VARIABLE`] names: an absolute path to a nami checkout, and
+/// the one this process runs in, so that the binary that does the work was built from it.
+fn delegated_root(root: &Path) -> Result<PathBuf, String> {
+    let named = format!("{ROOT_VARIABLE}={}", root.display());
+    if !root.is_absolute() {
+        return Err(format!("{named} is not an absolute path"));
+    }
+    let checkout = checkout_around(root);
+    if checkout.as_deref() != Some(root) {
+        return Err(format!("{named} is not the toplevel of a nami checkout"));
+    }
+    let current = std::env::current_dir().ok().and_then(|directory| checkout_around(&directory));
+    if current.as_deref() != Some(root) {
+        return Err(format!("{named} is not the checkout this xtask runs in"));
+    }
+    Ok(root.to_path_buf())
 }
 
 /// The checkout that a hook payload is about, found with `git rev-parse --show-toplevel`:
@@ -184,36 +278,109 @@ pub fn hook_root(event: Event, payload: &str, project: Option<&Path>) -> Option<
     Some(root)
 }
 
-/// True if this process runs in the checkout at `root`. The hook command starts in the checkout
-/// that `cargo xtask` was built from, so this says whether this binary has `root`'s rules.
-fn is_current_checkout(root: &Path) -> bool {
-    let current = std::env::current_dir().ok().and_then(|directory| checkout_around(&directory));
-    current.as_deref() == Some(root)
-}
-
 /// Hands the event to `cargo xtask hook` in the checkout at `root`, with the payload on stdin
-/// and [`ROOT_VARIABLE`] set to `root`. Returns its exit code if it ran the hook (0, 1 or 2),
-/// or what went wrong if it did not, for example because that xtask does not build.
+/// and [`ROOT_VARIABLE`] set to `root`, and waits for it until a deadline ([`hand_over_polls`]).
+///
+/// Returns the exit code to stop with if that xtask ran the hook: 0, 2, or for a stop that
+/// gave up [`EXIT_GAVE_UP`], which becomes 1. Anything else means that it did not run the hook:
+/// rustup exits 1 when the pinned toolchain is missing, cargo 101 when xtask does not build.
+/// Exit code 1 would make Claude Code let a failing stop through, so it is never passed on.
 fn delegate(event: Event, root: &Path, payload: &str) -> Result<ExitCode, String> {
     assert!(root.is_absolute(), "the checkout to delegate to is named by an absolute path");
     let command = format!("`cargo xtask hook {}` in {}", event.name(), root.display());
-    let mut child = Command::new("cargo")
+    let mut builder = Command::new("cargo");
+    let builder = builder
         .args(["xtask", "hook", event.name()])
         .current_dir(root)
         .env(ROOT_VARIABLE, root)
         .env_remove(TOOLCHAIN_VARIABLES[0])
         .env_remove(TOOLCHAIN_VARIABLES[1])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("cannot run {command}: {error}"))?;
+        .stdin(Stdio::piped());
+    let spawned = in_own_process_group(builder).spawn();
+    let mut child = spawned.map_err(|error| format!("cannot run {command}: {error}"))?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
-    // A child that exits without reading its payload is judged by its exit code below.
-    let _written = stdin.write_all(payload.as_bytes());
-    drop(stdin);
-    let status = child.wait().map_err(|error| format!("cannot wait for {command}: {error}"))?;
-    match status.code().map(u8::try_from) {
-        Some(Ok(code @ 0..=EXIT_FEEDBACK)) => Ok(ExitCode::from(code)),
-        _ => Err(format!("{command} did not run the hook ({status})")),
+    let bytes = payload.as_bytes().to_vec();
+    // A thread writes, so that the deadline holds while cargo builds and the pipe is full.
+    let writer = std::thread::spawn(move || stdin.write_all(&bytes));
+    let status = wait_until(&mut child, hand_over_polls(event));
+    let written = writer.join().map_err(|_panic| format!("cannot pass the payload to {command}"));
+    let status = status.map_err(|error| format!("{command} {error}"))?;
+    let code = status.code().and_then(|code| u8::try_from(code).ok());
+    let exit = match code {
+        Some(0) => ExitCode::SUCCESS,
+        Some(EXIT_FEEDBACK) => ExitCode::from(EXIT_FEEDBACK),
+        Some(EXIT_GAVE_UP) if event == Event::Stop => ExitCode::FAILURE,
+        _ => return Err(format!("{command} did not run the hook ({status})")),
+    };
+    match written? {
+        Ok(()) => Ok(exit),
+        // The payload was not read whole. Only a hook that then passed or blocked is trusted.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe && code != Some(EXIT_GAVE_UP) => {
+            Ok(exit)
+        }
+        Err(error) => Err(format!("cannot pass the payload to {command}: {error}")),
+    }
+}
+
+/// How many polls a hand-over may take: its deadline, well within the hook's timeout in
+/// `.claude/settings.json` (120 seconds after an edit and at session start, 600 at stop), so
+/// that this hook can still do the work itself when a first build of the other xtask is slow.
+/// The deadline counts polls, not wall-clock time (ADR-0005); it can only run late by the time
+/// the polls themselves take.
+fn hand_over_polls(event: Event) -> u32 {
+    let seconds = match event {
+        Event::PostEdit | Event::SessionStart => HAND_OVER_SECONDS_MAX,
+        Event::Stop => STOP_HAND_OVER_SECONDS_MAX,
+    };
+    let polls = seconds * 1000 / POLL_INTERVAL_MILLISECONDS;
+    assert!(polls > 0, "a hand-over gets at least one poll");
+    polls
+}
+
+/// Waits for `child` for at most `polls_max` polls, then kills it and its process group.
+fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
+    let interval = Duration::from_millis(u64::from(POLL_INTERVAL_MILLISECONDS));
+    for _ in 0..polls_max {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(interval),
+            Err(error) => return Err(format!("cannot be waited for: {error}")),
+        }
+    }
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(status);
+    }
+    kill_process_group(child);
+    let killed = match child.wait() {
+        Ok(status) => status.to_string(),
+        Err(error) => format!("cannot be waited for: {error}"),
+    };
+    let seconds = polls_max * POLL_INTERVAL_MILLISECONDS / 1000;
+    Err(format!("did not finish within {seconds} seconds and was killed ({killed})"))
+}
+
+/// Starts the child in a process group of its own, so that a kill reaches its children too.
+fn in_own_process_group(command: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    let command = std::os::unix::process::CommandExt::process_group(command, 0);
+    command
+}
+
+/// Kills `child`, and on Unix every process in its group: cargo's build or the gate's `just`.
+fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let killed = Command::new("kill").args(["-KILL", "--", &group]).status();
+        if let Err(error) = killed {
+            eprintln!("hook: cannot kill the process group {group}: {error}");
+        }
+    }
+    // The group kill has usually ended the child already; that is not an error.
+    if let Err(error) = child.kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        eprintln!("hook: cannot kill the process {}: {error}", child.id());
     }
 }
 
@@ -279,7 +446,7 @@ fn format_in_place(root: &Path, file: &Path, original: &str) -> Result<String, E
 
 /// The stop gate for the checkout at `root`. Its state lives in that checkout, so each worktree
 /// has its own last pass and its own counters.
-fn stop(root: &Path, payload: &str) -> ExitCode {
+fn stop(root: &Path, payload: &str, gave_up: u8) -> ExitCode {
     let state = gate_state(root);
     let attempts = json_string_field(payload, "session_id")
         .map(|session_id| sanitise_session_id(&session_id))
@@ -311,13 +478,19 @@ fn stop(root: &Path, payload: &str) -> ExitCode {
         String::from_utf8_lossy(&output.stderr)
     );
     let stop_hook_active = json_bool_field(payload, "stop_hook_active") == Some(true);
-    stop_failed(attempts.as_deref(), stop_hook_active, &tail(&text, FEEDBACK_LINES_MAX))
+    let output_tail = tail(&text, FEEDBACK_LINES_MAX);
+    stop_failed(attempts.as_deref(), stop_hook_active, &output_tail, gave_up)
 }
 
 /// Reports a failed gate: blocks the stop, or gives up once the session has been blocked
 /// [`STOP_BLOCKS_MAX`] times in a row. `attempts` is the session's counter file, if the payload
 /// names a session.
-fn stop_failed(attempts: Option<&Path>, stop_hook_active: bool, output_tail: &str) -> ExitCode {
+fn stop_failed(
+    attempts: Option<&Path>,
+    stop_hook_active: bool,
+    output_tail: &str,
+    gave_up: u8,
+) -> ExitCode {
     let mut decision = failure_decision(attempts.map(failures_stored), stop_hook_active);
     if let (Failure::Block { attempt }, Some(file)) = (decision, attempts)
         && let Err(error) = fs::write(file, attempt.to_string())
@@ -342,7 +515,7 @@ fn stop_failed(attempts: Option<&Path>, stop_hook_active: bool, output_tail: &st
             eprintln!("This hook has stopped blocking only so that the agent is not trapped.");
             eprintln!("The last output of the gate:");
             eprintln!("{output_tail}");
-            ExitCode::FAILURE
+            ExitCode::from(gave_up)
         }
     }
 }
@@ -568,23 +741,33 @@ pub fn gate_state(root: &Path) -> PathBuf {
 
 /// The git toplevel of the checkout or worktree that holds `path`, if it is a nami checkout:
 /// it holds `rust-toolchain.toml` and `xtask/`. `path` may be a file, or not exist yet; the
-/// search starts at its nearest existing directory.
+/// search starts at its nearest existing directory. A git repository nested in a checkout,
+/// such as a test's scratch repository, belongs to the checkout around it: the search goes on
+/// above each toplevel that is not nami.
 #[must_use]
 pub fn checkout_around(path: &Path) -> Option<PathBuf> {
     let path = std::path::absolute(path).ok()?;
     let mut candidate = Some(path.as_path());
-    let mut directory = None;
+    let mut existing = None;
     for _ in 0..ANCESTORS_MAX {
-        let existing = candidate?;
-        if existing.is_dir() {
-            directory = Some(existing);
+        let directory = candidate?;
+        if directory.is_dir() {
+            existing = Some(directory);
             break;
         }
-        candidate = existing.parent();
+        candidate = directory.parent();
     }
-    let toplevel = PathBuf::from(git(directory?, None, &["rev-parse", "--show-toplevel"])?);
-    let is_nami = toplevel.join("rust-toolchain.toml").is_file() && toplevel.join("xtask").is_dir();
-    is_nami.then_some(toplevel)
+    let mut directory = existing?.to_path_buf();
+    for _ in 0..ANCESTORS_MAX {
+        let toplevel = PathBuf::from(git(&directory, None, &["rev-parse", "--show-toplevel"])?);
+        let is_nami =
+            toplevel.join("rust-toolchain.toml").is_file() && toplevel.join("xtask").is_dir();
+        if is_nami {
+            return Some(toplevel);
+        }
+        directory = toplevel.parent()?.to_path_buf();
+    }
+    None
 }
 
 /// Returns the first string value stored under `key`, decoding JSON escapes.
@@ -745,6 +928,38 @@ mod tests {
         let edit = format!(r#"{{"cwd":"/","tool_input":{{"file_path":"{}"}}}}"#, file.display());
         assert_eq!(hook_root(Event::PostEdit, &edit, None), Some(root), "the file, not the cwd");
         assert_eq!(hook_root(Event::PostEdit, r#"{"cwd":"/"}"#, None), None, "no file");
+    }
+
+    // Goal: a hand-over that outlives its deadline is killed with its process group and
+    // reported, and one that ends in time is waited for. Method: a shell whose child sleeps
+    // far longer than the test may take; the test ends only if the kill reaches the group.
+    #[test]
+    fn hand_overs_are_killed_at_their_deadline() {
+        use super::{in_own_process_group, wait_until};
+        let mut command = std::process::Command::new("sh");
+        let slow = in_own_process_group(command.args(["-c", "sleep 600; exit 0"]));
+        let mut child = slow.stdout(std::process::Stdio::null()).spawn().unwrap();
+        let error = wait_until(&mut child, 5).expect_err("the deadline passes first");
+        assert!(error.starts_with("did not finish within 0 seconds and was killed"), "{error}");
+        let mut quick = std::process::Command::new("true").spawn().unwrap();
+        let status = wait_until(&mut quick, 500).expect("`true` ends in time");
+        assert!(status.success(), "its status is kept: {status}");
+    }
+
+    // Goal: each hand-over deadline leaves the hook time to do the work itself before Claude
+    // Code's timeout in `.claude/settings.json` (120 seconds, and 600 at stop).
+    #[test]
+    fn hand_over_deadlines_are_within_the_hook_timeouts() {
+        use super::{Event, POLL_INTERVAL_MILLISECONDS, hand_over_polls};
+        let seconds = |event| hand_over_polls(event) * POLL_INTERVAL_MILLISECONDS / 1000;
+        assert_eq!(seconds(Event::PostEdit), 60, "half of 120");
+        assert_eq!(seconds(Event::SessionStart), 60, "half of 120");
+        assert_eq!(seconds(Event::Stop), 300, "half of 600");
+        let settings =
+            std::fs::read_to_string(crate::workspace_root().join(".claude/settings.json"))
+                .expect("the settings are readable");
+        assert_eq!(settings.matches(r#""timeout": 120"#).count(), 2, "edit and session start");
+        assert_eq!(settings.matches(r#""timeout": 600"#).count(), 2, "stop and subagent stop");
     }
 
     // Goal: every event name round-trips, and anything else is not an event.

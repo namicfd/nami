@@ -9,7 +9,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use xtask::hook::{Gate, ROOT_VARIABLE, base_tree, gate_decision, gate_state, tree_fingerprint};
+use xtask::hook::{Event, hook_root, tree_fingerprint};
+use xtask::hook::{Gate, ROOT_VARIABLE, base_tree, checkout_around, gate_decision, gate_state};
 use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent};
 use xtask::pr::{body_problems, changed_protected};
 
@@ -24,14 +25,19 @@ fi
 "#;
 
 /// A stand-in for `cargo`: it records where it runs, the checkout it is handed and the toolchain
-/// override it inherits, then runs the xtask under test, or fails like an xtask that does not
-/// build while `broken-xtask` exists.
+/// overrides it inherits, then runs the xtask under test. While `broken-xtask` exists it fails
+/// like an xtask that does not build; while `missing-toolchain` exists, like rustup without the
+/// pinned toolchain.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 mkdir -p target
-echo "$PWD|$NAMI_HOOK_ROOT|$RUSTUP_TOOLCHAIN|$*" >> target/cargo-calls
+echo "$PWD|$NAMI_HOOK_ROOT|$RUSTUP_TOOLCHAIN|$RUSTUP_TOOLCHAIN_SOURCE|$*" >> target/cargo-calls
 if [ -e broken-xtask ]; then
     echo "error: could not compile xtask" >&2
     exit 101
+fi
+if [ -e missing-toolchain ]; then
+    echo "error: toolchain 'pinned' is not installed" >&2
+    exit 1
 fi
 shift
 exec "$NAMI_TEST_XTASK" "$@"
@@ -127,10 +133,21 @@ impl Scratch {
     /// Runs `xtask hook <event>` in the checkout, as `.claude/settings.json` does in the project
     /// directory, with `payload` on stdin and the fake `just` and `cargo` first on `PATH`.
     fn hook(&self, event: &str, payload: &str, environment: &[(&str, &Path)]) -> Output {
+        self.hook_in(&self.root(), event, payload, environment)
+    }
+
+    /// Runs `xtask hook <event>` like [`Scratch::hook`], but in `directory`.
+    fn hook_in(
+        &self,
+        directory: &Path,
+        event: &str,
+        payload: &str,
+        environment: &[(&str, &Path)],
+    ) -> Output {
         let path = std::env::var("PATH").expect("PATH is set");
         let mut child = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(["hook", event])
-            .current_dir(self.root())
+            .current_dir(directory)
             .env("PATH", format!("{}:{path}", self.directory.join("bin").display()))
             .env("NAMI_TEST_XTASK", env!("CARGO_BIN_EXE_xtask"))
             .env_remove(ROOT_VARIABLE)
@@ -391,7 +408,8 @@ fn session_start_extends_path_and_reports_findings() {
     assert_eq!(fs::read_to_string(&env_file).unwrap(), export, "but only once");
 }
 
-/// The calls the fake `cargo` recorded in `checkout`: `<directory>|<root>|<toolchain>|<args>`.
+/// The calls the fake `cargo` recorded in `checkout`:
+/// `<directory>|<root>|<toolchain>|<toolchain source>|<args>`.
 fn cargo_calls(checkout: &Path) -> Vec<String> {
     let calls = fs::read_to_string(checkout.join("target/cargo-calls")).unwrap_or_default();
     calls.lines().map(str::to_owned).collect()
@@ -410,13 +428,16 @@ fn stop_gates_the_worktree_in_the_payload() {
     fs::write(worktree.join("src/new.rs"), "fn new() {}\n").unwrap();
     fs::write(worktree.join("violation.txt"), "x\n").unwrap();
     let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, worktree.join("src").display());
-    let toolchain = [("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain"))];
+    let toolchain = [
+        ("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain")),
+        ("RUSTUP_TOOLCHAIN_SOURCE", Path::new("env")),
+    ];
     let blocked = scratch.hook("stop", &payload, &toolchain);
     let stderr = String::from_utf8_lossy(&blocked.stderr);
     assert_eq!(blocked.status.code(), Some(2), "the worktree's violation blocks: {stderr}");
     assert!(stderr.contains("blocked stop 1 of 3"), "{stderr}");
     assert!(stderr.contains("violation.txt must not exist"), "{stderr}");
-    let handed = format!("{0}|{0}||xtask hook stop", worktree.display());
+    let handed = format!("{0}|{0}|||xtask hook stop", worktree.display());
     assert_eq!(
         cargo_calls(&worktree),
         std::slice::from_ref(&handed),
@@ -427,6 +448,22 @@ fn stop_gates_the_worktree_in_the_payload() {
     assert_eq!(just_calls, "check dylint\n", "the gate ran in the worktree");
     assert!(!project.join("target/just-calls").exists(), "and not in the project");
     assert!(gate_state(&worktree).join("attempts-s1").exists(), "the count is the worktree's");
+
+    // A delegated stop that gives up is not taken for a failed hand-over and gated again.
+    for attempt in 2..=3 {
+        let again = scratch.hook("stop", &payload, &[]);
+        assert_eq!(again.status.code(), Some(2), "blocked again");
+        let again = String::from_utf8_lossy(&again.stderr);
+        assert!(again.contains(&format!("blocked stop {attempt} of 3")), "{again}");
+    }
+    let gave_up = scratch.hook("stop", &payload, &[]);
+    let gave_up_stderr = String::from_utf8_lossy(&gave_up.stderr);
+    assert_eq!(gave_up.status.code(), Some(1), "the fourth stop gives up: {gave_up_stderr}");
+    assert!(gave_up_stderr.starts_with("STOP GATE STILL FAILING"), "{gave_up_stderr}");
+    assert!(!gave_up_stderr.contains("did not run the hook"), "it ran: {gave_up_stderr}");
+    assert!(!gate_state(&worktree).join("attempts-s1").exists(), "no fallback counted again");
+    let gate_runs = fs::read_to_string(worktree.join("target/just-calls")).unwrap();
+    assert_eq!(gate_runs.lines().count(), 4, "one gate run per stop");
 
     fs::remove_file(worktree.join("violation.txt")).unwrap();
     assert_eq!(scratch.hook("stop", &payload, &[]).status.code(), Some(0), "fixed");
@@ -442,7 +479,7 @@ fn stop_gates_the_worktree_in_the_payload() {
     assert_eq!(cargo_calls(&project), Vec::<String>::new(), "by the xtask that runs there");
     let kept = fs::read_to_string(gate_state(&worktree).join("passed")).unwrap();
     assert_eq!(kept, passed, "and the worktree's pass is untouched");
-    assert_eq!(cargo_calls(&worktree), [handed.clone(), handed], "one hand-over per stop");
+    assert_eq!(cargo_calls(&worktree), vec![handed; 5], "one hand-over per worktree stop");
 }
 
 // Goal: an edit is checked in the worktree that holds the file, whatever the `cwd` says; a
@@ -465,7 +502,7 @@ fn edits_and_session_starts_use_their_own_worktree() {
     let stderr = String::from_utf8_lossy(&edited.stderr);
     assert_eq!(edited.status.code(), Some(2), "the draft is a violation: {stderr}");
     assert!(stderr.contains("tests/snapshots/a.snap.new:0: error[snapshot-draft]"), "{stderr}");
-    let handed = format!("{0}|{0}||xtask hook post-edit", worktree.display());
+    let handed = format!("{0}|{0}|||xtask hook post-edit", worktree.display());
     assert_eq!(cargo_calls(&worktree), [handed], "checked by the worktree's xtask");
 
     fs::write(worktree.join("broken-xtask"), "").unwrap();
@@ -474,7 +511,8 @@ fn edits_and_session_starts_use_their_own_worktree() {
     assert_eq!(fallback.status.code(), Some(2), "a broken xtask is feedback: {told}");
     assert!(told.contains("could not compile xtask"), "cargo's error is shown: {told}");
     assert!(told.contains("did not run the hook"), "{told}");
-    assert!(told.contains("checking with this xtask instead"), "{told}");
+    assert!(told.contains("the toolchain that"), "{told}");
+    assert!(told.contains("pins was not used"), "the fallback names the toolchain: {told}");
     assert!(told.contains("error[snapshot-draft]"), "and the file is still checked: {told}");
     fs::remove_file(&draft).unwrap();
     let clean = scratch.hook("post-edit", &payload.replace(".snap.new", ".snap"), &[]);
@@ -489,6 +527,126 @@ fn edits_and_session_starts_use_their_own_worktree() {
     let stdout = String::from_utf8_lossy(&started.stdout);
     assert!(stdout.contains("error[doctor]: "), "the worktree's findings are shown: {stdout}");
     assert_eq!(cargo_calls(&project), Vec::<String>::new(), "the project never ran cargo");
+}
+
+/// A second worktree of `scratch` on the branch `work`, with committed-to-be work in `src/` and
+/// a planted `violation.txt`, and the Stop payload of a session whose `cwd` is in it.
+fn worktree_with_violation(scratch: &Scratch) -> (PathBuf, String) {
+    let worktree = scratch.worktree("work");
+    fs::create_dir_all(worktree.join("src")).expect("the worktree is writable");
+    fs::write(worktree.join("src/new.rs"), "fn new() {}\n").expect("the worktree is writable");
+    fs::write(worktree.join("violation.txt"), "x\n").expect("the worktree is writable");
+    let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, worktree.display());
+    (worktree, payload)
+}
+
+// Goal: a hand-over that exits 1 without running the hook, as rustup does when the pinned
+// toolchain is missing, never lets a failing stop through: exit 1 would not block. Method: the
+// fake `cargo` exits 1; the hook gates the worktree itself, blocks three times and then gives
+// up like any gate, and it says that the worktree's toolchain was not used.
+#[test]
+fn a_hand_over_that_exits_1_falls_back_to_the_gate() {
+    let scratch = Scratch::new("stop-exit-1");
+    let (worktree, payload) = worktree_with_violation(&scratch);
+    fs::write(worktree.join("missing-toolchain"), "").unwrap();
+    for attempt in 1..=3 {
+        let blocked = scratch.hook("stop", &payload, &[]);
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert_eq!(blocked.status.code(), Some(2), "the violation blocks: {stderr}");
+        assert!(stderr.contains("toolchain 'pinned' is not installed"), "rustup's error: {stderr}");
+        assert!(stderr.contains("did not run the hook (exit status: 1)"), "{stderr}");
+        assert!(stderr.contains("pins was not used"), "the fallback is named: {stderr}");
+        assert!(stderr.contains(&format!("blocked stop {attempt} of 3")), "{stderr}");
+        assert!(stderr.contains("violation.txt must not exist"), "the gate ran: {stderr}");
+    }
+    let gave_up = scratch.hook("stop", &payload, &[]);
+    let stderr = String::from_utf8_lossy(&gave_up.stderr);
+    assert_eq!(gave_up.status.code(), Some(1), "then it gives up, loudly: {stderr}");
+    assert!(stderr.contains("STOP GATE STILL FAILING"), "{stderr}");
+    let gate_runs = fs::read_to_string(worktree.join("target/just-calls")).unwrap();
+    assert_eq!(gate_runs.lines().count(), 4, "the gate ran in the worktree every time");
+    assert_eq!(cargo_calls(&worktree).len(), 4, "after a hand-over was tried every time");
+}
+
+// Goal: only a worktree of the project's own repository is handed over; another clone, such as
+// a fork's review checkout, is checked by the project's xtask as before, so that the hooks never
+// run code that the project does not hold. Method: a clone with a planted violation and an
+// unreviewed snapshot; the fake `cargo` would record any hand-over.
+#[test]
+fn another_clone_is_checked_by_the_project_xtask() {
+    let scratch = Scratch::new("foreign-clone");
+    let clone_path = scratch.directory.join("clone");
+    scratch.git(&["clone", "--quiet", ".", clone_path.to_str().expect("the path is UTF-8")]);
+    let clone = fs::canonicalize(&clone_path).expect("the clone exists");
+    git(&clone, &["switch", "--quiet", "--create", "work"]);
+    fs::write(clone.join("violation.txt"), "x\n").unwrap();
+    let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, clone.display());
+    let stopped = scratch.hook("stop", &payload, &[]);
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert_eq!(stopped.status.code(), Some(2), "the clone is gated: {stderr}");
+    assert!(!stderr.contains("did not run the hook"), "no hand-over was tried: {stderr}");
+    let gate_runs = fs::read_to_string(clone.join("target/just-calls")).unwrap();
+    assert_eq!(gate_runs, "check dylint\n", "the gate ran in the clone");
+
+    let draft = clone.join("a.snap.new");
+    fs::write(&draft, "draft\n").unwrap();
+    let edit = format!(r#"{{"tool_input":{{"file_path":"{}"}}}}"#, draft.display());
+    let edited = scratch.hook("post-edit", &edit, &[]);
+    let edit_stderr = String::from_utf8_lossy(&edited.stderr);
+    assert_eq!(edited.status.code(), Some(2), "the clone's file is checked: {edit_stderr}");
+    assert!(edit_stderr.contains("a.snap.new:0: error[snapshot-draft]"), "{edit_stderr}");
+    assert_eq!(cargo_calls(&clone), Vec::<String>::new(), "the clone's xtask never ran");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    assert_eq!(cargo_calls(&project), Vec::<String>::new(), "and nothing was built");
+}
+
+// Goal: a delegated hook works on the checkout that `NAMI_HOOK_ROOT` names, not on the one the
+// payload names, and refuses a root it cannot trust. Method: run the hook in the worktree with
+// the root set and a payload about the clean project: honoured, the worktree's violation
+// blocks; ignored, the hook would hand over to the project, whose gate passes.
+#[test]
+fn a_delegated_hook_honours_and_checks_its_root() {
+    let scratch = Scratch::new("delegated-root");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let (worktree, _payload) = worktree_with_violation(&scratch);
+    let about_project = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, project.display());
+    let root = [(ROOT_VARIABLE, worktree.as_path())];
+    let delegated = scratch.hook_in(&worktree, "stop", &about_project, &root);
+    let stderr = String::from_utf8_lossy(&delegated.stderr);
+    assert_eq!(delegated.status.code(), Some(2), "the named worktree is gated: {stderr}");
+    assert!(stderr.contains("violation.txt must not exist"), "{stderr}");
+    assert!(worktree.join("target/just-calls").exists(), "the gate ran in the worktree");
+    assert!(!project.join("target/just-calls").exists(), "and not in the project");
+    assert_eq!(cargo_calls(&project), Vec::<String>::new(), "nothing was handed on");
+
+    let refused = |name: &Path, expected: &str| {
+        let output = scratch.hook_in(&worktree, "stop", &about_project, &[(ROOT_VARIABLE, name)]);
+        let refusal = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(1), "a root that is not trusted fails: {refusal}");
+        assert!(refusal.contains(expected), "{expected}: {refusal}");
+    };
+    refused(Path::new("work"), "is not an absolute path");
+    refused(&worktree.join("src"), "is not the toplevel of a nami checkout");
+    refused(&project, "is not the checkout this xtask runs in");
+    let gate_runs = fs::read_to_string(worktree.join("target/just-calls")).unwrap();
+    assert_eq!(gate_runs.lines().count(), 1, "a refused root runs no gate");
+}
+
+// Goal: a git repository nested in a checkout, such as a test's scratch repository, belongs to
+// the checkout around it, as it did before the hooks used git's toplevel.
+#[test]
+fn a_nested_repository_belongs_to_the_enclosing_checkout() {
+    let scratch = Scratch::new("nested");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let nested = project.join("target/tmp/nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "--quiet"]);
+    assert_eq!(git_output(&nested, &["rev-parse", "--show-toplevel"]), nested.to_str().unwrap());
+    let file = nested.join("src/lib.rs");
+    assert_eq!(checkout_around(&file), Some(project.clone()), "the enclosing checkout");
+    let edit = format!(r#"{{"tool_input":{{"file_path":"{}"}}}}"#, file.display());
+    assert_eq!(hook_root(Event::PostEdit, &edit, None), Some(project));
+    assert_eq!(checkout_around(&scratch.directory), None, "outside every checkout: none");
 }
 
 /// A checkout whose branch `work` changes protected and unprotected files and moves a file out
