@@ -10,7 +10,7 @@
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
-| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b) agreed; (c) open | [0025](design/0025-extension-points-and-composition.md) |
+| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) agreed | [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
 | 5 | Performance and parallelism | Open | |
 | 6 | Interface, output and determinism guarantees | Open | |
 | 7 | Verification strategy | Open | |
@@ -327,3 +327,73 @@ combination of extension points in Rust types. The runtime configuration sets on
   `(Gravity, PassiveScalars)`, and applied in a fixed order every stage.
 - **Boundary conditions.** Chosen per block face at init, and dispatched once per face per stage
   with a `match`, never per cell. User boundary conditions come from the problem crate.
+
+### 4(c) Mesh, blocks, and init versus the time loop (agreed)
+
+**Blocks.**
+
+- Every block has the same size: nx1×nx2×nx3 cells plus ghost cells. That gives one scratch size,
+  equal work per block, and refinement that splits a block into 8 children of the same size.
+  Block size may become a compile-time constant (§ 4(b)) if the prototype shows that it helps.
+- A block's state is its slice of a pool, in the layout of § 4(a). For constrained transport, a
+  block also holds the face-centred magnetic field and the edge electric fields, each with one
+  extra cell in its staggered direction.
+- A uniform Cartesian block stores only its origin and spacing. Curvilinear and non-uniform blocks
+  store their face positions, areas and volumes, computed at init.
+
+**The block tree is a linear octree.**
+
+- It is a sorted array of Morton keys. Each key is a level plus logical coordinates, as typed
+  newtypes (ADR-0002).
+- Finding a neighbour is arithmetic on the key followed by a binary search: iterative, with fixed
+  bounds, and no recursion (ADR-0006).
+- The Morton order is also the space-filling curve that load balancing partitions, so the
+  partition is deterministic.
+- With 2:1 balance between levels, a 3D block has at most 56 neighbour slots: up to 4 per face,
+  2 per edge and 1 per corner. Every neighbour table is a fixed-size array.
+
+**Pools with a fixed capacity.**
+
+- The configuration sets a memory budget. Init turns it into a maximum number of blocks per rank,
+  and allocates every pool once: block storage, neighbour buffers, flux-correction buffers, and
+  scratch space for each thread.
+- Refining takes slots from a fixed free list, and coarsening returns them.
+- Running out of slots is an operating error. The run stops cleanly, writes a checkpoint, and
+  reports the memory it would have needed. It never allocates (ADR-0003).
+
+**Init.** `Solver::init(config, problem) -> Result<Solver, InitError>`:
+
+1. validates the configuration;
+2. builds the initial tree, refining iteratively up to a configured maximum level;
+3. allocates every pool;
+4. calls the problem's initial conditions;
+5. sets `alloc-guard`'s flag that init is done.
+
+**One step** runs the integrator's table of stages (§ 4(b)). Every stage runs a fixed list of
+phases over all blocks:
+
+1. fill ghost cells, and exchange them between blocks and ranks;
+2. compute the fluxes for each direction with the row kernels;
+3. compute the edge electric fields (constrained transport);
+4. update;
+5. add the source terms;
+6. apply the positivity correction (§ 3.2);
+7. correct fluxes and electric fields between refinement levels.
+
+After the last stage, the next time step is the minimum over all blocks, which does not depend
+on order. AMR regrids every N steps: tag blocks, refine and coarsen within the pool, rebalance
+(§ 5).
+
+**Bulk-synchronous first.** Each phase finishes on every block before the next one starts. The
+overlap of communication with computation (interiors first, then the cells next to boundaries)
+comes in M7, without changing any kernel. Block order never changes results: a block's update
+depends only on its own data and its ghost cells, and reductions combine in block-key order.
+
+**Crates.**
+
+- A new `mesh` crate holds the tree, the neighbour tables and the pools.
+- `kernels` never sees the mesh, so the face-frame physics of § 4(b) can be reused on unstructured
+  meshes later.
+- The manifest change lands in M0 as its own protected commit.
+- An unstructured or Voronoi mesh (M10) will be a second mesh kind with its own design pass. It
+  shares `kernels`, not `mesh`.
