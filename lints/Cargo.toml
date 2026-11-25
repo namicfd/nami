@@ -3,7 +3,7 @@
 [package]
 name = "nami_lints"
 version = "0.0.0"
-description = "Lints that clippy does not have: no recursion (ADR-0006)."
+description = "Lints clippy does not have: no recursion (ADR-0006), no naive float sums (ADR-0005)."
 edition = "2024"
 publish = false
 license = "MIT"

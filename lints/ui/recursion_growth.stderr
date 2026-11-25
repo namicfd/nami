@@ -1,0 +1,40 @@
+error: `deeper` is recursive: deeper -> deeper::<(T, T)>. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_growth.rs:6:1
+   |
+LL | fn deeper<T: Copy>(x: T, n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(nami_recursion)]` on by default
+
+error: `calls_deeper` cannot be shown to be free of recursion: its calls reach more than 100000 function instances, or nest more than 500 deep. The search stopped in `deeper`, which probably calls itself with generic arguments that grow with every call. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_growth.rs:11:1
+   |
+LL | fn calls_deeper() -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `wider` is recursive: wider -> wider::<(T, u8)>. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_growth.rs:16:1
+   |
+LL | fn wider<T>(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `calls_wider` cannot be shown to be free of recursion: its calls reach more than 100000 function instances, or nest more than 500 deep. The search stopped in `wider`, which probably calls itself with generic arguments that grow with every call. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_growth.rs:21:1
+   |
+LL | fn calls_wider() -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Nest<T> as Probe>::value` is recursive: <Nest<T> as Probe>::value -> <Nest<Nest<T>> as Probe>::value. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_growth.rs:45:5
+   |
+LL |     fn value(&self, depth: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `calls_nest` cannot be shown to be free of recursion: its calls reach more than 100000 function instances, or nest more than 500 deep. The search stopped in `<Nest<T> as Probe>::value`, which probably calls itself with generic arguments that grow with every call. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_growth.rs:52:1
+   |
+LL | fn calls_nest() -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 6 previous errors
+
