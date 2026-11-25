@@ -342,6 +342,20 @@ mod tests {
         assert_eq!(lines("[dependencies]\n\n# only libm\nlibm.workspace = true\n"), NONE);
     }
 
+    // Goal: each message names the dependency, says what to do and cites the ADR.
+    #[test]
+    fn messages_name_the_dependency_and_the_fix() {
+        let manifest = "[dependencies]\nserde = \"1\"\nlibm = { package = \"cc\" }\n\"arch\",\n";
+        let violations = check_manifest(Path::new("crates/a/Cargo.toml"), manifest, &[]);
+        let messages: Vec<&str> =
+            violations.iter().map(|violation| violation.message.as_str()).collect();
+        assert_eq!(messages.len(), 3, "a disallowed crate, a rename and an unreadable line");
+        assert!(messages[0].starts_with("runtime dependency `serde`; the only runtime dependency"));
+        assert!(messages[1].starts_with("dependency `libm` is renamed with `package = \"...\"`;"));
+        assert!(messages[2].starts_with("cannot read `\"arch\",` as `name = ...`; write each"));
+        assert!(messages.iter().all(|message| message.ends_with("(ADR-0001)")), "the reason");
+    }
+
     // Goal: in the workspace manifest, a rename in `[workspace.dependencies]` is reported, in
     // the inline and in the table form. Names are not restricted there, and other tables are
     // not read.

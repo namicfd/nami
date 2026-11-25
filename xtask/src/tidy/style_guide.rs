@@ -28,7 +28,10 @@ const NAMED_MECHANISMS: [&str; 5] = ["tidy", "clippy", "rustc", "dylint", "plann
 /// Former tags, each with what to write now.
 const RETIRED_MECHANISMS: [(&str, &str); 2] = [
     ("hook", "hooks only give feedback and gate nothing; name what gates the rule, or `[review]`"),
-    ("reference", "the reference suite is not built yet; write `[planned:reference-suite]`"),
+    (
+        "reference",
+        "the reference suite is not built yet; write the `[planned:<id>]` that covers it",
+    ),
 ];
 
 /// Where the reason for the tag rules is written down.
@@ -180,7 +183,14 @@ fn lint_table_advice(table: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Mechanisms, Tag, check, is_tag, review_count, tags};
+    use crate::tidy::registry;
     use std::path::Path;
+
+    /// A planned mechanism to name in tags. The tests do not depend on which one it is, so
+    /// they survive the day it is built and leaves the table.
+    fn planned_id() -> &'static str {
+        registry::PLANNED.first().expect("something is planned").id
+    }
 
     fn mechanisms() -> Mechanisms {
         Mechanisms {
@@ -204,8 +214,9 @@ mod tests {
     fn valid_tags_pass() {
         let valid = "`[compiler]` `[fmt]` `[deny]` `[review]` `[tidy:usize]` `[tidy:direct-libm]` \
                      `[clippy:unwrap_used]` `[clippy:pedantic]` `[rustc:missing_docs]` \
-                     `[dylint:nami_recursion]` `[planned:float-reduction]`";
+                     `[dylint:nami_recursion]`";
         assert_eq!(problems(valid), Vec::<String>::new());
+        assert_eq!(problems(&format!("`[planned:{}]`", planned_id())), Vec::<String>::new());
     }
 
     // Goal: a named tag whose target does not exist is reported, with the place to look.
@@ -215,7 +226,6 @@ mod tests {
             ("`[tidy:no-such-rule]`", "is not a tidy rule"),
             ("`[planned:no-such-plan]`", "is not in PLANNED"),
             ("`[planned:usize]`", "is not in PLANNED"),
-            ("`[tidy:float-reduction]`", "is not a tidy rule"),
             ("`[dylint:nami_float_reduction]`", "is not declared at `Deny` in lints/src/"),
             ("`[clippy:float_cmp]`", "under `[workspace.lints.clippy]`"),
             ("`[clippy:missing_docs]`", "under `[workspace.lints.clippy]`"),
@@ -228,6 +238,8 @@ mod tests {
             assert!(found[0].contains(expected), "{tag}: {}", found[0]);
             assert!(found[0].ends_with("(TIGER_STYLE.md, How rules are enforced)"), "{tag}");
         }
+        let planned_as_built = problems(&format!("`[tidy:{}]`", planned_id()));
+        assert_eq!(planned_as_built.len(), 1, "a planned mechanism is not a tidy rule yet");
     }
 
     // Goal: tags of an unknown, bare, retired or misspelt form are reported, each with the fix.
@@ -239,7 +251,7 @@ mod tests {
             ("`[dylint]`", "does not say which one"),
             ("`[planned]`", "does not say which one"),
             ("`[hook]`", "no longer a mechanism: hooks only give feedback"),
-            ("`[reference]`", "write `[planned:reference-suite]`"),
+            ("`[reference]`", "write the `[planned:<id>]` that covers it"),
             ("`[reference:euler]`", "no longer a mechanism"),
             ("`[review:later]`", "takes no name"),
             ("`[tydy:usize]`", "unknown tag `[tydy:usize]`"),
