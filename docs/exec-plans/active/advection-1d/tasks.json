@@ -12,7 +12,9 @@
         "reference::advection1d::tests::leaky_scheme_fails_conservation",
         "reference::advection1d::tests::large_step_scheme_fails_step_count",
         "reference::advection1d::tests::flat_slope_scheme_fails_tvd_order",
-        "reference::advection1d::tests::mirror_check_tells_symmetric_from_one_sided"
+        "reference::advection1d::tests::mirror_check_tells_symmetric_from_one_sided",
+        "reference::advection1d::tests::order_check_measures_known_orders",
+        "reference::advection1d::tests::nan_scheme_fails_every_check"
       ],
       "passes": false
     },

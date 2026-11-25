@@ -40,10 +40,10 @@ There is exactly one flux per interface, shared by both neighbours.
   |---|---|---|
   | upwind with forward Euler | ν ≤ 1 | LeVeque §4.4 |
   | Fromm with SSP-RK2 | ν ≤ 1 | von Neumann analysis |
-  | minmod with SSP-RK2 | ν ≤ 2/3 | Harten's incremental form: C = ν(1 + ψ_i/2 − ψ_{i−1}/2) with ψ ∈ [0, 1]. Forward Euler is TVD when ν(1 + ψ_max/2) ≤ 1, and SSP-RK2 inherits that limit. |
-  | MC with SSP-RK2 | ν ≤ 1/2 | the same argument, with ψ ∈ [0, 2] |
+  | minmod with SSP-RK2 | ν ≤ 2/3 | Harten's incremental form: C = ν(1 + ψ(θ_i)/2 − ψ(θ_{i−1})/(2θ_{i−1})), with ψ and ψ(θ)/θ both in [0, 1]. Forward Euler is TVD when 0 ≤ C ≤ 1, which holds for ν(1 + ψ_max/2) ≤ 1. SSP-RK2 has SSP coefficient 1, so it keeps the forward-Euler limit. |
+  | MC with SSP-RK2 | ν ≤ 1/2 | the same argument, with ψ and ψ(θ)/θ both in [0, 2] |
 
-  `Config` rejects a Courant number above its scheme's limit.
+  These are Harten's sufficient conditions for TVD, not necessarily the largest TVD ν. `Config` rejects a Courant number above its scheme's limit.
 - **Ghost cells.** Two per side, filled periodically before every stage. That is enough for the MUSCL stencil: a cell's slope needs its neighbours, and an interface needs the slopes of both its cells.
 
 ### Data layout
@@ -113,6 +113,7 @@ Write `reference::advection1d`: exact solutions, the `Scheme` contract and the c
   - **square pulse** that is 1 on [p, q) and 0 elsewhere, periodic. Its cell average is the overlap length of the cell with the shifted pulse, divided by Δx.
   - Use `libm` directly for sin/cos, not the solver's `kernels::math`, so that the reference shares no numerical code with what it checks.
 - **Checks** each return `Result<(), String>`, and `check_scheme` panics with the first error. Every check uses both signs of a, at least two resolutions (none coarser than N = 32), and **ν = 0.45** unless noted.
+  - **Finite first.** Every check first requires each cell average, error, mass and observed order it computes to be finite, and fails otherwise. Each comparison is written so that NaN fails, never `!(x < bound)`, which NaN passes. A solver that produces NaN must fail every check.
   - **Why ν = 0.45:** it is below every scheme's limit in the table above. It also makes t|a|/(νΔx) a non-integer at every tested N for t = 0.25 and t = 0.3. With a dyadic ν such as 0.5, the step counts come out as whole numbers, and a solver that never shortens its last step would pass.
   - **Why ν < 1:** at ν = 1, upwind is an exact shift, and its observed order and error ceiling both collapse to zero.
   - **Conservation.**
@@ -132,20 +133,33 @@ Write `reference::advection1d`: exact solutions, the `Scheme` contract and the c
       - second order unlimited: p ≥ 2 − δ, with δ = 0.1 (ADR-0007);
       - second order TVD: p ≥ 1.5. Limiters clip the smooth extrema, which costs some accuracy but not first order.
 
-      That lower bound for TVD is what separates a working minmod or MC from a slope that is always zero or a dropped σ/2. For reference, the review prototype measured minmod 1.87, MC 2.02 and σ ≡ 0 0.99 on this data. Record that bound and its reasoning in the thresholds.
+      That lower bound for TVD is what separates a working minmod or MC from a slope that is always zero, or one used without its factor of ½. For reference, the review prototype measured these orders on this data at ν = 0.45:
+      - minmod 1.87 and MC 2.02;
+      - flat-slope MUSCL with SSP-RK2 0.97;
+      - full-slope ū ± σ: minmod 1.00, MC 0.61, Fromm 1.03.
+
+      Record the bound and its reasoning in the thresholds.
     - The finest error must also be under a ceiling, one per kind.
   - **Maximum principle** (first order and TVD only). From square-pulse data, every cell average stays within [min ū⁰, max ū⁰], up to round-off.
   - **Mirror symmetry.** Run with a and initial data ū_i, then with −a and the mirrored data ū_{N−1−i}. The results must be mirrors of each other, **bitwise** (ADR-0007, symmetry tier). The review prototype matched bitwise in all 648 cases it tried, across every scheme.
   - **Determinism.** Two identical runs give bitwise-identical results.
   - **Step count.** `steps()` must be at least ⌈(t |a| / (ν Δx)) · (1 − 4ε)⌉. The factor keeps a correct solver from failing when the exact quotient is an integer. This bounds the number of steps, so a scheme that covers the run in fewer, longer steps fails. It does not bound the longest single step.
 - **Thresholds** (see the open question above). Derive every error ceiling from theory, never from a solver's output, and document the derivation next to the constant.
-  - For first-order upwind, the modified equation gives the numerical diffusion |a| Δx (1 − ν)/2 (LeVeque §8.6). The ceiling is **at most 1.5 times** the resulting amplitude error, so a scheme with twice the diffusion fails. The review prototype predicted 1.215e-2 and measured 1.216e-2 at N = 128, ν = 0.5.
+  - For first-order upwind, the modified equation gives the numerical diffusion |a| Δx (1 − ν)/2 (LeVeque §8.6). The ceiling is **at most 1.5 times** the resulting amplitude error, so a scheme with twice the diffusion fails. At ν = 0.45, N = 128 and t = 0.25, the review prototype predicted (2/π)(1 − exp(−4π² · |a|Δx(1 − ν)/2 · t)) = 1.3357e-2 and measured 1.3373e-2.
   - For the other schemes, use the leading truncation-error term, or a published measurement with its citation.
   - Margins are generous enough to tolerate round-off and tight enough that a factor-of-two error in the scheme fails.
 - **Self-tests**, which are this task's acceptance tests:
-  - An *exact scheme* reads the private profile in `Initial` and returns `exact_cell_averages` at the current time. It passes every check of every kind except mirror symmetry. Exact cell averages of the mirrored problem are equal only up to rounding, not bitwise.
+  - An *exact scheme* reads the private profile in `Initial` and returns `exact_cell_averages` at the current time. It reports `steps()` = ⌈t|a|/(νΔx)⌉, as if it stepped at the CFL limit.
+    - It passes conservation, moved-correctly, the maximum principle, determinism and the step count, for every kind.
+    - It is exempt from two checks:
+      - **Mirror symmetry:** exact cell averages of the mirrored problem agree only up to rounding, not bitwise.
+      - **Order of accuracy:** its error is exactly zero, so the observed order is log₂(0/0).
+  - The order check gets its own self-tests. A *known-order scheme* returns the exact cell averages plus c·Δx^p·g, for a fixed smooth zero-mean g. Its error is c·Δx^p·‖g‖₁, so its observed order is p up to rounding.
+    - With p = 2, it passes the order check of every kind.
+    - With p = 1, it passes first order and fails both second-order kinds.
+    - A *NaN scheme*, whose averages are all NaN, fails every check.
   - The mirror check gets its own two self-tests:
-    - a *shift scheme*, upwind at ν = 1, which moves every average by exactly one cell per step and is mirror-symmetric by construction, passes it;
+    - a *shift scheme*, upwind at ν = 1, passes it. Every full step moves each average by exactly one cell. A shortened last step is no longer a pure shift, but it is still mirror-symmetric;
     - a *one-sided scheme*, upwind that always takes the left state whatever the sign of a, fails it.
   - A *no-op scheme* fails the moved-correctly and order checks.
   - A *reversed scheme* (one that advects with −a) fails the moved-correctly check.
