@@ -14,7 +14,7 @@ The only well-documented cost anchor is Anthropic's C compiler: just under $20k 
 2. **Spend controls, from the first unattended run:**
    - **Per session:** `claude -p --max-budget-usd` caps every worker run.
    - **Per day:** the runner keeps a running total and stops launching sessions once the daily cap is reached. There is also a manual kill switch, a file or flag the runner checks before each launch.
-   - **Concurrency:** never more agents than there are independent ready tasks (ADR-0011) or independent failing oracles.
+   - **Concurrency:** never more agents than there are independent ready tasks (ADR-0011) or independent failing references.
    - **Model mix:** janitor and planner roles may use cheaper models when the metrics allow it.
 3. **Metrics** (shared with ADR-0008):
    - cost per merged PR;
@@ -23,7 +23,7 @@ The only well-documented cost anchor is Anthropic's C compiler: just under $20k 
    - surviving mutants.
 
    They are reported weekly.
-4. **Review point:** after the first month of phase 2, a new ADR either keeps the pilot level, moves to about $5–10k per month, or plans bursts at C-compiler scale (about $20k per 2-week push) for well-specified, well-oracled milestones. The decision rests on measured cost per merged PR, not on the anchor above.
+4. **Review point:** after the first month of phase 2, a new ADR either keeps the pilot level, moves to about $5–10k per month, or plans bursts at C-compiler scale (about $20k per 2-week push) for well-specified, well-referenced milestones. The decision rests on measured cost per merged PR, not on the anchor above.
 
 Phase 1 is interactive and its cost is mostly maintainer time. No additional controls apply in that phase.
 
@@ -40,7 +40,7 @@ Phase 1 is interactive and its cost is mostly maintainer time. No additional con
 ## Alternatives considered
 
 - **Medium (about $5–10k/month) from the start.** Rejected. It would scale before the gates are proven.
-- **C-compiler-scale bursts.** Deferred until there is a milestone with strong oracles.
+- **C-compiler-scale bursts.** Deferred until there is a milestone with strong references.
 - **Leaving the budget undecided.** Rejected. Controls need a number to enforce.
 
 ## Evidence

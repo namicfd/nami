@@ -1,5 +1,5 @@
 [package]
-name = "nami-solver"
+name = "solver"
 description = "Orchestration: initialisation, the time loop, boundary conditions and I/O."
 version.workspace = true
 edition.workspace = true

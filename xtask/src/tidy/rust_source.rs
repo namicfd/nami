@@ -21,7 +21,7 @@ const FUNCTION_LINES_TRIVIAL_MAX: u32 = 5;
 const FUNCTION_LINES_UNASSERTED_MAX: u32 = 10;
 
 /// The only crate that may contain `unsafe` code (ADR-0014).
-const UNSAFE_ALLOWED_CRATE: &str = "crates/nami-alloc-guard";
+const UNSAFE_ALLOWED_CRATE: &str = "crates/alloc-guard";
 
 /// Macros that count as assertions.
 const ASSERTION_MACROS: [&str; 6] =
@@ -199,7 +199,7 @@ impl Visitor<'_> {
 
     fn report_unsafe(&mut self, span: Span) {
         if !self.path.starts_with(UNSAFE_ALLOWED_CRATE) {
-            let message = "`unsafe` outside crates/nami-alloc-guard; nami has no other unsafe \
+            let message = "`unsafe` outside crates/alloc-guard; nami has no other unsafe \
                            code. Find a safe formulation, or propose an ADR (ADR-0014)";
             self.report(span, "unsafe", message);
         }
@@ -208,7 +208,7 @@ impl Visitor<'_> {
     fn report_kernel_indirection(&mut self, span: Span, what: &str) {
         if self.scope == Scope::Kernels && !self.in_tests() {
             let message = format!(
-                "{what} in nami-kernels; use generics so every call resolves statically \
+                "{what} in kernels; use generics so every call resolves statically \
                  (ADR-0003, ADR-0006)"
             );
             self.report(span, "kernel-indirection", message);
@@ -532,11 +532,8 @@ mod tests {
         assert_eq!(rules("unsafe fn a() {}", Scope::Crate), ["unsafe"]);
         assert_eq!(rules("unsafe impl Send for S {}", Scope::Crate), ["unsafe"]);
         assert_eq!(rules("unsafe trait T {}", Scope::Crate), ["unsafe"]);
-        let guard = check(
-            Path::new("crates/nami-alloc-guard/src/lib.rs"),
-            "unsafe fn a() {}",
-            Scope::Crate,
-        );
+        let guard =
+            check(Path::new("crates/alloc-guard/src/lib.rs"), "unsafe fn a() {}", Scope::Crate);
         assert_eq!(guard.violations, Vec::new());
     }
 

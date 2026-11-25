@@ -27,14 +27,15 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
 
 | Path | What it is |
 |---|---|
-| `crates/nami-core` | Typed indices (`CellIndex`, `CellCount`) and field views. The only place `usize` is allowed. `no_std`. |
-| `crates/nami-kernels` | Numerical kernels. `no_std` without `alloc`. `math` is the single entry point for `libm`; `reduce` holds the deterministic sums. |
-| `crates/nami-solver` | Control plane: `Solver::init` (all allocation), the time loop, boundaries, I/O. |
-| `crates/nami-alloc-guard` | Test-only counting allocator: `assert_no_allocations` around everything after init. The only crate with `unsafe` (ADR-0014). |
-| `crates/nami-oracle` | Numerical oracles: exact solutions, manufactured solutions, convergence harness. **Protected.** |
-| `xtask/` | Project tooling (`cargo xtask tidy`, Claude Code hooks). |
+| `crates/base` | Typed indices (`CellIndex`, `CellCount`) and field views. The only place `usize` is allowed. `no_std`. |
+| `crates/kernels` | Numerical kernels. `no_std` without `alloc`. `math` is the single entry point for `libm`; `reduce` holds the deterministic sums. |
+| `crates/solver` | Control plane: `Solver::init` (all allocation), the time loop, boundaries, I/O. |
+| `crates/alloc-guard` | Test-only counting allocator: `assert_no_allocations` around everything after init. The only crate with `unsafe` (ADR-0014). |
+| `crates/reference` | Numerical references: exact solutions, manufactured solutions, convergence harness. **Protected.** |
+| `xtask/` | Project tooling: `cargo xtask tidy`, the Claude Code hooks, and `agent-token.sh`, which makes git and gh act as the `nami-agent[bot]` GitHub App. |
 | `lints/` | dylint library on a pinned nightly: compiler-level lints such as `nami_recursion`. |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
+| `docs/operations/` | Runbooks: how GitHub and the `nami-agent` bot are set up, and how to set them up again. |
 | `docs/TIGER_STYLE.md` | The full style guide. |
 | `docs/exec-plans/` | Plans and `tasks.json` task lists (ADR-0011). |
 | `docs/research/` | Background research. |
@@ -47,16 +48,16 @@ Each rule is checked mechanically or in review. The reference says where the rea
    iteration limit and assert convergence. (ADR-0006)
 2. **No allocation after init.** Kernels are `no_std` without `alloc`. Fixed-size storage is
    `Box<[T]>`, not `Vec<T>`. (ADR-0003)
-3. **Indices and counts are `u32` newtypes.** `usize` only inside `nami_core::index`. No `as`
+3. **Indices and counts are `u32` newtypes.** `usize` only inside `base::index`. No `as`
    casts. (ADR-0002)
 4. **Kernels never index slices directly.** Use `array_windows`/`chunks_exact`, `[f64; NVAR]`
    states, or `field[CellIndex]`. (ADR-0003)
 5. **Assert arguments, results and invariants.** Average at least 2 assertions per function, every
-   assertion with a message. `debug_assert!` is only for per-cell checks inside `nami-kernels`.
+   assertion with a message. `debug_assert!` is only for per-cell checks inside `kernels`.
    (ADR-0004)
 6. **Functions are at most 70 lines; lines are at most 100 columns.** (ADR-0006)
 7. **Results are bitwise deterministic:**
-   - math functions only through `nami_kernels::math`;
+   - math functions only through `kernels::math`;
    - no `algebraic_*`;
    - `mul_add` only where written explicitly;
    - sums through `sum_fixed`/`sum_compensated`;
@@ -78,20 +79,30 @@ Each rule is checked mechanically or in review. The reference says where the rea
   - `#[expect(lint, reason = "...")]` needs a real reason, and the number of them is budgeted.
 - **Never loosen a tolerance, threshold or reference value.** Never edit a test so that it matches
   the output, and never clamp a value to make a test pass.
-- **If a rule is wrong for your case, stop.** Explain why in your PR or task, and propose an ADR in
-  `docs/design/` with status `Proposed`. A human decides.
+- **If a rule is wrong for your case, change it openly. Never work around it.**
+  - Change the check or configuration in the same PR.
+  - Add an ADR in `docs/design/` with status `Proposed` that explains why.
+  - Say so at the top of the PR description. A human decides at review.
 
 ## Protected paths
 
-These paths need human review (ADR-0008). Edit them only when your task explicitly says so:
+These paths need a human's approval at PR review (ADR-0008, ADR-0015). You may edit them when
+your task needs it, and nothing blocks you locally. A PR that touches them waits for the code owner
+instead of merging automatically, so:
+
+- change them only as far as the task needs;
+- put those changes in a commit of their own;
+- list every protected file you changed in the PR description, with the reason.
+
+The protected paths are:
 
 - **Manifests and lockfile:** `Cargo.toml` (all of them) and `Cargo.lock`.
 - **Tool configuration:** `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`,
   `.cargo/` and `.config/`.
 - **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
-- **Policy:** `docs/design/` and `docs/TIGER_STYLE.md`.
-- **Oracles:** `crates/nami-oracle/` and `tools/`.
+- **Policy:** `docs/design/`, `docs/TIGER_STYLE.md` and `docs/operations/`.
+- **References:** `crates/reference/` and `tools/`.
 
 The authoritative list is `.github/CODEOWNERS`.
 
@@ -102,7 +113,7 @@ The authoritative list is `.github/CODEOWNERS`.
 - **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`.**
   - Touch only the task's `owner_paths`.
   - Never set `passes`; only CI does.
-- **An oracle lands before the feature it tests.** Never write the oracle for code you also
+- **A reference lands before the feature it tests.** Never write the reference for code you also
   implement.
 - **A change that alters output bits** is labelled `changes-results` and waits for a human. Explain
   the change and include before/after convergence numbers.

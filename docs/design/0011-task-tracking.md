@@ -29,16 +29,16 @@ Anthropic's long-running-agent pattern keeps a JSON feature list where agents ma
        {
          "id": "euler1d-hllc",
          "title": "HLLC Riemann solver for 1D Euler",
-         "depends_on": ["euler1d-exact-oracle"],
-         "owner_paths": ["crates/nami-kernels/src/riemann/hllc.rs"],
-         "acceptance": ["oracle::euler1d::toro_tests_1_to_5", "oracle::euler1d::hllc_convergence"],
+         "depends_on": ["euler1d-exact-reference"],
+         "owner_paths": ["crates/kernels/src/riemann/hllc.rs"],
+         "acceptance": ["reference::euler1d::toro_tests_1_to_5", "reference::euler1d::hllc_convergence"],
          "passes": false
        }
      ]
    }
    ```
    - `owner_paths` declares which files a task may touch. The planner keeps concurrently ready tasks disjoint, which avoids merge conflicts.
-   - `acceptance` lists oracle test names, never prose.
+   - `acceptance` lists reference test names, never prose.
    - **Only CI may set `passes` to `true`**, after the acceptance tests are green on `main`.
 3. **Claims** are files `claims/<task-id>` on a dedicated `claims` branch. Each holds the agent id, the session id and a UTC timestamp. Claiming means pushing that file, so a second claim fails as a non-fast-forward push. A claim older than its timeout (initially 2 hours) can be released by the runner.
 4. **CLI:** `cargo xtask task ready | claim <id> | release <id> | status`. It has no dependencies beyond std and git, and an agent may implement it.

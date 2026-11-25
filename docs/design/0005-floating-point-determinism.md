@@ -24,13 +24,13 @@ nami's output is **bitwise identical across platforms** (at minimum Linux x86_64
 2. **`algebraic_*` operations are banned.** No fast-math of any kind.
 3. **`mul_add` is allowed only where written explicitly.** Clippy's `suboptimal_flops` stays off, so nobody is pushed to rewrite expressions. x86_64 CI and release builds use `-C target-cpu=x86-64-v3`, so `mul_add` runs on hardware FMA. The target CPU does not change results.
 4. **Reductions run in a fixed order.**
-   - Sums use `nami_kernels::reduce::sum_fixed`: 8 accumulator lanes combined in a fixed tree, which is deterministic and as fast as a reordering sum.
+   - Sums use `kernels::reduce::sum_fixed`: 8 accumulator lanes combined in a fixed tree, which is deterministic and as fast as a reordering sum.
    - Conservation totals use `sum_compensated` (Neumaier).
    - `max`/`min` give the same result in any order.
    - Future threaded or SIMD reductions must combine partial results in partition-index order.
 5. **NaN is always an error.** Any NaN in a state, flux or time step fails an assertion, so NaN payload bits never matter.
 6. **No iteration over hashed collections** (`HashMap`, `HashSet`).
-7. **Tolerances are only for correctness oracles** (convergence order, exact solutions; ADR-0007). Regression and determinism tests compare bits.
+7. **Tolerances are only for correctness references** (convergence order, exact solutions; ADR-0007). Regression and determinism tests compare bits.
 8. **A change in output bits must be explained.** That includes changes caused by a toolchain or `libm` bump. Such PRs are labelled `changes-results` and need a human (ADR-0008).
 
 **Fallback.** If the cross-platform hash comparison shows that `libm` itself differs between platforms, a superseding ADR falls back to "bitwise on the pinned Linux CI platform, √ε-relative error norms elsewhere".
@@ -83,4 +83,4 @@ Local benchmarks, rustc 1.100, Apple Silicon, release builds:
 | `powf` | 3.68× |
 
 - Codegen: `a*b+c` → `fmul`+`fadd` (no FMA), even with `target-cpu=native`. `mul_add` → `fmadd`.
-- Reproducibility literature: CESM-ECT and FELTOR (bitwise only with identical compiler, flags and FMA behaviour), FLiT (tolerance bands across platforms). See the research report's section on numerical oracles.
+- Reproducibility literature: CESM-ECT and FELTOR (bitwise only with identical compiler, flags and FMA behaviour), FLiT (tolerance bands across platforms). See the research report's section on numerical oracles (called references in nami).

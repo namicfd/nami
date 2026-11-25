@@ -6,10 +6,10 @@
 //!
 //! ```ignore
 //! #[global_allocator]
-//! static ALLOCATOR: nami_alloc_guard::CountingAllocator = nami_alloc_guard::CountingAllocator;
+//! static ALLOCATOR: alloc_guard::CountingAllocator = alloc_guard::CountingAllocator;
 //!
 //! let solver = Solver::init(&config);              // allocation is allowed here
-//! nami_alloc_guard::assert_no_allocations(|| {
+//! alloc_guard::assert_no_allocations(|| {
 //!     solver.step();                                 // and forbidden here
 //! });
 //! ```
