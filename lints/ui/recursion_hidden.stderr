@@ -1,0 +1,64 @@
+error: `walk` is recursive: walk -> walk. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:16:1
+   |
+LL | fn walk(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(nami_recursion)]` on by default
+
+error: `ping` is recursive: ping -> pong -> ping. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:21:1
+   |
+LL | fn ping(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `pong` is recursive: pong -> ping -> pong. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:25:1
+   |
+LL | fn pong(n: u32) -> u32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Counter::step` is recursive: Counter::step -> Counter::step. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:33:5
+   |
+LL |     fn step(n: u32) -> u32 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Steps as std::ops::Add>::add` is recursive: <Steps as std::ops::Add>::add -> <Steps as std::ops::Add>::add. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:55:5
+   |
+LL |     fn add(self, other: Steps) -> Steps {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Flip as std::ops::Neg>::neg` is recursive: <Flip as std::ops::Neg>::neg -> <Flip as std::ops::Neg>::neg. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:78:5
+   |
+LL |     fn neg(self) -> Flip {
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+error: `<Tally as std::ops::AddAssign>::add_assign` is recursive: <Tally as std::ops::AddAssign>::add_assign -> <Tally as std::ops::AddAssign>::add_assign. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:98:5
+   |
+LL |     fn add_assign(&mut self, other: Tally) {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Ramp as std::ops::Index<u32>>::index` is recursive: <Ramp as std::ops::Index<u32>>::index -> <Ramp as std::ops::Index<u32>>::index. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:121:5
+   |
+LL |     fn index(&self, i: u32) -> &f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Chain as std::ops::Deref>::deref` is recursive: <Chain as std::ops::Deref>::deref -> <Chain as std::ops::Deref>::deref. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:146:5
+   |
+LL |     fn deref(&self) -> &f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Link as std::ops::Deref>::deref` is recursive: <Link as std::ops::Deref>::deref -> <Link as std::ops::Deref>::deref. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:163:5
+   |
+LL |     fn deref(&self) -> &f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 10 previous errors
+

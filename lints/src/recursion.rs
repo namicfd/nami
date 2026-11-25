@@ -24,6 +24,24 @@
 //!
 //! Closures count as part of the function that defines them, whether or not they are called.
 //!
+//! A call is any of these in a function body:
+//!
+//! - a path to a function, whether it is called or used as a value: `f(x)`, `T::f(x)`, and the
+//!   `f` in `apply(f, x)` or `.map(T::f)`;
+//! - a method call `x.f()`;
+//! - an operator that type checking resolved to a trait method: `a + b`, `a == b`, `-a`, `!a`,
+//!   `*a`, `a += b` and `a[i]` (`Index::index`; type checking names `index_mut` where the place
+//!   is mutated);
+//! - a deref that the compiler inserts through `Deref` or `DerefMut`: autoderef of a method
+//!   receiver or a field access, and deref coercion.
+//!
+//! A function used as a value is taken to be called by the function that names it. That
+//! over-approximates: the function may be stored and never called, and it may be called later
+//! by someone else. In return, the lint need not follow the value into the receiver, so a
+//! callback handed down the call stack closes its cycle whatever the receiver is: a generic
+//! `F: Fn`, a `dyn Fn`, or a function pointer. A function that names itself without calling
+//! itself, for example to return a pointer to itself, is reported too.
+//!
 //! The search from one function is bounded in instances and in call depth. A function whose
 //! search hits a bound is reported too, because it was not shown to be free of recursion. That
 //! happens when a callee calls itself with generic arguments that grow with every call.
@@ -34,14 +52,16 @@
 //!   crate calls a generic function of another crate, which calls back through a trait impl or
 //!   a closure of this crate, the path ends at the foreign function: its body is not available
 //!   under `cargo check`. Closures still count for the function that defines them.
-//! - Calls through `dyn Trait` are followed only into the trait's default methods, and calls
-//!   through function pointers and `Fn` bounds are not followed at all. Kernels ban `dyn` and
-//!   function pointers (ADR-0003), so this gap is open only in the other crates.
-//! - A function that passes itself by name to a generic function (`apply(walk, n)`) is not
-//!   reported, because naming a function is not a call.
-//! - Only calls written as calls are edges: `f(x)`, `T::f(x)` and `x.f()`. Calls that the
-//!   compiler inserts are not: overloaded operators (`a + b`, `a[i]`, `*a`), implicit derefs,
-//!   and `Drop`.
+//! - Calls through `dyn Trait` are followed only into the trait's default methods, not into the
+//!   impls whose values were coerced to `dyn Trait`.
+//! - A call through a function pointer or an `Fn` bound is not an edge. A function value is
+//!   seen only where it is named, so a pointer that is stored (in a struct, a static or a
+//!   table) and called from a function that did not name it closes no cycle. Kernels ban `dyn`
+//!   and function pointers (ADR-0003), but not `impl Fn` parameters.
+//! - `Drop` is not an edge: the compiler inserts drop glue after type checking, where this lint
+//!   does not look.
+//! - A cycle through a standard-library impl that forwards to a local one is not seen: `&a == &b`
+//!   calls `<&A as PartialEq<&B>>::eq`, whose body is in `core`.
 //! - A generic function is searched with its own parameters, so it is reported only if its
 //!   cycle does not depend on them. If only some instantiation is recursive, the report is at
 //!   the function whose call chooses that instantiation, when that function is in this crate.
@@ -53,6 +73,7 @@ use rustc_hir::def::{DefKind, Namespace, Res};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Body, Expr, ExprKind};
 use rustc_lint::{LateContext, Lint};
+use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind};
 use rustc_middle::ty::print::{FmtPrinter, Printer};
 use rustc_middle::ty::{
     EarlyBinder, GenericArgs, GenericArgsRef, Instance, InstanceKind, TyCtxt, TypeckResults,
@@ -165,6 +186,24 @@ struct CallCollector<'tcx> {
 }
 
 impl<'tcx> CallCollector<'tcx> {
+    /// Adds a call to `Deref::deref` or `DerefMut::deref_mut` for every overloaded deref that
+    /// the compiler inserts around `expression`: autoderef of a method receiver or a field
+    /// access, and deref coercion. Each step derefs the type that the step before produced.
+    fn add_overloaded_derefs(&mut self, expression: &Expr<'tcx>) {
+        let adjustments = self.typeck.expr_adjustments(expression);
+        if adjustments.is_empty() {
+            return;
+        }
+        let mut source = self.typeck.expr_ty(expression);
+        for adjustment in adjustments {
+            if let Adjust::Deref(DerefAdjustKind::Overloaded(deref)) = adjustment.kind {
+                let method = deref.method_call(self.tcx);
+                self.add_call(method, self.tcx.mk_args(&[source.into()]));
+            }
+            source = adjustment.target;
+        }
+    }
+
     fn add_call(&mut self, callee: DefId, args: GenericArgsRef<'tcx>) {
         // Desugared calls (`for` loops, `?`) can carry no recorded arguments. Resolving those
         // would crash the compiler, so they are dropped. Their callees are lang items of the
@@ -182,16 +221,24 @@ impl<'tcx> CallCollector<'tcx> {
 
 impl<'tcx> Visitor<'tcx> for CallCollector<'tcx> {
     fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+        self.add_overloaded_derefs(expression);
         match expression.kind {
-            ExprKind::Call(callee, _) => {
-                if let ExprKind::Path(path) = &callee.kind
-                    && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) =
-                        self.typeck.qpath_res(path, callee.hir_id)
+            // A path to a function, called or not: `f(x)`, `T::f(x)`, and `apply(f, x)`.
+            ExprKind::Path(ref path) => {
+                if let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) =
+                    self.typeck.qpath_res(path, expression.hir_id)
                 {
-                    self.add_call(def_id, self.typeck.node_args(callee.hir_id));
+                    self.add_call(def_id, self.typeck.node_args(expression.hir_id));
                 }
             }
-            ExprKind::MethodCall(..) => {
+            // A method call, or an operator that type checking resolved to a trait method:
+            // `a + b`, `-a`, `*a`, `a += b` and `a[i]`. Operators on primitive types record no
+            // method, because they are built in.
+            ExprKind::MethodCall(..)
+            | ExprKind::Binary(..)
+            | ExprKind::Unary(..)
+            | ExprKind::AssignOp(..)
+            | ExprKind::Index(..) => {
                 if let Some(def_id) = self.typeck.type_dependent_def_id(expression.hir_id) {
                     self.add_call(def_id, self.typeck.node_args(expression.hir_id));
                 }

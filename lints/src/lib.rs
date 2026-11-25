@@ -28,8 +28,9 @@ dylint_linting::declare_lint! {
     /// ### What it does
     ///
     /// Reports functions that call themselves, directly or through other functions, including
-    /// through closures, through trait methods resolved to a concrete impl, and through generic
-    /// functions that call back into a trait impl.
+    /// through closures, through trait methods resolved to a concrete impl, through generic
+    /// functions that call back into a trait impl, through functions passed as values, and
+    /// through overloaded operators and derefs.
     ///
     /// ### Why is this bad?
     ///
