@@ -121,6 +121,9 @@ pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
 ///
 /// `cargo deny check sources` rejects a git override but accepts a path override, because a
 /// path dependency has no source to check. So the rule bans both, and does not rely on it.
+///
+/// Tidy does not decode TOML escapes, so `"patch"` would read as another key. A top-level
+/// key with a backslash is reported too, because it could spell an override.
 fn check_overrides(relative: &Path, text: &str) -> Vec<Violation> {
     let mut violations = Vec::new();
     let mut in_root_table = true;
@@ -135,17 +138,35 @@ fn check_overrides(relative: &Path, text: &str) -> Vec<Violation> {
         } else {
             None
         };
-        if let Some(key) = key
-            && OVERRIDE_KEYS.contains(&key.as_str())
-        {
-            violations.push(Violation::new(relative, line_number, OVERRIDE_RULE, overridden(&key)));
+        let message = match key {
+            Some(key) if OVERRIDE_KEYS.contains(&key.as_str()) => Some(overridden(&key)),
+            Some(key) if key.contains('\\') => Some(escaped(&key)),
+            Some(_) | None => None,
+        };
+        if let Some(message) = message {
+            violations.push(Violation::new(relative, line_number, OVERRIDE_RULE, message));
         }
     }
+    let line_count = text.lines().count();
     assert!(
-        violations.iter().all(|violation| violation.rule == OVERRIDE_RULE),
-        "only overrides are reported here"
+        violations.is_sorted_by(|earlier, later| earlier.line < later.line),
+        "at most one violation per line, in line order"
+    );
+    assert!(
+        violations.iter().all(|violation| {
+            usize::try_from(violation.line).is_ok_and(|line| (1..=line_count).contains(&line))
+        }),
+        "every reported line is a line of the manifest"
     );
     violations
+}
+
+fn escaped(key: &str) -> String {
+    format!(
+        "cannot read the top-level key `{key}` of the workspace manifest: it holds an escape, \
+         which tidy does not decode, so it could spell `patch` or `replace`. Write the key \
+         without escapes (ADR-0001)"
+    )
 }
 
 fn overridden(key: &str) -> String {
@@ -443,10 +464,23 @@ mod tests {
         assert_eq!(lines("# [patch.crates-io]\n[workspace]\nmembers = []\n"), NONE);
         assert_eq!(lines("[workspace.metadata.patch]\npatch = 1\nreplace = 2\n"), NONE);
         assert_eq!(lines("[workspace]\npatch.crates-io.libm = { path = \"x\" }\n"), NONE);
-        let violations = check_workspace_manifest(Path::new("Cargo.toml"), "[replace]\n");
-        let message = violations.first().map_or("", |violation| violation.message.as_str());
-        assert!(message.starts_with("`[replace]` in the workspace manifest swaps"), "{message}");
-        assert!(message.ends_with("(ADR-0001)"), "the message cites the reason");
+        // Escapes are not decoded, so an escaped top-level key is reported: it could spell
+        // `patch`. An escape below the top level cannot.
+        assert_eq!(lines("[\"p\\u0061tch\".crates-io]\nlibm = { path = \"x\" }\n"), [1]);
+        assert_eq!(lines("\"p\\u0061tch\".crates-io.libm = { path = \"x\" }\n"), [1]);
+        assert_eq!(lines("\"r\\u0065place\" = { \"libm:0.2.16\" = { path = \"x\" } }\n"), [1]);
+        assert_eq!(lines("[workspace]\n\"p\\u0061tch\" = 1\n"), NONE);
+        assert_eq!(lines("[workspace.metadata.\"a\\u0062\"]\n"), NONE);
+        let message_of = |manifest: &str| -> String {
+            let violations = check_workspace_manifest(Path::new("Cargo.toml"), manifest);
+            violations.first().map_or(String::new(), |violation| violation.message.clone())
+        };
+        let escape = message_of("[\"p\\u0061tch\"]\n");
+        assert!(escape.starts_with("cannot read the top-level key `p\\u0061tch`"), "{escape}");
+        assert!(escape.ends_with("(ADR-0001)"), "the message cites the reason");
+        let replace = message_of("[replace]\n");
+        assert!(replace.starts_with("`[replace]` in the workspace manifest swaps"), "{replace}");
+        assert!(replace.ends_with("(ADR-0001)"), "the message cites the reason");
     }
 
     // Goal: headers and keys split at dots outside quotes; sections follow from the segments.

@@ -10,6 +10,10 @@ libm = { version = "=0.2.16", default-features = false }
 [patch.crates-io]
 libm = { path = "../libm-fork" }
 
+# `patch` spelled with an escape, which tidy does not decode.
+["patch".'https://example.com/index']
+libm = { path = "../libm-fork" }
+
 # The older form of the same thing.
 [replace]
 "libm:0.2.16" = { git = "https://example.com/libm-fork" }
