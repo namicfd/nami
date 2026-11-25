@@ -232,7 +232,8 @@ multiply the bug-finding power of fuzzing and seeded simulation.
     `[compiler]`
   - Elsewhere, `Solver::init()` sizes every field, ghost layer, scratch pencil and output buffer
     once. `[review]`
-  - A counting allocator aborts any allocation after init in test builds.
+  - A counting allocator (`crates/alloc-guard`) fails any test that allocates inside
+    `assert_no_allocations`. Wrapping the time loop in it is still to do.
     `[planned:alloc-after-init]`
 - **Storage that must not grow is `Box<[T]>`, not `Vec<T>`.** A boxed slice has no `push`, so the
   type itself documents and enforces the fixed size. `[tidy:vec-field]`
@@ -308,14 +309,21 @@ finite-volume codes, and especially in agent-written ones.
       for ((next, &current), &[flux_left, flux_right]) in cells {
           *next = current - dt_over_dx * (flux_right - flux_left);
       }
+
+      assert!(all_finite(state_next), "updated state must be finite; NaN is always a bug (ADR-0005)");
   }
   ```
 
-  The example also shows the kernel conventions:
+  This is `crates/kernels/src/update.rs`, the template to copy for a new kernel. It also shows
+  the kernel conventions:
   - lengths asserted before the loop;
   - no raw indexing (`array_windows` with array patterns, ADR-0003);
   - primitive arguments instead of `&self`;
+  - a per-pencil backstop after the loop (ADR-0004);
   - names with qualifiers last.
+
+  Its tests show the test conventions: exact expected bits, a check that the solution moved
+  correctly, the conservation identity, and one test per assertion.
 
 ### Data access in kernels
 
@@ -338,7 +346,8 @@ finite-volume codes, and especially in agent-written ones.
   - `mul_add` is allowed where written explicitly. Never rewrite an expression into `mul_add`
     without a reason, because doing so changes results. `[review]`
   - **Sums use `sum_fixed`** (or `sum_compensated` for conservation totals), never a naive fold.
-    `[planned:float-reduction]`
+    The lint sees `Iterator::sum` and `fold`; a sum written as a `for` loop is for review.
+    `[dylint:nami_float_reduction]` `[review]`
   - No iteration over `HashMap` or `HashSet`. `[clippy:iter_over_hash_type]`
     `[clippy:disallowed_types]`
 - **NaN is always a bug.** Every state, flux and time step is finite, and that is asserted

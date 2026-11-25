@@ -1,10 +1,11 @@
-//! Claude Code hooks (ADR-0008, `.claude/settings.json`).
+//! Claude Code hooks (ADR-0018, `.claude/settings.json`).
 //!
 //! Hooks are defence in depth: they give agents fast feedback, while the server-side gates stay
 //! authoritative (ADR-0009). Each hook reads the event JSON on stdin. Exit code 2 sends stderr
 //! back to the agent; any other failure is reported to the human as a hook error.
 //!
-//! - `post-edit`: formats an edited Rust file and runs the single-file tidy rules on it.
+//! - `post-edit`: formats an edited Rust file, and runs on the edited file every tidy rule that
+//!   needs only that file: Rust sources, manifests, ADRs, learnings and the style guide.
 //! - `stop`: runs `just check dylint` before an agent or subagent may finish, unless the working
 //!   state is the unchanged base or has already passed.
 //! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH` and reports tools whose
@@ -80,30 +81,30 @@ fn post_edit(payload: &str) -> ExitCode {
     let Some(file) = json_string_field(payload, "file_path").map(PathBuf::from) else {
         return ExitCode::SUCCESS;
     };
-    let is_rust = file.extension().is_some_and(|extension| extension == "rs");
     let Some(root) = workspace_root_of(&file) else {
         return ExitCode::SUCCESS;
     };
-    if !is_rust || !file.is_file() {
-        return ExitCode::SUCCESS;
-    }
+    // A deleted file, a directory or a binary file has nothing to check.
     let Ok(original) = std::fs::read_to_string(&file) else {
         return ExitCode::SUCCESS;
     };
-    let text = match format_source(&root, &original) {
-        Ok(formatted) => formatted,
+    let is_rust = file.extension().is_some_and(|extension| extension == "rs");
+    let text = if is_rust {
+        match format_in_place(&root, &file, &original) {
+            Ok(formatted) => formatted,
+            Err(exit) => return exit,
+        }
+    } else {
+        original
+    };
+    let relative = file.strip_prefix(&root).expect("root is an ancestor of the file");
+    let violations = match crate::tidy::check_single_file(&root, relative, &text) {
+        Ok(violations) => violations,
         Err(error) => {
-            eprintln!("rustfmt cannot format {}; fix the syntax error first:", file.display());
-            eprintln!("{error}");
-            return ExitCode::from(EXIT_FEEDBACK);
+            eprintln!("hook post-edit: cannot check {}: {error}", file.display());
+            return ExitCode::FAILURE;
         }
     };
-    if text != original && std::fs::write(&file, &text).is_err() {
-        eprintln!("cannot write the formatted {}", file.display());
-        return ExitCode::FAILURE;
-    }
-    let relative = file.strip_prefix(&root).expect("root is an ancestor of the file");
-    let (violations, _stats) = crate::tidy::check_rust_source(relative, &text);
     if violations.is_empty() {
         return ExitCode::SUCCESS;
     }
@@ -111,6 +112,25 @@ fn post_edit(payload: &str) -> ExitCode {
         eprintln!("{violation}");
     }
     ExitCode::from(EXIT_FEEDBACK)
+}
+
+/// Formats a Rust file and writes it back if the text changed. Returns the formatted text, or
+/// the exit code to stop with: feedback for a syntax error, failure if the file cannot be
+/// written.
+fn format_in_place(root: &Path, file: &Path, original: &str) -> Result<String, ExitCode> {
+    let text = match format_source(root, original) {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            eprintln!("rustfmt cannot format {}; fix the syntax error first:", file.display());
+            eprintln!("{error}");
+            return Err(ExitCode::from(EXIT_FEEDBACK));
+        }
+    };
+    if text != original && std::fs::write(file, &text).is_err() {
+        eprintln!("cannot write the formatted {}", file.display());
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(text)
 }
 
 fn stop(payload: &str) -> ExitCode {

@@ -122,12 +122,12 @@ pub const RULES: &[Rule] = &[
         "planned-task",
         "Every planned mechanism has a task with the same id in a `tasks.json` under \
          `docs/exec-plans/active/`.",
-        "ADR-0011",
+        "ADR-0017",
     ),
     workspace(
         "rules-doc",
         "`docs/RULES.md` matches what `cargo xtask rules` generates from the registry.",
-        "ADR-0006",
+        "ADR-0017",
     ),
     source(
         "runtime-dependency",
@@ -264,6 +264,13 @@ pub const PLANNED: &[Planned] = &[
         "ADR-0003",
     ),
     planned(
+        "clippy-fixtures",
+        "test",
+        "One planted violation per clippy ban and configured lint proves that each still fires \
+         after a toolchain bump.",
+        "ADR-0006",
+    ),
+    planned(
         "determinism-hash",
         "ci",
         "CI hashes the output of a canonical problem set and compares Linux, macOS and a \
@@ -285,12 +292,6 @@ pub const PLANNED: &[Planned] = &[
         "ADR-0006",
     ),
     planned(
-        "float-reduction",
-        "dylint",
-        "Flag naive float reductions (`.sum::<f64>()`, a `fold` with `+`) and name `sum_fixed`.",
-        "ADR-0005",
-    ),
-    planned(
         "floor-activation-count",
         "test",
         "A floor or limiter that is part of a scheme counts its activations, and a reference \
@@ -306,8 +307,8 @@ pub const PLANNED: &[Planned] = &[
     planned(
         "recursion-cross-crate",
         "dylint",
-        "Detect call cycles that cross crate boundaries; `nami_recursion` checks each crate on \
-         its own.",
+        "Detect call cycles that cross crates through a generic callback; `nami_recursion` \
+         checks each crate on its own.",
         "ADR-0006",
     ),
     planned(

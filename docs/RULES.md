@@ -26,8 +26,8 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `line-length` | source | Lines in Rust sources are at most 100 columns. | TIGER_STYLE.md, Style by the numbers |
 | `magic-tolerance` | source | In nami crates outside tests, a float literal in (0, 1e-6] appears only in the initialiser of a `const` item that has a doc comment. | TIGER_STYLE.md, Floating point |
 | `parse` | source | Every Rust source file parses. | ADR-0006 |
-| `planned-task` | workspace | Every planned mechanism has a task with the same id in a `tasks.json` under `docs/exec-plans/active/`. | ADR-0011 |
-| `rules-doc` | workspace | `docs/RULES.md` matches what `cargo xtask rules` generates from the registry. | ADR-0006 |
+| `planned-task` | workspace | Every planned mechanism has a task with the same id in a `tasks.json` under `docs/exec-plans/active/`. | ADR-0017 |
+| `rules-doc` | workspace | `docs/RULES.md` matches what `cargo xtask rules` generates from the registry. | ADR-0017 |
 | `runtime-dependency` | source | Runtime and build dependencies of nami crates are `libm` and workspace crates only, and none is renamed with `package = "..."`. | ADR-0001 |
 | `snapshot-draft` | source | No unreviewed insta snapshots (`*.snap.new`). | ADR-0006 |
 | `test-goal` | source | Every test starts with a comment that states its goal. | TIGER_STYLE.md, Comments, docs and commits |
@@ -52,6 +52,7 @@ Declarative source rules: a ban is one row in `PATH_BANS` or `MACRO_BANS` plus t
 
 | Lint | Level | What it reports |
 | --- | --- | --- |
+| `nami_float_reduction` | Deny | naive float sum (ADR-0005) |
 | `nami_recursion` | Deny | function that can call itself (ADR-0006) |
 
 ## Clippy and rustc lints
@@ -65,13 +66,13 @@ Promised in the documents and not built yet. The style guide tags the rules they
 | Id | Intended mechanism | What it will check | Reference |
 | --- | --- | --- | --- |
 | `alloc-after-init` | test | A counting-allocator test around the time loop proves that nothing allocates after init. | ADR-0003 |
+| `clippy-fixtures` | test | One planted violation per clippy ban and configured lint proves that each still fires after a toolchain bump. | ADR-0006 |
 | `determinism-hash` | ci | CI hashes the output of a canonical problem set and compares Linux, macOS and a same-seed rerun. | ADR-0005 |
 | `doc-example-sync` | test | The code blocks in `docs/TIGER_STYLE.md` are compiled and linted, so the examples cannot drift from the rules. | ADR-0013 |
 | `float-eq-in-eq-fn` | tidy | Flag `==` and `!=` between floats in functions whose name contains `eq`, which clippy's `float_cmp` skips. | ADR-0006 |
-| `float-reduction` | dylint | Flag naive float reductions (`.sum::<f64>()`, a `fold` with `+`) and name `sum_fixed`. | ADR-0005 |
 | `floor-activation-count` | test | A floor or limiter that is part of a scheme counts its activations, and a reference test fails on an unexpected count. | TIGER_STYLE.md, Physical admissibility |
 | `glossary` | docs | `docs/glossary.md` records the one meaning of each word that could be overloaded. | TIGER_STYLE.md, Naming |
-| `recursion-cross-crate` | dylint | Detect call cycles that cross crate boundaries; `nami_recursion` checks each crate on its own. | ADR-0006 |
+| `recursion-cross-crate` | dylint | Detect call cycles that cross crates through a generic callback; `nami_recursion` checks each crate on its own. | ADR-0006 |
 | `reference-suite` | test | The reference crate holds the tiered tests: invariants, symmetry, convergence order, exact solutions and one reference per boundary-condition type. | ADR-0007 |
 | `tasks-schema` | ci | CI validates every `tasks.json` against the schema and rejects a PR in which an agent sets `passes`. | ADR-0011 |
 | `thresholds-file` | codeowners | `reference/thresholds.toml` is the one human-owned file that holds every test tolerance. | ADR-0007 |
@@ -80,7 +81,7 @@ Promised in the documents and not built yet. The style guide tags the rules they
 
 ## Rules left to review
 
-`docs/TIGER_STYLE.md` carries 46 `[review]` tags: rules, or parts of rules, that no tool checks and that the AI reviewer and the human reviewer have to hold. A rule that keeps getting broken in review is a candidate for a mechanism.
+`docs/TIGER_STYLE.md` carries 47 `[review]` tags: rules, or parts of rules, that no tool checks and that the AI reviewer and the human reviewer have to hold. A rule that keeps getting broken in review is a candidate for a mechanism.
 
 ## Checking another revision's tree
 
