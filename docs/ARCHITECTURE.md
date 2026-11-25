@@ -10,7 +10,7 @@
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
-| 4 | Core architecture | Open | |
+| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) open | |
 | 5 | Performance and parallelism | Open | |
 | 6 | Interface, output and determinism guarantees | Open | |
 | 7 | Verification strategy | Open | |
@@ -234,3 +234,38 @@ Each mechanism counts its activations and reports them per step.
   ADR in § 4.
 - Positivity mechanisms work per face and per cell, and count their activations. They need an
   output channel for the counts that does not allocate.
+
+## 4. Core architecture
+
+The topic has three parts:
+
+- (a) data layout and kernel shape;
+- (b) the extension-point interfaces and how they compose;
+- (c) the mesh and blocks, and what happens at init versus in the time loop.
+
+### 4(a) Data layout and kernel shape (agreed as a hypothesis, waiting for the prototype)
+
+- **Structure of arrays.** A block stores one array per variable, laid out `[var][k][j][i]` with
+  i fastest, as Athena++ and AthenaK do.
+- **Kernels work on row stencils.** The loop over i vectorises in every sweep direction. A sweep
+  in y reconstructs from the rows at j−1, j and j+1 (and further for wider stencils), each
+  contiguous in i, so nothing is transposed or copied into pencils. Vectorising across i does not
+  reorder any floating-point operation, so it is compatible with ADR-0005.
+- **Per-face physics over named-field state structs,** for example
+  `EulerPrimitive { density, velocity: [f64; 3], pressure }`. Riemann solvers and equations of
+  state are written for one face and called in a loop over i that loads each field from its own
+  row.
+  - On stable Rust, an associated constant cannot be an array length in generic code, so state
+    types are associated types in any case.
+  - Named fields also read better than `[f64; NVAR]` with constant indices (§ 1, readability).
+- **This amends ADR-0003:**
+  - pencils become row stencils;
+  - `[f64; NVAR]` becomes named state structs;
+  - typed gathers stay;
+  - raw indexing stays banned.
+
+  The ADR is written once the prototype confirms the layout.
+- **The prototype** measures zone-cycles per second for 3D Euler (PLM, HLLC, RK2, single core,
+  64³ and 128³). It compares structure of arrays with row stencils, array of structures, and a
+  hybrid, against Athena++ built on the same workstation. The code stays on a branch, and the
+  results go to `docs/research/`.
