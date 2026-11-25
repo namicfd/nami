@@ -34,6 +34,7 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
 | `crates/reference` | Numerical references: exact solutions, manufactured solutions, convergence harness. **Protected.** |
 | `xtask/` | Project tooling: `cargo xtask tidy`, the Claude Code hooks, and `agent-token.sh`, which makes git and gh act as the `nami-agent[bot]` GitHub App. |
 | `lints/` | dylint library on a pinned nightly: compiler-level lints such as `nami_recursion`. |
+| `.claude/` | Claude Code configuration: hooks, the reviewer agents and the `review-pr` skill (ADR-0008). |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
 | `docs/operations/` | Runbooks: how GitHub and the `nami-agent` bot are set up, and how to set them up again. |
 | `docs/TIGER_STYLE.md` | The full style guide. |
@@ -121,4 +122,7 @@ The authoritative list is `.github/CODEOWNERS`.
 - **Done means all of these hold:**
   - `just check` passes;
   - the task's acceptance tests pass;
-  - no new `#[expect]` without a real reason.
+  - no new `#[expect]` without a real reason;
+  - the AI review has run, and its blocking threads are resolved. The review is `/review-pr <n>`,
+    run in a fresh session, never the one that wrote the PR. Fix each finding, or reply with why
+    it is wrong; the reviewer resolves its threads when it re-reviews.
