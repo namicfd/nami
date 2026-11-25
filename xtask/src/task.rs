@@ -68,12 +68,11 @@ pub fn execute(root: &Path, remote: &str, arguments: &[&str]) -> Result<String, 
 
 /// A task ID given on the command line is user input: reject what cannot be an ID.
 fn check_task_id(id: &str) -> Result<(), String> {
-    let valid = !id.is_empty()
-        && !id.starts_with('-')
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if valid { Ok(()) } else { Err(format!("`{id}` is not a task id (lowercase, digits, dashes)")) }
+    if plan::is_valid_id(id) {
+        Ok(())
+    } else {
+        Err(format!("`{id}` is not a task id (lowercase letters, digits and dashes)"))
+    }
 }
 
 /// Where a task stands.

@@ -78,13 +78,14 @@ Claims are files `claims/<task-id>` on the `claims` branch.
 - **Holder:** the claim file records `$NAMI_AGENT_ID` (default: git's `user.name`) and `$NAMI_SESSION_ID`.
 - **Age:** `status` shows how old each claim is.
 - **After the PR merges, the claim stays.** It keeps the task from being picked up again until `passes` is set. Then `status` shows the task as done, whatever the claim says.
-- **Stale claims:** nothing releases them automatically yet. A human or the runner (ADR-0010, phase 2) releases claims older than about two hours. `status` shows each claim's time, from the claim commit.
+- **Stale claims** are claims older than about two hours whose task has **no open or merged PR**. Check that with `gh pr list --head task/<id> --state all`. Only stale claims may be released.
+  - A claim on a task whose PR merged is not stale, however old: it is what keeps the task from being done twice until `passes` is set.
+  - Nothing releases claims automatically yet. A human, or the runner (ADR-0010, phase 2), applies this rule.
+  - `status` shows each claim's time, taken from the claim commit.
 
 ## Setting `passes`
 
-ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet: it needs a bot commit to `main` that bypasses the ruleset, and that is a decision for the maintainer.
-
-Until then, the maintainer sets `passes` by hand. They do it in a PR, which `check-pr` fails as designed, and merge it with the admin bypass. The override is explicit and visible in the PR. An agent can never do it, because agents have no bypass (ADR-0009).
+ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet. ADR-0017 (Proposed) covers the gap until it does: the maintainer sets `passes` by hand, and agents never do.
 
 ## Writing a plan
 

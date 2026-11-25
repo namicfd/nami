@@ -74,9 +74,9 @@ fn commands_follow_a_task_through_its_life() {
     assert!(run(&clone, &["release", "a"]).expect_err("twice").contains("not claimed"));
     assert_eq!(run(&clone, &["ready"]), Ok("a\tTask a\n".to_owned()), "a is free again");
     assert!(run(&clone, &["bogus"]).expect_err("usage").starts_with("usage:"));
-    for bad in ["", "a/b", "-a", "A"] {
-        let error = run(&clone, &["release", bad]).expect_err("bad ids are input errors");
-        assert!(error.contains("is not a task id"), "{bad:?}: {error}");
+    for (command, bad) in [("release", ""), ("release", "a/b"), ("claim", "-a"), ("claim", "A")] {
+        let error = run(&clone, &[command, bad]).expect_err("bad ids are input errors");
+        assert!(error.contains("is not a task id"), "{command} {bad:?}: {error}");
     }
     // `ls-remote` matches by suffix: a branch named `task/claims` must not confuse the lookup.
     let _ = git(&clone, &["push", "--quiet", "origin", "HEAD:refs/heads/task/claims"]);

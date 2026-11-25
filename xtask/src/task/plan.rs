@@ -143,9 +143,7 @@ fn task_from_json(entry: &Value) -> Result<Task, String> {
         return Err(format!("has the fields {names:?}; expected exactly {TASK_FIELDS:?}"));
     }
     let id = string_field(entry, "id")?;
-    let valid_id =
-        id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if id.is_empty() || !valid_id || id.starts_with('-') {
+    if !is_valid_id(&id) {
         return Err(format!("id `{id}` must be lowercase letters, digits and dashes"));
     }
     let task = Task {
@@ -171,6 +169,14 @@ fn task_from_json(entry: &Value) -> Result<Task, String> {
         ));
     }
     Ok(task)
+}
+
+/// A task ID: lowercase letters, digits and dashes, not starting with a dash.
+#[must_use]
+pub fn is_valid_id(id: &str) -> bool {
+    let allowed =
+        id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    !id.is_empty() && allowed && !id.starts_with('-')
 }
 
 fn string_field(entry: &Value, name: &str) -> Result<String, String> {

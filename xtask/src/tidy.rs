@@ -236,7 +236,8 @@ mod tests {
         std::fs::write(source.join(".claude/b.rs"), "fn b() { loop {} }").unwrap();
         std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
         std::fs::write(root.join(".claude/agents/c.rs"), "fn c() { loop {} }").unwrap();
-        let worktree = root.join(".claude/worktrees/other");
+        // A nested checkout outside `.claude/`, so that the nested-`.git` rule itself is tested.
+        let worktree = root.join("other-checkout");
         std::fs::create_dir_all(worktree.join("crates/old/src")).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
         std::fs::write(worktree.join("crates/old/src/lib.rs"), "fn a() { loop {} }").unwrap();
