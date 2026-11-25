@@ -11,7 +11,7 @@
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
 | 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) agreed | [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
-| 5 | Performance and parallelism | Open | |
+| 5 | Performance and parallelism | Agreed (problem sizes open until M7) | [0027](design/0027-parallelism-and-communication.md), [0028](design/0028-infiniband-binding-crate.md) |
 | 6 | Interface, output and determinism guarantees | Open | |
 | 7 | Verification strategy | Open | |
 
@@ -397,3 +397,69 @@ depends only on its own data and its ghost cells, and reductions combine in bloc
 - The manifest change lands in M0 as its own protected commit.
 - An unstructured or Voronoi mesh (M10) will be a second mesh kind with its own design pass. It
   shares `kernels`, not `mesh`.
+
+## 5. Performance and parallelism
+
+The hardware is fixed in § 1: CPUs only, a workstation for development, and production on several
+nodes connected by InfiniBand, scheduled by Slurm.
+
+### 5.1 Within a core: auto-vectorisation only
+
+Explicit SIMD needs `std::arch` intrinsics, which are `unsafe`, or `std::simd`, which is
+nightly-only. So the row kernels of § 4(a) must vectorise on their own, which the layout prototype
+measures. A loop that does not vectorise is restructured, never rewritten with intrinsics.
+
+### 5.2 Within a node: one process per NUMA domain, with threads
+
+- Threads are created once at init with `std::thread::scope` and live for the whole run.
+- Blocks are assigned to threads statically, in contiguous ranges along the Morton curve. There is
+  no work stealing, so the schedule is the same every run.
+- Phases are synchronised with `std::sync::Barrier`.
+- Each thread writes its own blocks first at init, so their memory pages land on its NUMA node.
+- Threads share ghost cells within a process without passing messages.
+
+### 5.3 Between nodes: nami's own communication layer
+
+- **A `Transport` trait** has three implementations:
+  - in-process: several ranks in one process, for deterministic tests on the workstation;
+  - TCP, over `std::net`;
+  - InfiniBand verbs, through the binding crate of ADR-0028.
+- **No new message pattern after init.** Every pair of neighbouring ranks gets a persistent channel
+  with preallocated buffers, built at init and rebuilt only when AMR rebalances.
+- **Collectives:** a barrier, a minimum (for the time step), sums for diagnostics, and an all-gather
+  of tree changes under AMR.
+- **Launching:** Slurm's `srun` starts the processes, and each reads its rank from `SLURM_PROCID`
+  and the number of ranks from `SLURM_NTASKS`. Rank 0 runs a rendezvous over TCP, where the ranks
+  exchange their addresses, including their InfiniBand queue-pair information. nami has no
+  launcher of its own.
+- **A failed link is an operating error.** The run stops and writes a checkpoint if it can.
+
+### 5.4 Bitwise-identical results for any decomposition
+
+One thread or a thousand ranks, any placement of blocks: the result is bitwise the same. This
+extends ADR-0005.
+
+- A block's update depends only on its own data and its ghost cells, and the ghost cells hold the
+  same values whatever the layout.
+- The time step is a minimum, which does not depend on order.
+- Diagnostic sums, such as conservation totals, use an exact accumulator (an integer
+  superaccumulator) whose result does not depend on order. Across ranks it replaces
+  `sum_compensated`. It is not in the hot path.
+- Refinement decisions depend only on block data. Load balancing changes where blocks live, not
+  what they compute.
+
+So every scaling run is also a correctness test.
+
+### 5.5 Targets and measurement
+
+- **Per core and per node:** at least 1.0× Athena++ on the same CPUs and the same algorithm, and
+  below 0.8× counts as failure (§ 1).
+- **Scaling, first target:** at least 90% weak-scaling efficiency from 1 to 64 nodes. Problem sizes
+  and strong-scaling targets are set with M7.
+- **Measurement:**
+  - Gungraun instruction counts in CI catch regressions;
+  - zone-cycles per second against Athena++ on the workstation at every milestone, not in CI,
+    because shared runners are too noisy;
+  - scaling runs on the cluster from M7 on.
+- **Widths:** Morton keys and global cell numbers are `u64`, since 21 levels in 3D take 63 bits.
+  ADR-0002's limit of 2³² − 1 cells per rank stays.
