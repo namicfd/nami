@@ -197,6 +197,7 @@ impl Visitor<'_> {
         if self.scope.is_nami() && !is_test {
             self.count_assertions(function, lines);
         }
+        self.check_float_equality(function);
     }
 
     fn count_assertions(&mut self, function: &Function<'_>, lines: u32) {
@@ -703,6 +704,148 @@ fn derives_default(attribute: &Attribute) -> bool {
     parsed.is_ok() && found
 }
 
+// The `float-eq-in-eq-fn` rule. Clippy's `float_cmp` is silent in a function named `eq`, `ne`
+// or `is_nan`, or whose name starts with `eq_` or ends with `_eq` (ADR-0006, Known gaps). Tidy
+// has no types, so a float operand is recognised by its syntax alone.
+
+/// Function names, besides those that contain `eq`, in which `float_cmp` is silent.
+const FLOAT_CMP_SILENT_NAMES: [&str; 2] = ["ne", "is_nan"];
+
+/// The float types a parameter can be declared with.
+const FLOAT_TYPES: [&str; 2] = ["f32", "f64"];
+
+/// Upper bound on the wrappers peeled off an operand or a parameter type.
+const FLOAT_WRAPPERS_MAX: u32 = 64;
+
+impl Visitor<'_> {
+    /// Reports `==` and `!=` with a float operand in a function where `float_cmp` is silent.
+    fn check_float_equality(&mut self, function: &Function<'_>) {
+        let name = function.signature.ident.to_string();
+        let is_test = self.in_test_code() || has_attribute(function.attributes, "test");
+        if !self.scope.is_nami() || is_test || !float_cmp_is_silent_in(&name) {
+            return;
+        }
+        let floats = float_parameters(function.signature);
+        let mut finder = FloatEqualityFinder { floats: &floats, found: Vec::new() };
+        finder.visit_block(function.block);
+        for (span, operator) in finder.found {
+            let message = format!(
+                "`{operator}` between floats in function `{name}`, where clippy's `float_cmp` \
+                 is silent; compare against a named tolerance, or, for an exact sentinel or a \
+                 bitwise check, compare `to_bits()` and say which it is (TIGER_STYLE.md, \
+                 Floating point)"
+            );
+            self.report(span, "float-eq-in-eq-fn", message);
+        }
+    }
+}
+
+/// Finds `==` and `!=` with a float operand in one function body, closures included. Nested
+/// items are left to the visitor, which checks each function under its own name.
+struct FloatEqualityFinder<'a> {
+    /// Parameters of the function that are declared as floats.
+    floats: &'a [Ident],
+    /// The span and spelling of every offending operator.
+    found: Vec<(Span, &'static str)>,
+}
+
+impl<'ast> Visit<'ast> for FloatEqualityFinder<'_> {
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        let operator = if matches!(node.op, syn::BinOp::Eq(_)) {
+            Some("==")
+        } else if matches!(node.op, syn::BinOp::Ne(_)) {
+            Some("!=")
+        } else {
+            None
+        };
+        let floats = self.floats;
+        let has_float =
+            is_float_operand(&node.left, floats) || is_float_operand(&node.right, floats);
+        if let Some(operator) = operator
+            && has_float
+        {
+            self.found.push((node.op.span(), operator));
+        }
+        visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_item(&mut self, _node: &'ast syn::Item) {}
+}
+
+/// True for a function name in which clippy's `float_cmp` reports nothing. Every name that
+/// contains `eq` is included, a superset of clippy's `eq`, `eq_*` and `*_eq`.
+fn float_cmp_is_silent_in(name: &str) -> bool {
+    name.contains("eq") || FLOAT_CMP_SILENT_NAMES.contains(&name)
+}
+
+/// The parameters declared as `f32` or `f64`, or as a reference to one. A receiver and a
+/// destructuring pattern name no single float.
+fn float_parameters(signature: &Signature) -> Vec<Ident> {
+    let parameters = signature.inputs.iter().filter_map(|input| {
+        if let syn::FnArg::Typed(typed) = input
+            && let syn::Pat::Ident(pattern) = &*typed.pat
+            && is_float_type(&typed.ty)
+        {
+            Some(pattern.ident.clone())
+        } else {
+            None
+        }
+    });
+    let floats: Vec<Ident> = parameters.collect();
+    assert!(floats.len() <= signature.inputs.len(), "every float parameter is a parameter");
+    floats
+}
+
+/// True for `f32` or `f64` under references and parentheses.
+fn is_float_type(declared: &Type) -> bool {
+    let mut declared = declared;
+    for _ in 0..FLOAT_WRAPPERS_MAX {
+        if let Type::Reference(reference) = declared {
+            declared = &reference.elem;
+        } else if let Type::Paren(paren) = declared {
+            declared = &paren.elem;
+        } else if let Type::Group(group) = declared {
+            declared = &group.elem;
+        } else {
+            return matches!(declared, Type::Path(path) if path.qself.is_none()
+                && FLOAT_TYPES.iter().any(|float| path.path.is_ident(float)));
+        }
+    }
+    panic!("a type is wrapped in more than {FLOAT_WRAPPERS_MAX} references or parentheses");
+}
+
+/// True for `1.5`, `1e3` and `1.0_f32`, and for an integer with a float suffix such as `1f64`,
+/// which `syn` reads as an integer literal.
+fn is_float_literal(literal: &syn::Lit) -> bool {
+    matches!(literal, syn::Lit::Float(_))
+        || matches!(literal, syn::Lit::Int(integer) if FLOAT_TYPES.contains(&integer.suffix()))
+}
+
+/// True for an operand that is a float by its syntax: a float literal, a cast to a float type,
+/// or a parameter in `floats`, under parentheses, references, negation and dereference.
+fn is_float_operand(operand: &Expr, floats: &[Ident]) -> bool {
+    let mut operand = operand;
+    for _ in 0..FLOAT_WRAPPERS_MAX {
+        if let Expr::Paren(paren) = operand {
+            operand = &paren.expr;
+        } else if let Expr::Group(group) = operand {
+            operand = &group.expr;
+        } else if let Expr::Reference(reference) = operand {
+            operand = &reference.expr;
+        } else if let Expr::Unary(unary) = operand {
+            operand = &unary.expr;
+        } else if let Expr::Lit(literal) = operand {
+            return is_float_literal(&literal.lit);
+        } else if let Expr::Cast(cast) = operand {
+            return is_float_type(&cast.ty);
+        } else {
+            return matches!(operand, Expr::Path(path) if path.qself.is_none()
+                && floats.iter().any(|float| path.path.is_ident(float)));
+        }
+    }
+    panic!("an operand is wrapped in more than {FLOAT_WRAPPERS_MAX} operators or parentheses");
+}
+
 fn line_of(span: Span) -> u32 {
     u32::try_from(span.start().line).expect("source files have fewer than 2^32 lines")
 }
@@ -1071,5 +1214,60 @@ mod tests {
         }
         let passes = "fn a(x: f64) { assert!(x > 0.0, \"debug_assert! is for kernels\"); }";
         assert_eq!(rules_in_crate(passes), NONE);
+    }
+
+    // Goal: in a function where clippy's `float_cmp` is silent, `==` and `!=` with a float
+    // literal, a float cast or a float parameter on either side are reported, closures
+    // included, in every kind of function.
+    #[test]
+    fn float_eq_in_eq_fn_rule_fires() {
+        let fires = [
+            "fn eq(a: f64, b: f64) -> bool { a == b }",
+            "fn ne(a: f64, b: f64) -> bool { a != b }",
+            "fn is_nan(a: f64) -> bool { a != a }",
+            "fn eq_exact(a: f32, b: f32) -> bool { a == b }",
+            "fn almost_eq(a: &f64, b: &f64) -> bool { *a == *b }",
+            "fn is_equal(a: &mut f64) -> bool { (*a) == 0.0 }",
+            "fn equals(a: u32) -> bool { 0.5 == a as f64 }",
+            "fn equals(a: u32) -> bool { f64::from(a) == -1.0 }",
+            "fn equals(a: u32) -> bool { f(a) == 1f64 }",
+            "fn eq(a: f64) -> bool { let c = || a == 2.5; c() }",
+            "impl S { fn eq(&self, a: f64) -> bool { self.x == a } }",
+            "impl PartialEq for S { fn eq(&self, other: &Self) -> bool { self.x == 0.0 } }",
+            "trait T { fn eq(&self, a: f64) -> bool { a == 1.0 } }",
+        ];
+        for text in fires {
+            assert_eq!(rules_in_crate(text), ["float-eq-in-eq-fn"], "{text}");
+        }
+        let both = "fn eq(a: f64, b: f64) -> bool { a == b || a != 1.0 }";
+        assert_eq!(rules_in_crate(both), ["float-eq-in-eq-fn", "float-eq-in-eq-fn"]);
+    }
+
+    // Goal: the rule is silent outside the functions it covers, on comparisons it cannot show
+    // to be between floats, in test code and in tooling. A nested function is judged by its
+    // own name.
+    #[test]
+    fn float_eq_in_eq_fn_rule_passes() {
+        let passes = [
+            "fn same(a: f64, b: f64) -> bool { a == b }",
+            "fn eq(a: u32, b: u32) -> bool { a == b }",
+            "fn eq(a: u32) -> bool { a == 1 && a as u64 == 2 }",
+            "fn eq(a: f64, b: f64) -> bool { a < b || a > 1.0 }",
+            "fn eq(a: f64, b: f64) -> bool { a.to_bits() == b.to_bits() }",
+            "fn eq((a, b): (f64, f64)) -> bool { a.to_bits() == b.to_bits() }",
+            "fn eq(a: [f64; 2], b: [f64; 2]) -> bool { a.len() == b.len() }",
+            "fn eq(a: f64) -> bool { fn inner(b: f64) -> bool { b == 1.0 } inner(a) }",
+        ];
+        for text in passes {
+            assert_eq!(rules_in_crate(text), NONE, "{text}");
+        }
+        let nested_eq = "fn same() -> bool { fn eq(b: f64) -> bool { b == 1.0 } eq(0.5) }";
+        assert_eq!(rules_in_crate(nested_eq), ["float-eq-in-eq-fn"], "judged by its own name");
+        let literal = "fn eq(a: f64) -> bool { a == 1.0 }";
+        assert_eq!(rules_in_crate(&format!("#[cfg(test)]\nmod tests {{ {literal} }}")), NONE);
+        assert_eq!(rules_in_crate("#[test]\nfn eq_holds() { let _x = 1.0 == 1.0; }"), NONE);
+        assert_eq!(rules_at("crates/solver/tests/eq.rs", literal), NONE);
+        assert_eq!(rules_at("xtask/src/example.rs", literal), NONE);
+        assert_eq!(rules_at("crates/kernels/src/example.rs", literal), ["float-eq-in-eq-fn"]);
     }
 }
