@@ -141,20 +141,32 @@ pub fn protected_paths(patterns: &[Pattern], changed: &[String]) -> Vec<String> 
 
 /// The lines of the section of `body` under `heading`, or `None` if there is no such heading.
 ///
-/// HTML comments, blank lines, thematic breaks (`---`) and the attribution line are left out,
-/// so they neither count as content nor end the section: what follows them is still checked.
-/// The section ends at the next `#` or `##` heading.
+/// HTML comments, blank lines and thematic breaks (`---`) are left out, so they neither count
+/// as content nor end the section: what follows them is still checked. So are the attribution
+/// lines at the end of the section, after its last other line; an attribution line in the
+/// middle is content. The section ends at the next `#` or `##` heading.
 #[must_use]
 pub fn section(body: &str, heading: &str) -> Option<Vec<String>> {
     let visible = without_comments(body);
     let mut lines = visible.lines().map(str::trim).skip_while(|line| *line != heading);
     let _heading = lines.next()?;
     let is_next_section = |line: &&str| line.starts_with("# ") || line.starts_with("## ");
-    let is_filler = |line: &&str| {
-        line.is_empty() || is_thematic_break(line) || line.starts_with(ATTRIBUTION_PREFIX)
-    };
-    let content = lines.take_while(|line| !is_next_section(line)).filter(|line| !is_filler(line));
-    Some(content.map(str::to_owned).collect())
+    let is_filler = |line: &&str| line.is_empty() || is_thematic_break(line);
+    let mut content: Vec<String> = lines
+        .take_while(|line| !is_next_section(line))
+        .filter(|line| !is_filler(line))
+        .map(str::to_owned)
+        .collect();
+    let footer_start = content
+        .iter()
+        .rposition(|line| !line.starts_with(ATTRIBUTION_PREFIX))
+        .map_or(0, |last| last + 1);
+    content.truncate(footer_start);
+    assert!(
+        content.last().is_none_or(|line| !line.starts_with(ATTRIBUTION_PREFIX)),
+        "the trailing attribution lines are cut off"
+    );
+    Some(content)
 }
 
 /// True for a line of three or more `-` and nothing else.
@@ -682,12 +694,36 @@ mod tests {
             let body = body_with_follow_ups(&follow_ups);
             assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
         }
+        let more_footers = format!("None.\n{footer}\n\n---\n<!-- end -->\n{footer}\n");
+        let body = body_with_follow_ups(&more_footers);
+        assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
         let failing = [format!("\n{footer}"), format!("\n---\n\n{footer}"), "---".to_owned()];
         for follow_ups in failing {
             let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
             assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
             assert!(problems[0].contains("names no issue; write `None`, or"), "{problems:?}");
         }
+    }
+
+    // Goal: only the attribution lines at the end of a section are left out; one in the middle
+    // is content and is checked like any other line.
+    #[test]
+    fn attribution_in_the_middle_is_content() {
+        let middle = "🤖 Generated with #3";
+        assert_eq!(
+            section(&format!("## A\n- #12\n{middle}\n- #13\n"), "## A"),
+            Some(paths(&["- #12", middle, "- #13"]))
+        );
+        let follow_ups = format!("- #12\n{middle}\n- #13");
+        let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
+        assert_eq!(problems.len(), 2, "#3 and #13 are checked: {problems:?}");
+        assert!(problems[0].contains("#3, listed under"), "{problems:?}");
+        assert!(problems[1].contains("#13, listed under"), "{problems:?}");
+        let after_none = format!("None.\n{middle}\n---\nA footer.");
+        let none_problems = check_body(&body_with_follow_ups(&after_none), &[], "work", exists);
+        assert_eq!(none_problems.len(), 1, "{none_problems:?}");
+        let expected = format!("says `None` and then `{middle}`;");
+        assert!(none_problems[0].contains(&expected), "{none_problems:?}");
     }
 
     // Goal: `None` followed by more text is reported as such, not as a section that names no
