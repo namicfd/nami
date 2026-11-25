@@ -167,25 +167,31 @@ fn a_landed_claim_holds_when_the_push_dies_silently() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
-// Goal: a remote that refuses the push (a hook, branch protection, permissions) is an error
-// that says so, after one attempt: retrying cannot help. Method: a pre-receive hook that
-// counts its runs and declines.
+// Goal: a remote that keeps rejecting the push is retried a bounded number of times, then an
+// error that names both causes: a refusal (hooks, protection, permissions) or contention.
+// Method: a pre-receive hook that counts its runs and always declines.
 #[test]
-fn a_refused_claim_push_is_an_error_without_retries() {
+fn a_claim_push_the_remote_keeps_rejecting_is_an_error_after_bounded_retries() {
     let (root, clones) = setup("pre-receive", 1);
     install_hook(&root, "pre-receive", "echo run >> pre-receive-runs; exit 1");
     let refused = claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot");
-    let said = matches!(&refused, Err(ClaimError::Git(message)) if message.contains("refused"));
-    assert!(said, "the error says the remote refused: {refused:?}");
+    let message = match &refused {
+        Err(ClaimError::Git(message)) => message.clone(),
+        other => panic!("a rejected claim is a git error: {other:?}"),
+    };
+    for part in ["may be refusing", "hooks, branch protection", "kept landing", "hook declined"] {
+        assert!(message.contains(part), "the error names `{part}`: {message}");
+    }
     let runs = std::fs::read_to_string(root.join("remote.git/pre-receive-runs"));
-    assert_eq!(runs.expect("the hook ran").lines().count(), 1, "one push, no retries");
+    let runs = u32::try_from(runs.expect("the hook ran").lines().count()).expect("few runs");
+    assert_eq!(runs, claims::PUSH_ATTEMPTS_MAX, "every attempt pushed, and no more");
     assert_eq!(claimed(&clones[0]), Vec::<String>::new(), "nothing was claimed");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
-// Goal: a remote rejection while the branch moved is a lost race, not a refusal: the claim
-// refetches and wins on the new tip. Method: a pre-receive hook that, the first time, creates
-// the branch itself (as a racing claim would) and declines; afterwards it accepts.
+// Goal: a remote rejection while the branch moved is retried, and the claim wins on the new
+// tip. Method: a pre-receive hook that, the first time, creates the branch itself (as a racing
+// claim would) and declines; afterwards it accepts.
 #[test]
 fn a_remote_rejection_while_the_branch_moved_is_retried() {
     let (root, clones) = setup("moved", 1);
@@ -197,6 +203,76 @@ fn a_remote_rejection_while_the_branch_moved_is_retried() {
     install_hook(&root, "pre-receive", script);
     claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot").expect("the retry wins");
     assert!(root.join("remote.git/raced").exists(), "the first push lost the race");
-    assert_eq!(claimed(&clones[0]), ["t1=agent: bot"], "the claim sits on the racing commit");
+    assert_eq!(claimed(&clones[0]), ["t1=agent: bot"], "our claim is the only one held");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a claim of a free task wins while another claim holds the remote's ref lock, though
+// the remote rejects its first pushes and the tip has not moved yet when it refetches.
+// Method: a reference-transaction hook holds the first update in `prepared` for a second and a
+// half; the second clone claims another task meanwhile, and its retries outlast the hold. The
+// remote answers its pushes with `[remote rejected] (reference already exists)`; a pre-receive
+// hook counts the pushes.
+#[test]
+fn a_claim_outlasts_another_claim_holding_the_ref_lock() {
+    let (root, clones) = setup("contention", 2);
+    let script = r#"if [ "$1" = prepared ] && [ ! -e held ]; then touch held; sleep 1.5; fi"#;
+    install_hook(&root, "reference-transaction", script);
+    install_hook(&root, "pre-receive", "echo push >> pushes");
+    let held = root.join("remote.git/held");
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| claims::claim(&clones[0], "origin", BOT, "t1", "agent: one"));
+        for _ in 0..1000 {
+            if held.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(held.exists(), "the first claim holds the ref lock");
+        let second = claims::claim(&clones[1], "origin", BOT, "t2", "agent: two");
+        (first.join().expect("the first claim finishes"), second)
+    });
+    assert_eq!(first, Ok(()), "the claim holding the lock wins");
+    assert_eq!(second, Ok(()), "the claim that waited wins too");
+    let pushes = std::fs::read_to_string(root.join("remote.git/pushes")).expect("hook ran");
+    let pushes = pushes.lines().count();
+    assert!(pushes > 2, "the waiting claim was rejected at least once: {pushes} pushes");
+    assert_eq!(claimed(&clones[0]), ["t1=agent: one", "t2=agent: two"], "both claims are held");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a claim wins when another claim lands on top of it before it reads the branch back:
+// the remote holds our commit as an ancestor, not as its tip. Method: a post-receive hook
+// that, once, commits on top of what was pushed.
+#[test]
+fn a_claim_wins_when_another_lands_on_top_before_the_refetch() {
+    let (root, clones) = setup("stacked", 1);
+    let script = r#"read old new ref
+[ -e stacked ] && exit 0
+touch stacked
+other=$(git -c user.name=o -c user.email=o@x commit-tree "$new^{tree}" -p "$new" -m other)
+git update-ref refs/heads/claims "$other""#;
+    install_hook(&root, "post-receive", script);
+    claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot").expect("our claim is held");
+    assert!(root.join("remote.git/stacked").exists(), "another commit landed on ours");
+    assert_eq!(claimed(&clones[0]), ["t1=agent: bot"], "the remote holds our claim");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: when the push may have landed but the branch cannot be read back, the error says the
+// claim may be held, how to check, and what git push said. Method: a post-receive hook moves
+// the remote away, so the refetch finds no repository.
+#[test]
+fn a_claim_that_cannot_be_read_back_says_it_may_be_held() {
+    let (root, clones) = setup("unreadable", 1);
+    install_hook(&root, "post-receive", "echo landed >&2; mv ../remote.git ../moved.git");
+    let unknown = claims::claim(&clones[0], "origin", BOT, "t1", "agent: bot");
+    let message = match &unknown {
+        Err(ClaimError::Git(message)) => message.clone(),
+        other => panic!("an unreadable branch is a git error: {other:?}"),
+    };
+    for part in ["may be held", "cargo xtask task status", "landed"] {
+        assert!(message.contains(part), "the error names `{part}`: {message}");
+    }
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
