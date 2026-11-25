@@ -11,6 +11,20 @@
       "Bash(gh api /repos/namicfd/nami/issues:*)"
     ]
   },
+  "env": {
+    "GIT_AUTHOR_NAME": "nami-agent[bot]",
+    "GIT_AUTHOR_EMAIL": "360897210+nami-agent[bot]@users.noreply.github.com",
+    "GIT_COMMITTER_NAME": "nami-agent[bot]",
+    "GIT_COMMITTER_EMAIL": "360897210+nami-agent[bot]@users.noreply.github.com",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_CONFIG_COUNT": "3",
+    "GIT_CONFIG_KEY_0": "credential.helper",
+    "GIT_CONFIG_VALUE_0": "",
+    "GIT_CONFIG_KEY_1": "credential.helper",
+    "GIT_CONFIG_VALUE_1": "!\"$(git rev-parse --show-toplevel)/xtask/agent-token.sh\" git-credential",
+    "GIT_CONFIG_KEY_2": "url.https://github.com/.insteadOf",
+    "GIT_CONFIG_VALUE_2": "git@github.com:"
+  },
   "hooks": {
     "SessionStart": [
       {

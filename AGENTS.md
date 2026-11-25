@@ -147,6 +147,10 @@ The authoritative list is `.github/CODEOWNERS`.
 
 - **One task per session.** Work on your own branch or worktree, open a PR, and never push to
   `main`.
+- **You act as `nami-agent[bot]`.** In Claude Code, `.claude/settings.json` already makes git
+  commit and push as the bot, so use plain commands: `git push origin <branch>`. Prefix gh with
+  `GH_TOKEN=$(xtask/agent-token.sh)`. If a push or token is refused, stop and ask. Never use a
+  human's credentials (`docs/operations/github-setup.md`, step 6).
 - **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
   `docs/exec-plans/README.md`).
   - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
