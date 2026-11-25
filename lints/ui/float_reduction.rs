@@ -163,6 +163,58 @@ fn fold_assign_sum(values: &[f64]) -> f64 {
     })
 }
 
+fn fold_add_in_a_match_scrutinee(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| match total + value {
+        sum => sum,
+    })
+}
+
+fn fold_add_through_a_pattern_local(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let (sum, _count) = (total + value, 1);
+        sum
+    })
+}
+
+fn fold_add_in_an_if_let(values: &[f64]) -> f64 {
+    values.iter().fold(
+        0.0,
+        |total, &value| {
+            if let Some(sum) = Some(total + value) { sum } else { total }
+        },
+    )
+}
+
+fn fold_add_in_a_tuple_field(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| (total + value, 0).0)
+}
+
+fn fold_add_in_an_array(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| [total + value][0])
+}
+
+fn fold_add_in_a_discarded_statement(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        total + value;
+        value
+    })
+}
+
+// Reported as too complex: more expressions than the lint traces, even though it is a maximum.
+macro_rules! times_four {
+    ($e:expr) => {
+        $e * $e * $e * $e
+    };
+}
+
+fn fold_too_complex(values: &[f64]) -> f64 {
+    values.iter().fold(f64::NEG_INFINITY, |greatest, &value| {
+        greatest.max(times_four!(times_four!(times_four!(times_four!(times_four!(times_four!(
+            times_four!(value)
+        )))))))
+    })
+}
+
 // Not reported: integer sums.
 fn sum_integers(values: &[u32]) -> u32 {
     values.iter().sum()

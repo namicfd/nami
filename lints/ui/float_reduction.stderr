@@ -236,5 +236,69 @@ LL | |         total
 LL | |     })
    | |______^
 
-error: aborting due to 36 previous errors
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:167:19
+   |
+LL |       values.iter().fold(0.0, |total, &value| match total + value {
+   |  ___________________^
+LL | |         sum => sum,
+LL | |     })
+   | |______^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:173:19
+   |
+LL |       values.iter().fold(0.0, |total, &value| {
+   |  ___________________^
+LL | |         let (sum, _count) = (total + value, 1);
+LL | |         sum
+LL | |     })
+   | |______^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:180:19
+   |
+LL |       values.iter().fold(
+   |  ___________________^
+LL | |         0.0,
+LL | |         |total, &value| {
+LL | |             if let Some(sum) = Some(total + value) { sum } else { total }
+LL | |         },
+LL | |     )
+   | |_____^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:189:19
+   |
+LL |     values.iter().fold(0.0, |total, &value| (total + value, 0).0)
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:193:19
+   |
+LL |     values.iter().fold(0.0, |total, &value| [total + value][0])
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:197:19
+   |
+LL |       values.iter().fold(0.0, |total, &value| {
+   |  ___________________^
+LL | |         total + value;
+LL | |         value
+LL | |     })
+   | |______^
+
+error: fold closure too complex for `nami_float_reduction` to check that it is no naive float sum (over 10 000 expressions); simplify the closure (ADR-0005)
+  --> $DIR/float_reduction.rs:211:19
+   |
+LL |       values.iter().fold(f64::NEG_INFINITY, |greatest, &value| {
+   |  ___________________^
+LL | |         greatest.max(times_four!(times_four!(times_four!(times_four!(times_four!(times_four!(
+LL | |             times_four!(value)
+LL | |         )))))))
+LL | |     })
+   | |______^
+
+error: aborting due to 43 previous errors
 
