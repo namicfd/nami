@@ -11,6 +11,7 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | Rule | Kind | What it requires | Reference |
 | --- | --- | --- | --- |
 | `adr-index` | source | Every ADR is listed in `docs/design/README.md`. | ADR-0000 |
+| `adr-number` | source | No two ADR files share a number, and an ADR's title repeats the number of its file name. | ADR-0000 |
 | `adr-section` | source | Every ADR has the six required sections. | ADR-0000 |
 | `adr-status` | source | Every ADR has a valid status line. | ADR-0000 |
 | `assertion-density` | workspace | Each nami crate averages at least two assertions per non-trivial function. | ADR-0004 |

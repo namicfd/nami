@@ -84,6 +84,8 @@ The registry has a second table for mechanisms that a document promises and nobo
 
 New rules that check the documents themselves: `doc-tag` (point 4), `rules-doc` (point 6), `planned-task` (point 5) and `learning-format` (ADR-0020).
 
+`adr-number` rejects two ADR files with the same number, and a title whose number differs from the file name. Two branches that each add the next ADR merge without a conflict, because the file names differ. This ADR was renumbered twice on 2026-11-25 for that reason, and the second clash was found by reading the directory listing, not by a check.
+
 ### 8. Tidy can check another tree
 
 `cargo xtask tidy --root <dir> [--policy <dir>]` runs this binary's rules on another checkout. With `--policy`, the `#[expect]` budget is read from that directory, and the rules that compare documents with the binary's own registry (`doc-tag`, `rules-doc`, `planned-task`) are skipped. ADR-0020 uses this for the base gate.

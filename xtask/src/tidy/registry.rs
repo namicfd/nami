@@ -55,6 +55,12 @@ const fn workspace(id: &'static str, summary: &'static str, reference: &'static 
 /// Every tidy rule that is written as code. Keep the rows sorted by id.
 pub const RULES: &[Rule] = &[
     source("adr-index", "Every ADR is listed in `docs/design/README.md`.", "ADR-0000"),
+    source(
+        "adr-number",
+        "No two ADR files share a number, and an ADR's title repeats the number of its file \
+         name.",
+        "ADR-0000",
+    ),
     source("adr-section", "Every ADR has the six required sections.", "ADR-0000"),
     source("adr-status", "Every ADR has a valid status line.", "ADR-0000"),
     workspace(

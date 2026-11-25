@@ -283,6 +283,8 @@ fn check_file(root: &Path, relative: &Path, text: &str) -> io::Result<FileReport
         }
         FileKind::Adr => {
             report.violations = docs::check_adr(relative, text, &docs::adr_index(root)?);
+            let names = docs::adr_file_names(root)?;
+            report.violations.extend(docs::check_adr_number(relative, text, &names));
         }
         FileKind::Learning => report.violations = docs::check_learning(relative, text),
         FileKind::StyleGuide => {
@@ -448,7 +450,7 @@ mod tests {
             ["runtime-dependency", "assertion-density", "runtime-dependency", "unbounded-loop"]
                 .into_iter()
                 .chain(["snapshot-draft", "unasserted-function", "rules-doc", "doc-tag"])
-                .chain(["adr-index"])
+                .chain(["adr-index", "adr-number"])
                 .chain(["adr-section"; 6])
                 .chain(planned_tasks)
                 .chain(["plan-files", "tasks-json", "plan-section", "task-graph", "plan-stage"])
@@ -546,7 +548,8 @@ mod tests {
         tree.write("crates/demo/Cargo.toml", "[dependencies]\nserde = \"1\"\n");
         tree.write("docs/design/0001-x.md", "- Status: Accepted\n");
         let broken = check_with_policy(tree.root(), policy.root()).unwrap();
-        let expected = ["adr-index", "adr-section", "runtime-dependency", "unbounded-loop"];
+        let expected =
+            ["adr-index", "adr-number", "adr-section", "runtime-dependency", "unbounded-loop"];
         assert_eq!(fired(&broken), BTreeSet::from(expected), "source rules still run");
     }
 
@@ -562,7 +565,7 @@ mod tests {
         assert_eq!(rules("crates/demo/Cargo.toml", "[dependencies]\nserde = \"1\"\n").len(), 1);
         assert_eq!(rules("crates/demo/Cargo.toml", "[dependencies]\ndemo = \"1\"\n").len(), 0);
         assert_eq!(rules("crates/demo/src/lib.rs", "fn a() { loop {} }"), ["unbounded-loop"]);
-        assert_eq!(rules("docs/design/0001-x.md", "- Status: Accepted\n").len(), 7);
+        assert_eq!(rules("docs/design/0001-x.md", "- Status: Accepted\n").len(), 8);
         assert_eq!(rules("crates/demo/src/a.snap.new", ""), ["snapshot-draft"]);
         assert_eq!(
             rules("Cargo.toml", "[workspace.dependencies.libm]\npackage = \"a\"\n").len(),
