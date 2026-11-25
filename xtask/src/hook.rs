@@ -1,4 +1,4 @@
-//! Claude Code hooks (ADR-0018, `.claude/settings.json`).
+//! Claude Code hooks (ADR-0019, `.claude/settings.json`).
 //!
 //! Hooks are defence in depth: they give agents fast feedback, while the server-side gates stay
 //! authoritative (ADR-0009). Each hook reads the event JSON on stdin. Exit code 2 sends stderr

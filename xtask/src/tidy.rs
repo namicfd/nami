@@ -35,6 +35,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use docs::LEARNING_DIRECTORY;
 pub use rust_source::AssertionStats;
 
 /// Upper bound on directories visited, so the walk is bounded (`TIGER_STYLE.md`, Limits).
@@ -45,6 +46,11 @@ const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "docs"];
 
 /// Tidy's own fixtures hold deliberate violations, so the walk skips them.
 const FIXTURE_DIRECTORY: &str = "xtask/fixtures";
+
+/// Skipped only at the workspace root: agent configuration and Claude Code's worktrees, which
+/// are other checkouts. Copies of the tree (cargo-mutants) drop the worktrees' `.git` files, so
+/// the nested-checkout rule alone does not catch them there.
+const ROOT_AGENT_DIRECTORY: &str = ".claude";
 
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
 const INDEX_MODULE: &str = "crates/base/src/index.rs";
@@ -230,6 +236,7 @@ fn check_tree(root: &Path, policy_root: Option<&Path>) -> io::Result<Vec<Violati
     violations.extend(workspace::density_violations(&tally.stats_by_crate));
     let budget_root = policy_root.unwrap_or(root);
     violations.extend(workspace::check_expect_budget(budget_root, tally.expect_count)?);
+    violations.extend(crate::task::plan::check(root)?);
     if !is_foreign {
         violations.extend(rules_doc::check(root)?);
         violations.extend(rules_doc::check_planned_tasks(root)?);
@@ -341,7 +348,8 @@ fn is_skipped(root: &Path, relative: &Path) -> bool {
     let is_listed = name.is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name.as_ref()));
     // A nested `.git` (a directory, or the file a worktree has) marks another checkout.
     let is_checkout = root.join(relative).join(".git").exists();
-    is_listed || is_checkout || relative == Path::new(FIXTURE_DIRECTORY)
+    let is_root_only = [FIXTURE_DIRECTORY, ROOT_AGENT_DIRECTORY].map(Path::new).contains(&relative);
+    is_listed || is_checkout || is_root_only
 }
 
 #[cfg(test)]
@@ -377,9 +385,54 @@ mod tests {
         scratch.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy:no-such-rule]`\n");
         scratch.write("target/ignored/skipped.rs", "fn a() { loop {} }");
         scratch.write("xtask/fixtures/tidy/skipped.rs", "fn a() { loop {} }");
-        scratch.write(".claude/worktrees/other/.git", "gitdir: elsewhere\n");
-        scratch.write(".claude/worktrees/other/crates/old/src/lib.rs", "fn a() { loop {} }");
+        // Only the root `.claude/` is skipped; one inside a crate is checked like any source.
+        scratch.write("crates/demo/src/.claude/b.rs", "fn b() { loop {} }");
+        scratch.write(".claude/agents/c.rs", "fn c() { loop {} }");
+        // A nested checkout outside `.claude/`, so that the nested-`.git` rule itself is tested.
+        scratch.write("other-checkout/.git", "gitdir: elsewhere\n");
+        scratch.write("other-checkout/crates/old/src/lib.rs", "fn a() { loop {} }");
+        write_broken_plans(&scratch);
         scratch
+    }
+
+    fn task_json(id: &str, depends_on: &str, owner_path: &str) -> String {
+        format!(
+            "{{\"id\": \"{id}\", \"title\": \"A task\", \"depends_on\": [{depends_on}], \
+             \"owner_paths\": [\"{owner_path}\"], \"acceptance\": [\"a_test\"], \
+             \"passes\": false}}"
+        )
+    }
+
+    /// Plans that break the plan rules: a directory without its two files, a task list that is
+    /// not JSON, a task without a section that depends on a task that does not exist, and a
+    /// completed plan with an open task.
+    fn write_broken_plans(scratch: &Scratch) {
+        scratch.write("docs/exec-plans/active/empty/notes.md", "Neither a plan nor a task list.\n");
+        scratch.write("docs/exec-plans/active/garbled/plan.md", "# A plan\n");
+        scratch.write("docs/exec-plans/active/garbled/tasks.json", "{\n");
+        let orphan = task_json("orphan", "\"missing\"", "crates/demo");
+        scratch.write("docs/exec-plans/active/graph/plan.md", "# A plan without sections\n");
+        scratch.write(
+            "docs/exec-plans/active/graph/tasks.json",
+            &format!("{{\"tasks\": [{orphan}]}}\n"),
+        );
+        let open = task_json("open", "", "crates/other");
+        scratch.write("docs/exec-plans/completed/old/plan.md", "### open\n");
+        scratch.write(
+            "docs/exec-plans/completed/old/tasks.json",
+            &format!("{{\"tasks\": [{open}]}}\n"),
+        );
+    }
+
+    /// Replaces the task with the missing dependency by two tasks that own the same path and
+    /// may run at the same time. The owner-path rule runs only on a graph without other faults.
+    fn write_overlapping_tasks(scratch: &Scratch) {
+        let first = task_json("first", "", "crates/demo");
+        let second = task_json("second", "", "crates/demo/src");
+        scratch.write(
+            "docs/exec-plans/active/graph/tasks.json",
+            &format!("{{\"tasks\": [{first}, {second}]}}\n"),
+        );
     }
 
     // Goal: a workspace with violations reports them, through every layer of the walk, sorted
@@ -392,12 +445,13 @@ mod tests {
         let planned_tasks = vec!["planned-task"; registry::PLANNED.len()];
         assert_eq!(
             rules,
-            ["runtime-dependency", "assertion-density", "runtime-dependency"]
+            ["runtime-dependency", "assertion-density", "runtime-dependency", "unbounded-loop"]
                 .into_iter()
                 .chain(["snapshot-draft", "unasserted-function", "rules-doc", "doc-tag"])
                 .chain(["adr-index"])
                 .chain(["adr-section"; 6])
                 .chain(planned_tasks)
+                .chain(["plan-files", "tasks-json", "plan-section", "task-graph", "plan-stage"])
                 .chain(["learning-format"; 2])
                 .chain(["expect-budget"])
                 .collect::<Vec<_>>()
@@ -409,18 +463,21 @@ mod tests {
 
     // Goal: every workspace rule in the registry fires on the broken workspace, and no workspace
     // rule fires that the registry does not know. A new workspace rule must be added to
-    // `broken_workspace`, or this test fails.
+    // `broken_workspace`, or this test fails. The owner-path rule needs a second look: it runs
+    // only once the task graph has no other fault.
     #[test]
     fn every_workspace_rule_fires_in_a_broken_workspace() {
         let scratch = broken_workspace("workspace-rules");
-        let violations = check(scratch.root()).unwrap();
+        let mut violations = check(scratch.root()).unwrap();
+        assert!(!fired(&violations).contains("task-owner-paths"), "the graph fault comes first");
+        write_overlapping_tasks(&scratch);
+        let overlapping = check(scratch.root()).unwrap();
+        assert!(!fired(&overlapping).contains("task-graph"), "the graph fault is gone");
+        violations.extend(overlapping);
         let registered: BTreeSet<&str> =
             registry::rule_ids_of(registry::RuleKind::Workspace).collect();
-        let fired: BTreeSet<&str> = violations
-            .iter()
-            .map(|violation| violation.rule)
-            .filter(|rule| registered.contains(rule))
-            .collect();
+        let fired: BTreeSet<&str> =
+            fired(&violations).into_iter().filter(|rule| registered.contains(rule)).collect();
         assert_eq!(fired, registered, "workspace rules that fired, against those registered");
     }
 
@@ -433,9 +490,17 @@ mod tests {
         scratch.write("xtask/expect-budget.txt", "0\n");
         scratch.write("docs/design/README.md", "No decisions yet.\n");
         scratch.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[review]`\n");
-        let tasks: Vec<String> =
-            registry::PLANNED.iter().map(|planned| format!("\"id\": \"{}\"", planned.id)).collect();
-        scratch.write("docs/exec-plans/active/all/tasks.json", &tasks.join("\n"));
+        let tasks: Vec<String> = registry::PLANNED
+            .iter()
+            .map(|planned| task_json(planned.id, "", &format!("crates/{}", planned.id)))
+            .collect();
+        let sections: Vec<String> =
+            registry::PLANNED.iter().map(|planned| format!("### {}\n", planned.id)).collect();
+        scratch.write("docs/exec-plans/active/all/plan.md", &sections.concat());
+        scratch.write(
+            "docs/exec-plans/active/all/tasks.json",
+            &format!("{{\"tasks\": [{}]}}\n", tasks.join(", ")),
+        );
         scratch.write(rules_doc::RULES_DOC, &rules_doc::render(scratch.root()).unwrap());
         scratch
     }
@@ -455,7 +520,7 @@ mod tests {
         assert_eq!(check(tree.root()).unwrap(), Vec::new(), "the tree starts clean");
         tree.write(rules_doc::RULES_DOC, "# Rules of another revision\n");
         tree.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy:rule-of-the-future]`\n");
-        std::fs::remove_file(tree.root().join("docs/exec-plans/active/all/tasks.json")).unwrap();
+        tree.write("docs/exec-plans/active/all/tasks.json", "{\"tasks\": []}\n");
         let own = check(tree.root()).unwrap();
         assert_eq!(fired(&own), BTreeSet::from(registry::REGISTRY_BOUND_RULES));
         let foreign = check_with_policy(tree.root(), policy.root()).unwrap();
@@ -535,6 +600,8 @@ mod tests {
         assert!(super::is_skipped(&root, Path::new("xtask/fixtures")), "fixtures are skipped");
         assert!(!super::is_skipped(&root, Path::new("crates")), "sources are walked");
         assert!(!super::is_skipped(&root, Path::new("crates/fixtures")), "only tidy's fixtures");
+        assert!(super::is_skipped(&root, Path::new(".claude")), "agent configuration is skipped");
+        assert!(!super::is_skipped(&root, Path::new("crates/.claude")), "only at the root");
     }
 
     // Goal: paths map to the scopes whose rules apply to them.

@@ -1,4 +1,4 @@
-# Checks on what a pull request does to the guardrails themselves (ADR-0019).
+# Checks on what a pull request does to the guardrails themselves (ADR-0020).
 # Neither job is a required check: a guardrail change waits for the code owner anyway
 # (ADR-0015). These jobs tell the code owner where to look first.
 name: guardrails

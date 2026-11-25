@@ -26,10 +26,16 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `line-length` | source | Lines in Rust sources are at most 100 columns. | TIGER_STYLE.md, Style by the numbers |
 | `magic-tolerance` | source | In nami crates outside tests, a float literal in (0, 1e-6] appears only in the initialiser of a `const` item that has a doc comment. | TIGER_STYLE.md, Floating point |
 | `parse` | source | Every Rust source file parses. | ADR-0006 |
-| `planned-task` | workspace | Every planned mechanism has a task with the same id in a `tasks.json` under `docs/exec-plans/active/`. | ADR-0017 |
-| `rules-doc` | workspace | `docs/RULES.md` matches what `cargo xtask rules` generates from the registry. | ADR-0017 |
+| `plan-files` | workspace | Every plan directory under `docs/exec-plans/` holds both `plan.md` and `tasks.json`. | ADR-0011 |
+| `plan-section` | workspace | Every task has a `### <id>` section in its plan's `plan.md`. | ADR-0011 |
+| `plan-stage` | workspace | A plan under `completed/` has no unfinished task. | ADR-0011 |
+| `planned-task` | workspace | Every planned mechanism has a task with the same id in a `tasks.json` under `docs/exec-plans/active/`. | ADR-0018 |
+| `rules-doc` | workspace | `docs/RULES.md` matches what `cargo xtask rules` generates from the registry. | ADR-0018 |
 | `runtime-dependency` | source | Runtime and build dependencies of nami crates are `libm` and workspace crates only, and none is renamed with `package = "..."`. | ADR-0001 |
 | `snapshot-draft` | source | No unreviewed insta snapshots (`*.snap.new`). | ADR-0006 |
+| `task-graph` | workspace | Task ids are unique, every dependency exists, no task passes before its dependencies, and the dependencies form no cycle. | ADR-0011 |
+| `task-owner-paths` | workspace | Two unfinished tasks that can run at the same time own no common path. | ADR-0011 |
+| `tasks-json` | workspace | Every `tasks.json` is valid JSON with one `tasks` array, and every task has exactly the six fields of the schema. | ADR-0011 |
 | `test-goal` | source | Every test starts with a comment that states its goal. | TIGER_STYLE.md, Comments, docs and commits |
 | `unasserted-function` | source | A function in a nami crate longer than 10 lines contains an assertion. | ADR-0004 |
 | `unbounded-loop` | source | No `loop`, no `while`, and no `for` over a range without an end unless `take` or `zip` bounds it: every loop has a fixed upper bound. | TIGER_STYLE.md, Put a limit on everything |
@@ -74,7 +80,6 @@ Promised in the documents and not built yet. The style guide tags the rules they
 | `glossary` | docs | `docs/glossary.md` records the one meaning of each word that could be overloaded. | TIGER_STYLE.md, Naming |
 | `recursion-cross-crate` | dylint | Detect call cycles that cross crates through a generic callback; `nami_recursion` checks each crate on its own. | ADR-0006 |
 | `reference-suite` | test | The reference crate holds the tiered tests: invariants, symmetry, convergence order, exact solutions and one reference per boundary-condition type. | ADR-0007 |
-| `tasks-schema` | ci | CI validates every `tasks.json` against the schema and rejects a PR in which an agent sets `passes`. | ADR-0011 |
 | `thresholds-file` | codeowners | `reference/thresholds.toml` is the one human-owned file that holds every test tolerance. | ADR-0007 |
 | `tier-tag` | tidy | Every test under `tests/` carries its reference tier. | ADR-0007 |
 | `usize-alias` | dylint | A type-aware `usize` rule, so that an alias such as `type Idx = usize;` or a local variable cannot get around the tidy rule. | ADR-0002 |

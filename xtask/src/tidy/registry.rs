@@ -119,15 +119,26 @@ pub const RULES: &[Rule] = &[
     ),
     source("parse", "Every Rust source file parses.", "ADR-0006"),
     workspace(
+        "plan-files",
+        "Every plan directory under `docs/exec-plans/` holds both `plan.md` and `tasks.json`.",
+        "ADR-0011",
+    ),
+    workspace(
+        "plan-section",
+        "Every task has a `### <id>` section in its plan's `plan.md`.",
+        "ADR-0011",
+    ),
+    workspace("plan-stage", "A plan under `completed/` has no unfinished task.", "ADR-0011"),
+    workspace(
         "planned-task",
         "Every planned mechanism has a task with the same id in a `tasks.json` under \
          `docs/exec-plans/active/`.",
-        "ADR-0017",
+        "ADR-0018",
     ),
     workspace(
         "rules-doc",
         "`docs/RULES.md` matches what `cargo xtask rules` generates from the registry.",
-        "ADR-0017",
+        "ADR-0018",
     ),
     source(
         "runtime-dependency",
@@ -136,6 +147,23 @@ pub const RULES: &[Rule] = &[
         "ADR-0001",
     ),
     source("snapshot-draft", "No unreviewed insta snapshots (`*.snap.new`).", "ADR-0006"),
+    workspace(
+        "task-graph",
+        "Task ids are unique, every dependency exists, no task passes before its dependencies, \
+         and the dependencies form no cycle.",
+        "ADR-0011",
+    ),
+    workspace(
+        "task-owner-paths",
+        "Two unfinished tasks that can run at the same time own no common path.",
+        "ADR-0011",
+    ),
+    workspace(
+        "tasks-json",
+        "Every `tasks.json` is valid JSON with one `tasks` array, and every task has exactly the \
+         six fields of the schema.",
+        "ADR-0011",
+    ),
     source(
         "test-goal",
         "Every test starts with a comment that states its goal.",
@@ -317,13 +345,6 @@ pub const PLANNED: &[Planned] = &[
         "The reference crate holds the tiered tests: invariants, symmetry, convergence order, \
          exact solutions and one reference per boundary-condition type.",
         "ADR-0007",
-    ),
-    planned(
-        "tasks-schema",
-        "ci",
-        "CI validates every `tasks.json` against the schema and rejects a PR in which an agent \
-         sets `passes`.",
-        "ADR-0011",
     ),
     planned(
         "thresholds-file",

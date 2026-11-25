@@ -8,14 +8,14 @@ review only. This plan is the backlog of those mechanisms: one task per row of `
 `xtask/src/tidy/registry.rs`, with the same id. `docs/RULES.md` lists them with their references.
 
 Gaps that nobody has promised a check for are not here. They are in `docs/learnings/`
-(ADR-0019). A learning becomes a task of this plan when the planner picks it up.
+(ADR-0020). A learning becomes a task of this plan when the planner picks it up.
 
 ## How the backlog stays honest
 
 - Tidy rule `doc-tag`: a tag in the style guide must name something that exists, so a planned
-  mechanism cannot be passed off as built (ADR-0017).
+  mechanism cannot be passed off as built (ADR-0018).
 - Tidy rule `planned-task`: every row of `PLANNED` has a task here, so a promise cannot be
-  dropped silently (ADR-0017).
+  dropped silently (ADR-0018).
 - Tidy rule `rules-doc`: `docs/RULES.md` is generated from the registry and cannot drift.
 
 ## Finishing a task
@@ -37,7 +37,7 @@ The tasks form one chain: each depends on the one before it.
 - **Why a chain.** Steps 1 to 3 above edit `xtask/src/tidy/registry.rs`, `docs/TIGER_STYLE.md`
   and `docs/RULES.md` in every task. Two unfinished tasks may not own the same path (ADR-0011),
   so the tasks cannot run side by side.
-- **Why this order.** The first seven need nothing that does not exist yet. The rest need the
+- **Why this order.** The first six need nothing that does not exist yet. The rest need the
   reference crate or the solver's time loop, which belong to the first equation-system plan.
 - **To relax it,** the planner can take the three shared files out of `owner_paths` and accept
   a small rebase on them. That is a decision for the maintainer.
@@ -50,13 +50,12 @@ The tasks form one chain: each depends on the one before it.
 | 4 | `usize-alias` | dylint lint | nothing |
 | 5 | `recursion-cross-crate` | dylint lint | nothing |
 | 6 | `glossary` | document and tidy rule | nothing |
-| 7 | `tasks-schema` | CI job | nothing |
-| 8 | `thresholds-file` | code-owned file | the reference crate |
-| 9 | `reference-suite` | tests | `thresholds-file`, a solver |
-| 10 | `tier-tag` | tidy rule | reference tests to tag |
-| 11 | `floor-activation-count` | test | `reference-suite`, a scheme with a floor |
-| 12 | `alloc-after-init` | test | the solver's time loop |
-| 13 | `determinism-hash` | CI job | a canonical problem set |
+| 7 | `thresholds-file` | code-owned file | the reference crate |
+| 8 | `reference-suite` | tests | `thresholds-file`, a solver |
+| 9 | `tier-tag` | tidy rule | reference tests to tag |
+| 10 | `floor-activation-count` | test | `reference-suite`, a scheme with a floor |
+| 11 | `alloc-after-init` | test | the solver's time loop |
+| 12 | `determinism-hash` | CI job | a canonical problem set |
 
 Every task under `crates/reference/`, `xtask/`, `lints/`, `.github/` or `docs/TIGER_STYLE.md`
 touches protected paths, so its PR waits for the code owner (ADR-0008, ADR-0015). A reference is
@@ -118,11 +117,6 @@ does not exist. Write it from the terms the ADRs and the code already use ("flux
 its form: one entry per term, sorted, no term defined twice.
 
 Out of scope: checking that the code uses each word in its one meaning. That stays with review.
-
-### tasks-schema
-
-ADR-0011 promises that CI validates every `tasks.json` and rejects a PR in which an agent sets
-`passes`. Add the schema check to tidy and the `passes` check to CI.
 
 ### thresholds-file
 

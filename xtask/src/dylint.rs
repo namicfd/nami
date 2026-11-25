@@ -5,7 +5,7 @@
 //! fresh, and the new lint never runs on it: locally, and in CI when `target/` comes from a
 //! cache. The dylint driver does tell cargo to track the environment variable
 //! `DYLINT_RUSTFLAGS`. This command puts a fingerprint of the lint library into that variable,
-//! so that a changed library makes cargo check every crate again (ADR-0017).
+//! so that a changed library makes cargo check every crate again (ADR-0018).
 
 use std::ffi::OsString;
 use std::fs;

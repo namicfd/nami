@@ -26,7 +26,7 @@
         "float-eq-in-eq-fn"
       ],
       "owner_paths": [
-        "xtask/fixtures/clippy/",
+        "xtask/fixtures/clippy",
         "xtask/tests/clippy_fixtures.rs",
         "xtask/src/tidy/registry.rs",
         "docs/TIGER_STYLE.md",
@@ -113,30 +113,10 @@
       "passes": false
     },
     {
-      "id": "tasks-schema",
-      "title": "CI validates every tasks.json against the schema and rejects a PR in which an agent sets passes (ADR-0011)",
-      "depends_on": [
-        "glossary"
-      ],
-      "owner_paths": [
-        "xtask/src/task.rs",
-        "xtask/src/main.rs",
-        ".github/workflows/ci.yml",
-        "xtask/src/tidy/registry.rs",
-        "docs/TIGER_STYLE.md",
-        "docs/RULES.md"
-      ],
-      "acceptance": [
-        "xtask::task::tests::tasks_json_matches_the_schema",
-        "xtask::task::tests::only_ci_sets_passes"
-      ],
-      "passes": false
-    },
-    {
       "id": "thresholds-file",
       "title": "crates/reference/thresholds.toml: the one human-owned file that holds every test tolerance (ADR-0007)",
       "depends_on": [
-        "tasks-schema"
+        "glossary"
       ],
       "owner_paths": [
         "crates/reference/thresholds.toml",
@@ -157,8 +137,8 @@
         "thresholds-file"
       ],
       "owner_paths": [
-        "crates/reference/src/",
-        "crates/reference/tests/",
+        "crates/reference/src",
+        "crates/reference/tests",
         "crates/reference/Cargo.toml",
         "xtask/src/tidy/registry.rs",
         "docs/TIGER_STYLE.md",

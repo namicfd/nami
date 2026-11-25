@@ -1,4 +1,4 @@
-# ADR-0019: Guardrails that grow: learnings, the pull-request record and the base gate
+# ADR-0020: Guardrails that grow: learnings, the pull-request record and the base gate
 
 - Status: Proposed
 - Date: 2026-11-25
@@ -32,7 +32,7 @@ When one of these happens, the agent turns it into a check or records it (point 
 |---|---|---|
 | 1 | A type, or the compiler (`no_std`, a newtype, a private field) | a design change |
 | 2 | A clippy lint in the workspace table, or a ban in `clippy.toml` with a reason | one line |
-| 3 | A row in a tidy ban table (ADR-0017) | one row and two fixtures |
+| 3 | A row in a tidy ban table (ADR-0018) | one row and two fixtures |
 | 4 | A tidy rule | a visitor method, a registry entry and two fixtures |
 | 5 | A dylint lint | a lint pass and a UI test, on the pinned nightly |
 | 6 | A reference or invariant test (ADR-0007) | a reference PR, written by another session |
@@ -55,7 +55,7 @@ Rungs 7 and 8 are requests, not guarantees (ADR-0006). They are for what cannot 
 - **Status.** `Open`, then `Codified in <rule id, lint or ADR>` when a check enforces it, or `Rejected` with a reason. The PR that adds the check sets the status. Only a human rejects.
 - **Access.** The directory is not protected, and any task may add a file to it, whatever its `owner_paths` say. A learning must cost the agent one small file and no review.
 - **One file each,** because parallel agents that append to one shared file conflict (ADR-0009 evidence).
-- **Open learnings are the guardrail backlog,** next to the planned mechanisms in `docs/RULES.md` (ADR-0017). The planner turns them into tasks (ADR-0011), and a janitor session may pick one directly.
+- **Open learnings are the guardrail backlog,** next to the planned mechanisms in `docs/RULES.md` (ADR-0018). The planner turns them into tasks (ADR-0011), and a janitor session may pick one directly.
 
 ### 3. The pull-request description is a record
 
@@ -79,7 +79,7 @@ A CI job replays tidy across the two revisions of a guardrail PR.
 | The **base branch's** tidy on the **PR's** tree | the PR's code breaks a rule that `main` enforces | **Loosening.** The PR is green only because it changed the rule. |
 | The **PR's** tidy on the **base** tree | `main`'s code breaks a rule that the PR enforces | **Tightening.** The job summary lists what the new rule found. |
 
-- Both runs use tidy's policy mode (`--policy`, ADR-0017): the `#[expect]` budget comes from the base branch, and the rules that compare the docs with the binary's own rule registry are skipped, because two revisions with different registries fail those by construction.
+- Both runs use tidy's policy mode (`--policy`, ADR-0018): the `#[expect]` budget comes from the base branch, and the rules that compare the docs with the binary's own rule registry are skipped, because two revisions with different registries fail those by construction.
 - The job is **not a required check.** A legitimate loosening, approved through an ADR, must still be able to merge.
 
 ### 5. How review uses this
@@ -104,7 +104,7 @@ Every guardrail PR still waits for the code owner (ADR-0015). The two signals sa
 
 - A guardrail gap costs an agent one file, and a ban costs one row. The backlog of gaps is in the repo, where the planner and the janitors can read it.
 - The code owner sees at a glance whether a guardrail PR loosens anything, and what a new rule would have caught.
-- **The base gate replays tidy only.** A loosened clippy level, `clippy.toml` entry, `deny.toml` list, dylint lint or `justfile` recipe shows only in the diff. The doc-tag check (ADR-0017) covers part of this: a lint that the style guide names cannot be removed without tidy failing.
+- **The base gate replays tidy only.** A loosened clippy level, `clippy.toml` entry, `deny.toml` list, dylint lint or `justfile` recipe shows only in the diff. The doc-tag check (ADR-0018) covers part of this: a lint that the style guide names cannot be removed without tidy failing.
 - **`pr-body` reads `.github/CODEOWNERS` from the PR's own tree.** A PR that deletes a pattern shortens the list it has to write. GitHub applies the base branch's file, so the review itself is not bypassed.
 - **The first PR after this ADR has no base gate,** because the base branch's tidy cannot check another tree yet. The job skips itself in that case.
 - More small PRs touch protected paths. That is intended (ADR-0015): they are quick to review, and the alternative is that the gap stays open.
@@ -120,7 +120,7 @@ Every guardrail PR still waits for the code owner (ADR-0015). The two signals sa
 
 ## Evidence
 
-- Review of 2026-11-25: ten planted violations of documented rules passed `just check-full` (ADR-0017 lists them). None of those gaps had been written down anywhere before the review found them.
+- Review of 2026-11-25: ten planted violations of documented rules passed `just check-full` (ADR-0018 lists them). None of those gaps had been written down anywhere before the review found them.
 - ADR-0015, Consequences: "A PR that weakens `justfile`, `xtask/` or `clippy.toml` passes its own gate."
 - OpenAI's harness team: agents replicate existing patterns, and custom lints whose messages carry the remediation are the cheapest way to change behaviour ([openai.com](https://openai.com/index/harness-engineering/)).
 - Claude Code's guidance on where a rule belongs: an instruction is a request, a hook or a check is enforcement (research report, section on hooks).

@@ -1,7 +1,7 @@
 # Learnings
 
 What you found out during a task that the next agent should not have to find out again. Each
-learning is a guardrail that does not exist yet (ADR-0019).
+learning is a guardrail that does not exist yet (ADR-0020).
 
 Write one when:
 

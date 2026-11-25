@@ -1,7 +1,7 @@
 # Playbook: add a guardrail
 
 Use this when a check should have caught something and did not: a bug, a review comment that no
-check enforces, an error message that did not say how to fix the problem (ADR-0019).
+check enforces, an error message that did not say how to fix the problem (ADR-0020).
 
 If the guardrail is not needed for your task, do not build it now. Write a learning instead
 (`docs/learnings/README.md`) and carry on.

@@ -19,7 +19,7 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 
 The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 
-Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0018):
+Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0019):
 
 - **At session start,** `$HOME/.cargo/bin` is put on `PATH`, and `cargo xtask doctor` reports any
   tool whose version is wrong.
@@ -41,6 +41,7 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0
 | `crates/reference` | Numerical references: exact solutions, manufactured solutions, convergence harness. **Protected.** |
 | `xtask/` | Project tooling: `cargo xtask tidy`, the Claude Code hooks, and `agent-token.sh`, which makes git and gh act as the `nami-agent[bot]` GitHub App. |
 | `lints/` | dylint library on a pinned nightly: compiler-level lints such as `nami_recursion`. |
+| `.claude/` | Claude Code configuration: hooks, the reviewer agents and the `review-pr` skill (ADR-0008). |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
 | `docs/operations/` | Runbooks: how GitHub and the `nami-agent` bot are set up, and how to set them up again. |
 | `docs/TIGER_STYLE.md` | The full style guide. Each rule ends with a tag that names its check; tidy verifies the tags. |
@@ -97,7 +98,7 @@ reference says where the reason is written down.
 
 ## When a check is missing
 
-Leave the guardrails stricter than you found them (ADR-0019). Act when a check would have caught
+Leave the guardrails stricter than you found them (ADR-0020). Act when a check would have caught
 your bug, when a reviewer tells you something that no check enforces, or when an error message did
 not say how to fix the problem.
 
@@ -144,9 +145,15 @@ The authoritative list is `.github/CODEOWNERS`.
 
 - **One task per session.** Work on your own branch or worktree, open a PR, and never push to
   `main`.
-- **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`.**
-  - Touch only the task's `owner_paths`, plus `docs/learnings/`.
-  - Never set `passes`; only CI does.
+- **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
+  `docs/exec-plans/README.md`).
+  - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
+    failed claim means someone else holds the task: pick another.
+  - Read the task's `### <id>` section in its `plan.md` before you start.
+  - Work on a branch named `task/<id>`. Touch only the task's `owner_paths`, plus
+    `docs/learnings/`.
+  - Never set `passes`. CI sets it, or for now the maintainer (ADR-0017).
+  - If you give up on a task, `cargo xtask task release <id>` and say why in the plan.
 - **A reference lands before the feature it tests.** Never write the reference for code you also
   implement.
 - **A change that alters output bits** is labelled `changes-results` and waits for a human. Explain
@@ -157,4 +164,7 @@ The authoritative list is `.github/CODEOWNERS`.
 - **Done means all of these hold:**
   - `just check-full` passes;
   - the task's acceptance tests pass;
-  - no new `#[expect]` without a real reason.
+  - no new `#[expect]` without a real reason;
+  - the AI review has run, and its blocking threads are resolved. The review is `/review-pr <n>`,
+    run in a fresh session, never the one that wrote the PR. Fix each finding, or reply with why
+    it is wrong; the reviewer resolves its threads when it re-reviews.

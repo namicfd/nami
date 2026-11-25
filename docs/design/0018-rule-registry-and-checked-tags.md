@@ -1,4 +1,4 @@
-# ADR-0017: One rule registry, enforcement tags that tidy checks, and the gaps they exposed
+# ADR-0018: One rule registry, enforcement tags that tidy checks, and the gaps they exposed
 
 - Status: Proposed
 - Date: 2026-11-25
@@ -82,11 +82,11 @@ The registry has a second table for mechanisms that a document promises and nobo
 
 **The recursion lint.** For each function, the lint searches breadth-first from that function with its own generic parameters. At each call it substitutes the current type arguments and resolves the callee. A call that stays too generic to name an impl continues in the trait's declaration, so a default method is followed and a required method ends the path. The function is reported when the search reaches it again, with any type arguments. A generic decorator, `impl<T: Flux> Flux for Limited<T>` calling `self.inner.flux()`, is therefore not reported, however deeply it is nested. The search is bounded at 100,000 instances and 500 nested calls per function; a function whose search hits a bound is reported as one that cannot be shown to be free of recursion.
 
-New rules that check the documents themselves: `doc-tag` (point 4), `rules-doc` (point 6), `planned-task` (point 5) and `learning-format` (ADR-0019).
+New rules that check the documents themselves: `doc-tag` (point 4), `rules-doc` (point 6), `planned-task` (point 5) and `learning-format` (ADR-0020).
 
 ### 8. Tidy can check another tree
 
-`cargo xtask tidy --root <dir> [--policy <dir>]` runs this binary's rules on another checkout. With `--policy`, the `#[expect]` budget is read from that directory, and the rules that compare documents with the binary's own registry (`doc-tag`, `rules-doc`, `planned-task`) are skipped. ADR-0019 uses this for the base gate.
+`cargo xtask tidy --root <dir> [--policy <dir>]` runs this binary's rules on another checkout. With `--policy`, the `#[expect]` budget is read from that directory, and the rules that compare documents with the binary's own registry (`doc-tag`, `rules-doc`, `planned-task`) are skipped. ADR-0020 uses this for the base gate.
 
 ### 9. `just dylint` lints every crate again after a lint changed
 

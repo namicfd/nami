@@ -47,7 +47,7 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
     let path = Path::new(RULES_DOC);
     let Ok(actual) = fs::read_to_string(root.join(path)) else {
         let message = format!(
-            "{RULES_DOC} is missing; run `{WRITE_COMMAND}` and commit the result (ADR-0017)"
+            "{RULES_DOC} is missing; run `{WRITE_COMMAND}` and commit the result (ADR-0018)"
         );
         return Ok(vec![Violation::new(path, 0, "rules-doc", message)]);
     };
@@ -58,7 +58,7 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
     let line = u32::try_from(same_lines + 1).expect("documents have < 2^32 lines");
     let message = format!(
         "{RULES_DOC} is stale: it differs from the registry from this line on. Do not edit it by \
-         hand; run `{WRITE_COMMAND}` and commit the result (ADR-0017)"
+         hand; run `{WRITE_COMMAND}` and commit the result (ADR-0018)"
     );
     Ok(vec![Violation::new(path, line, "rules-doc", message)])
 }
@@ -83,7 +83,7 @@ pub fn check_planned_tasks(root: &Path) -> io::Result<Vec<Violation>> {
             let message = format!(
                 "planned mechanism `{id}` has no task; add a task with `\"id\": \"{id}\"` to a \
                  `{TASKS_FILE}` under {ACTIVE_PLANS}/, or delete the row from PLANNED once it is \
-                 built (ADR-0017)",
+                 built (ADR-0018)",
                 id = planned.id
             );
             violations.push(Violation::new(Path::new(ACTIVE_PLANS), 0, "planned-task", message));

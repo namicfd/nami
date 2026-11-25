@@ -1,4 +1,4 @@
-# ADR-0018: The stop hook is a gate, and sessions start with working tools
+# ADR-0019: The stop hook is a gate, and sessions start with working tools
 
 - Status: Proposed
 - Date: 2026-11-25

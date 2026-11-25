@@ -18,12 +18,13 @@ fn main() -> ExitCode {
         ["protected", options @ ..] => xtask::pr::run_protected(options),
         ["pr-body", options @ ..] => xtask::pr::run_body(options),
         ["hook", event] => xtask::hook::run(event),
+        ["task", rest @ ..] => xtask::task::run(rest),
         _ => {
             eprintln!("usage: cargo xtask tidy [--root <dir> [--policy <dir>]] | rules [--write]");
             eprintln!(
                 "       | doctor | dylint | protected [--base <ref>] | pr-body [--base <ref>]"
             );
-            eprintln!("       | hook <post-edit|stop|session-start>");
+            eprintln!("       | hook <post-edit|stop|session-start> | task <command>");
             ExitCode::FAILURE
         }
     }

@@ -28,6 +28,16 @@ jobs:
       - uses: ./.github/actions/setup
       - name: just check-full
         run: just check-full
+      # Only CI may set `passes` in a plan's tasks.json (ADR-0011). On `task/<id>` branches this
+      # also lists files outside the task's owner_paths (advisory).
+      - name: Tasks never set passes
+        if: github.event_name != 'push'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"
+          cargo xtask task check-pr "$BASE_SHA" "$HEAD_REF"
 
   # The dylint library's own UI tests: each lint fires where it must and stays silent elsewhere.
   lints:
