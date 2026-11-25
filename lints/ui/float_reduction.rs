@@ -121,6 +121,48 @@ fn rfold_add_reference_method(values: &[f64]) -> f64 {
     values.iter().rfold(0.0, <f64 as Add<&f64>>::add)
 }
 
+fn fold_add_method_call(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, value| total.add(value))
+}
+
+fn fold_sub_method_call(values: &[f32]) -> f32 {
+    values.iter().fold(0.0, |total, &value| value.sub(total))
+}
+
+fn fold_add_path_call(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| f64::add(total, value))
+}
+
+fn reduce_sub_trait_path_call(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(|total, value| Sub::sub(total, value))
+}
+
+fn fold_dot_product_mul_add(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right).fold(0.0, |total, (a, b)| a.mul_add(*b, total))
+}
+
+fn fold_mul_add_path_call(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).fold(0.0, |total, (&a, &b)| f32::mul_add(a, b, total))
+}
+
+fn fold_add_through_a_local(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| {
+        let next = total + value;
+        next
+    })
+}
+
+fn fold_add_in_a_branch(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |total, &value| if value > 0.0 { total + value } else { total })
+}
+
+fn fold_assign_sum(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        total = total + value;
+        total
+    })
+}
+
 // Not reported: integer sums.
 fn sum_integers(values: &[u32]) -> u32 {
     values.iter().sum()
@@ -163,6 +205,42 @@ fn try_fold_max(values: &[f64]) -> Option<f64> {
 
 fn rfold_min_shifted(values: &[f64], shift: f64) -> f64 {
     values.iter().rfold(f64::INFINITY, |least, &value| least.min(value - shift))
+}
+
+fn try_rfold_max(values: &[f64]) -> Option<f64> {
+    values.iter().try_rfold(f64::NEG_INFINITY, |greatest, &value| Some(greatest.max(value)))
+}
+
+// Not reported: an argmin or argmax, where the accumulator is subtracted only in the condition,
+// in a local that only the condition uses, or in an `if` statement that assigns the value.
+fn fold_argmin(values: &[f64]) -> f64 {
+    values.iter().fold(f64::INFINITY, |best, &value| if value - best < 0.0 { value } else { best })
+}
+
+fn reduce_argmax_through_a_local(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(|best, value| {
+        let gain = value - best;
+        if gain > 0.0 { value } else { best }
+    })
+}
+
+fn fold_argmin_assign(values: &[f64]) -> f64 {
+    values.iter().fold(f64::INFINITY, |mut best, &value| {
+        if value - best < 0.0 {
+            best = value;
+        }
+        best
+    })
+}
+
+// Not reported: a `mul_add` with the accumulator as a factor is a recurrence, not a sum.
+fn fold_mul_add_factor(values: &[f64], x: f64) -> f64 {
+    values.iter().fold(0.0, |value, &coefficient| value.mul_add(x, coefficient))
+}
+
+// Not reported: a sum into `Result` of an integer.
+fn sum_integers_into_result(values: &[u32]) -> Result<u32, String> {
+    values.iter().map(|&value| Ok(value)).sum()
 }
 
 // Not reported: integer products, sums into `Option` of an integer, and integer folds that

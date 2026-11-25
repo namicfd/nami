@@ -8,9 +8,17 @@
 //!   is a float, and `reduce` whose result is an `Option` of a float, when their function adds
 //!   to or subtracts from the accumulator.
 //!
-//! The function adds to or subtracts from the accumulator if it is a closure whose first
-//! parameter, the accumulator, is an operand of a `+` or `-` or the target of a `+=` or `-=`,
-//! or if it is a path to the method of `Add` or `Sub` (`f64::add`, `core::ops::Sub::sub`).
+//! The function adds to or subtracts from the accumulator if it is a path to the method of
+//! `Add` or `Sub` (`f64::add`, `core::ops::Sub::sub`), or a closure whose returned value, the
+//! new accumulator, is computed from one of these with its first parameter, the accumulator:
+//!
+//! - a `+` or `-` with the accumulator as an operand, or a `+=` or `-=` on it;
+//! - a call of `Add::add` or `Sub::sub` with the accumulator as an operand, in any spelling
+//!   (`total.add(value)`, `f64::sub(total, value)`);
+//! - a `mul_add` with the accumulator as the addend (`a.mul_add(b, total)`).
+//!
+//! Only expressions that the returned value is computed from count (see `ResultFlow`). A
+//! `-` in the condition of an `if`, as in an argmin, does not.
 //!
 //! A fold that takes a maximum or a minimum is not reported, and neither is a fold such as
 //! Horner's rule (`|acc, c| acc * x + c`), where the accumulator is not itself an addend: the
@@ -27,8 +35,12 @@
 //! - A fold is checked only with a float accumulator, and only when its function is a closure
 //!   written at the call or a path to `Add` or `Sub`. A float carried inside a tuple or struct
 //!   accumulator, a function or closure bound to a name first, an accumulator copied to another
-//!   variable before the addition, and a fold that multiplies (`fold(1.0, f64::mul)`) are not
-//!   seen.
+//!   variable before the addition, a call of a helper function that adds, and a fold that
+//!   multiplies (`fold(1.0, f64::mul)`) are not seen.
+//! - The returned value is traced through operators, calls, blocks, branches, assignments to
+//!   the accumulator and locals declared in the closure; not through a `match` scrutinee (so
+//!   not through the operand of `?`), nor a local declared by a pattern (`let (a, b) = ..`).
+//!   A sum that reaches the result only that way is not seen.
 //! - `Sum::sum` and `Product::product` called directly, and a `sum` whose result type is a
 //!   generic parameter, are not seen.
 //! - An integration test is recognised by its path, `tests/` below the package root. A test
@@ -39,7 +51,9 @@ use clippy_utils::{fn_def_id, is_in_test};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{AssignOpKind, BinOpKind, BodyId, Expr, ExprKind, HirId, PatKind, QPath};
+use rustc_hir::{
+    AssignOpKind, BinOpKind, BodyId, Expr, ExprKind, HirId, LetStmt, PatKind, QPath, StmtKind,
+};
 use rustc_lint::{LateContext, Lint};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::{Symbol, sym};
@@ -59,8 +73,8 @@ const SUM_MESSAGE: &str = "naive float sum; use `kernels::reduce::sum_fixed`, or
                            `sum_compensated` for conservation totals (ADR-0005)";
 
 const PRODUCT_MESSAGE: &str = "naive float product; `kernels::reduce` has no deterministic \
-                               product yet; ask for one with `cargo xtask issue file --kind \
-                               guardrail-gap` (ADR-0005)";
+                               product yet; say in the PR description that you need one, and \
+                               the maintainer decides (ADR-0005)";
 
 /// Reports `expression` if it is a naive float sum or product outside test code.
 pub fn check_expr<'tcx>(cx: &LateContext<'tcx>, lint: &'static Lint, expression: &'tcx Expr<'tcx>) {
@@ -142,18 +156,17 @@ fn combines<'tcx>(cx: &LateContext<'tcx>, arguments: &'tcx [Expr<'tcx>]) -> bool
         return false;
     };
     match function.kind {
-        ExprKind::Closure(closure) => adds_to_accumulator(cx.tcx, closure.body),
-        ExprKind::Path(ref path) => is_add_or_sub_method(cx, path, function.hir_id),
+        ExprKind::Closure(closure) => adds_to_accumulator(cx, closure.body),
+        ExprKind::Path(ref path) => match cx.qpath_res(path, function.hir_id) {
+            Res::Def(DefKind::AssocFn, method) => is_add_or_sub_method(cx.tcx, method),
+            _ => false,
+        },
         _ => false,
     }
 }
 
-/// True if `path` names the method of `Add` or `Sub`, in the trait or in an implementation.
-fn is_add_or_sub_method(cx: &LateContext<'_>, path: &QPath<'_>, id: HirId) -> bool {
-    let tcx = cx.tcx;
-    let Res::Def(DefKind::AssocFn, method) = cx.qpath_res(path, id) else {
-        return false;
-    };
+/// True if `method` is the method of `Add` or `Sub`, in the trait or in an implementation.
+fn is_add_or_sub_method(tcx: TyCtxt<'_>, method: DefId) -> bool {
     let owner = tcx
         .trait_of_assoc(method)
         .or_else(|| tcx.trait_impl_of_assoc(method).map(|block| tcx.impl_trait_id(block)));
@@ -161,31 +174,173 @@ fn is_add_or_sub_method(cx: &LateContext<'_>, path: &QPath<'_>, id: HirId) -> bo
     owner.is_some() && (owner == lang_items.add_trait() || owner == lang_items.sub_trait())
 }
 
+/// True if `method` is the inherent `mul_add` of `f32` or `f64`.
+fn is_float_mul_add(tcx: TyCtxt<'_>, method: DefId) -> bool {
+    // The name is compared as text: the compiler has no predefined symbol for it.
+    tcx.item_name(method).as_str() == "mul_add"
+        && tcx
+            .impl_of_assoc(method)
+            .is_some_and(|block| tcx.type_of(block).skip_binder().is_floating_point())
+}
+
 /// True if the closure with body `body` adds to or subtracts from its first parameter, the
-/// accumulator.
-fn adds_to_accumulator(tcx: TyCtxt<'_>, body: BodyId) -> bool {
-    let body = tcx.hir_body(body);
+/// accumulator, in the value it returns.
+fn adds_to_accumulator<'tcx>(cx: &LateContext<'tcx>, body: BodyId) -> bool {
+    let body = cx.tcx.hir_body(body);
     let Some(accumulator) = body.params.first() else {
         return false;
     };
-    let mut finder = AdditionFinder { accumulators: Vec::new(), found: false };
+    let mut accumulators = Vec::new();
     accumulator.pat.walk_always(|pattern| {
         if let PatKind::Binding(_, binding, _, _) = pattern.kind {
-            finder.accumulators.push(binding);
+            accumulators.push(binding);
         }
     });
-    finder.visit_expr(body.value);
-    finder.found
+    let mut locals = LocalFinder { locals: Vec::new() };
+    locals.visit_expr(body.value);
+    let flow = ResultFlow { cx, accumulators, locals: locals.locals };
+    flow.adds(body.value)
 }
 
-/// Looks for `accumulator + _`, `_ + accumulator`, `accumulator += _`, and the same with `-`.
-struct AdditionFinder {
+/// Upper bound on the expressions that one closure's result is traced through. A closure
+/// written by hand stays far below it; past it the closure is not reported.
+const RESULT_EXPRESSIONS_MAX: u32 = 10_000;
+
+/// Traces the value a fold closure returns, its new accumulator, back through the expressions
+/// it is computed from, and looks there for a sum or difference with the old accumulator.
+///
+/// The value of an expression comes from its operands for arithmetic, negation, casts, borrows
+/// and calls; from the tail and the statements of a block; from the branches of an `if` or a
+/// `match` but not from the condition or the scrutinee; from the right side of an assignment
+/// to the accumulator; and from the initialiser of a local declared in the closure. A
+/// comparison or a logical operator yields a `bool`, never the accumulator, so its operands
+/// are not traced: an argmin's `if value - best < 0.0 { value } else { best }` is no sum.
+struct ResultFlow<'a, 'tcx> {
+    cx: &'a LateContext<'tcx>,
     /// The bindings of the closure's first parameter.
     accumulators: Vec<HirId>,
-    found: bool,
+    /// The locals declared in the closure with a single binding, and their initialisers.
+    locals: Vec<(HirId, &'tcx Expr<'tcx>)>,
 }
 
-impl AdditionFinder {
+impl<'tcx> ResultFlow<'_, 'tcx> {
+    /// True if `value`, the closure's body, adds to or subtracts from the accumulator.
+    fn adds(&self, value: &'tcx Expr<'tcx>) -> bool {
+        let mut pending = vec![value];
+        for _ in 0..RESULT_EXPRESSIONS_MAX {
+            let Some(expression) = pending.pop() else {
+                return false;
+            };
+            if self.combines_at(expression, &mut pending) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if `expression` itself adds to or subtracts from the accumulator. Otherwise pushes
+    /// onto `pending` the expressions that its value comes from.
+    fn combines_at(
+        &self,
+        expression: &'tcx Expr<'tcx>,
+        pending: &mut Vec<&'tcx Expr<'tcx>>,
+    ) -> bool {
+        match expression.kind {
+            ExprKind::Binary(operator, left, right) => match operator.node {
+                BinOpKind::Add | BinOpKind::Sub => {
+                    if self.is_accumulator(left) || self.is_accumulator(right) {
+                        return true;
+                    }
+                    pending.extend([left, right]);
+                }
+                BinOpKind::Mul | BinOpKind::Div | BinOpKind::Rem => pending.extend([left, right]),
+                _ => {}
+            },
+            ExprKind::AssignOp(operator, target, _) => {
+                let adds =
+                    matches!(operator.node, AssignOpKind::AddAssign | AssignOpKind::SubAssign);
+                return adds && self.is_accumulator(target);
+            }
+            ExprKind::Assign(target, value, _) if self.is_accumulator(target) => {
+                pending.push(value)
+            }
+            ExprKind::Unary(_, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner)
+            | ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Ret(Some(inner))
+            | ExprKind::Break(_, Some(inner)) => pending.push(inner),
+            ExprKind::Block(block, _) | ExprKind::Loop(block, ..) => {
+                pending.extend(block.expr);
+                pending.extend(block.stmts.iter().filter_map(|statement| match statement.kind {
+                    StmtKind::Expr(inner) | StmtKind::Semi(inner) => Some(inner),
+                    _ => None,
+                }));
+            }
+            ExprKind::If(_, then, otherwise) => {
+                pending.extend(std::iter::once(then).chain(otherwise))
+            }
+            ExprKind::Match(_, arms, _) => pending.extend(arms.iter().map(|arm| arm.body)),
+            ExprKind::Call(..) | ExprKind::MethodCall(..) => {
+                return self.call_combines(expression, pending);
+            }
+            ExprKind::Path(QPath::Resolved(None, path)) => {
+                if let Res::Local(local) = path.res {
+                    let initialiser = self.locals.iter().find(|(binding, _)| *binding == local);
+                    pending.extend(initialiser.map(|(_, initialiser)| *initialiser));
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// True if `expression`, a call, adds to or subtracts from the accumulator. Otherwise
+    /// pushes its receiver and arguments onto `pending`.
+    fn call_combines(
+        &self,
+        expression: &'tcx Expr<'tcx>,
+        pending: &mut Vec<&'tcx Expr<'tcx>>,
+    ) -> bool {
+        let start = pending.len();
+        let method = match expression.kind {
+            ExprKind::Call(function, arguments) => {
+                pending.extend(arguments);
+                match function.kind {
+                    ExprKind::Path(ref path) => callee_def_id(self.cx, path, function.hir_id),
+                    _ => None,
+                }
+            }
+            ExprKind::MethodCall(_, receiver, arguments, _) => {
+                pending.extend(std::iter::once(receiver).chain(arguments));
+                self.cx.typeck_results().type_dependent_def_id(expression.hir_id)
+            }
+            _ => None,
+        };
+        // The operands are the ones just pushed, receiver first.
+        let operands = pending.get(start..).unwrap_or_default().iter().copied();
+        self.method_combines(method, operands)
+    }
+
+    /// True if a call of `method` with `operands`, the receiver first, adds to or subtracts
+    /// from the accumulator: `Add::add` or `Sub::sub` with the accumulator as an operand, or
+    /// `mul_add` with the accumulator as the addend.
+    fn method_combines(
+        &self,
+        method: Option<DefId>,
+        mut operands: impl Iterator<Item = &'tcx Expr<'tcx>>,
+    ) -> bool {
+        let Some(method) = method else {
+            return false;
+        };
+        let tcx = self.cx.tcx;
+        if is_add_or_sub_method(tcx, method) {
+            return operands.take(2).any(|operand| self.is_accumulator(operand));
+        }
+        is_float_mul_add(tcx, method)
+            && operands.nth(2).is_some_and(|addend| self.is_accumulator(addend))
+    }
+
     fn is_accumulator(&self, operand: &Expr<'_>) -> bool {
         let operand = operand.peel_drop_temps().peel_borrows();
         matches!(
@@ -196,22 +351,27 @@ impl AdditionFinder {
     }
 }
 
-impl<'tcx> Visitor<'tcx> for AdditionFinder {
-    fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
-        self.found |= match expression.kind {
-            ExprKind::Binary(operator, left, right)
-                if matches!(operator.node, BinOpKind::Add | BinOpKind::Sub) =>
-            {
-                self.is_accumulator(left) || self.is_accumulator(right)
-            }
-            ExprKind::AssignOp(operator, target, _)
-                if matches!(operator.node, AssignOpKind::AddAssign | AssignOpKind::SubAssign) =>
-            {
-                self.is_accumulator(target)
-            }
-            _ => false,
-        };
-        intravisit::walk_expr(self, expression);
+/// The function that `path`, the callee of a call, resolves to.
+fn callee_def_id(cx: &LateContext<'_>, path: &QPath<'_>, id: HirId) -> Option<DefId> {
+    match cx.qpath_res(path, id) {
+        Res::Def(DefKind::AssocFn | DefKind::Fn, function) => Some(function),
+        _ => None,
+    }
+}
+
+/// Collects the locals declared with a single binding and an initialiser.
+struct LocalFinder<'tcx> {
+    locals: Vec<(HirId, &'tcx Expr<'tcx>)>,
+}
+
+impl<'tcx> Visitor<'tcx> for LocalFinder<'tcx> {
+    fn visit_local(&mut self, local: &'tcx LetStmt<'tcx>) {
+        if let (PatKind::Binding(_, binding, _, None), Some(initialiser)) =
+            (local.pat.kind, local.init)
+        {
+            self.locals.push((binding, initialiser));
+        }
+        intravisit::walk_local(self, local);
     }
 }
 
