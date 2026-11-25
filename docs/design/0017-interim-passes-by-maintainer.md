@@ -1,6 +1,6 @@
 # ADR-0017: The maintainer sets `passes` until CI can
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0011 (point 2, "Only CI may set `passes`")

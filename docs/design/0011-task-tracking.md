@@ -1,6 +1,6 @@
 # ADR-0011: Task tracking
 
-- Status: Accepted
+- Status: Accepted (amended by ADR-0017)
 - Date: 2026-11-24
 - Deciders: maintainer
 
