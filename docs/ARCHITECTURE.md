@@ -10,7 +10,7 @@
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
-| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b) proposed; (c) open | [0025](design/0025-extension-points-and-composition.md) |
+| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b) agreed; (c) open | [0025](design/0025-extension-points-and-composition.md) |
 | 5 | Performance and parallelism | Open | |
 | 6 | Interface, output and determinism guarantees | Open | |
 | 7 | Verification strategy | Open | |
@@ -270,7 +270,7 @@ The topic has three parts:
   hybrid, against Athena++ built on the same workstation. The code stays on a branch, and the
   results go to `docs/research/`.
 
-### 4(b) Extension points and how they compose (proposed)
+### 4(b) Extension points and how they compose (agreed)
 
 **A run is a compiled combination.** A user writes a small **problem crate** that depends on nami.
 It provides the initial conditions, user boundary conditions and source terms, and names its
@@ -280,7 +280,11 @@ combination of extension points in Rust types. The runtime configuration sets on
 - The speed comes from monomorphisation: the Riemann solver, the equation of state and the
   reconstruction are inlined into the row loop, constants fold, and the loop vectorises.
   Selecting among already-compiled combinations once at init would be just as fast. Compile-time
-  selection wins on build cost: each build compiles only what it uses.
+  selection wins in two other ways:
+  - build cost: each build compiles only what it uses;
+  - more constants: block size, the number of passive scalars and the ghost width can be
+    compile-time constants, and loops of known length can be faster. Whether block size should
+    be one is for the prototype to measure.
 - A problem crate may compile several combinations and select one at init.
 - nami's own test suite instantiates every supported combination, which is how "every selectable
   combination is verified" (§ 3.3) is achieved.
