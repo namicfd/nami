@@ -269,17 +269,20 @@ fn ancestors(tasks: &[Task], index: &BTreeMap<&str, usize>) -> Vec<BTreeSet<usiz
 fn reachable(edges: &[Vec<usize>], start: usize) -> BTreeSet<usize> {
     let mut seen = BTreeSet::new();
     let mut frontier = edges.get(start).cloned().unwrap_or_default();
+    let mut exhausted = frontier.is_empty();
     for _ in 0..=edges.len() {
+        if exhausted {
+            break;
+        }
         let next: Vec<usize> = frontier
             .into_iter()
             .filter(|&node| seen.insert(node))
             .flat_map(|node| edges.get(node).into_iter().flatten().copied())
             .collect();
-        if next.is_empty() {
-            break;
-        }
+        exhausted = next.is_empty();
         frontier = next;
     }
+    assert!(exhausted, "the search ends within one round per node");
     assert!(seen.len() <= edges.len(), "only known nodes are reachable");
     seen
 }

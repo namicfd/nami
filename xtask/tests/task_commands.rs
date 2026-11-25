@@ -74,6 +74,14 @@ fn commands_follow_a_task_through_its_life() {
     assert!(run(&clone, &["release", "a"]).expect_err("twice").contains("not claimed"));
     assert_eq!(run(&clone, &["ready"]), Ok("a\tTask a\n".to_owned()), "a is free again");
     assert!(run(&clone, &["bogus"]).expect_err("usage").starts_with("usage:"));
+    for bad in ["", "a/b", "-a", "A"] {
+        let error = run(&clone, &["release", bad]).expect_err("bad ids are input errors");
+        assert!(error.contains("is not a task id"), "{bad:?}: {error}");
+    }
+    // `ls-remote` matches by suffix: a branch named `task/claims` must not confuse the lookup.
+    let _ = git(&clone, &["push", "--quiet", "origin", "HEAD:refs/heads/task/claims"]);
+    let _ = git(&clone, &["push", "--quiet", "origin", "--delete", "claims"]);
+    assert_eq!(run(&clone, &["ready"]), Ok("a\tTask a\n".to_owned()), "no claims branch again");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
@@ -95,14 +103,50 @@ fn check_pr_rejects_passes_set_outside_ci() {
     std::fs::create_dir_all(clone.join("src/a")).expect("source directory is writable");
     std::fs::write(clone.join("src/a/lib.rs"), "").expect("owned file is written");
     std::fs::write(clone.join("outside.rs"), "").expect("outside file is written");
+    // Widening its own owner paths does not help a task: the base definition counts, and the
+    // edit to tasks.json is itself reported.
+    std::fs::write(&tasks, tasks_json(true).replace("\"src/a\"", "\".\"")).expect("written");
     let _ = git(&clone, &["add", "."]);
     let _ = git(&clone, &["commit", "--quiet", "-m", "work on a"]);
     let output = run(&clone, &["check-pr", &marked, "task/a"]).expect("warnings do not fail");
-    assert_eq!(output, "warning: `outside.rs` is outside the owner_paths of `a` (ADR-0011)\n");
+    let expected = [
+        concat!(
+            "warning: `docs/exec-plans/active/p/tasks.json` ",
+            "is outside the owner_paths of `a` (ADR-0011)"
+        ),
+        "warning: `outside.rs` is outside the owner_paths of `a` (ADR-0011)",
+    ];
+    assert_eq!(output.lines().collect::<Vec<_>>(), expected);
     assert_eq!(run(&clone, &["check-pr", &marked, "feature/x"]), Ok(String::new()), "not a task");
 
     std::fs::write(&tasks, "{").expect("tasks.json is written");
     let invalid = run(&clone, &["ready"]).expect_err("invalid plans block the commands");
     assert!(invalid.contains("invalid JSON") && invalid.contains("1 problem(s)"), "{invalid}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a dependency on a task in a completed plan counts as passing. Method: a completed plan
+// holds the passing task `c`, and the active task `d` depends on it.
+#[test]
+fn completed_plans_unblock_their_dependants() {
+    let (root, clone) = setup("completed");
+    let done = clone.join("docs/exec-plans/completed/done");
+    std::fs::create_dir_all(&done).expect("plan directory is writable");
+    std::fs::write(done.join("plan.md"), "### c\n").expect("plan.md is written");
+    let task = |id: &str, depends: &str, passes: bool| {
+        format!(
+            r#"{{"id": "{id}", "title": "Task {id}", "depends_on": [{depends}],
+                "owner_paths": ["src/{id}"], "acceptance": ["{id}::works"], "passes": {passes}}}"#
+        )
+    };
+    let completed = format!("{{\"tasks\": [{}]}}", task("c", "", true));
+    std::fs::write(done.join("tasks.json"), completed).expect("tasks.json is written");
+    let active = clone.join("docs/exec-plans/active/p");
+    std::fs::write(active.join("plan.md"), "### d\n").expect("plan.md is written");
+    let pending = format!("{{\"tasks\": [{}]}}", task("d", "\"c\"", false));
+    std::fs::write(active.join("tasks.json"), pending).expect("tasks.json is written");
+    assert_eq!(run(&clone, &["ready"]), Ok("d\tTask d\n".to_owned()), "c passes, so d is ready");
+    let status = run(&clone, &["status"]).expect("status works");
+    assert!(!status.contains("Task c"), "completed plans are not listed: {status}");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }

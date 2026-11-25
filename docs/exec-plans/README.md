@@ -67,7 +67,7 @@ In pull requests and the merge queue, `cargo xtask task check-pr` fails if the c
 cargo xtask task status          # every active task: done, claimed, ready or blocked
 cargo xtask task ready           # tasks that can start now: `id<TAB>title`, one per line
 cargo xtask task claim <id>      # take a ready task
-cargo xtask task release <id>    # give it back (done, abandoned or stale)
+cargo xtask task release <id>    # give it back: abandoned or stale, never after the PR merged
 cargo xtask task validate        # the plan checks on their own
 ```
 
@@ -77,7 +77,14 @@ Claims are files `claims/<task-id>` on the `claims` branch.
 - **Claiming:** a claim pushes a commit to that branch. Git accepts only fast-forward pushes, so when two agents claim the same task at once, exactly one push wins.
 - **Holder:** the claim file records `$NAMI_AGENT_ID` (default: git's `user.name`) and `$NAMI_SESSION_ID`.
 - **Age:** `status` shows how old each claim is.
-- **Stale claims:** nothing releases them automatically yet. A human or the runner (ADR-0010, phase 2) releases claims older than about two hours.
+- **After the PR merges, the claim stays.** It keeps the task from being picked up again until `passes` is set. Then `status` shows the task as done, whatever the claim says.
+- **Stale claims:** nothing releases them automatically yet. A human or the runner (ADR-0010, phase 2) releases claims older than about two hours. `status` shows each claim's time, from the claim commit.
+
+## Setting `passes`
+
+ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet: it needs a bot commit to `main` that bypasses the ruleset, and that is a decision for the maintainer.
+
+Until then, the maintainer sets `passes` by hand. They do it in a PR, which `check-pr` fails as designed, and merge it with the admin bypass. The override is explicit and visible in the PR. An agent can never do it, because agents have no bypass (ADR-0009).
 
 ## Writing a plan
 

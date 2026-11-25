@@ -25,7 +25,9 @@ pub struct Claim {
     pub task: String,
     /// The claim file: who holds it.
     pub holder: String,
-    /// When it was claimed, as git describes it relative to now ("2 hours ago").
+    /// When it was claimed: the claim commit's committer time, in strict ISO 8601.
+    pub claimed_at: String,
+    /// The same time as git describes it relative to now ("2 hours ago"), for people.
     pub age: String,
 }
 
@@ -56,7 +58,10 @@ impl fmt::Display for ClaimError {
 ///
 /// Returns the git error if the remote cannot be reached.
 pub fn fetch(root: &Path, remote: &str) -> Result<Option<String>, ClaimError> {
-    let heads = git(root, &["ls-remote", "--heads", remote, BRANCH], &[], None)?;
+    // The full ref: `ls-remote` matches patterns by suffix, so `claims` alone would also match
+    // a branch such as `task/claims`.
+    let full_ref = format!("refs/heads/{BRANCH}");
+    let heads = git(root, &["ls-remote", remote, &full_ref], &[], None)?;
     if heads.trim().is_empty() {
         return Ok(None);
     }
@@ -75,20 +80,23 @@ pub fn list(root: &Path, tip: Option<&str>) -> Result<Vec<Claim>, ClaimError> {
     let Some(tip) = tip else {
         return Ok(Vec::new());
     };
-    let names = git(root, &["ls-tree", "--name-only", &format!("{tip}:claims/")], &[], None);
-    // A branch whose last claim was released has no `claims/` directory.
-    let Ok(names) = names else {
-        return Ok(Vec::new());
-    };
+    // With a pathspec, a missing `claims/` directory (every claim released) lists nothing and
+    // exits 0, so any error here is real and must not read as "no claims".
+    let paths = git(root, &["ls-tree", "--name-only", tip, "--", "claims/"], &[], None)?;
     let mut claims = Vec::new();
-    for task in names.lines().filter(|name| !name.is_empty()) {
-        let path = format!("claims/{task}");
+    for path in paths.lines().filter(|path| !path.is_empty()) {
+        let task = path.strip_prefix("claims/").expect("ls-tree lists paths below claims/");
         let holder = git(root, &["show", &format!("{tip}:{path}")], &[], None)?;
-        let age = git(root, &["log", "-1", "--format=%cr", tip, "--", &path], &[], None)?;
+        let time = git(root, &["log", "-1", "--format=%cI%n%cr", tip, "--", path], &[], None)?;
+        let mut lines = time.lines();
+        let (claimed_at, age) =
+            (lines.next().unwrap_or_default(), lines.next().unwrap_or_default());
+        assert!(!claimed_at.is_empty(), "every claim file was added by a commit");
         claims.push(Claim {
             task: task.to_owned(),
             holder: holder.trim().to_owned(),
-            age: age.trim().to_owned(),
+            claimed_at: claimed_at.to_owned(),
+            age: age.to_owned(),
         });
     }
     Ok(claims)
@@ -153,8 +161,11 @@ fn commit_change(
     let index_text = index.to_string_lossy().into_owned();
     let environment = [("GIT_INDEX_FILE", index_text.as_str())];
     let result = build_commit(root, &environment, tip, task, holder);
-    let _ = std::fs::remove_file(&index);
-    result
+    match std::fs::remove_file(&index) {
+        Ok(()) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => result,
+        Err(error) => Err(ClaimError::Git(format!("cannot remove {}: {error}", index.display()))),
+    }
 }
 
 fn build_commit(

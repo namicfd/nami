@@ -49,6 +49,9 @@ pub fn run(arguments: &[&str]) -> ExitCode {
 /// Returns the reason the command failed: invalid plans, a task that cannot be claimed, a git
 /// failure, or a change that sets `passes`.
 pub fn execute(root: &Path, remote: &str, arguments: &[&str]) -> Result<String, String> {
+    if let ["claim" | "release", id] = arguments {
+        check_task_id(id)?;
+    }
     match arguments {
         ["status"] => status(root, remote),
         ["ready"] => ready(root, remote),
@@ -61,6 +64,16 @@ pub fn execute(root: &Path, remote: &str, arguments: &[&str]) -> Result<String, 
         ["check-pr", base, branch] => check_pr(root, base, branch),
         _ => Err(USAGE.to_owned()),
     }
+}
+
+/// A task ID given on the command line is user input: reject what cannot be an ID.
+fn check_task_id(id: &str) -> Result<(), String> {
+    let valid = !id.is_empty()
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid { Ok(()) } else { Err(format!("`{id}` is not a task id (lowercase, digits, dashes)")) }
 }
 
 /// Where a task stands.
@@ -116,23 +129,30 @@ fn valid_tasks(root: &Path) -> Result<Vec<Task>, String> {
     Err(format!("{}\n{} problem(s) in the plans; fix them first", report.join("\n"), report.len()))
 }
 
-/// The active tasks and the current claims.
-fn snapshot(root: &Path, remote: &str) -> Result<(Vec<Task>, Vec<Claim>), String> {
-    let tasks: Vec<Task> = valid_tasks(root)?.into_iter().filter(|task| task.active).collect();
+/// Every active task with its state. States are computed over all plans, so a dependency on a
+/// task in a completed plan counts as passing.
+fn snapshot(root: &Path, remote: &str) -> Result<Vec<(Task, State)>, String> {
+    let tasks = valid_tasks(root)?;
     let tip = claims::fetch(root, remote).map_err(|error| error.to_string())?;
     let current = claims::list(root, tip.as_deref()).map_err(|error| error.to_string())?;
-    Ok((tasks, current))
+    let all_states = states(&tasks, &current);
+    let active: Vec<(Task, State)> =
+        tasks.into_iter().zip(all_states).filter(|(task, _)| task.active).collect();
+    Ok(active)
 }
 
 fn status(root: &Path, remote: &str) -> Result<String, String> {
-    let (tasks, current) = snapshot(root, remote)?;
+    let tasks = snapshot(root, remote)?;
     let mut lines = Vec::with_capacity(tasks.len());
-    for (task, state) in tasks.iter().zip(states(&tasks, &current)) {
+    for (task, state) in tasks {
         let description = match state {
             State::Done => "done".to_owned(),
-            State::Claimed(claim) => {
-                format!("claimed {} by {}", claim.age, claim.holder.replace('\n', ", "))
-            }
+            State::Claimed(claim) => format!(
+                "claimed {} ({}) by {}",
+                claim.age,
+                claim.claimed_at,
+                claim.holder.replace('\n', ", ")
+            ),
             State::Ready => "ready".to_owned(),
             State::Blocked(waiting) => format!("blocked on {}", waiting.join(", ")),
         };
@@ -142,10 +162,9 @@ fn status(root: &Path, remote: &str) -> Result<String, String> {
 }
 
 fn ready(root: &Path, remote: &str) -> Result<String, String> {
-    let (tasks, current) = snapshot(root, remote)?;
+    let tasks = snapshot(root, remote)?;
     let ready: Vec<String> = tasks
         .iter()
-        .zip(states(&tasks, &current))
         .filter(|(_, state)| *state == State::Ready)
         .map(|(task, _)| format!("{}\t{}\n", task.id, task.title))
         .collect();
@@ -153,11 +172,12 @@ fn ready(root: &Path, remote: &str) -> Result<String, String> {
 }
 
 fn claim(root: &Path, remote: &str, id: &str) -> Result<String, String> {
-    let (tasks, current) = snapshot(root, remote)?;
-    let position = tasks.iter().position(|task| task.id == id);
-    let position = position.ok_or_else(|| format!("no active task `{id}`"))?;
-    let state = states(&tasks, &current).into_iter().nth(position);
-    match state.expect("one state per task") {
+    let tasks = snapshot(root, remote)?;
+    let (_, state) = tasks
+        .into_iter()
+        .find(|(task, _)| task.id == id)
+        .ok_or_else(|| format!("no active task `{id}`"))?;
+    match state {
         State::Ready => {}
         State::Done => return Err(format!("`{id}` is already done")),
         State::Claimed(claim) => return Err(format!("`{id}` is claimed by {}", claim.holder)),
@@ -182,19 +202,22 @@ fn holder(root: &Path) -> String {
     format!("agent: {}\nsession: {session}", agent.unwrap_or_else(|| "unknown".to_owned()))
 }
 
-/// CI: fail if the change sets `passes` on any task (only CI may), and list the files outside
-/// the task's `owner_paths` when the branch is `task/<id>` (advisory).
+/// CI: fail if the change sets `passes` on any task, and list the files outside the task's
+/// `owner_paths` when the branch is `task/<id>` (advisory). The task's definition comes from
+/// `base`, so a branch cannot widen its own `owner_paths`.
 fn check_pr(root: &Path, base: &str, branch: &str) -> Result<String, String> {
     let (head_tasks, _) =
         plan::load(root).map_err(|error| format!("cannot read the plans: {error}"))?;
-    let base_passing = passing_at(root, base)?;
+    let base_tasks = tasks_at(root, base)?;
+    let base_passing: BTreeSet<String> =
+        base_tasks.iter().filter(|task| task.passes).map(|task| task.id.clone()).collect();
     let flipped = passes_flips(&head_tasks, &base_passing);
     let mut output = String::new();
     if let Some(id) = branch.strip_prefix(TASK_BRANCH_PREFIX) {
         let changed = claims::git(root, &["diff", "--name-only", base, "HEAD"], &[], None)
             .map_err(|error| error.to_string())?;
         let changed: Vec<&str> = changed.lines().collect();
-        let warnings = outside_owner_paths(&head_tasks, id, &changed);
+        let warnings = outside_owner_paths(&base_tasks, id, &changed);
         let lines: Vec<String> =
             warnings.iter().map(|warning| format!("warning: {warning}\n")).collect();
         output = lines.concat();
@@ -205,18 +228,14 @@ fn check_pr(root: &Path, base: &str, branch: &str) -> Result<String, String> {
     let errors: Vec<String> = flipped
         .iter()
         .map(|id| {
-            format!("error: this change sets `passes` on `{id}`; only CI may set it (ADR-0011)")
+            format!("error: this change sets `passes` on `{id}`; agents never set it (ADR-0011)")
         })
         .collect();
-    Err(format!(
-        "{output}{}\n{} task(s) had `passes` set outside CI",
-        errors.join("\n"),
-        flipped.len()
-    ))
+    Err(format!("{output}{}\n{} task(s) had `passes` set", errors.join("\n"), flipped.len()))
 }
 
-/// The ids of the tasks that pass at commit `base`.
-fn passing_at(root: &Path, base: &str) -> Result<BTreeSet<String>, String> {
+/// Every task in the plans at commit `base`.
+fn tasks_at(root: &Path, base: &str) -> Result<Vec<Task>, String> {
     let files = claims::git(
         root,
         &["ls-tree", "-r", "--name-only", base, "--", plan::PLANS_DIRECTORY],
@@ -224,14 +243,13 @@ fn passing_at(root: &Path, base: &str) -> Result<BTreeSet<String>, String> {
         None,
     )
     .map_err(|error| error.to_string())?;
-    let mut passing = BTreeSet::new();
+    let mut tasks = Vec::new();
     for file in files.lines().filter(|file| file.ends_with("/tasks.json")) {
         let text = claims::git(root, &["show", &format!("{base}:{file}")], &[], None)
             .map_err(|error| error.to_string())?;
-        let (tasks, _) = plan::parse_tasks(Path::new(file), &text, true);
-        passing.extend(tasks.into_iter().filter(|task| task.passes).map(|task| task.id));
+        tasks.extend(plan::parse_tasks(Path::new(file), &text, true).0);
     }
-    Ok(passing)
+    Ok(tasks)
 }
 
 /// Tasks that pass now but did not pass at the base.
@@ -246,18 +264,19 @@ pub fn passes_flips(head: &[Task], base_passing: &BTreeSet<String>) -> Vec<Strin
     flipped
 }
 
-/// Advisory: changed files that lie outside task `id`'s owner paths. The plan's own files are
-/// exempt, so that a task may record notes in its plan.
+/// Advisory: changed files that lie outside task `id`'s owner paths, as defined in `tasks`.
+/// The task's `plan.md` is exempt, so that a task may record notes there; its `tasks.json` is
+/// not, so that a change to the task's own definition is always reported.
 #[must_use]
 pub fn outside_owner_paths(tasks: &[Task], id: &str, changed: &[&str]) -> Vec<String> {
     let Some(task) = tasks.iter().find(|task| task.id == id) else {
-        return vec![format!("the branch names task `{id}`, which does not exist")];
+        return vec![format!("the branch names task `{id}`, which does not exist at the base")];
     };
-    let plan_directory = task.file.parent().map(|path| path.to_string_lossy().into_owned());
+    let plan_file = task.file.with_file_name("plan.md").to_string_lossy().into_owned();
     let outside: Vec<String> = changed
         .iter()
         .filter(|file| !task.owner_paths.iter().any(|owned| plan::overlaps(file, owned)))
-        .filter(|file| plan_directory.as_deref().is_none_or(|plan| !plan::overlaps(file, plan)))
+        .filter(|file| **file != plan_file)
         .map(|file| format!("`{file}` is outside the owner_paths of `{id}` (ADR-0011)"))
         .collect();
     assert!(outside.len() <= changed.len(), "at most every changed file is outside");
@@ -295,8 +314,12 @@ mod tests {
             task("c", &["a", "b"], false),
             task("d", &[], false),
         ];
-        let claim =
-            Claim { task: "d".to_owned(), holder: "agent: x".to_owned(), age: "now".to_owned() };
+        let claim = Claim {
+            task: "d".to_owned(),
+            holder: "agent: x".to_owned(),
+            claimed_at: "2026-11-25T00:00:00Z".to_owned(),
+            age: "now".to_owned(),
+        };
         let result = states(&tasks, std::slice::from_ref(&claim));
         assert_eq!(
             result,
@@ -326,11 +349,16 @@ mod tests {
     #[test]
     fn owner_path_warnings() {
         let tasks = [task("a", &[], false)];
-        let changed =
-            ["crates/a/src/lib.rs", "crates/b/src/lib.rs", "docs/exec-plans/active/p/plan.md"];
+        let changed = [
+            "crates/a/src/lib.rs",
+            "crates/b/src/lib.rs",
+            "docs/exec-plans/active/p/plan.md",
+            "docs/exec-plans/active/p/tasks.json",
+        ];
         let warnings = outside_owner_paths(&tasks, "a", &changed);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("crates/b/src/lib.rs"), "the outside file is named");
+        assert!(warnings[1].contains("tasks.json"), "editing the task list is always reported");
         assert!(
             outside_owner_paths(&tasks, "zz", &changed)[0].contains("does not exist"),
             "unknown task"

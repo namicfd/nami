@@ -28,8 +28,12 @@ pub use rust_source::AssertionStats;
 const DIRECTORIES_MAX: u32 = 100_000;
 
 /// Directories that the source walk never enters. ADRs and plans are checked separately.
-/// `.claude` holds agent configuration and Claude Code's worktrees, which are other checkouts.
-const SKIPPED_DIRECTORIES: [&str; 4] = ["target", ".git", "docs", ".claude"];
+const SKIPPED_DIRECTORIES: [&str; 3] = ["target", ".git", "docs"];
+
+/// Skipped only at the workspace root: agent configuration and Claude Code's worktrees, which
+/// are other checkouts. Copies of the tree (cargo-mutants) drop the worktrees' `.git` files, so
+/// the nested-checkout rule alone does not catch them there.
+const ROOT_AGENT_DIRECTORY: &str = ".claude";
 
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
 const INDEX_MODULE: &str = "crates/base/src/index.rs";
@@ -181,7 +185,7 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
             let path = entry?.path();
             if !path.is_dir() {
                 found.push(path);
-            } else if !is_skipped(&path) {
+            } else if !is_skipped(&path) && path != root.join(ROOT_AGENT_DIRECTORY) {
                 pending.push(path);
             }
         }
@@ -227,6 +231,11 @@ mod tests {
         let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
         std::fs::write(source.join("lib.rs"), unasserted).unwrap();
         std::fs::write(root.join("target/ignored/skipped.rs"), "fn a() { loop {} }").unwrap();
+        // Only the root `.claude/` is skipped; one inside a crate is checked like any source.
+        std::fs::create_dir_all(source.join(".claude")).unwrap();
+        std::fs::write(source.join(".claude/b.rs"), "fn b() { loop {} }").unwrap();
+        std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+        std::fs::write(root.join(".claude/agents/c.rs"), "fn c() { loop {} }").unwrap();
         let worktree = root.join(".claude/worktrees/other");
         std::fs::create_dir_all(worktree.join("crates/old/src")).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
@@ -237,9 +246,9 @@ mod tests {
         let rules: Vec<&str> = violations.iter().map(|violation| violation.rule).collect();
         assert_eq!(
             rules,
-            ["assertion-density", "runtime-dependency", "snapshot-draft", "unasserted-function"]
+            ["assertion-density", "runtime-dependency", "unbounded-loop", "snapshot-draft"]
                 .into_iter()
-                .chain(["adr-index"])
+                .chain(["unasserted-function", "adr-index"])
                 .chain(["adr-section"; 6])
                 .chain(["plan-files", "expect-budget"])
                 .collect::<Vec<_>>()
@@ -262,7 +271,6 @@ mod tests {
         assert_eq!(super::crate_root(lib).as_deref(), Some(Path::new("crates/base")));
         assert_eq!(super::crate_root(Path::new("xtask/src/tidy.rs")), None);
         assert!(super::is_skipped(Path::new("/repo/target")), "build output is skipped");
-        assert!(super::is_skipped(Path::new("/repo/.claude")), "agent worktrees are skipped");
         assert!(!super::is_skipped(Path::new("/repo/crates")), "sources are walked");
     }
 
