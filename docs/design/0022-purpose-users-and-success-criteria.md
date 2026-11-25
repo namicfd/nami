@@ -46,6 +46,10 @@ directions.
    - **Swarm record:** each merged PR records its cost, the maintainer's minutes, whether a human
      changed the code, and every defect that escaped and was found later.
 
+8. **Benchmark baselines.** Athena++ and AthenaK are built from pinned commits, outside the
+   workspace and never linked into nami, only to measure the performance criterion. This adds
+   them to ADR-0001's list of tools.
+
 ## Enforcement
 
 - **Performance:** none yet. A benchmark job that runs pinned builds of Athena++ and AthenaK
