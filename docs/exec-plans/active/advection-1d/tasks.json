@@ -1,0 +1,60 @@
+{
+  "tasks": [
+    {
+      "id": "advection1d-reference",
+      "title": "Exact solutions, the Scheme contract and the check suite for 1D advection",
+      "depends_on": [],
+      "owner_paths": ["crates/reference", "Cargo.lock"],
+      "acceptance": [
+        "reference::advection1d::tests::exact_scheme_passes_every_check",
+        "reference::advection1d::tests::no_op_scheme_fails",
+        "reference::advection1d::tests::reversed_scheme_fails",
+        "reference::advection1d::tests::leaky_scheme_fails_conservation",
+        "reference::advection1d::tests::large_step_scheme_fails_step_count"
+      ],
+      "passes": false
+    },
+    {
+      "id": "advection1d-upwind",
+      "title": "First-order upwind with forward Euler, through kernels and solver",
+      "depends_on": ["advection1d-reference"],
+      "owner_paths": [
+        "crates/kernels/src/advection.rs",
+        "crates/kernels/src/lib.rs",
+        "crates/solver",
+        "Cargo.lock"
+      ],
+      "acceptance": ["solver::advection1d::upwind_passes_the_reference_suite"],
+      "passes": false
+    },
+    {
+      "id": "advection1d-muscl",
+      "title": "Second-order MUSCL (Fromm, minmod, MC) with SSP-RK2",
+      "depends_on": ["advection1d-upwind"],
+      "owner_paths": [
+        "crates/kernels/src/reconstruction.rs",
+        "crates/kernels/src/lib.rs",
+        "crates/solver/src",
+        "crates/solver/tests/advection1d.rs"
+      ],
+      "acceptance": [
+        "solver::advection1d::fromm_passes_the_reference_suite",
+        "solver::advection1d::minmod_passes_the_reference_suite",
+        "solver::advection1d::mc_passes_the_reference_suite"
+      ],
+      "passes": false
+    },
+    {
+      "id": "advection1d-no-allocation",
+      "title": "Prove the advection time loop never allocates",
+      "depends_on": ["advection1d-upwind", "advection1d-muscl"],
+      "owner_paths": [
+        "crates/solver/tests/advection1d_no_allocation.rs",
+        "crates/solver/Cargo.toml",
+        "Cargo.lock"
+      ],
+      "acceptance": ["solver::advection1d_no_allocation::time_loop_does_not_allocate"],
+      "passes": false
+    }
+  ]
+}
