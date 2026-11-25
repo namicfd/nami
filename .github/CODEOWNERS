@@ -24,6 +24,7 @@
 /CLAUDE.md                 @cxkoda
 /docs/design/              @cxkoda
 /docs/TIGER_STYLE.md       @cxkoda
+/docs/operations/          @cxkoda
 
 # Reference solutions, their generators and reference data (ADR-0007).
 /crates/reference/         @cxkoda

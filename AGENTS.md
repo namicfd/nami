@@ -35,6 +35,7 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work:
 | `xtask/` | Project tooling: `cargo xtask tidy`, the Claude Code hooks, and `agent-token.sh`, which makes git and gh act as the `nami-agent[bot]` GitHub App. |
 | `lints/` | dylint library on a pinned nightly: compiler-level lints such as `nami_recursion`. |
 | `docs/design/` | ADRs: every rule, its reason and how it is enforced. |
+| `docs/operations/` | Runbooks: how GitHub and the `nami-agent` bot are set up, and how to set them up again. |
 | `docs/TIGER_STYLE.md` | The full style guide. |
 | `docs/exec-plans/` | Plans and `tasks.json` task lists (ADR-0011). |
 | `docs/research/` | Background research. |
@@ -100,7 +101,7 @@ The protected paths are:
   `.cargo/` and `.config/`.
 - **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
-- **Policy:** `docs/design/` and `docs/TIGER_STYLE.md`.
+- **Policy:** `docs/design/`, `docs/TIGER_STYLE.md` and `docs/operations/`.
 - **References:** `crates/reference/` and `tools/`.
 
 The authoritative list is `.github/CODEOWNERS`.
