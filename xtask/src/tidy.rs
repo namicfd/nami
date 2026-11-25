@@ -24,7 +24,7 @@ pub mod registry;
 mod rules_doc;
 mod rust_source;
 #[cfg(test)]
-mod scratch;
+pub(crate) mod scratch;
 mod style_guide;
 mod text;
 mod tokens;
