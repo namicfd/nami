@@ -1,0 +1,17 @@
+// path: crates/solver/src/example.rs
+//! Typed counts in signatures and fields. A const generic parameter may be `usize`, because
+//! array lengths have to be.
+
+use base::index::CellCount;
+
+pub fn cell_count(cells: CellCount) -> CellCount {
+    cells
+}
+
+struct Mesh {
+    cells: CellCount,
+}
+
+pub fn zeros<const N: usize>() -> [f64; N] {
+    [0.0; N]
+}

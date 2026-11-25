@@ -1,0 +1,17 @@
+// path: crates/solver/src/example.rs
+//! A configuration that can be built without saying what it holds.
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Config {
+    cfl: f64,
+}
+
+struct Limits {
+    steps_max: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { steps_max: 100 }
+    }
+}

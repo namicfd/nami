@@ -1,0 +1,8 @@
+// path: crates/solver/src/example.rs
+//! An `async` function and an `async` block.
+
+async fn advance() {}
+
+fn schedule() {
+    let _pending = async {};
+}

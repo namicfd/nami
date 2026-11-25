@@ -1,0 +1,7 @@
+// path: crates/solver/src/example.rs
+//! A test that does not say what it checks.
+
+#[test]
+fn addition_is_exact() {
+    assert_eq!(1 + 1, 2, "small integers add exactly");
+}

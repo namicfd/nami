@@ -1,0 +1,10 @@
+// path: crates/solver/src/example.rs
+//! Loops with a fixed upper bound.
+
+/// Upper bound on time steps.
+const STEPS_MAX: u32 = 8;
+
+fn run() {
+    for _step in 0..STEPS_MAX {}
+    for _step in 0..=STEPS_MAX {}
+}

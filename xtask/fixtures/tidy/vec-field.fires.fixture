@@ -1,0 +1,6 @@
+// path: crates/solver/src/example.rs
+//! Storage that could grow after init.
+
+struct Field {
+    values: Vec<f64>,
+}

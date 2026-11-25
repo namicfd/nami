@@ -1,0 +1,4 @@
+// path: crates/solver/src/example.rs
+//! A file that parses.
+
+fn fine() {}

@@ -1,0 +1,6 @@
+// path: crates/kernels/src/example.rs
+//! A generic parameter: every call resolves statically.
+
+fn limit(limiter: impl Fn(f64) -> f64, slope: f64) -> f64 {
+    limiter(slope)
+}

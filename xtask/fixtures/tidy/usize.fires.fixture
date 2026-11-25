@@ -1,0 +1,14 @@
+// path: crates/solver/src/example.rs
+//! `usize` outside the index module: a public signature, a field, a public constant and an alias.
+
+pub fn cell_count(cells: usize) -> usize {
+    cells
+}
+
+struct Mesh {
+    cells: usize,
+}
+
+pub const GHOST_LAYERS: usize = 2;
+
+type Position = usize;

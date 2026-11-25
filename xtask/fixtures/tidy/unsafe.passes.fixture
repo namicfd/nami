@@ -1,0 +1,7 @@
+// path: crates/alloc-guard/src/example.rs
+//! The allocation guard is the one crate that may contain `unsafe` (ADR-0014).
+
+fn first(values: &[f64]) -> f64 {
+    // SAFETY: the caller passes a non-empty slice.
+    unsafe { *values.get_unchecked(0) }
+}

@@ -1,0 +1,11 @@
+// path: crates/solver/src/example.rs
+//! A configuration whose fields are all written out where it is built.
+
+#[derive(Clone, Copy, Debug)]
+struct Config {
+    cfl: f64,
+}
+
+fn config() -> Config {
+    Config { cfl: 0.5 }
+}

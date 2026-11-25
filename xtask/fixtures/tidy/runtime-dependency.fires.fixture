@@ -1,0 +1,6 @@
+# path: crates/demo/Cargo.toml
+[package]
+name = "demo"
+
+[dependencies]
+serde = "1"

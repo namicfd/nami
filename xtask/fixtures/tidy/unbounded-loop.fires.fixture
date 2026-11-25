@@ -1,0 +1,10 @@
+// path: crates/solver/src/example.rs
+//! Loops without a fixed upper bound.
+
+fn wait_forever() {
+    loop {}
+}
+
+fn wait_until(done: bool) {
+    while !done {}
+}
