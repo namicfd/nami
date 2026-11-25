@@ -31,7 +31,10 @@ pub fn workspace_root() -> PathBuf {
             current.display()
         )
     });
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
+    let manifest_file = root.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_file).unwrap_or_else(|error| {
+        panic!("cannot read the workspace manifest {}: {error}", manifest_file.display())
+    });
     assert!(
         manifest.lines().any(|line| line.trim() == "[workspace]"),
         "{} must declare [workspace]: the root is the workspace, not a member crate",
@@ -65,31 +68,19 @@ pub fn workspace_root_of(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-
-    /// A scratch directory that is removed on drop, also when an assertion fails first.
-    struct Scratch(PathBuf);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            // Removal is best effort: a failed removal must not hide the test's own failure.
-            let _removed = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tidy::scratch::Scratch;
 
     // Goal: the root search climbs from a member crate to the directory that holds both the
     // workspace manifest and xtask/, and finds nothing outside a checkout.
     #[test]
     fn workspace_root_is_found_from_any_directory_inside_it() {
-        let root = std::env::temp_dir().join(format!("nami-root-{}", std::process::id()));
-        let _scratch = Scratch(root.clone());
+        let scratch = Scratch::new("workspace-root-of");
+        scratch.write("Cargo.toml", "[workspace]\n");
+        scratch.write("xtask/Cargo.toml", "[package]\n");
+        scratch.write("crates/solver/Cargo.toml", "[package]\n");
+        scratch.write("crates/solver/src/lib.rs", "");
+        let root = scratch.root().to_path_buf();
         let nested = root.join("crates/solver/src");
-        fs::create_dir_all(&nested).expect("the temp directory is writable");
-        fs::create_dir_all(root.join("xtask")).expect("the temp directory is writable");
-        fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("the root is writable");
-        fs::write(root.join("xtask/Cargo.toml"), "[package]\n").expect("xtask is writable");
-        fs::write(root.join("crates/solver/Cargo.toml"), "[package]\n").expect("writable");
         assert_eq!(super::workspace_root_of(&nested), Some(root.clone()), "from a member");
         assert_eq!(super::workspace_root_of(&root), Some(root.clone()), "from the root");
         assert_eq!(super::workspace_root_of(std::path::Path::new("/")), None, "outside");

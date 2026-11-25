@@ -5,101 +5,93 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-/// The source file, relative to the root, that gets a planted violation in the copy.
+/// The source file, relative to the root, that gets the planted violation.
 const PLANTED_FILE: &str = "crates/solver/src/lib.rs";
 
-/// Directories not copied: build output, git metadata, and other checkouts nested inside.
-const SKIPPED_DIRECTORIES: [&str; 2] = ["target", ".git"];
+/// The files a synthetic workspace needs for tidy to reach its source rules, with their text.
+/// Tidy reports the missing documents (such as `docs/RULES.md`) as violations; the test only
+/// looks for the planted one.
+const SKELETON: [(&str, &str); 5] = [
+    ("Cargo.toml", "[workspace]\nmembers = [\"crates/solver\"]\n"),
+    ("xtask/Cargo.toml", "[package]\nname = \"xtask\"\n"),
+    ("xtask/expect-budget.txt", "0\n"),
+    ("docs/TIGER_STYLE.md", "# TigerStyle\n"),
+    ("crates/solver/Cargo.toml", "[package]\nname = \"solver\"\n"),
+];
 
-/// Upper bound on directories walked while copying the checkout.
-const DIRECTORIES_MAX: u32 = 10_000;
+/// A synthetic workspace under the temporary directory, removed on drop, also when a setup
+/// step panics first. Built from scratch, so it never depends on stray files in a checkout.
+struct Workspace(PathBuf);
 
-/// A scratch directory that is removed on drop, also when a setup step fails first.
-struct Scratch(PathBuf);
+impl Workspace {
+    fn new(name: &str, source: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("nami-root-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("a stale workspace is removable");
+        }
+        let workspace = Self(root);
+        fs::create_dir_all(workspace.0.join("docs/design")).expect("temp is writable");
+        for (relative, text) in SKELETON.iter().chain([(PLANTED_FILE, source)].iter()) {
+            let file = workspace.0.join(relative);
+            fs::create_dir_all(file.parent().expect("a file has a parent")).expect("writable");
+            fs::write(&file, text).expect("temp is writable");
+        }
+        assert!(workspace.0.join(PLANTED_FILE).is_file(), "the workspace has its source file");
+        workspace
+    }
 
-impl Drop for Scratch {
+    /// Runs the built `xtask tidy` from `relative` inside the workspace. Returns its stderr.
+    fn tidy_from(&self, relative: &str) -> String {
+        let binary = std::env::var_os("CARGO_BIN_EXE_xtask")
+            .expect("cargo and nextest set CARGO_BIN_EXE_xtask when they run a test");
+        let directory = self.0.join(relative);
+        assert!(directory.is_dir(), "tidy starts in a directory of the workspace");
+        let output =
+            Command::new(binary).arg("tidy").current_dir(directory).output().expect("xtask starts");
+        String::from_utf8(output.stderr).expect("tidy reports in UTF-8")
+    }
+}
+
+impl Drop for Workspace {
     fn drop(&mut self) {
         // Removal is best effort: a failed removal must not hide the test's own failure.
         let _removed = fs::remove_dir_all(&self.0);
     }
 }
 
-/// True for a directory the copy leaves out. A `.git` inside a directory (a folder, or the
-/// file a worktree has) marks another checkout, such as `.claude/worktrees/<agent>`.
-fn is_skipped(source: &Path, directory: &Path) -> bool {
-    let name = directory.file_name().map(|name| name.to_string_lossy().into_owned());
-    let is_listed = name.is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name.as_str()));
-    is_listed || (directory != source && directory.join(".git").exists())
+/// True if one line of `stderr` reports a debt marker in the planted file.
+fn reports_planted_marker(stderr: &str) -> bool {
+    let prefix = format!("{PLANTED_FILE}:");
+    stderr.lines().any(|line| line.starts_with(&prefix) && line.contains("debt-marker"))
 }
 
-/// Copies `file`, which lies below `source`, to the same place below `target`.
-fn copy_file(source: &Path, target: &Path, file: &Path) {
-    let relative = file.strip_prefix(source).expect("the walk stays below the source");
-    let to = target.join(relative);
-    fs::create_dir_all(to.parent().expect("a file has a parent")).expect("temp is writable");
-    let _bytes = fs::copy(file, &to).expect("a checkout file is copyable");
-    assert!(to.is_file(), "{} was copied to {}", relative.display(), to.display());
-}
-
-/// Copies the checkout at `source` to `target` with a filesystem walk, without `target/`,
-/// `.git` and nested checkouts. Needs no git, so it also works in cargo-mutants' copy.
-fn copy_checkout(source: &Path, target: &Path) -> u32 {
-    assert!(source.join("Cargo.toml").is_file(), "the source is a workspace");
-    assert!(!target.exists(), "the copy starts empty");
-    let mut pending = vec![source.to_path_buf()];
-    let mut copied = 0_u32;
-    for _ in 0..DIRECTORIES_MAX {
-        let Some(directory) = pending.pop() else {
-            assert!(copied > 0, "the checkout has files");
-            return copied;
-        };
-        for entry in fs::read_dir(&directory).expect("the checkout is readable") {
-            let path = entry.expect("a directory entry is readable").path();
-            if !path.is_dir() {
-                copy_file(source, target, &path);
-                copied += 1;
-            } else if !is_skipped(source, &path) {
-                pending.push(path);
-            }
-        }
-    }
-    panic!("the copy visited more than {DIRECTORIES_MAX} directories under {}", source.display());
-}
-
-// Goal: `xtask tidy`, started inside a copy of the checkout, reports a violation planted in
-// the copy only. Method: copy the checkout to a temp dir, add a debt marker there, and run the
-// built binary from a member crate of the copy. A root compiled into the binary would check
-// the original tree instead, which lacks the marker, and tidy would pass.
+// Goal: `xtask tidy`, started inside a workspace, checks that workspace. Method: build two
+// synthetic workspaces in the temp dir, one with a debt marker planted in a member crate and a
+// control without it, and run the built binary from the member crate of each. Only the first
+// may report the marker. A root compiled into the binary would check the checkout the binary
+// was built in instead, which lacks the marker, so the first run would not report it.
 #[test]
-fn tidy_checks_the_checkout_around_the_current_directory() {
-    let original = xtask::workspace_root();
-    let copy = std::env::temp_dir().join(format!("nami-root-copy-{}", std::process::id()));
-    if copy.exists() {
-        fs::remove_dir_all(&copy).expect("a stale copy is removable");
-    }
-    let _scratch = Scratch(copy.clone());
-    let _copied = copy_checkout(&original, &copy);
-    let planted = copy.join(PLANTED_FILE);
-    let text = fs::read_to_string(&planted).expect("the planted file was copied");
+fn tidy_checks_the_workspace_around_the_current_directory() {
     let marker = concat!("TO", "DO");
-    fs::write(&planted, format!("{text}// {marker}: planted by the workspace_root test\n"))
-        .expect("the copy is writable");
+    let planted = Workspace::new("planted", &format!("//! Solver.\n// {marker}: planted\n"));
+    let control = Workspace::new("control", "//! Solver.\n");
 
-    let binary = std::env::var_os("CARGO_BIN_EXE_xtask")
-        .expect("cargo and nextest set CARGO_BIN_EXE_xtask when they run a test");
-    let output = Command::new(binary)
-        .arg("tidy")
-        .current_dir(copy.join("crates/solver"))
-        .output()
-        .expect("xtask starts");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "tidy must fail on the copy's violation: {stderr}");
+    let planted_stderr = planted.tidy_from("crates/solver");
     assert!(
-        stderr.contains(&format!("{PLANTED_FILE}:")) && stderr.contains("debt-marker"),
-        "tidy must report the marker planted in the copy: {stderr}"
+        reports_planted_marker(&planted_stderr),
+        "tidy must report the planted marker: {planted_stderr}"
+    );
+    let control_stderr = control.tidy_from("crates/solver");
+    assert!(
+        !reports_planted_marker(&control_stderr),
+        "the control has no marker: {control_stderr}"
+    );
+    // The control run must have checked its tree, not stopped on an unreadable workspace.
+    assert!(
+        control_stderr.contains("violation(s)"),
+        "tidy ran its rules on the control: {control_stderr}"
     );
 }
