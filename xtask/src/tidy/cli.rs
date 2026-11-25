@@ -29,13 +29,9 @@ pub fn tidy(root: &str, policy: Option<&str>) -> ExitCode {
     report(result)
 }
 
-/// Prints `docs/RULES.md` as the registry generates it for this workspace, or writes it with
-/// `write`.
-pub fn rules(write: bool) -> ExitCode {
-    rules_at(&crate::workspace_root(), write)
-}
-
-fn rules_at(root: &Path, write: bool) -> ExitCode {
+/// Prints `docs/RULES.md` as the registry generates it for the workspace at `root`, or writes
+/// it with `write`.
+pub fn rules(root: &Path, write: bool) -> ExitCode {
     let text = match rules_doc::render(root) {
         Ok(text) => text,
         Err(error) => {
@@ -78,7 +74,7 @@ fn report(result: io::Result<Vec<Violation>>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{rules, rules_at, tidy};
+    use super::{rules, tidy};
     use crate::tidy::rules_doc;
     use crate::tidy::scratch::Scratch;
     use std::process::ExitCode;
@@ -111,21 +107,22 @@ mod tests {
     #[test]
     fn rules_prints_or_writes_the_document() {
         let scratch = Scratch::new("cli-rules");
-        assert!(is(rules_at(scratch.root(), false), ExitCode::FAILURE), "no style guide to count");
+        assert!(is(rules(scratch.root(), false), ExitCode::FAILURE), "no style guide to count");
         scratch.write("docs/TIGER_STYLE.md", "## Rules\n\n- A rule. `[review]`\n");
         let document = scratch.root().join(rules_doc::RULES_DOC);
-        assert!(is(rules_at(scratch.root(), false), ExitCode::SUCCESS));
+        assert!(is(rules(scratch.root(), false), ExitCode::SUCCESS));
         assert!(!document.exists(), "printing writes nothing");
-        assert!(is(rules_at(scratch.root(), true), ExitCode::SUCCESS));
+        assert!(is(rules(scratch.root(), true), ExitCode::SUCCESS));
         let written = std::fs::read_to_string(&document).unwrap();
         assert_eq!(written, rules_doc::render(scratch.root()).unwrap());
         assert_eq!(rules_doc::check(scratch.root()).unwrap(), Vec::new(), "it is current");
         std::fs::remove_file(&document).unwrap();
         std::fs::create_dir(&document).unwrap();
+        assert!(is(rules(scratch.root(), true), ExitCode::FAILURE), "the file cannot be written");
+        let workspace = crate::workspace_root();
         assert!(
-            is(rules_at(scratch.root(), true), ExitCode::FAILURE),
-            "the file cannot be written"
+            is(rules(&workspace, false), ExitCode::SUCCESS),
+            "this workspace has a style guide"
         );
-        assert!(is(rules(false), ExitCode::SUCCESS), "this workspace has a style guide");
     }
 }

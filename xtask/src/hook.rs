@@ -495,8 +495,57 @@ fn json_escape(characters: &mut std::str::Chars<'_>) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Failure, Gate, STOP_BLOCKS_MAX, failure_decision, gate_decision};
-    use super::{json_bool_field, json_string_field};
+    use super::{EXIT_FEEDBACK, Failure, Gate, STOP_BLOCKS_MAX, failure_decision, gate_decision};
+    use super::{format_in_place, json_bool_field, json_string_field};
+    use crate::tidy::scratch::Scratch;
+    use std::process::ExitCode;
+
+    /// `ExitCode` has no equality, so compare what it prints.
+    fn is(code: ExitCode, expected: ExitCode) -> bool {
+        format!("{code:?}") == format!("{expected:?}")
+    }
+
+    const UNFORMATTED: &str = "fn a( )->u32{1}\n";
+    const FORMATTED: &str = "fn a() -> u32 {\n    1\n}\n";
+
+    // Goal: an unformatted Rust file is rewritten in its formatted form, and the formatted text
+    // is what the tidy rules then see.
+    #[test]
+    fn format_in_place_rewrites_an_unformatted_file() {
+        let scratch = Scratch::new("hook-format-rewrite");
+        scratch.write("lib.rs", UNFORMATTED);
+        let file = scratch.root().join("lib.rs");
+        let text = format_in_place(&crate::workspace_root(), &file, UNFORMATTED);
+        assert_eq!(text.ok().as_deref(), Some(FORMATTED), "the formatted text is returned");
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(on_disk, FORMATTED, "the file is rewritten");
+    }
+
+    // Goal: a file that is already formatted is not written at all, so the hook never touches a
+    // file it has no reason to change. A path that cannot be written proves it: a write fails.
+    #[test]
+    fn format_in_place_leaves_a_formatted_file_alone() {
+        let scratch = Scratch::new("hook-format-alone");
+        let unwritable = scratch.root();
+        let text = format_in_place(&crate::workspace_root(), unwritable, FORMATTED);
+        assert_eq!(text.ok().as_deref(), Some(FORMATTED), "nothing to write, nothing fails");
+    }
+
+    // Goal: a syntax error is feedback for the agent (exit 2), and a file that cannot be written
+    // is a failure of the hook itself (exit 1). Neither is silently passed.
+    #[test]
+    fn format_in_place_reports_syntax_errors_and_write_failures() {
+        let scratch = Scratch::new("hook-format-errors");
+        let root = crate::workspace_root();
+        scratch.write("broken.rs", "fn a( {\n");
+        let broken = format_in_place(&root, &scratch.root().join("broken.rs"), "fn a( {\n");
+        let broken = broken.expect_err("a syntax error cannot be formatted");
+        assert!(is(broken, ExitCode::from(EXIT_FEEDBACK)), "feedback, got {broken:?}");
+        let unwritable = format_in_place(&root, scratch.root(), UNFORMATTED);
+        let unwritable = unwritable.expect_err("a directory cannot be written as a file");
+        assert!(is(unwritable, ExitCode::FAILURE), "a failure, got {unwritable:?}");
+        assert!(!is(ExitCode::FAILURE, ExitCode::from(EXIT_FEEDBACK)), "the codes differ");
+    }
 
     // Goal: the file path is extracted from a PostToolUse payload, with escapes decoded.
     #[test]
