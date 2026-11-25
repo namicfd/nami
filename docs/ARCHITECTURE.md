@@ -12,7 +12,7 @@
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
 | 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) agreed | [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
 | 5 | Performance and parallelism | Agreed (problem sizes open until M7) | [0027](design/0027-parallelism-and-communication.md), [0028](design/0028-infiniband-binding-crate.md) |
-| 6 | Interface, output and determinism guarantees | Open | |
+| 6 | Interface, output and determinism guarantees | Agreed | [0029](design/0029-interface-output-and-guarantees.md) |
 | 7 | Verification strategy | Open | |
 
 ## 1. Purpose, users and success criteria
@@ -463,3 +463,83 @@ So every scaling run is also a correctness test.
   - scaling runs on the cluster from M7 on.
 - **Widths:** Morton keys and global cell numbers are `u64`, since 21 levels in 3D take 63 bits.
   ADR-0002's limit of 2³² − 1 cells per rank stays.
+
+## 6. Interface, output and determinism guarantees
+
+nami follows no outside standard for its interface or files. It optimises for its own goals.
+Compatibility with existing tools is welcome where it comes for free. nami will probably have its
+own visualisation tools.
+
+### 6.1 Running a problem
+
+A problem crate (§ 4(b)) is a small binary whose `main` calls `nami::run::<Problem>()`. Its
+commands are:
+
+- `run <config>`;
+- `check <config>`: validates without running, for agents and for job scripts;
+- `restart <checkpoint>`.
+
+`--set key=value` overrides one value of the configuration.
+
+### 6.2 Configuration
+
+The configuration is a strict subset of TOML, read by nami's own parser (ADR-0001 rules out a
+crate).
+
+- There are no defaults. Every key the compiled combination needs must be present (TIGER_STYLE.md:
+  numerical configuration is spelled out in full).
+- Unknown keys, missing keys and wrong types are errors. The message names the file, the line and
+  the fix.
+- The resolved configuration is written into every output and checkpoint.
+
+### 6.3 Diagnostics
+
+- Per-step diagnostics go to a JSON Lines file, written by nami's own code: time, time step,
+  conservation totals, and the activation counts of positivity mechanisms and floors (§ 3.2).
+- Errors on stderr are one line each and start with `ERROR`.
+- The buffers for both are allocated at init.
+
+### 6.4 Output and checkpoints
+
+- **nami's own binary format.** There is one file per output. Every rank writes its blocks at
+  offsets computed in advance, with `pwrite`, which gives parallel I/O without MPI-IO. The data is
+  raw little-endian `f64`, after a self-describing header.
+- **Checkpoints use the same format** and keep exact bits.
+- **Readers:** a small Python reader in `tools/` that needs only numpy. An XDMF sidecar that lets
+  ParaView and VisIt read the raw data is optional, kept only if it stays free. nami's own
+  visualisation tools come later.
+
+### 6.5 Version metadata
+
+Every output and checkpoint header records:
+
+- `format_version`: the file layout;
+- `results_version`: an integer in the code that every `changes-results` PR increments. Two
+  outputs with the same `results_version` and configuration are expected to be bitwise equal;
+- the build:
+  - the nami commit, flagged if the working tree was dirty;
+  - the `rustc` version;
+  - a hash of `Cargo.lock`;
+  - the target and its CPU flags;
+  - the type names of the compiled combination;
+- the resolved configuration.
+
+A build script that uses only `std` gathers the build fields at compile time. On restart, nami
+compares the checkpoint with the running build. If any of the fields that affect bits differ, the
+restart is refused and the message names the difference. `--allow-different-build` overrides
+this, and the output then records that the restart guarantee does not hold.
+
+### 6.6 Guarantees users can rely on
+
+With the same binary, configuration and toolchain, a run is bitwise reproducible:
+
+1. across platforms: Linux x86_64 and macOS arm64 (ADR-0005);
+2. across decompositions: threads, ranks and the placement of blocks (ADR-0027);
+3. across restarts: a run that stops and restarts from a checkpoint gives the same bits as one
+   that does not stop.
+
+Bits are **not** guaranteed to match across `results_version` changes, which include toolchain
+upgrades. Each such change is labelled `changes-results` and explained (ADR-0005).
+
+There are no Python bindings: `pyo3` is a crate, so ADR-0001 rules it out. Python only reads
+output.
