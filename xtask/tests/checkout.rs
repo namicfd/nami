@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use xtask::hook::{Gate, base_tree, gate_decision, tree_fingerprint};
+use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent};
 use xtask::pr::{body_problems, changed_protected};
 
 /// A stand-in for `just`: it records its arguments and fails while `violation.txt` exists.
@@ -410,35 +411,88 @@ fn protected_changes_are_found_since_the_merge_base() {
     assert!(unreadable.starts_with("cannot read .github/CODEOWNERS"), "{unreadable}");
 }
 
-// Goal: `pr-body` checks a description against the real changes and the real tree, and a check
-// that cannot run reports a problem instead of passing.
+/// GitHub with the issues #12 by the bot and #13 by an outsider.
+struct Issues;
+
+impl GitHub for Issues {
+    fn issue(&self, number: u32) -> Result<Issue, String> {
+        let author = match number {
+            12 => "nami-agent[bot]",
+            13 => "outsider",
+            _ => return Err(format!("no issue #{number}")),
+        };
+        Ok(Issue {
+            number,
+            title: "A gap".to_owned(),
+            author: author.to_owned(),
+            is_open: true,
+            is_pull_request: false,
+            labels: vec!["guardrail-gap".to_owned()],
+            body: String::new(),
+        })
+    }
+    fn open_issues(&self) -> Result<Vec<Issue>, String> {
+        Err("not used".to_owned())
+    }
+    fn comments(&self, _number: u32) -> Result<Vec<Comment>, String> {
+        Err("not used".to_owned())
+    }
+    fn label_events(&self, _number: u32) -> Result<Vec<LabelEvent>, String> {
+        Err("not used".to_owned())
+    }
+    fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
+        Err("not used".to_owned())
+    }
+}
+
+// Goal: `pr-body` checks a description against the real changes, the code owners on the base
+// and the issues on GitHub, and a check that cannot run reports a problem instead of passing.
 #[test]
 fn pr_body_is_checked_against_the_checkout() {
     let scratch = scratch_with_protected_changes("pr-body");
     let root = scratch.root();
     let on_main = ["--base", "main"];
+    let check = |options: &[&str], body: Option<&str>, branch: &str| {
+        body_problems(&root, options, body, branch, &Issues)
+    };
     let body = "## Protected files\n- xtask/: hooks\n- crates/a/Cargo.toml: a crate\n\n\
-                ## Guardrail gaps\n- docs/learnings/stop-gate.md\n";
-    let no_learning = body_problems(&root, &on_main, Some(body));
-    assert_eq!(no_learning.len(), 1, "the learning is not in the tree: {no_learning:?}");
-    assert!(no_learning[0].contains("`docs/learnings/stop-gate.md`, named"), "{no_learning:?}");
-    scratch.write("docs/learnings/stop-gate.md", "# The stop gate\n");
-    assert_eq!(body_problems(&root, &on_main, Some(body)), Vec::<String>::new(), "complete");
+                ## Follow-up issues\n- #12\n";
+    assert_eq!(check(&on_main, Some(body), "work"), Vec::<String>::new(), "complete");
+    let outsider = check(&on_main, Some(&body.replace("#12", "#13, #14")), "work");
+    assert_eq!(outsider.len(), 2, "{outsider:?}");
+    assert!(outsider[0].contains("#13, listed") && outsider[0].contains("neither the bot"));
+    assert!(outsider[1].contains("#14, listed") && outsider[1].contains("no issue #14"));
+    let unclosed = check(&on_main, Some(body), "task/issue-12");
+    assert_eq!(unclosed.len(), 1, "{unclosed:?}");
+    assert!(unclosed[0].contains("add the line `Fixes #12`"), "{unclosed:?}");
+    let closed = format!("Fixes #12.\n\n{body}");
+    assert_eq!(check(&on_main, Some(&closed), "task/issue-12"), Vec::<String>::new());
 
-    let gaps_only = Some("## Guardrail gaps\nNone\n");
-    let unlisted = body_problems(&root, &on_main, gaps_only);
+    let follow_ups_only = Some("## Follow-up issues\nNone\n");
+    let unlisted = check(&on_main, follow_ups_only, "work");
     assert_eq!(unlisted.len(), 1, "protected paths changed: {unlisted:?}");
     assert!(unlisted[0].contains("the section `## Protected files` is missing"), "{unlisted:?}");
-    let on_head = body_problems(&root, &["--base", "HEAD"], gaps_only);
+    let on_head = check(&["--base", "HEAD"], follow_ups_only, "work");
     assert_eq!(on_head, Vec::<String>::new(), "no protected change, nothing to list");
 
-    let unset = body_problems(&root, &on_main, None);
+    let unset = check(&on_main, None, "work");
     assert_eq!(unset.len(), 1, "{unset:?}");
     assert!(unset[0].starts_with("error[pr-body]: the environment variable PR_BODY is not set; "));
-    let no_base = body_problems(&root, &[], Some(body));
+    let no_base = check(&[], Some(body), "work");
     assert_eq!(no_base.len(), 1, "{no_base:?}");
     assert!(no_base[0].starts_with("error[pr-body]: `git diff --name-only origin/main...HEAD`"));
-    let options = body_problems(&root, &["--bass", "main"], Some(body));
+    let options = check(&["--bass", "main"], Some(body), "work");
     assert_eq!(options.len(), 1, "{options:?}");
     assert!(options[0].starts_with("error[pr-body]: cannot read the options `--bass main`; "));
+
+    // The code owners come from the base, not from the PR's tree.
+    scratch.git(&["switch", "--quiet", "main"]);
+    scratch.git(&["rm", "--quiet", ".github/CODEOWNERS"]);
+    scratch.commit("no code owners on main");
+    scratch.git(&["switch", "--quiet", "work"]);
+    let no_owners = check(&on_main, Some(body), "work");
+    assert_eq!(no_owners.len(), 1, "{no_owners:?}");
+    assert!(no_owners[0].contains("cannot read .github/CODEOWNERS on main"), "{no_owners:?}");
+    let none = check(&on_main, follow_ups_only, "work");
+    assert!(none.iter().all(|problem| !problem.contains("CODEOWNERS on")), "{none:?}");
 }

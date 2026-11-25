@@ -107,12 +107,6 @@ pub const RULES: &[Rule] = &[
         "ADR-0003",
     ),
     source(
-        "learning-format",
-        "Every file in `docs/learnings/` is named `YYYY-MM-DD-<slug>.md` and has a status line \
-         and the sections `## What happened` and `## Proposed guardrail`.",
-        "docs/learnings/README.md",
-    ),
-    source(
         "line-length",
         "Lines in Rust sources are at most 100 columns.",
         "TIGER_STYLE.md, Style by the numbers",

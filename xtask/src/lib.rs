@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub mod doctor;
 pub mod dylint;
 pub mod hook;
+pub mod issue;
 pub mod json;
 pub mod pr;
 pub mod task;

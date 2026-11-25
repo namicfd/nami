@@ -3,8 +3,9 @@
 Use this when a check should have caught something and did not: a bug, a review comment that no
 check enforces, an error message that did not say how to fix the problem (ADR-0020).
 
-If the guardrail is not needed for your task, do not build it now. Write a learning instead
-(`docs/learnings/README.md`) and carry on.
+If the guardrail is not needed for your task, do not build it now. File an issue instead
+(`cargo xtask issue file --kind guardrail-gap`, see `docs/exec-plans/README.md`, Issues) and
+carry on. Another session claims the issue and builds the check (ADR-0021).
 
 ## 1. Pick the rung
 
@@ -97,13 +98,13 @@ Tidy fails until all of these are done.
 - Run `cargo xtask rules --write` to regenerate `docs/RULES.md`.
 - If the mechanism was planned: delete its row from `PLANNED` in the registry, and replace its
   `[planned:<id>]` tags. Leave `passes` in `tasks.json` alone.
-- If it came from a learning: set that file's status to `Codified in <id>`.
+- If it came from an issue: write `Fixes #<n>` in the PR description, so that the merge closes it.
 
 ## 6. Check that it does not fire on correct code
 
 Run `just check-full`. If the new rule fires on existing code, fix that code in the same PR.
 Never narrow the rule to make it pass. If the code is right and the rule is wrong, the rule is
-not ready: write a learning and leave it out.
+not ready: file an issue and leave it out.
 
 ## 7. The pull request
 

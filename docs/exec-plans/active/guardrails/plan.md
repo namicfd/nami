@@ -7,8 +7,9 @@ guide tags its rule `[planned:<id>]` instead of claiming enforcement, and the ru
 review only. This plan is the backlog of those mechanisms: one task per row of `PLANNED` in
 `xtask/src/tidy/registry.rs`, with the same id. `docs/RULES.md` lists them with their references.
 
-Gaps that nobody has promised a check for are not here. They are in `docs/learnings/`
-(ADR-0020). A learning becomes a task of this plan when the planner picks it up.
+Gaps that nobody has promised a check for are not here. They are GitHub issues of kind
+`guardrail-gap` (ADR-0021), which `cargo xtask task ready` lists next to these tasks. An issue
+that needs more than one small PR becomes a task of this plan when the planner picks it up.
 
 ## How the backlog stays honest
 
