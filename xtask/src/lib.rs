@@ -51,7 +51,8 @@ const ANCESTORS_MAX: u32 = 64;
 ///
 /// # Panics
 ///
-/// Panics if `path` is relative, or more than `ANCESTORS_MAX` directories deep.
+/// Panics if `path` is relative, or if no root lies within its `ANCESTORS_MAX` nearest
+/// ancestors while the path goes deeper than that.
 #[must_use]
 pub fn workspace_root_of(path: &Path) -> Option<PathBuf> {
     assert!(path.is_absolute(), "the search for the workspace root starts at an absolute path");

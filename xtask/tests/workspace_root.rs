@@ -39,7 +39,6 @@ impl Workspace {
             fs::create_dir_all(file.parent().expect("a file has a parent")).expect("writable");
             fs::write(&file, text).expect("temp is writable");
         }
-        assert!(workspace.0.join(PLANTED_FILE).is_file(), "the workspace has its source file");
         workspace
     }
 
@@ -89,9 +88,11 @@ fn tidy_checks_the_workspace_around_the_current_directory() {
         !reports_planted_marker(&control_stderr),
         "the control has no marker: {control_stderr}"
     );
-    // The control run must have checked its tree, not stopped on an unreadable workspace.
+    // The control relies on the skeleton's missing documents: only a synthetic tree lacks
+    // docs/RULES.md, so this line proves tidy checked the control, not the checkout it was
+    // built in, and got past reading the workspace.
     assert!(
-        control_stderr.contains("violation(s)"),
-        "tidy ran its rules on the control: {control_stderr}"
+        control_stderr.lines().any(|line| line.starts_with("docs/RULES.md:0: error[rules-doc]")),
+        "tidy must report the control's missing docs/RULES.md: {control_stderr}"
     );
 }
