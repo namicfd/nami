@@ -10,11 +10,12 @@ fn main() -> ExitCode {
     match arguments.as_slice() {
         ["tidy"] => run_tidy(),
         ["doctor"] => xtask::doctor::run(),
+        ["dylint"] => xtask::dylint::run(&xtask::workspace_root()),
         ["protected", options @ ..] => xtask::pr::run_protected(options),
         ["pr-body", options @ ..] => xtask::pr::run_body(options),
         ["hook", event] => xtask::hook::run(event),
         _ => {
-            eprintln!("usage: cargo xtask tidy | doctor | protected [--base <ref>]");
+            eprintln!("usage: cargo xtask tidy | doctor | dylint | protected [--base <ref>]");
             eprintln!("       | pr-body [--base <ref>] | hook <post-edit|stop|session-start>");
             ExitCode::FAILURE
         }

@@ -5,5 +5,5 @@
 exclude_globs = ["xtask/src/main.rs"]
 exclude_re = [
     "hook\\.rs.*(replace|in) (run|post_edit)\\b",
-    "(doctor|pr)\\.rs.*(replace|in) (run|run_protected|run_body)\\b",
+    "(doctor|dylint|pr)\\.rs.*(replace|in) (run|run_protected|run_body)\\b",
 ]
