@@ -179,7 +179,7 @@ impl Visitor<'_> {
         }
     }
 
-    /// Rules about a function body: its length and its assertions.
+    /// Rules about a function body: its length, its assertions and its float equalities.
     fn check_body(&mut self, function: &Function<'_>) {
         let name = &function.signature.ident;
         let first = line_of(function.signature.fn_token.span);
@@ -714,6 +714,10 @@ const FLOAT_CMP_SILENT_NAMES: [&str; 2] = ["ne", "is_nan"];
 /// The float types a parameter can be declared with.
 const FLOAT_TYPES: [&str; 2] = ["f32", "f64"];
 
+/// The associated constants of `f32` and `f64` that are floats themselves.
+const FLOAT_CONSTANTS: [&str; 7] =
+    ["EPSILON", "INFINITY", "MAX", "MIN", "MIN_POSITIVE", "NAN", "NEG_INFINITY"];
+
 /// Upper bound on the wrappers peeled off an operand or a parameter type.
 const FLOAT_WRAPPERS_MAX: u32 = 64;
 
@@ -735,7 +739,8 @@ impl Visitor<'_> {
         for (span, operator) in finder.found {
             let message = format!(
                 "`{operator}` between floats in function `{name}`, where clippy's `float_cmp` \
-                 is silent; compare against a named tolerance. Test an exact zero with \
+                 is silent; compare against a named tolerance. This rule is stricter than \
+                 clippy on purpose and reports `== 0.0` too: test an exact zero with \
                  `classify() == FpCategory::Zero`, and a bitwise check with `to_bits()`, and \
                  say which it is (TIGER_STYLE.md, Floating point)"
             );
@@ -770,8 +775,6 @@ impl FloatEqualityFinder {
             && is_float_type(&typed.ty)
         {
             self.floats.push(pattern.ident.clone());
-            let count = self.floats.iter().filter(|float| **float == pattern.ident).count();
-            assert_eq!(count, 1, "a name is bound as a float once, the latest binding wins");
         }
     }
 
@@ -874,12 +877,17 @@ fn float_cmp_is_silent_in(name: &str) -> bool {
     name.contains("eq") || FLOAT_CMP_SILENT_NAMES.contains(&name)
 }
 
-/// True for `f32` or `f64` under references and parentheses.
+/// True for `f32` or `f64` under references, parentheses, arrays and slices: `&[f64; NVAR]`,
+/// nami's state, is a float type here.
 fn is_float_type(declared: &Type) -> bool {
     let mut declared = declared;
     for _ in 0..FLOAT_WRAPPERS_MAX {
         if let Type::Reference(reference) = declared {
             declared = &reference.elem;
+        } else if let Type::Array(array) = declared {
+            declared = &array.elem;
+        } else if let Type::Slice(slice) = declared {
+            declared = &slice.elem;
         } else if let Type::Paren(paren) = declared {
             declared = &paren.elem;
         } else if let Type::Group(group) = declared {
@@ -889,7 +897,7 @@ fn is_float_type(declared: &Type) -> bool {
                 && FLOAT_TYPES.iter().any(|float| path.path.is_ident(float)));
         }
     }
-    panic!("a type is wrapped in more than {FLOAT_WRAPPERS_MAX} references or parentheses");
+    panic!("a type is wrapped in more than {FLOAT_WRAPPERS_MAX} references, arrays or parentheses");
 }
 
 /// True for `1.5`, `1e3` and `1.0_f32`, and for an integer with a float suffix such as `1f64`,
@@ -899,8 +907,19 @@ fn is_float_literal(literal: &syn::Lit) -> bool {
         || matches!(literal, syn::Lit::Int(integer) if FLOAT_TYPES.contains(&integer.suffix()))
 }
 
-/// True for an operand that is a float by its syntax: a float literal, a cast to a float type,
-/// or a parameter in `floats`, under parentheses, references, negation and dereference.
+/// True for a float name in scope, or a float constant such as `f64::NAN` or
+/// `core::f32::INFINITY`.
+fn is_float_path(path: &syn::Path, floats: &[Ident]) -> bool {
+    let names: Vec<&Ident> = path.segments.iter().map(|segment| &segment.ident).collect();
+    let is_constant = matches!(names.as_slice(), [.., float, constant]
+        if FLOAT_TYPES.iter().any(|name| *float == name)
+            && FLOAT_CONSTANTS.iter().any(|name| *constant == name));
+    is_constant || floats.iter().any(|float| path.is_ident(float))
+}
+
+/// True for an operand that is a float by its syntax: a float literal, a float constant, a cast
+/// to a float type, or a name in `floats`, under parentheses, references, negation,
+/// dereference and indexing.
 fn is_float_operand(operand: &Expr, floats: &[Ident]) -> bool {
     let mut operand = operand;
     for _ in 0..FLOAT_WRAPPERS_MAX {
@@ -912,13 +931,15 @@ fn is_float_operand(operand: &Expr, floats: &[Ident]) -> bool {
             operand = &reference.expr;
         } else if let Expr::Unary(unary) = operand {
             operand = &unary.expr;
+        } else if let Expr::Index(index) = operand {
+            operand = &index.expr;
         } else if let Expr::Lit(literal) = operand {
             return is_float_literal(&literal.lit);
         } else if let Expr::Cast(cast) = operand {
             return is_float_type(&cast.ty);
         } else {
             return matches!(operand, Expr::Path(path) if path.qself.is_none()
-                && floats.iter().any(|float| path.path.is_ident(float)));
+                && is_float_path(&path.path, floats));
         }
     }
     panic!("an operand is wrapped in more than {FLOAT_WRAPPERS_MAX} operators or parentheses");
@@ -1316,6 +1337,13 @@ mod tests {
             "fn eq(a: u32) -> bool { let b: f64 = f(a); b == g(a) }",
             "fn eq(a: u32) -> bool { let c = |b: &f32| b == g(a); c(&h()) }",
             "fn eq(a: f64) -> bool { { let a = 1_u32; } a == g() }",
+            "fn states_eq(a: [f64; 3], b: [f64; 3]) -> bool { a == b }",
+            "fn states_eq(a: &[f32; 3]) -> bool { a[0] == g() }",
+            "fn states_eq(a: &mut [f64]) -> bool { a[g()] != g() }",
+            "fn eq(a: u32) -> bool { g(a) == f64::INFINITY }",
+            "fn eq(a: u32) -> bool { g(a) != core::f32::NAN }",
+            "fn eq(a: u32) -> bool { -f64::MAX == g(a) }",
+            "fn eq(a: u32) -> bool { g(a) == f32::MIN_POSITIVE }",
             "fn eq(a: f64) -> bool { match g() { 0 => a == g(), _ => false } }",
             "fn eq(a: f64) -> bool { match g() { b if a == g() => b, _ => false } }",
             "fn eq(a: f64) -> bool { for i in 0..2_u32 { h(a == g(i)); } true }",
@@ -1343,6 +1371,10 @@ mod tests {
             "fn eq((a, b): (f64, f64)) -> bool { a.to_bits() == b.to_bits() }",
             "fn eq(a: [f64; 2], b: [f64; 2]) -> bool { a.len() == b.len() }",
             "fn eq(a: f64) -> bool { fn inner(b: f64) -> bool { b == 1.0 } inner(a) }",
+            "fn eq(a: [u32; 2], b: &[u32]) -> bool { a[0] == 1 && b == g() }",
+            "fn eq(a: Option<f64>) -> bool { a == g() }",
+            "fn eq(a: u32) -> bool { a == u32::MAX || a == f64::RADIX || a == MAX }",
+            "fn eq(a: u32) -> bool { a == f64::MANTISSA_DIGITS || a == NAN }",
             "fn eq(a: f64) -> bool { let a = a.to_bits(); a == 0 }",
             "fn eq(a: f64) -> bool { let (a, _) = (a.to_bits(), 1); a == 0 }",
             "fn eq(a: f64) -> bool { let c = |a: u32| a == 1; c(2) }",

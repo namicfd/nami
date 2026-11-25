@@ -32,6 +32,7 @@ mod tests {
     fn bitwise_eq_is_reflexive() {
         let value = 0.5_f64;
         assert!(states_bitwise_eq(value, value), "reflexive");
-        assert!(value == 0.5, "exact sentinel in a test");
+        let is_exact = value == 0.5;
+        assert!(is_exact, "exact sentinel in a test");
     }
 }
