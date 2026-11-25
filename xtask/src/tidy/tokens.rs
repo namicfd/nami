@@ -208,6 +208,9 @@ mod tests {
         assert_eq!(expect_count("#[derive(Debug)]\nstruct A;"), 0, "another attribute");
         assert_eq!(expect_count("#[expect]\nfn a() {}"), 0, "no parenthesised lint");
         assert_eq!(expect_count("fn a() { expect(1); }"), 0, "a function outside an attribute");
+        assert_eq!(expect_count("fn a() { m![expect(1)]; }"), 0, "a macro's brackets");
+        let after_attribute = "#[derive(Debug)] static A: [u8; expect(3)] = [0; 3];";
+        assert_eq!(expect_count(after_attribute), 0, "brackets later in the same sequence");
         assert_eq!(expect_count("fn a( {"), 0, "a file that does not lex");
     }
 
@@ -216,6 +219,8 @@ mod tests {
     fn path_starts_are_found() {
         assert_eq!(found("libm::sqrt(x)").0, ["libm"]);
         assert_eq!(found("::libm::sqrt(x)").0, ["libm"], "a leading `::` still starts at libm");
+        assert_eq!(found("1.0 + ::libm::sqrt(x)").0, ["libm"], "an operator is no path segment");
+        assert_eq!(found("f(y, ::libm::sqrt(x))").0, ["libm"], "nor is a comma");
         assert_eq!(found("a + libm::sqrt(x)").0, ["libm"]);
         assert_eq!(found("f(1.0, (libm::sqrt(x)))").0, ["libm"], "inside nested groups");
         assert_eq!(found("kernels::libm::sqrt(x)").0, ["kernels"], "libm continues a path");
