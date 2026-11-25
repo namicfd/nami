@@ -9,7 +9,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use xtask::hook::{Gate, base_tree, gate_decision, tree_fingerprint};
+use xtask::hook::{Gate, ROOT_VARIABLE, base_tree, gate_decision, gate_state, tree_fingerprint};
 use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent};
 use xtask::pr::{body_problems, changed_protected};
 
@@ -21,6 +21,20 @@ if [ -e violation.txt ]; then
     echo "error: violation.txt must not exist"
     exit 1
 fi
+"#;
+
+/// A stand-in for `cargo`: it records where it runs, the checkout it is handed and the toolchain
+/// override it inherits, then runs the xtask under test, or fails like an xtask that does not
+/// build while `broken-xtask` exists.
+const FAKE_CARGO: &str = r#"#!/bin/sh
+mkdir -p target
+echo "$PWD|$NAMI_HOOK_ROOT|$RUSTUP_TOOLCHAIN|$*" >> target/cargo-calls
+if [ -e broken-xtask ]; then
+    echo "error: could not compile xtask" >&2
+    exit 101
+fi
+shift
+exec "$NAMI_TEST_XTASK" "$@"
 "#;
 
 /// Runs git in `directory` with a fixed identity and without the user's hooks or signing.
@@ -64,12 +78,22 @@ impl Scratch {
         scratch.write("xtask/README", "tooling\n");
         scratch.git(&["init", "--quiet", "--initial-branch=main"]);
         scratch.commit("base");
-        let just = scratch.directory.join("bin/just");
         fs::create_dir_all(scratch.directory.join("bin"))
             .expect("the scratch directory is writable");
-        fs::write(&just, FAKE_JUST).expect("the scratch directory is writable");
-        fs::set_permissions(&just, fs::Permissions::from_mode(0o755)).expect("just is ours");
+        for (tool_name, script) in [("just", FAKE_JUST), ("cargo", FAKE_CARGO)] {
+            let tool = scratch.directory.join("bin").join(tool_name);
+            fs::write(&tool, script).expect("the scratch directory is writable");
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("it is ours");
+        }
         scratch
+    }
+
+    /// A second worktree of the checkout, on a new branch `name` that starts at `HEAD`.
+    fn worktree(&self, name: &str) -> PathBuf {
+        let path = self.directory.join(name);
+        let path_text = path.to_str().expect("the path is UTF-8");
+        self.git(&["worktree", "add", "--quiet", "-b", name, path_text]);
+        fs::canonicalize(path).expect("the worktree exists")
     }
 
     fn root(&self) -> PathBuf {
@@ -100,12 +124,17 @@ impl Scratch {
         git_output(&self.root(), &["rev-parse", "HEAD^{tree}"])
     }
 
-    /// Runs `xtask hook <event>` with `payload` on stdin and the fake `just` first on `PATH`.
+    /// Runs `xtask hook <event>` in the checkout, as `.claude/settings.json` does in the project
+    /// directory, with `payload` on stdin and the fake `just` and `cargo` first on `PATH`.
     fn hook(&self, event: &str, payload: &str, environment: &[(&str, &Path)]) -> Output {
         let path = std::env::var("PATH").expect("PATH is set");
         let mut child = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(["hook", event])
+            .current_dir(self.root())
             .env("PATH", format!("{}:{path}", self.directory.join("bin").display()))
+            .env("NAMI_TEST_XTASK", env!("CARGO_BIN_EXE_xtask"))
+            .env_remove(ROOT_VARIABLE)
+            .env_remove("CLAUDE_PROJECT_DIR")
             .envs(environment.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -360,6 +389,106 @@ fn session_start_extends_path_and_reports_findings() {
     assert_eq!(fs::read_to_string(&env_file).unwrap(), export, "the export is appended");
     assert_eq!(start("/usr/bin:/bin").status.code(), Some(0), "the hook succeeds again");
     assert_eq!(fs::read_to_string(&env_file).unwrap(), export, "but only once");
+}
+
+/// The calls the fake `cargo` recorded in `checkout`: `<directory>|<root>|<toolchain>|<args>`.
+fn cargo_calls(checkout: &Path) -> Vec<String> {
+    let calls = fs::read_to_string(checkout.join("target/cargo-calls")).unwrap_or_default();
+    calls.lines().map(str::to_owned).collect()
+}
+
+// Goal: a subagent in its own worktree is gated in that worktree, by that worktree's xtask,
+// with state of its own, although the hook command runs in the project directory. Method: the
+// hook runs in the main checkout with a Stop payload whose `cwd` is a second worktree; the fake
+// `cargo` shows the hand-over, and the fake `just` shows where the gate ran.
+#[test]
+fn stop_gates_the_worktree_in_the_payload() {
+    let scratch = Scratch::new("stop-worktree");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let worktree = scratch.worktree("work");
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(worktree.join("src/new.rs"), "fn new() {}\n").unwrap();
+    fs::write(worktree.join("violation.txt"), "x\n").unwrap();
+    let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, worktree.join("src").display());
+    let toolchain = [("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain"))];
+    let blocked = scratch.hook("stop", &payload, &toolchain);
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert_eq!(blocked.status.code(), Some(2), "the worktree's violation blocks: {stderr}");
+    assert!(stderr.contains("blocked stop 1 of 3"), "{stderr}");
+    assert!(stderr.contains("violation.txt must not exist"), "{stderr}");
+    let handed = format!("{0}|{0}||xtask hook stop", worktree.display());
+    assert_eq!(
+        cargo_calls(&worktree),
+        std::slice::from_ref(&handed),
+        "the worktree's own xtask ran"
+    );
+    assert_eq!(cargo_calls(&project), Vec::<String>::new(), "the project's xtask handed over");
+    let just_calls = fs::read_to_string(worktree.join("target/just-calls")).unwrap();
+    assert_eq!(just_calls, "check dylint\n", "the gate ran in the worktree");
+    assert!(!project.join("target/just-calls").exists(), "and not in the project");
+    assert!(gate_state(&worktree).join("attempts-s1").exists(), "the count is the worktree's");
+
+    fs::remove_file(worktree.join("violation.txt")).unwrap();
+    assert_eq!(scratch.hook("stop", &payload, &[]).status.code(), Some(0), "fixed");
+    let passed = fs::read_to_string(gate_state(&worktree).join("passed")).unwrap();
+    assert_eq!(Some(passed.clone()), tree_fingerprint(&worktree), "the worktree's pass");
+    assert!(!gate_state(&worktree).join("attempts-s1").exists(), "a pass clears the count");
+    assert!(!gate_state(&project).join("passed").exists(), "the project has passed nothing");
+
+    let in_project = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, project.display());
+    scratch.write("violation.txt", "x\n");
+    assert_eq!(scratch.hook("stop", &in_project, &[]).status.code(), Some(2), "the project");
+    assert_eq!(scratch.gate_runs(), 1, "is gated in itself");
+    assert_eq!(cargo_calls(&project), Vec::<String>::new(), "by the xtask that runs there");
+    let kept = fs::read_to_string(gate_state(&worktree).join("passed")).unwrap();
+    assert_eq!(kept, passed, "and the worktree's pass is untouched");
+    assert_eq!(cargo_calls(&worktree), [handed.clone(), handed], "one hand-over per stop");
+}
+
+// Goal: an edit is checked in the worktree that holds the file, whatever the `cwd` says; a
+// worktree whose xtask does not build still gets the check and is told about it; session start
+// reports on the `cwd`'s worktree. Method: as above, with PostToolUse and SessionStart payloads.
+#[test]
+fn edits_and_session_starts_use_their_own_worktree() {
+    let scratch = Scratch::new("edit-worktree");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let worktree = scratch.worktree("work");
+    let draft = worktree.join("tests/snapshots/a.snap.new");
+    fs::create_dir_all(draft.parent().expect("a file has a parent")).unwrap();
+    fs::write(&draft, "draft\n").unwrap();
+    let payload = format!(
+        r#"{{"cwd":"{}","tool_input":{{"file_path":"{}"}}}}"#,
+        project.display(),
+        draft.display()
+    );
+    let edited = scratch.hook("post-edit", &payload, &[]);
+    let stderr = String::from_utf8_lossy(&edited.stderr);
+    assert_eq!(edited.status.code(), Some(2), "the draft is a violation: {stderr}");
+    assert!(stderr.contains("tests/snapshots/a.snap.new:0: error[snapshot-draft]"), "{stderr}");
+    let handed = format!("{0}|{0}||xtask hook post-edit", worktree.display());
+    assert_eq!(cargo_calls(&worktree), [handed], "checked by the worktree's xtask");
+
+    fs::write(worktree.join("broken-xtask"), "").unwrap();
+    let fallback = scratch.hook("post-edit", &payload, &[]);
+    let told = String::from_utf8_lossy(&fallback.stderr);
+    assert_eq!(fallback.status.code(), Some(2), "a broken xtask is feedback: {told}");
+    assert!(told.contains("could not compile xtask"), "cargo's error is shown: {told}");
+    assert!(told.contains("did not run the hook"), "{told}");
+    assert!(told.contains("checking with this xtask instead"), "{told}");
+    assert!(told.contains("error[snapshot-draft]"), "and the file is still checked: {told}");
+    fs::remove_file(&draft).unwrap();
+    let clean = scratch.hook("post-edit", &payload.replace(".snap.new", ".snap"), &[]);
+    assert_eq!(clean.status.code(), Some(2), "a broken xtask is feedback even for a clean file");
+    fs::remove_file(worktree.join("broken-xtask")).unwrap();
+
+    let start = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, worktree.display());
+    let started = scratch.hook("session-start", &start, &[]);
+    assert_eq!(started.status.code(), Some(0), "findings do not fail the hook");
+    let started_in = cargo_calls(&worktree).last().cloned().unwrap_or_default();
+    assert!(started_in.ends_with("|xtask hook session-start"), "handed over: {started_in}");
+    let stdout = String::from_utf8_lossy(&started.stdout);
+    assert!(stdout.contains("error[doctor]: "), "the worktree's findings are shown: {stdout}");
+    assert_eq!(cargo_calls(&project), Vec::<String>::new(), "the project never ran cargo");
 }
 
 /// A checkout whose branch `work` changes protected and unprotected files and moves a file out

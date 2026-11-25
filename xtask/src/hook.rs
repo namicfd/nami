@@ -11,6 +11,16 @@
 //! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH` and reports tools whose
 //!   version is not the pinned one.
 //!
+//! # Which checkout, and which xtask
+//!
+//! A subagent may work in its own git worktree, while Claude Code starts every hook command in
+//! the session's project directory. So the hooks take the checkout from the payload: the git
+//! toplevel of the edited file, or of the `cwd` at stop and session start. If that checkout is
+//! not the one this binary was built from, the hook runs `cargo xtask hook` there instead, so
+//! that new code is checked by the rules on its own branch. [`ROOT_VARIABLE`] passes the
+//! checkout on and stops the hand-over from repeating. If that xtask cannot run, this one does
+//! the work, and an edit gets feedback that says so.
+//!
 //! # The stop gate
 //!
 //! The working state is named by a fingerprint: the git tree of everything that is tracked, or
@@ -18,7 +28,8 @@
 //! the gate. The gate is skipped only for a state that is known to be good: the merge base with
 //! `main`, or the state of the last passing run. A failing gate blocks the stop
 //! [`STOP_BLOCKS_MAX`] times in a row per session; after that it lets the agent go and tells the
-//! human. The state is kept in `target/stop-gate/`, which git ignores.
+//! human. The state is kept in `target/stop-gate/` of the checkout, which git ignores, so each
+//! worktree has its own.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -59,34 +70,168 @@ const SESSION_ID_CHARACTERS_MAX: usize = 128;
 /// The line that puts cargo's tools on `PATH`. The shell expands it when it reads the file.
 const CARGO_BIN_EXPORT: &str = r#"export PATH="$HOME/.cargo/bin:$PATH""#;
 
-/// Runs the hook named `event`, reading its JSON payload from stdin.
-pub fn run(event: &str) -> ExitCode {
-    let mut payload = String::new();
-    if let Err(error) = io::stdin().read_to_string(&mut payload) {
-        eprintln!("hook {event}: cannot read stdin: {error}");
-        return ExitCode::FAILURE;
+/// The environment variable that names the checkout a delegated hook works on. The hook sets it
+/// when it hands an event to that checkout's own xtask, which then takes the checkout from it
+/// and never hands the event on again.
+pub const ROOT_VARIABLE: &str = "NAMI_HOOK_ROOT";
+
+/// The variable Claude Code sets to the directory where the session started.
+const PROJECT_VARIABLE: &str = "CLAUDE_PROJECT_DIR";
+
+/// Variables that rustup sets for the process it runs. Passed on, they would make the delegated
+/// cargo use this checkout's toolchain instead of the one the other checkout pins.
+const TOOLCHAIN_VARIABLES: [&str; 2] = ["RUSTUP_TOOLCHAIN", "RUSTUP_TOOLCHAIN_SOURCE"];
+
+/// A Claude Code hook event that `cargo xtask hook` handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// `PostToolUse` for `Edit`, `Write` and `MultiEdit`.
+    PostEdit,
+    /// `Stop` and `SubagentStop`.
+    Stop,
+    /// `SessionStart`.
+    SessionStart,
+}
+
+impl Event {
+    /// The event named `name` on the command line, if it is one.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let event = match name {
+            "post-edit" => Self::PostEdit,
+            "stop" => Self::Stop,
+            "session-start" => Self::SessionStart,
+            _ => return None,
+        };
+        assert_eq!(event.name(), name, "the name round-trips");
+        Some(event)
     }
-    match event {
-        "post-edit" => post_edit(&payload),
-        "stop" => stop(&payload),
-        "session-start" => session_start(&payload),
-        _ => {
-            eprintln!("hook: unknown event `{event}`; expected post-edit, stop or session-start");
-            ExitCode::FAILURE
+
+    /// The name of the event on the command line.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PostEdit => "post-edit",
+            Self::Stop => "stop",
+            Self::SessionStart => "session-start",
         }
     }
 }
 
-fn post_edit(payload: &str) -> ExitCode {
-    let Some(file) = json_string_field(payload, "file_path").map(PathBuf::from) else {
-        return ExitCode::SUCCESS;
+/// Runs the hook named `event`, reading its JSON payload from stdin.
+///
+/// The hook works on the checkout the payload is about (see [`hook_root`]), and it runs that
+/// checkout's own xtask: if this process was built from another checkout, it hands the event to
+/// `cargo xtask hook` in that checkout, so that a worktree is checked by its own rules.
+pub fn run(event: &str) -> ExitCode {
+    let Some(event) = Event::parse(event) else {
+        eprintln!("hook: unknown event `{event}`; expected post-edit, stop or session-start");
+        return ExitCode::FAILURE;
     };
-    let Some(root) = workspace_root_of(&file) else {
+    let mut payload = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut payload) {
+        eprintln!("hook {}: cannot read stdin: {error}", event.name());
+        return ExitCode::FAILURE;
+    }
+    let delegated = std::env::var_os(ROOT_VARIABLE).filter(|root| !root.is_empty());
+    let mut is_fallback = false;
+    let root = if let Some(root) = delegated {
+        Some(PathBuf::from(root))
+    } else {
+        let project = std::env::var_os(PROJECT_VARIABLE).filter(|project| !project.is_empty());
+        let root = hook_root(event, &payload, project.as_deref().map(Path::new));
+        if let Some(root) = &root
+            && !is_current_checkout(root)
+        {
+            match delegate(event, root, &payload) {
+                Ok(exit) => return exit,
+                Err(error) => {
+                    eprintln!("hook {}: {error}; checking with this xtask instead", event.name());
+                    is_fallback = true;
+                }
+            }
+        }
+        root
+    };
+    let exit = match event {
+        Event::PostEdit => root.map_or(ExitCode::SUCCESS, |root| post_edit(&root, &payload)),
+        Event::Stop => root.map_or(ExitCode::SUCCESS, |root| stop(&root, &payload)),
+        Event::SessionStart => session_start(root.as_deref()),
+    };
+    // A checkout whose xtask does not build must hear about it after an edit; the stop gate
+    // fails on it by itself, and at session start the human sees it.
+    if is_fallback && event == Event::PostEdit { ExitCode::from(EXIT_FEEDBACK) } else { exit }
+}
+
+/// The checkout that a hook payload is about, found with `git rev-parse --show-toplevel`:
+///
+/// - after an edit, the one that holds the edited file;
+/// - at stop and session start, the one around the payload's `cwd`, or, if the payload has no
+///   `cwd`, around `project` (`CLAUDE_PROJECT_DIR`), or else around the current directory.
+///
+/// `None` if that is not a nami checkout, or if an edit names no file.
+#[must_use]
+pub fn hook_root(event: Event, payload: &str, project: Option<&Path>) -> Option<PathBuf> {
+    let start = match event {
+        Event::PostEdit => PathBuf::from(json_string_field(payload, "file_path")?),
+        Event::Stop | Event::SessionStart => json_string_field(payload, "cwd")
+            .map(PathBuf::from)
+            .or_else(|| project.map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    let root = checkout_around(&start)?;
+    assert!(root.is_absolute(), "git names the toplevel by an absolute path");
+    Some(root)
+}
+
+/// True if this process runs in the checkout at `root`. The hook command starts in the checkout
+/// that `cargo xtask` was built from, so this says whether this binary has `root`'s rules.
+fn is_current_checkout(root: &Path) -> bool {
+    let current = std::env::current_dir().ok().and_then(|directory| checkout_around(&directory));
+    current.as_deref() == Some(root)
+}
+
+/// Hands the event to `cargo xtask hook` in the checkout at `root`, with the payload on stdin
+/// and [`ROOT_VARIABLE`] set to `root`. Returns its exit code if it ran the hook (0, 1 or 2),
+/// or what went wrong if it did not, for example because that xtask does not build.
+fn delegate(event: Event, root: &Path, payload: &str) -> Result<ExitCode, String> {
+    assert!(root.is_absolute(), "the checkout to delegate to is named by an absolute path");
+    let command = format!("`cargo xtask hook {}` in {}", event.name(), root.display());
+    let mut child = Command::new("cargo")
+        .args(["xtask", "hook", event.name()])
+        .current_dir(root)
+        .env(ROOT_VARIABLE, root)
+        .env_remove(TOOLCHAIN_VARIABLES[0])
+        .env_remove(TOOLCHAIN_VARIABLES[1])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot run {command}: {error}"))?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    // A child that exits without reading its payload is judged by its exit code below.
+    let _written = stdin.write_all(payload.as_bytes());
+    drop(stdin);
+    let status = child.wait().map_err(|error| format!("cannot wait for {command}: {error}"))?;
+    match status.code().map(u8::try_from) {
+        Some(Ok(code @ 0..=EXIT_FEEDBACK)) => Ok(ExitCode::from(code)),
+        _ => Err(format!("{command} did not run the hook ({status})")),
+    }
+}
+
+fn post_edit(root: &Path, payload: &str) -> ExitCode {
+    let Some(file) = json_string_field(payload, "file_path").map(PathBuf::from) else {
         return ExitCode::SUCCESS;
     };
     // A deleted file, a directory or a binary file has nothing to check.
     let Ok(original) = std::fs::read_to_string(&file) else {
         return ExitCode::SUCCESS;
+    };
+    // git names the root without symbolic links, so the file is compared in the same form.
+    let (Ok(root), Ok(file)) = (fs::canonicalize(root), fs::canonicalize(&file)) else {
+        return ExitCode::SUCCESS;
+    };
+    let Ok(relative) = file.strip_prefix(&root) else {
+        eprintln!("hook post-edit: {} is not in {}", file.display(), root.display());
+        return ExitCode::FAILURE;
     };
     let is_rust = file.extension().is_some_and(|extension| extension == "rs");
     let text = if is_rust {
@@ -97,7 +242,6 @@ fn post_edit(payload: &str) -> ExitCode {
     } else {
         original
     };
-    let relative = file.strip_prefix(&root).expect("root is an ancestor of the file");
     let violations = match crate::tidy::check_single_file(&root, relative, &text) {
         Ok(violations) => violations,
         Err(error) => {
@@ -133,23 +277,22 @@ fn format_in_place(root: &Path, file: &Path, original: &str) -> Result<String, E
     Ok(text)
 }
 
-fn stop(payload: &str) -> ExitCode {
-    let Some(root) = checkout_of(payload) else {
-        return ExitCode::SUCCESS;
-    };
-    let state = root.join(GATE_STATE_DIRECTORY);
+/// The stop gate for the checkout at `root`. Its state lives in that checkout, so each worktree
+/// has its own last pass and its own counters.
+fn stop(root: &Path, payload: &str) -> ExitCode {
+    let state = gate_state(root);
     let attempts = json_string_field(payload, "session_id")
         .map(|session_id| sanitise_session_id(&session_id))
         .filter(|session_id| !session_id.is_empty())
         .map(|session_id| state.join(format!("attempts-{session_id}")));
-    let fingerprint = tree_fingerprint(&root);
+    let fingerprint = tree_fingerprint(root);
     let passed = fs::read_to_string(state.join(GATE_PASSED_FILE)).ok();
     let passed = passed.as_deref().map(str::trim);
-    if gate_decision(fingerprint.as_deref(), base_tree(&root).as_deref(), passed) == Gate::Skip {
+    if gate_decision(fingerprint.as_deref(), base_tree(root).as_deref(), passed) == Gate::Skip {
         discard(attempts.as_deref());
         return ExitCode::SUCCESS;
     }
-    let Ok(output) = Command::new("just").args(GATE_RECIPES).current_dir(&root).output() else {
+    let Ok(output) = Command::new("just").args(GATE_RECIPES).current_dir(root).output() else {
         eprintln!("hook stop: cannot run `just check dylint`; is `just` installed?");
         return ExitCode::FAILURE;
     };
@@ -204,7 +347,7 @@ fn stop_failed(attempts: Option<&Path>, stop_hook_active: bool, output_tail: &st
     }
 }
 
-fn session_start(payload: &str) -> ExitCode {
+fn session_start(root: Option<&Path>) -> ExitCode {
     let status = match export_cargo_bin() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -212,10 +355,10 @@ fn session_start(payload: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    if let Some(root) = checkout_of(payload) {
+    if let Some(root) = root {
         // Claude Code adds stdout to the agent's context. A finding informs; it never fails the
         // hook.
-        for finding in crate::doctor::findings(&root) {
+        for finding in crate::doctor::findings(root) {
             println!("{finding}");
         }
     }
@@ -344,7 +487,7 @@ fn discard(file: Option<&Path>) {
 /// hooks in one checkout must not mix their states.
 #[must_use]
 pub fn tree_fingerprint(root: &Path) -> Option<String> {
-    let state = std::path::absolute(root.join(GATE_STATE_DIRECTORY)).ok()?;
+    let state = std::path::absolute(gate_state(root)).ok()?;
     fs::create_dir_all(&state).ok()?;
     let index = state.join(format!("index-{}", std::process::id()));
     let lock = state.join(format!("index-{}.lock", std::process::id()));
@@ -417,25 +560,31 @@ fn format_source(root: &Path, source: &str) -> Result<String, String> {
     }
 }
 
-/// The checkout that a `Stop` or `SessionStart` payload is about: the one around its `cwd`.
-fn checkout_of(payload: &str) -> Option<PathBuf> {
-    let directory =
-        json_string_field(payload, "cwd").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    workspace_root_of(&directory)
+/// The directory where the stop gate keeps its state for the checkout at `root`.
+#[must_use]
+pub fn gate_state(root: &Path) -> PathBuf {
+    root.join(GATE_STATE_DIRECTORY)
 }
 
-/// The nearest ancestor of `path` that holds `rust-toolchain.toml`, i.e. a nami checkout or
-/// worktree.
-fn workspace_root_of(path: &Path) -> Option<PathBuf> {
-    let mut candidate = Some(path);
+/// The git toplevel of the checkout or worktree that holds `path`, if it is a nami checkout:
+/// it holds `rust-toolchain.toml` and `xtask/`. `path` may be a file, or not exist yet; the
+/// search starts at its nearest existing directory.
+#[must_use]
+pub fn checkout_around(path: &Path) -> Option<PathBuf> {
+    let path = std::path::absolute(path).ok()?;
+    let mut candidate = Some(path.as_path());
+    let mut directory = None;
     for _ in 0..ANCESTORS_MAX {
-        let directory = candidate?;
-        if directory.join("rust-toolchain.toml").is_file() && directory.join("xtask").is_dir() {
-            return Some(directory.to_path_buf());
+        let existing = candidate?;
+        if existing.is_dir() {
+            directory = Some(existing);
+            break;
         }
-        candidate = directory.parent();
+        candidate = existing.parent();
     }
-    None
+    let toplevel = PathBuf::from(git(directory?, None, &["rev-parse", "--show-toplevel"])?);
+    let is_nami = toplevel.join("rust-toolchain.toml").is_file() && toplevel.join("xtask").is_dir();
+    is_nami.then_some(toplevel)
 }
 
 /// Returns the first string value stored under `key`, decoding JSON escapes.
@@ -573,16 +722,40 @@ mod tests {
         assert_eq!(json_bool_field(r#"{"stop_hook_active":"x"}"#, "stop_hook_active"), None);
     }
 
-    // Goal: the workspace root is found from any file inside it, and nothing is found outside.
+    // Goal: the checkout is found from any file or directory inside it, even one that does not
+    // exist yet, and nothing is found outside a checkout. Each event takes it from its own
+    // field, and only a payload without `cwd` falls back to the project directory.
     #[test]
-    fn workspace_root_is_found_from_a_file() {
-        let root = crate::workspace_root();
+    fn checkout_is_found_from_the_payload() {
+        use super::{Event, checkout_around, hook_root};
+        let root = std::fs::canonicalize(crate::workspace_root()).unwrap();
         let file = root.join("crates/base/src/lib.rs");
-        assert_eq!(super::workspace_root_of(&file), Some(root.clone()));
-        assert_eq!(super::workspace_root_of(std::path::Path::new("/")), None);
-        let payload = format!(r#"{{"session_id":"s","cwd":"{}"}}"#, file.display());
-        assert_eq!(super::checkout_of(&payload), Some(root));
-        assert_eq!(super::checkout_of(r#"{"cwd":"/"}"#), None);
+        assert_eq!(checkout_around(&file), Some(root.clone()));
+        assert_eq!(checkout_around(&root.join("crates/base/src/new/new.rs")), Some(root.clone()));
+        assert_eq!(checkout_around(std::path::Path::new("/")), None);
+
+        let elsewhere = Some(std::path::Path::new("/"));
+        let cwd = format!(r#"{{"session_id":"s","cwd":"{}"}}"#, file.display());
+        assert_eq!(hook_root(Event::Stop, &cwd, elsewhere), Some(root.clone()), "the cwd wins");
+        assert_eq!(hook_root(Event::SessionStart, &cwd, None), Some(root.clone()));
+        assert_eq!(hook_root(Event::Stop, r#"{"cwd":"/"}"#, Some(&root)), None, "no fallback");
+        assert_eq!(hook_root(Event::Stop, "{}", Some(&root)), Some(root.clone()), "fallback");
+        assert_eq!(hook_root(Event::Stop, "{}", elsewhere), None, "the fallback is not nami");
+
+        let edit = format!(r#"{{"cwd":"/","tool_input":{{"file_path":"{}"}}}}"#, file.display());
+        assert_eq!(hook_root(Event::PostEdit, &edit, None), Some(root), "the file, not the cwd");
+        assert_eq!(hook_root(Event::PostEdit, r#"{"cwd":"/"}"#, None), None, "no file");
+    }
+
+    // Goal: every event name round-trips, and anything else is not an event.
+    #[test]
+    fn events_are_parsed() {
+        use super::Event;
+        for event in [Event::PostEdit, Event::Stop, Event::SessionStart] {
+            assert_eq!(Event::parse(event.name()), Some(event));
+        }
+        assert_eq!(Event::parse("subagent-stop"), None);
+        assert_eq!(Event::parse(""), None);
     }
 
     // Goal: malformed or unterminated strings yield None instead of a partial value.
