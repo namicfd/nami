@@ -350,10 +350,11 @@ fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
     if let Ok(Some(status)) = child.try_wait() {
         return Ok(status);
     }
-    kill_process_group(child);
-    let killed = match child.wait() {
-        Ok(status) => status.to_string(),
-        Err(error) => format!("cannot be waited for: {error}"),
+    let group = kill_process_group(child);
+    let killed = match (child.wait(), group) {
+        (Ok(status), Ok(())) => status.to_string(),
+        (Ok(status), Err(error)) => format!("{status}; {error}"),
+        (Err(error), _) => format!("cannot be waited for: {error}"),
     };
     let seconds = polls_max * POLL_INTERVAL_MILLISECONDS / 1000;
     Err(format!("did not finish within {seconds} seconds and was killed ({killed})"))
@@ -367,21 +368,22 @@ fn in_own_process_group(command: &mut Command) -> &mut Command {
 }
 
 /// Kills `child`, and on Unix every process in its group: cargo's build or the gate's `just`.
-fn kill_process_group(child: &mut Child) {
+/// The child itself is killed in any case. Returns what went wrong with the group, if anything.
+fn kill_process_group(child: &mut Child) -> Result<(), String> {
     #[cfg(unix)]
-    {
+    let group = {
         let group = format!("-{}", child.id());
-        let killed = Command::new("kill").args(["-KILL", "--", &group]).status();
-        if let Err(error) = killed {
-            eprintln!("hook: cannot kill the process group {group}: {error}");
+        match Command::new("kill").args(["-KILL", "--", &group]).stderr(Stdio::null()).status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("cannot kill the process group {group}: {status}")),
+            Err(error) => Err(format!("cannot kill the process group {group}: {error}")),
         }
-    }
-    // The group kill has usually ended the child already; that is not an error.
-    if let Err(error) = child.kill()
-        && error.kind() != io::ErrorKind::InvalidInput
-    {
-        eprintln!("hook: cannot kill the process {}: {error}", child.id());
-    }
+    };
+    #[cfg(not(unix))]
+    let group = Ok(());
+    // The child is not reaped yet, so it can always be signalled, even after the group kill.
+    child.kill().map_err(|error| format!("cannot kill the process {}: {error}", child.id()))?;
+    group
 }
 
 fn post_edit(root: &Path, payload: &str) -> ExitCode {
@@ -911,7 +913,16 @@ mod tests {
     #[test]
     fn checkout_is_found_from_the_payload() {
         use super::{Event, checkout_around, hook_root};
-        let root = std::fs::canonicalize(crate::workspace_root()).unwrap();
+        // A git checkout of its own: the workspace may be a copy without `.git`, as under
+        // cargo-mutants.
+        let scratch = Scratch::new("hook-checkout");
+        scratch.write("rust-toolchain.toml", "[toolchain]\n");
+        scratch.write("xtask/README", "tooling\n");
+        scratch.write("crates/base/src/lib.rs", "\n");
+        let mut init = std::process::Command::new("git");
+        let init = init.args(["init", "--quiet"]).current_dir(scratch.root()).status().unwrap();
+        assert!(init.success(), "git init works");
+        let root = std::fs::canonicalize(scratch.root()).unwrap();
         let file = root.join("crates/base/src/lib.rs");
         assert_eq!(checkout_around(&file), Some(root.clone()));
         assert_eq!(checkout_around(&root.join("crates/base/src/new/new.rs")), Some(root.clone()));
@@ -936,14 +947,45 @@ mod tests {
     #[test]
     fn hand_overs_are_killed_at_their_deadline() {
         use super::{in_own_process_group, wait_until};
+        let scratch = Scratch::new("hook-deadline");
+        let pid_file = scratch.root().join("sleep.pid");
+        let script = format!("sleep 20 & echo $! > {}; wait", pid_file.display());
         let mut command = std::process::Command::new("sh");
-        let slow = in_own_process_group(command.args(["-c", "sleep 600; exit 0"]));
+        let slow = in_own_process_group(command.args(["-c", &script]));
         let mut child = slow.stdout(std::process::Stdio::null()).spawn().unwrap();
-        let error = wait_until(&mut child, 5).expect_err("the deadline passes first");
-        assert!(error.starts_with("did not finish within 0 seconds and was killed"), "{error}");
+        let error = wait_until(&mut child, 100).expect_err("the deadline passes first");
+        assert!(error.starts_with("did not finish within 2 seconds and was killed"), "{error}");
+        assert!(!error.contains("cannot kill"), "the group kill worked: {error}");
+        assert!(error.ends_with("(signal: 9 (SIGKILL))"), "by SIGKILL: {error}");
+        // The shell's own child is killed too: its pid answers no signal once init reaps it.
+        let sleep_pid = std::fs::read_to_string(&pid_file).unwrap();
+        let is_alive = || {
+            let mut probe = std::process::Command::new("kill");
+            let probe = probe.args(["-0", sleep_pid.trim()]).stderr(std::process::Stdio::null());
+            probe.status().unwrap().success()
+        };
+        let polls_until_gone = (0..500).find(|_| {
+            let is_gone = !is_alive();
+            if !is_gone {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            is_gone
+        });
+        assert!(polls_until_gone.is_some(), "the sleep {} outlived the kill", sleep_pid.trim());
         let mut quick = std::process::Command::new("true").spawn().unwrap();
         let status = wait_until(&mut quick, 500).expect("`true` ends in time");
         assert!(status.success(), "its status is kept: {status}");
+    }
+
+    // Goal: a child that leads no process group of its own is still killed, and the failed
+    // group kill is reported, not passed over.
+    #[test]
+    fn a_failed_group_kill_is_reported_and_the_child_still_dies() {
+        let mut child = std::process::Command::new("sleep").arg("20").spawn().unwrap();
+        let error = super::kill_process_group(&mut child).expect_err("it leads no group");
+        assert!(error.starts_with("cannot kill the process group -"), "{error}");
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "the child was killed: {status}");
     }
 
     // Goal: each hand-over deadline leaves the hook time to do the work itself before Claude

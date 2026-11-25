@@ -27,7 +27,8 @@ fi
 /// A stand-in for `cargo`: it records where it runs, the checkout it is handed and the toolchain
 /// overrides it inherits, then runs the xtask under test. While `broken-xtask` exists it fails
 /// like an xtask that does not build; while `missing-toolchain` exists, like rustup without the
-/// pinned toolchain.
+/// pinned toolchain; while `exit-without-reading` exists, it exits with the code that file
+/// holds, without reading its payload.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 mkdir -p target
 echo "$PWD|$NAMI_HOOK_ROOT|$RUSTUP_TOOLCHAIN|$RUSTUP_TOOLCHAIN_SOURCE|$*" >> target/cargo-calls
@@ -38,6 +39,9 @@ fi
 if [ -e missing-toolchain ]; then
     echo "error: toolchain 'pinned' is not installed" >&2
     exit 1
+fi
+if [ -e exit-without-reading ]; then
+    exit "$(cat exit-without-reading)"
 fi
 shift
 exec "$NAMI_TEST_XTASK" "$@"
@@ -647,6 +651,49 @@ fn a_nested_repository_belongs_to_the_enclosing_checkout() {
     let edit = format!(r#"{{"tool_input":{{"file_path":"{}"}}}}"#, file.display());
     assert_eq!(hook_root(Event::PostEdit, &edit, None), Some(project));
     assert_eq!(checkout_around(&scratch.directory), None, "outside every checkout: none");
+}
+
+// Goal: a hand-over counts only if the other hook ran: 0 and 2 for every event, and the
+// give-up code 3 only from a stop, which then exits 1 without a second gate. Anything else
+// falls back. A payload that the other side did not read whole is trusted only from a hook
+// that passed or blocked. Method: the fake `cargo` exits with a given code without reading;
+// a large payload cannot fit in the pipe, so its write breaks.
+#[test]
+fn only_a_hook_that_ran_counts_as_a_hand_over() {
+    let scratch = Scratch::new("exit-codes");
+    let (worktree, stop) = worktree_with_violation(&scratch);
+    let draft = worktree.join("a.snap.new");
+    fs::write(&draft, "draft\n").unwrap();
+    let edit = format!(r#"{{"tool_input":{{"file_path":"{}"}}}}"#, draft.display());
+    let padding = "x".repeat(1 << 20);
+    let large_edit = edit.replace("}}", &format!(r#"}},"padding":"{padding}"}}"#));
+    let large_stop = stop.replace('}', &format!(r#","padding":"{padding}"}}"#));
+    let fallback = "pins was not used";
+    // The exit code and whether the hook fell back, and its stderr for the messages.
+    let run = |code: &str, event: &str, payload: &str| {
+        fs::write(worktree.join("exit-without-reading"), code).unwrap();
+        let output = scratch.hook(event, payload, &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        ((output.status.code(), stderr.contains(fallback)), stderr)
+    };
+    for payload in [edit.as_str(), large_edit.as_str()] {
+        let (passed, passed_stderr) = run("0", "post-edit", payload);
+        assert_eq!(passed, (Some(0), false), "a pass is passed on: {passed_stderr}");
+        let (blocked, blocked_stderr) = run("2", "post-edit", payload);
+        assert_eq!(blocked, (Some(2), false), "a block is passed on: {blocked_stderr}");
+    }
+    for code in ["1", "3", "101"] {
+        let (failed, stderr) = run(code, "post-edit", &edit);
+        assert_eq!(failed, (Some(2), true), "exit {code} falls back: {stderr}");
+        assert!(stderr.contains("error[snapshot-draft]"), "and the file is checked: {stderr}");
+    }
+    let (gave_up, gave_up_stderr) = run("3", "stop", &stop);
+    assert_eq!(gave_up, (Some(1), false), "a stop that gave up exits 1: {gave_up_stderr}");
+    assert!(!worktree.join("target/just-calls").exists(), "and is not gated again");
+    let (unread, unread_stderr) = run("3", "stop", &large_stop);
+    assert_eq!(unread, (Some(2), true), "an unread payload falls back: {unread_stderr}");
+    assert!(unread_stderr.contains("Broken pipe"), "{unread_stderr}");
+    assert!(unread_stderr.contains("blocked stop 1 of 3"), "it is gated: {unread_stderr}");
 }
 
 /// A checkout whose branch `work` changes protected and unprotected files and moves a file out
