@@ -17,7 +17,9 @@ the layout prototype).
 1. **A run is a compiled combination.** A problem crate depends on nami, provides the initial
    conditions, user boundary conditions and user source terms, and names its combination of
    extension points as Rust types. It may compile several combinations and select one at init.
-   The runtime configuration sets only parameters, validated at init into a `Result`.
+   The runtime configuration sets only parameters, validated at init into a `Result`. Sizes that
+   help the compiler, such as the ghost width, the number of passive scalars and possibly the
+   block size, may be compile-time constants of the combination.
 2. **The extension points** (`docs/ARCHITECTURE.md` § 4(b) gives the details):
    - **Equation system:** associated `Conserved`, `Primitive` and `Parameters` types; conversion
      between conserved and primitive variables; the physical flux along a face normal; a
@@ -63,7 +65,7 @@ the layout prototype).
 
 - **One binary with every combination, selected at runtime.** Rejected as the default. It is just
   as fast in the hot loop, because selection happens once at init, but every build compiles the
-  whole menu. A problem crate can still do this for a few combinations.
+  whole menu, and sizes such as the ghost width cannot be compile-time constants. A problem crate can still do this for a few combinations.
 - **Dynamic dispatch per face or per cell.** Rejected. It prevents inlining and vectorisation and
   conflicts with ADR-0003.
 - **Integrators as hand-written code per method.** Rejected. Tables read like the papers, and one
