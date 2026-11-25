@@ -9,7 +9,7 @@
 |---|---|---|---|
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
-| 3 | Numerics | Open | |
+| 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
 | 4 | Core architecture | Open | |
 | 5 | Performance and parallelism | Open | |
 | 6 | Interface, output and determinism guarantees | Open | |
@@ -167,3 +167,70 @@ Each milestone is a complete vertical slice, with references first (ADR-0007).
   flux correction are written for every coordinate system from the start.
 - Multiple nodes come before mesh refinement, because load balancing under AMR depends on the
   communication layer.
+
+## 3. Numerics
+
+### 3.1 Baseline: the standard methods, with Athena++ as the yardstick
+
+nami implements the standard methods of the field. Athena++'s menu is the baseline, so that "the
+same algorithm" in the performance criterion (§ 1) means the same thing in both codes. It is a
+yardstick, not a design to copy (§ 3.3).
+
+| Part | Baseline | Later (the interfaces allow it now) |
+|---|---|---|
+| Scheme | Method of lines: reconstruct, solve the Riemann problem, update, once per stage | |
+| Time integrators | VL2 (van Leer predictor-corrector), SSP-RK2, SSP-RK3 | Higher-order and low-storage RK |
+| Reconstruction | Donor cell; PLM with minmod, van Leer and MC limiters; PPM. Primitive variables by default, characteristic as an option. | WENO-Z; fourth-order finite volume (Felker & Stone 2018) |
+| Riemann solvers | LLF and HLLE (every system); HLLC (Euler, shallow water); HLLD (MHD); exact for advection and Burgers | Roe |
+| Constrained transport | Gardiner–Stone upwind CT, with face-centred magnetic field | |
+| Source terms | Added unsplit in every stage; hydrostatic reconstruction for shallow water (Audusse et al. 2004) | |
+| Diffusion | Explicit | RKL2 super-time-stepping (Meyer, Balsara & Aslam 2014) |
+| Time step | CFL number times the largest signal speed, as a global minimum, which gives the same result in any order | Per-level steps (§ 3.3) |
+| Boundaries | Periodic, outflow, reflecting, user inflow; polar boundaries with M6 | Shearing box |
+
+### 3.2 Positivity without silent floors
+
+Athena++ keeps density and pressure positive with fixed floors that it applies silently. nami may
+not (TIGER_STYLE.md, Physical admissibility). It uses named scheme components instead:
+
+1. **First-order flux correction**, as in AthenaK. Where a high-order update would make density
+   or pressure non-physical, the affected faces fall back to the first-order flux. The update
+   stays conservative and deterministic.
+2. **A Zhang–Shu positivity limiter** for the higher-order schemes, used together with wave-speed
+   estimates that are guaranteed upper bounds (Guermond & Popov 2016).
+3. **Floors only as a last resort.** They are configured explicitly and every activation is
+   counted per step. An unexpected count fails a test.
+
+Each mechanism counts its activations and reports them per step.
+
+### 3.3 Better than the baseline (proposed)
+
+**Firm goals:**
+
+- **Every selectable combination is verified.** Each combination of equation system,
+  reconstruction, Riemann solver, integrator and coordinates that the configuration can select
+  passes the reference tiers of ADR-0007. With compile-time extension points (§ 2), the selectable
+  set and the tested set are the same set.
+- **Provable positivity** (§ 3.2).
+- **Well-balanced gravity** for hydrostatic equilibria in Euler and MHD, extending the shallow-water
+  well-balancing of M3.
+
+**The interfaces must allow these now; they are built later:**
+
+- **Subcycling in time per refinement level** (M9). Each level takes its own Δt, and fluxes and
+  electric fields are corrected between levels. The time-integration and flux-correction
+  interfaces must not assume one global Δt.
+- **Higher order:** WENO-Z and fourth-order finite volume. The ghost-cell width comes from the
+  reconstruction, as a compile-time constant. Cell averages and point values are distinct types,
+  so a fourth-order scheme cannot mix them up.
+
+### 3.4 What this means for § 4
+
+- Reconstruction works on primitive variables, so converting between conserved and primitive
+  variables is part of the equation-system interface. For relativity, that conversion needs a
+  root finder with a named iteration limit and an assertion that it converged (TIGER_STYLE.md).
+- VL2 with constrained transport needs fluxes and electric fields on edges. That goes beyond
+  ADR-0003's pencils. It is the CT exception that ADR-0003 already foresees, and it needs its
+  ADR in § 4.
+- Positivity mechanisms work per face and per cell, and count their activations. They need an
+  output channel for the counts that does not allocate.
