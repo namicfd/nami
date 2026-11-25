@@ -23,7 +23,6 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `function-length` | source | Functions are at most 70 physical lines, closures included. | TIGER_STYLE.md, Scope and size |
 | `ignore-reason` | source | `#[ignore]` carries a reason. | ADR-0006 |
 | `kernel-indirection` | source | No `dyn` trait objects and no function pointers in `crates/kernels`. | ADR-0003 |
-| `learning-format` | source | Every file in `docs/learnings/` is named `YYYY-MM-DD-<slug>.md` and has a status line and the sections `## What happened` and `## Proposed guardrail`. | docs/learnings/README.md |
 | `line-length` | source | Lines in Rust sources are at most 100 columns. | TIGER_STYLE.md, Style by the numbers |
 | `magic-tolerance` | source | In nami crates outside tests, a float literal in (0, 1e-6] appears only in the initialiser of a `const` item that has a doc comment. | TIGER_STYLE.md, Floating point |
 | `parse` | source | Every Rust source file parses. | ADR-0006 |
