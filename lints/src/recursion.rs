@@ -198,6 +198,13 @@ impl<'tcx> CallCollector<'tcx> {
         for adjustment in adjustments {
             if let Adjust::Deref(DerefAdjustKind::Overloaded(deref)) = adjustment.kind {
                 let method = deref.method_call(self.tcx);
+                // `add_call` drops a call whose arguments are incomplete, which is right only
+                // for desugared calls. These arguments are built here, so they must be complete.
+                assert_eq!(
+                    self.tcx.generics_of(method).count(),
+                    1,
+                    "`deref` and `deref_mut` have `Self` as their only generic parameter"
+                );
                 self.add_call(method, self.tcx.mk_args(&[source.into()]));
             }
             source = adjustment.target;
@@ -232,8 +239,9 @@ impl<'tcx> Visitor<'tcx> for CallCollector<'tcx> {
                 }
             }
             // A method call, or an operator that type checking resolved to a trait method:
-            // `a + b`, `-a`, `*a`, `a += b` and `a[i]`. Operators on primitive types record no
-            // method, because they are built in.
+            // binary operators and comparisons (`a + b`, `a == b`, `a < b`), `-a`, `!a`, `*a`,
+            // `a += b` and `a[i]`. Type checking names `deref_mut` and `index_mut` where the
+            // place is mutated. Operators on primitive types record no method: they are built in.
             ExprKind::MethodCall(..)
             | ExprKind::Binary(..)
             | ExprKind::Unary(..)

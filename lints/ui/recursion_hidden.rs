@@ -2,7 +2,7 @@
 // counts as called by the function that names it, and an overloaded operator or deref counts as
 // a call to the trait method behind it.
 
-use std::ops::{Add, AddAssign, Deref, Index, Neg};
+use std::ops::{Add, AddAssign, Deref, DerefMut, Index, IndexMut, Neg, Not};
 
 fn apply<F: Fn(u32) -> u32>(f: F, n: u32) -> u32 {
     f(n)
@@ -185,6 +185,103 @@ fn read_cell(cell: &Cell) -> f64 {
     **cell + cell.abs()
 }
 
+// Not recursive: deref coercion through a `Deref` impl that does not call back.
+fn cell_value(cell: &Cell) -> &f64 {
+    cell
+}
+
+// Not recursive: a `DerefMut` impl, used with `*` in a mutated place.
+impl DerefMut for Cell {
+    fn deref_mut(&mut self) -> &mut f64 {
+        &mut self.value
+    }
+}
+
+fn reset_cell(cell: &mut Cell) {
+    **cell = 0.0;
+}
+
+// Recursive: a `DerefMut` impl that derefs its own type with `*` in a mutated place.
+impl DerefMut for Chain {
+    fn deref_mut(&mut self) -> &mut f64 {
+        match &mut self.next {
+            Some(next) => &mut ***next,
+            None => &mut self.value,
+        }
+    }
+}
+
+// Recursive: a `Deref` impl that derefs its own type by autoderef of a method receiver.
+struct Node {
+    value: f64,
+    next: Option<Box<Node>>,
+}
+
+impl Deref for Node {
+    type Target = f64;
+
+    fn deref(&self) -> &f64 {
+        match &self.next {
+            Some(next) if next.is_nan() => &self.value,
+            _ => &self.value,
+        }
+    }
+}
+
+// Recursive: an `IndexMut` impl that indexes its own type in a mutated place.
+impl IndexMut<u32> for Ramp {
+    fn index_mut(&mut self, i: u32) -> &mut f64 {
+        if i == 0 { &mut self.0[0] } else { &mut self[i - 1] }
+    }
+}
+
+// Not recursive: an `IndexMut` impl that indexes the array.
+impl IndexMut<u32> for Cells {
+    fn index_mut(&mut self, i: u32) -> &mut f64 {
+        if i == 0 { &mut self.0[0] } else { &mut self.0[1] }
+    }
+}
+
+// Recursive: a `PartialEq` impl that compares its own type with `==`.
+struct Depth(u32);
+
+impl PartialEq for Depth {
+    fn eq(&self, other: &Depth) -> bool {
+        if self.0 == 0 || other.0 == 0 { self.0 == other.0 } else { Depth(self.0 - 1) == *other }
+    }
+}
+
+// Not recursive: a `PartialEq` impl that compares the fields, which is built in.
+struct Level(u32);
+
+impl PartialEq for Level {
+    fn eq(&self, other: &Level) -> bool {
+        self.0 == other.0
+    }
+}
+
+// Recursive: a `Not` impl that negates its own type with `!`.
+struct Gate(bool);
+
+impl Not for Gate {
+    type Output = Gate;
+
+    fn not(self) -> Gate {
+        if self.0 { Gate(false) } else { !Gate(true) }
+    }
+}
+
+// Not recursive: a `Not` impl that negates the field.
+struct Mask(bool);
+
+impl Not for Mask {
+    type Output = Mask;
+
+    fn not(self) -> Mask {
+        Mask(!self.0)
+    }
+}
+
 fn main() {
     let _ = walk(3) + ping(3) + Counter::step(3) + Counter::halve(3);
     let _ = (Steps(2) + Steps(1)).0;
@@ -197,5 +294,16 @@ fn main() {
     total += Total(1.0);
     let _ = Ramp([0.0; 4])[2] + Cells([0.0; 4])[2];
     let _ = *Chain { value: 1.0, next: None } + *Link { value: 1.0, next: None };
-    let _ = read_cell(&Cell { value: 1.0 });
+    let mut cell = Cell { value: 1.0 };
+    reset_cell(&mut cell);
+    let _ = read_cell(&cell) + *cell_value(&cell);
+    let mut chain = Chain { value: 1.0, next: None };
+    *chain = 2.0;
+    let _ = *Node { value: 1.0, next: None };
+    let mut ramp = Ramp([0.0; 4]);
+    ramp[2] = 1.0;
+    let mut cells = Cells([0.0; 4]);
+    cells[2] = 1.0;
+    let _ = Depth(2) == Depth(1) || Level(2) == Level(1);
+    let _ = (!Gate(true)).0 || (!Mask(true)).0;
 }

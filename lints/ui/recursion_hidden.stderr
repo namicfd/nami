@@ -60,5 +60,35 @@ error: `<Link as std::ops::Deref>::deref` is recursive: <Link as std::ops::Deref
 LL |     fn deref(&self) -> &f64 {
    |     ^^^^^^^^^^^^^^^^^^^^^^^
 
-error: aborting due to 10 previous errors
+error: `<Chain as std::ops::DerefMut>::deref_mut` is recursive: <Chain as std::ops::DerefMut>::deref_mut -> <Chain as std::ops::DerefMut>::deref_mut. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:206:5
+   |
+LL |     fn deref_mut(&mut self) -> &mut f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Node as std::ops::Deref>::deref` is recursive: <Node as std::ops::Deref>::deref -> <Node as std::ops::Deref>::deref. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:223:5
+   |
+LL |     fn deref(&self) -> &f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Ramp as std::ops::IndexMut<u32>>::index_mut` is recursive: <Ramp as std::ops::IndexMut<u32>>::index_mut -> <Ramp as std::ops::IndexMut<u32>>::index_mut. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:233:5
+   |
+LL |     fn index_mut(&mut self, i: u32) -> &mut f64 {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Depth as std::cmp::PartialEq>::eq` is recursive: <Depth as std::cmp::PartialEq>::eq -> <Depth as std::cmp::PartialEq>::eq. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:249:5
+   |
+LL |     fn eq(&self, other: &Depth) -> bool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `<Gate as std::ops::Not>::not` is recursive: <Gate as std::ops::Not>::not -> <Gate as std::ops::Not>::not. Rewrite it as a bounded loop (ADR-0006)
+  --> $DIR/recursion_hidden.rs:269:5
+   |
+LL |     fn not(self) -> Gate {
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 15 previous errors
 
