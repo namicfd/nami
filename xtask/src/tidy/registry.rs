@@ -136,15 +136,19 @@ pub const RULES: &[Rule] = &[
                  line and ignoring case. It reports the words `tidy`, `clippy`, `dylint`, \
                  `rustfmt`, `rustc`, `lints`, `nextest`, `miri`, `cargo-deny` and \
                  `cargo-mutants`, and the phrases `cargo deny`, `cargo mutants` and `the lint`, \
-                 as whole words in the prose outside code spans. A code span counts when it is \
-                 a command of that tool: the name alone or followed by arguments, also after \
-                 `cargo ` or `cargo xtask `, such as `cargo xtask tidy`; so a tag, `clippy.toml` \
-                 and `clippy::float_cmp` are not reported. `just` is left out because it is an \
-                 everyday English word. Known false positives, which have to be reworded: \
-                 tidy as an English adjective, and lints as a verb. Not seen: a phrase \
-                 broken across two lines, a code span that spans lines, and prose that describes \
-                 a check without naming its tool, such as a list of the syntax a rule reports. A \
-                 foreign gate (`--policy`) skips the style guide, and this rule with it.",
+                 as whole words in the prose outside code spans. A dash ends a word, so \
+                 `clippy-clean` is reported. A code span counts when it runs that tool: the \
+                 name alone or followed by arguments, after any `VAR=value` words, and after a \
+                 runner (`just`, `cargo` or `cargo xtask`) and the options that precede the tool \
+                 (`+nightly`, `--locked`), such as `cargo xtask tidy` or `just dylint`; so a tag, \
+                 `clippy.toml` and `clippy::float_cmp` are not reported. `just` alone is left \
+                 out because it is an everyday English word. A rule line with an odd number of \
+                 backticks is reported too, because a code span that runs across lines would \
+                 swap code and prose. Known false positives, which have to be reworded: tidy as \
+                 an English adjective, and lints as a verb. Not seen: a phrase broken across two \
+                 lines, and prose that describes a check without naming its tool, such as a \
+                 list of the syntax a rule reports. A foreign gate (`--policy`) runs this rule \
+                 too, because it reads only the style guide's text.",
         reference: "TIGER_STYLE.md, How rules are enforced",
     },
     Rule {
@@ -314,7 +318,8 @@ pub const RULES: &[Rule] = &[
                  that ends in `iter::`, and no `take` follows that source. A `zip` is endless only \
                  if both sides are, a `chain` if either side is. A bare `from_fn` imported from \
                  elsewhere, such as `core::array::from_fn`, is reported too: call it by a \
-                 qualified path. An iterable nested more than 256 steps deep is reported. Not \
+                 qualified path. An iterable that takes more than 256 steps to walk, counting each \
+                 expression and each combine, is reported. Not \
                  seen, and for review: any other iterator that never ends, such as a custom one, \
                  one held in a variable, or one returned by a function.",
         reference: "TIGER_STYLE.md, Put a limit on everything",

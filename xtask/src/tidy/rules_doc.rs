@@ -236,7 +236,6 @@ fn review_section(review_count: usize) -> Vec<String> {
 
 fn foreign_gate_section() -> Vec<String> {
     let skipped = code_list(&registry::REGISTRY_BOUND_RULES);
-    let style_guide_rules = code_list(&style_guide::STYLE_GUIDE_RULES);
     vec![
         String::new(),
         "## Checking another revision's tree".to_owned(),
@@ -248,8 +247,8 @@ fn foreign_gate_section() -> Vec<String> {
              In that mode the `#[expect]` budget is read from the policy directory, and the rules \
              that compare the tree's documents with the binary's own registry are skipped, \
              because a tree with a different registry fails them by construction: {skipped}. \
-             The style guide is not read at all, so its rules are skipped too, including those \
-             that do not depend on the registry: {style_guide_rules}."
+             Every other rule runs, `doc-tool-name` on the style guide included, because it \
+             reads only the guide's text."
         ),
     ]
 }
@@ -311,7 +310,7 @@ mod tests {
         }
         assert!(text.contains("carries 2 `[review]` tags"), "review tags are counted");
         assert!(text.contains("`doc-tag`, `planned-task`, `rules-doc`."), "skipped rules");
-        assert!(text.contains("registry: `doc-tag`, `doc-tool-name`."), "style guide rules");
+        assert!(text.contains("`doc-tool-name` on the style guide included"), "it still runs");
         assert!(text.contains("| `direct-libm` | paths that start with `libm::`"), "path bans");
         assert!(text.contains("`debug_assert!`, `debug_assert_eq!`, `debug_assert_ne!`"));
         assert!(text.ends_with(".\n") && !text.ends_with("\n\n"), "one trailing newline");

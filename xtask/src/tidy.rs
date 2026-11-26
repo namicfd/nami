@@ -206,16 +206,15 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
 /// runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by
 /// weakening its own gate.
 ///
-/// Three things differ from [`check`]:
+/// Two things differ from [`check`]:
 ///
 /// - the `#[expect]` budget is read from `policy_root`, not from the tree;
 /// - the rules in [`registry::REGISTRY_BOUND_RULES`] are skipped. They compare the tree's
 ///   documents with this binary's own registry, and a tree whose registry differs fails them by
-///   construction, which would make every guardrail change look like a loosening;
-/// - the style guide is not read at all, so its rules (`style_guide::STYLE_GUIDE_RULES`) are
-///   skipped: `doc-tag`, and `doc-tool-name` too, although it does not depend on the registry.
+///   construction, which would make every guardrail change look like a loosening.
 ///
-/// Every other rule runs as usual.
+/// Every other rule runs as usual. On the style guide that is `doc-tool-name`, which reads only
+/// the guide's text, so a pull request cannot drop the rule and add tool prose in one change.
 ///
 /// # Errors
 ///
@@ -228,22 +227,23 @@ pub fn check_with_policy(root: &Path, policy_root: &Path) -> io::Result<Vec<Viol
 fn check_tree(root: &Path, policy_root: Option<&Path>) -> io::Result<Vec<Violation>> {
     assert!(root.is_dir(), "tidy root must be a directory");
     let is_foreign = policy_root.is_some();
+    let is_registry_bound = |rule: &str| registry::REGISTRY_BOUND_RULES.contains(&rule);
     let mut violations = Vec::new();
     let mut tally = workspace::Tally::new();
     let mut paths = files_below(root, Path::new(""))?;
     paths.extend(document_files(root)?);
     for relative in &paths {
         let kind = FileKind::of(relative);
-        if is_foreign && kind == FileKind::StyleGuide {
-            continue;
-        }
         let text = if kind.reads_text() {
             fs::read_to_string(root.join(relative))?
         } else {
             String::new()
         };
         let report = check_file(root, relative, &text)?;
-        violations.extend(report.violations);
+        // The style guide's `doc-tag` is bound to the registry; `doc-tool-name` still runs.
+        let judged = report.violations.into_iter();
+        violations
+            .extend(judged.filter(|violation| !is_foreign || !is_registry_bound(violation.rule)));
         tally.add(relative, report.expect_count, report.stats);
     }
     violations.extend(workspace::density_violations(&tally.stats_by_crate));
@@ -254,7 +254,6 @@ fn check_tree(root: &Path, policy_root: Option<&Path>) -> io::Result<Vec<Violati
         violations.extend(rules_doc::check(root)?);
         violations.extend(rules_doc::check_planned_tasks(root)?);
     }
-    let is_registry_bound = |rule: &str| registry::REGISTRY_BOUND_RULES.contains(&rule);
     assert!(
         !is_foreign || !violations.iter().any(|violation| is_registry_bound(violation.rule)),
         "a foreign gate skips the rules that are bound to the registry"
@@ -565,9 +564,16 @@ mod tests {
         tree.write("crates/demo/src/lib.rs", "fn a() { loop {} }\n");
         tree.write("crates/demo/Cargo.toml", "[dependencies]\nserde = \"1\"\n");
         tree.write("docs/design/0001-x.md", "- Status: Accepted\n");
+        tree.write(style_guide::STYLE_GUIDE, "## Rules\n\n- Tidy sees it. `[tidy:no-such]`\n");
         let broken = check_with_policy(tree.root(), policy.root()).unwrap();
-        let expected =
-            ["adr-index", "adr-number", "adr-section", "runtime-dependency", "unbounded-loop"];
+        let expected = [
+            "adr-index",
+            "adr-number",
+            "adr-section",
+            "doc-tool-name",
+            "runtime-dependency",
+            "unbounded-loop",
+        ];
         assert_eq!(fired(&broken), BTreeSet::from(expected), "source rules still run");
     }
 
