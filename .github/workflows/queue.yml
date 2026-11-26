@@ -55,6 +55,7 @@ jobs:
     name: queue entry
     if: >-
       github.event_name == 'workflow_run' &&
+      github.event.workflow_run.path == '.github/workflows/ci.yml' &&
       github.event.workflow_run.event == 'merge_group' &&
       github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
@@ -97,11 +98,11 @@ jobs:
         run: git fetch --quiet --no-tags --depth=1 origin main:refs/remotes/origin/main
       - name: Build xtask
         run: cargo build --quiet --locked --package xtask
-      - name: cargo xtask queue failed
+      # The secret is in this step's environment only. Later steps' processes never have it in
+      # theirs: they get the file, which is deleted as soon as the token is minted.
+      - name: Write the bot's key
         env:
           NAMI_AGENT_PRIVATE_KEY: ${{ secrets.NAMI_AGENT_PRIVATE_KEY }}
-          NAMI_AGENT_PERMISSIONS: >-
-            {"issues":"write","actions":"read","contents":"read","pull_requests":"read"}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           if [[ -z "${NAMI_AGENT_PRIVATE_KEY}" ]]; then
@@ -110,14 +111,22 @@ jobs:
               "docs/operations/github-setup.md, step 8"
             exit 1
           fi
+          (umask 077 && printf '%s\n' "${NAMI_AGENT_PRIVATE_KEY}" > "${RUNNER_TEMP}/nami-agent.pem")
+      - name: cargo xtask queue failed
+        env:
+          NAMI_AGENT_PERMISSIONS: >-
+            {"issues":"write","actions":"read","contents":"read","pull_requests":"read"}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
           key="${RUNNER_TEMP}/nami-agent.pem"
           trap 'rm -f "${key}"' EXIT
-          (umask 077 && printf '%s\n' "${NAMI_AGENT_PRIVATE_KEY}" > "${key}")
-          # Only the file holds the key from here on: xtask and gh never see it.
-          unset NAMI_AGENT_PRIVATE_KEY
           GH_TOKEN=$(NAMI_AGENT_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
             xtask/agent-token.sh)
+          # The key file is gone before xtask starts.
           rm -f "${key}"
           echo "::add-mask::${GH_TOKEN}"
           export GH_TOKEN
           cargo xtask queue failed --run "${RUN_ID}"
+      - name: Delete the bot's key
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/nami-agent.pem"
