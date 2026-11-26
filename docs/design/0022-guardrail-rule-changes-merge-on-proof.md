@@ -112,6 +112,7 @@ The judge recomputes the base's reports at each placement itself.
 
 - **Sound against honest mistakes by agents**, which is what #31 showed: a rule that goes silent on cases written down, a deleted check, a narrowed table, a walk that skips a directory, tests that do not pin the change.
 - **Sound against any loosening that can be seen without running head code**: rule ids, ban rows, scopes, allowed lists, `check_*` call sites, lint declarations and registrations. The base reads these from the head's source, so no output of the head's code is involved.
+- **The review gate's separate identity** holds against an honest authoring session acting as the reviewer and against a review counted from the wrong identity. It is hardening only against PR code run during a review and against an authoring account that can become the reviewer account (point 5).
 - **Defence in depth only** against head code written to deceive. Such code can recognise inputs, behave differently when observed, or lie in the records it prints, which the judge reads as data. The placements (point 2) are hardening against code that special-cases the planted cases, not proof. The reviewer app (point 5), sampled audits after merge (ADR-0008) and the trusted core, which deceptive code would have to get past, back the ratchet here.
 
 ### 4. Isolation in CI
@@ -134,11 +135,29 @@ The check passes when all of these hold:
 
 - the reviewer app (`nami-reviewer[bot]`, a GitHub App separate from the agents' `nami-agent[bot]`) has a review on the PR's head commit that is not dismissed;
 - the PR was not opened by that app;
-- every review thread is resolved, and resolved by that app.
+- every review thread that the app opened is resolved, and resolved by that app; a thread of someone else's that the app resolved is a finding, and everyone else's threads are left to the ruleset, which requires every conversation resolved before merge.
 
 A review of an earlier commit does not count, not even for fixes, because `review-pr` re-reviews the new head and resolves the fixed threads then.
 
 The authoring sessions never hold the reviewer's key. It belongs to another OS account or machine (`docs/operations/github-setup.md`, step 5b). `xtask/agent-token.sh` selects the app with `NAMI_AGENT_APP=reviewer`, and refuses to let the reviewer app commit or push. CI learns the login from the repository variable `NAMI_REVIEWER_LOGIN`.
+
+**What the separate identity protects against:**
+
+- an honest authoring session posting or resolving as the reviewer by accident: the key is not in its environment, and its account cannot read it;
+- a review counted from the wrong identity: only `nami-reviewer[bot]` counts, never the `nami-agent[bot]` that every authoring session holds.
+
+**What it does not protect against:**
+
+- PR code run by the reviewer's subagents. That code runs as the reviewer account.
+- An authoring account that can become the reviewer account: passwordless `sudo` or `su`, `lxd`, `docker`, `pkexec`, or a launcher that switches user without a human.
+
+Against these it is hardening only, as point 3 says for all deceptive code. The mitigation:
+
+- The review-pr skill and both reviewer agents run PR code only in a bubblewrap sandbox. The sandbox hides the key directory, drops the reviewer's variables and the token, and runs in its own PID namespace.
+- The key is read only before the reviewers start and in the final posting steps.
+- The runbook requires that the authoring account cannot become the reviewer account.
+
+What holds and what does not is written in step 5b. A reviewer hosted in CI, with the key as a secret of a workflow that runs no PR code, is possible future work.
 
 Until the maintainer has created the app and set the variable, the review gate gives no verdict, so a rule-path PR needs a code owner's approval of its head commit, as today: the safe default.
 
