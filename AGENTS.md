@@ -25,7 +25,8 @@ The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0019):
 
 - **At session start,** `$HOME/.cargo/bin` is put on `PATH`, and `cargo xtask doctor` reports any
-  tool whose version is wrong.
+  tool whose version is wrong. A session in which gh can reach a person's GitHub login is
+  stopped.
 - **After every edit,** a `.rs` file is formatted, and the edited file is checked against the tidy
   rules that need only that file. Manifests, ADRs and `TIGER_STYLE.md` are checked too. Fix what is reported straight away.
 - **Before you stop,** `just check` and `just dylint` run, unless your tree equals `main` or the
@@ -150,8 +151,12 @@ The authoritative list is `.github/CODEOWNERS`.
   `main`.
 - **You act as `nami-agent[bot]`.** In Claude Code, `.claude/settings.json` already makes git
   commit and push as the bot, so use plain commands: `git push origin <branch>`. Prefix gh with
-  `GH_TOKEN=$(xtask/agent-token.sh)`. If a push or token is refused, stop and ask. Never use a
-  human's credentials (`docs/operations/github-setup.md`, step 6).
+  `GH_TOKEN=$(xtask/agent-token.sh)`. Without it, gh fails with "not logged in": sessions see
+  no human login. If a push or token is refused, stop and ask. Never use a human's credentials
+  (`docs/operations/github-setup.md`, step 6).
+- **Write files with the Write tool, never with a shell heredoc.** A heredoc that ends early
+  makes bash run the rest of the text as commands. Once it ran a `gh` command from a runbook.
+  Commit messages and PR bodies count too: write them to a file, then pass the file (`-F`).
 - **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
   `docs/exec-plans/README.md`).
   - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
