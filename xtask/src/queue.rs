@@ -15,7 +15,12 @@
 //!
 //! Both act on the checkout's GitHub repository as whoever `GH_TOKEN` names, and read the code
 //! owners from `.github/CODEOWNERS` on `<remote>/main` (`$NAMI_TASK_REMOTE`, or `origin`). The
-//! workflow `.github/workflows/queue.yml` runs them.
+//! workflow `.github/workflows/queue.yml` runs them. When `NAMI_FILING_TOKEN` is set, the two
+//! tokens are kept apart: everything about issues, the filing included, acts as
+//! `NAMI_FILING_TOKEN`, and every other read (runs, jobs, logs, pull requests, the merge queue,
+//! commits and the repository's contents) acts as `GH_TOKEN`, with `NAMI_FILING_TOKEN` removed
+//! from gh's environment. In CI, `GH_TOKEN` is the workflow's own read-only token and
+//! `NAMI_FILING_TOKEN` the CI app's, narrowed to `issues: write` (ADR-0023).
 
 pub mod clashes;
 pub mod failure;
@@ -37,6 +42,10 @@ const USAGE: &str =
 /// and the bot. A marker in anyone else's comment is ignored.
 const COMMENT_AUTHORS: [&str; 2] = ["github-actions[bot]", BOT_LOGIN];
 
+/// The variable whose token files issues, when it is set (ADR-0023). `GH_TOKEN` then reads
+/// everything else.
+const FILING_TOKEN: &str = "NAMI_FILING_TOKEN";
+
 /// The branch whose ADRs every PR is compared with.
 const MAIN: &str = "main";
 
@@ -45,10 +54,10 @@ pub fn run(arguments: &[&str]) -> ExitCode {
     let root = crate::workspace_root();
     let remote = std::env::var("NAMI_TASK_REMOTE").unwrap_or_else(|_| "origin".to_owned());
     let main = format!("{remote}/{MAIN}");
-    let gh = Gh::new(&root);
+    let (forge, tracker) = clients(&root, std::env::var_os(FILING_TOKEN).is_some());
     let vocabulary = || Vocabulary::load(&root, &main);
     let result = trust::load(&root, &main)
-        .and_then(|trust| execute(&gh, &gh, &trust, &vocabulary, arguments));
+        .and_then(|trust| execute(&forge, &tracker, &trust, &vocabulary, arguments));
     match result {
         Ok(output) => {
             print!("{output}");
@@ -59,6 +68,16 @@ pub fn run(arguments: &[&str]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The client for reads that are not about issues, and the one for issues. With
+/// `separate_filing`, the second acts as [`FILING_TOKEN`] and the first never sees it;
+/// otherwise both act as `GH_TOKEN`.
+fn clients(root: &std::path::Path, separate_filing: bool) -> (Gh, Gh) {
+    if !separate_filing {
+        return (Gh::new(root), Gh::new(root));
+    }
+    (Gh::new(root).hiding(FILING_TOKEN), Gh::with_token_from(root, FILING_TOKEN))
 }
 
 /// Runs one command against `forge` and `github`, trusting the authors in `trust`, and quoting
@@ -313,7 +332,7 @@ mod tests {
     use crate::issue::github::{
         Comment, GitHub, Issue, LabelEvent, issue_from_json, parse_lines, string_at,
     };
-    use crate::issue::trust::Trust;
+    use crate::issue::trust::{BOT_LOGIN, CI_LOGIN, Trust};
     use crate::json::{Value, parse};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -406,9 +425,23 @@ mod tests {
         )
     }
 
+    /// Which of the two clients a [`Fake`] stands for. A call that the other client should
+    /// have made fails the test.
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    enum Serves {
+        /// Both, as when `GH_TOKEN` is the only token.
+        #[default]
+        Both,
+        /// Reads that are not about issues: the workflow's own token in CI.
+        Forge,
+        /// Issues: the CI app's token in CI.
+        Tracker,
+    }
+
     /// GitHub as fixed `gh api` output, recording what is written.
     #[derive(Default)]
     struct Fake {
+        serves: Serves,
         pulls: &'static str,
         main: &'static str,
         files: BTreeMap<u32, String>,
@@ -431,68 +464,97 @@ mod tests {
         string_at(entry, &["name"])
     }
 
+    impl Fake {
+        /// Fails the test unless this fake stands for `client`.
+        fn serve(&self, client: Serves) {
+            assert!(
+                matches!(self.serves, Serves::Both) || self.serves == client,
+                "a {client:?} call reached the {:?} client",
+                self.serves
+            );
+        }
+    }
+
     impl Forge for Fake {
         fn adr_names_on(&self, branch: &str) -> Result<Vec<String>, String> {
+            self.serve(Serves::Forge);
             assert_eq!(branch, "main");
             Ok(lines(self.main, name_of))
         }
         fn open_pulls(&self) -> Result<Vec<Pull>, String> {
+            self.serve(Serves::Forge);
             Ok(lines(self.pulls, pull_from_json))
         }
         fn pull_files(&self, number: u32) -> Result<Vec<PullFile>, String> {
+            self.serve(Serves::Forge);
             Ok(lines(self.files.get(&number).map_or("", String::as_str), pull_file_from_json))
         }
         fn pull_comments(&self, _number: u32) -> Result<Vec<PullComment>, String> {
+            self.serve(Serves::Forge);
             Ok(lines(&self.comments, pull_comment_from_json))
         }
         fn post_comment(&self, number: u32, body: &str) -> Result<(), String> {
+            self.serve(Serves::Forge);
             self.posted.borrow_mut().push((number, body.to_owned()));
             Ok(())
         }
         fn edit_comment(&self, id: u64, body: &str) -> Result<(), String> {
+            self.serve(Serves::Forge);
             self.edited.borrow_mut().push((id, body.to_owned()));
             Ok(())
         }
         fn run(&self, _id: u64) -> Result<Run, String> {
+            self.serve(Serves::Forge);
             run_from_json(&parse(&self.run).unwrap())
         }
         fn jobs(&self, _id: u64) -> Result<Vec<Job>, String> {
+            self.serve(Serves::Forge);
             jobs_from_json(&parse(JOBS).unwrap())
         }
         fn job_log(&self, id: u64) -> Result<String, String> {
+            self.serve(Serves::Forge);
             if id == 11 { Ok(LOG.to_owned()) } else { Err(format!("no log for {id}")) }
         }
         fn commit_messages(&self, base: &str, head: &str) -> Result<Vec<String>, String> {
+            self.serve(Serves::Forge);
             assert_eq!((base, head), (BASE_SHA, SHA), "the group is read from its base");
             strings_from_json(&parse(self.messages).unwrap())
         }
         fn pull_state(&self, number: u32) -> Result<PullState, String> {
+            self.serve(Serves::Forge);
             assert_eq!(number, 51);
             pull_state_from_json(&parse(&self.state.0).unwrap(), &parse(&self.state.1).unwrap())
         }
         fn queue_runs_since(&self, created_at: &str) -> Result<Vec<Run>, String> {
+            self.serve(Serves::Forge);
             assert_eq!(created_at, "2026-11-26T08:24:28Z");
             Ok(lines(&self.queue_runs, run_from_json))
         }
         fn repository(&self) -> Result<String, String> {
+            self.serve(Serves::Forge);
             repository_from_text("namicfd/nami\n")
         }
     }
 
     impl GitHub for Fake {
         fn issue(&self, number: u32) -> Result<Issue, String> {
+            self.serve(Serves::Tracker);
             Err(format!("not asked for #{number}"))
         }
         fn open_issues(&self) -> Result<Vec<Issue>, String> {
+            self.serve(Serves::Tracker);
             Ok(lines(&self.issues, issue_from_json))
         }
         fn comments(&self, number: u32) -> Result<Vec<Comment>, String> {
+            self.serve(Serves::Tracker);
             Err(format!("not asked for #{number}"))
         }
         fn label_events(&self, number: u32) -> Result<Vec<LabelEvent>, String> {
+            self.serve(Serves::Tracker);
             Err(format!("not asked for #{number}"))
         }
         fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String> {
+            self.serve(Serves::Tracker);
             let labels = labels.iter().map(|label| (*label).to_owned()).collect();
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(70)
@@ -507,6 +569,7 @@ mod tests {
             Err("the queue commands never list the labels".to_owned())
         }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
+            self.serve(Serves::Tracker);
             Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
         }
     }
@@ -792,6 +855,57 @@ mod tests {
         let skipped = run(&rerun, &["failed", "--run", "950"]).unwrap();
         assert_eq!(skipped, "#70 already records that run 950 of #51 failed; not filed again\n");
         assert_eq!(rerun.filed.borrow().len(), 1, "only the filing before the re-run");
+    }
+
+    // Goal: with two clients, every read that is not about issues goes to the forge and
+    // every issue call, the filing included, to the tracker: the CI app's token never reads a
+    // run, a log or a PR, and the workflow's token never files (ADR-0023). Method: each fake
+    // fails on the other's calls; the forge also holds a trusted issue for this run, which
+    // would stop the filing if the forge were asked for issues. An issue that the CI app filed
+    // for an earlier run of #51 is trusted and named.
+    #[test]
+    fn reads_and_writes_go_to_their_own_clients() {
+        let recorded =
+            issue_line(5, "PR #51 failed in the merge queue (run 900)", BOT_LOGIN, "open");
+        let forge = Fake { serves: Serves::Forge, issues: recorded, ..dropped() };
+        let earlier = issue_line(6, "PR #51 failed in the merge queue (run 800)", CI_LOGIN, "open");
+        let tracker =
+            Fake { serves: Serves::Tracker, issues: issues() + &earlier, ..Fake::default() };
+        let output =
+            execute(&forge, &tracker, &trust(), &|| Ok(vocabulary()), &["failed", "--run", "900"]);
+        assert_eq!(
+            output.as_deref(),
+            Ok("filed #70: PR #51 failed in the merge queue (run 900)\n")
+        );
+        assert!(forge.filed.borrow().is_empty(), "the forge files nothing");
+        assert!(forge.posted.borrow().is_empty() && forge.edited.borrow().is_empty());
+        let filed = tracker.filed.borrow();
+        assert_eq!(filed.len(), 1, "the tracker files the issue");
+        assert!(
+            filed[0].1.contains("still open: #6."),
+            "the CI app's earlier issue: {}",
+            filed[0].1
+        );
+    }
+
+    // Goal: with `NAMI_FILING_TOKEN` set, the forge client never sees it and the tracker acts
+    // as it; without it, both act as `GH_TOKEN`.
+    #[test]
+    fn the_filing_token_is_kept_apart() {
+        let root = std::path::Path::new(".");
+        let environment = |gh: &crate::issue::github::Gh| -> Vec<(String, Option<String>)> {
+            let tokens = |name: &str| (name == super::FILING_TOKEN).then(|| "write".to_owned());
+            let command = gh.command(&["x"], &tokens).expect("the token is set");
+            let text = |value: &std::ffi::OsStr| value.to_str().expect("UTF-8").to_owned();
+            command.get_envs().map(|(name, value)| (text(name), value.map(text))).collect()
+        };
+        let removed = (super::FILING_TOKEN.to_owned(), None);
+        let (reads, writes) = super::clients(root, true);
+        assert_eq!(environment(&reads), std::slice::from_ref(&removed), "GH_TOKEN is inherited");
+        let filing = ("GH_TOKEN".to_owned(), Some("write".to_owned()));
+        assert_eq!(environment(&writes), [filing, removed]);
+        let (shared_reads, shared_writes) = super::clients(root, false);
+        assert!(environment(&shared_reads).is_empty() && environment(&shared_writes).is_empty());
     }
 
     // Goal: malformed commands and numbers are errors that show the usage.

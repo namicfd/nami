@@ -323,19 +323,63 @@ pub fn repository_of_url(url: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct Gh {
     root: PathBuf,
+    /// The environment variable whose token gh uses instead of `GH_TOKEN`, if any. Only its
+    /// name is kept, so that no token is ever printed with the struct.
+    token_variable: Option<&'static str>,
+    /// The environment variable that gh must not see, if any: another client's token.
+    hidden: Option<&'static str>,
 }
 
 impl Gh {
-    /// Runs `gh` in the checkout at `root`, which decides the repository.
+    /// Runs `gh` in the checkout at `root`, which decides the repository, as `GH_TOKEN`.
     #[must_use]
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf() }
+        Self { root: root.to_path_buf(), token_variable: None, hidden: None }
+    }
+
+    /// Like [`Gh::new`], but gh acts as the token in the environment variable `variable`, and
+    /// the variable itself is removed from gh's environment.
+    #[must_use]
+    pub fn with_token_from(root: &Path, variable: &'static str) -> Self {
+        assert!(!variable.is_empty() && variable != "GH_TOKEN", "a variable other than GH_TOKEN");
+        let gh = Self { root: root.to_path_buf(), token_variable: Some(variable), hidden: None };
+        assert!(gh.token_variable.is_some(), "the token's variable is kept");
+        gh
+    }
+
+    /// This client, with `variable` removed from gh's environment, so that gh never acts as
+    /// the token it holds.
+    #[must_use]
+    pub fn hiding(self, variable: &'static str) -> Self {
+        assert!(!variable.is_empty() && variable != "GH_TOKEN", "a variable other than GH_TOKEN");
+        assert!(self.token_variable.is_none(), "a client with its own token hides it already");
+        Self { hidden: Some(variable), ..self }
+    }
+
+    /// The `gh api` command for `arguments`, with the token that `lookup` gives for this
+    /// client's variable, or the inherited `GH_TOKEN`.
+    pub(crate) fn command(
+        &self,
+        arguments: &[&str],
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Command, String> {
+        let mut command = Command::new("gh");
+        let _ = command.arg("api").args(arguments).current_dir(&self.root);
+        if let Some(variable) = self.token_variable {
+            let token = lookup(variable).filter(|token| !token.trim().is_empty());
+            let token = token.ok_or_else(|| format!("`{variable}` holds no token for gh"))?;
+            let _ = command.env("GH_TOKEN", token).env_remove(variable);
+        }
+        if let Some(variable) = self.hidden {
+            let _ = command.env_remove(variable);
+        }
+        assert!(command.get_args().count() > arguments.len(), "`api` comes first");
+        Ok(command)
     }
 
     /// Runs `gh api` with `arguments`, and `input` on stdin; returns what gh printed.
     pub(crate) fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
-        let mut command = Command::new("gh");
-        let _ = command.arg("api").args(arguments).current_dir(&self.root);
+        let mut command = self.command(arguments, &|name| std::env::var(name).ok())?;
         let _ = command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
         let _ = command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
@@ -641,5 +685,38 @@ mod tests {
             parse_lines(&"{}\n".repeat(super::LIST_MAX)).map(|v| v.len()),
             Ok(super::LIST_MAX)
         );
+    }
+
+    /// The environment that `gh` gets: each variable set to `Some` value or removed (`None`).
+    fn environment_of(gh: &super::Gh) -> Vec<(String, Option<String>)> {
+        let tokens = |name: &str| match name {
+            "GH_TOKEN" => Some("read".to_owned()),
+            "NAMI_FILING_TOKEN" => Some("write".to_owned()),
+            _ => None,
+        };
+        let command = gh.command(&["x"], &tokens).expect("the token is set");
+        let text = |value: &std::ffi::OsStr| value.to_str().expect("UTF-8").to_owned();
+        command.get_envs().map(|(name, value)| (text(name), value.map(text))).collect()
+    }
+
+    // Goal: a client with its own token acts only as that token, and the client that hides it
+    // never sees it, so a write never uses the read token and a read never uses the write
+    // token (ADR-0023). An empty or unset token is an error, never a fallback to GH_TOKEN.
+    #[test]
+    fn each_client_takes_only_its_own_token() {
+        let root = std::path::Path::new(".");
+        let writes = super::Gh::with_token_from(root, "NAMI_FILING_TOKEN");
+        let reads = super::Gh::new(root).hiding("NAMI_FILING_TOKEN");
+        let removed = ("NAMI_FILING_TOKEN".to_owned(), None);
+        assert_eq!(
+            environment_of(&writes),
+            [("GH_TOKEN".to_owned(), Some("write".to_owned())), removed.clone()]
+        );
+        assert_eq!(environment_of(&reads), [removed], "GH_TOKEN, the read token, is inherited");
+        assert!(environment_of(&super::Gh::new(root)).is_empty(), "plain gh inherits all");
+        for empty in [None, Some(" ".to_owned())] {
+            let error = writes.command(&["x"], &|_| empty.clone()).expect_err("no token");
+            assert!(error.contains("`NAMI_FILING_TOKEN` holds no token"), "{error}");
+        }
     }
 }
