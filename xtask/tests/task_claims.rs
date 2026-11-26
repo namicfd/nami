@@ -207,36 +207,68 @@ fn a_remote_rejection_while_the_branch_moved_is_retried() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
-// Goal: a claim of a free task wins while another claim holds the remote's ref lock, though
-// the remote rejects its first pushes and the tip has not moved yet when it refetches.
-// Method: a reference-transaction hook holds the first update in `prepared` for a second and a
-// half; the second clone claims another task meanwhile, and its retries outlast the hold. The
-// remote answers its pushes with `[remote rejected] (reference already exists)`; a pre-receive
-// hook counts the pushes.
+/// Shell: wait for the file `$1` (up to 30 s), else fail loudly.
+const WAIT_FOR: &str = r#"wait_for() {
+  i=0
+  while [ ! -e "$1" ]; do
+    i=$((i + 1))
+    if [ "$i" -gt 3000 ]; then echo "timed out waiting for $1" >&2; exit 1; fi
+    sleep 0.01
+  done
+}"#;
+
+/// Waits (up to 30 s) until `done` holds, else fails the test.
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..3000 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// How many pushes the remote's counting pre-receive hook has seen.
+fn pushes(root: &Path) -> usize {
+    let pushes = std::fs::read_to_string(root.join("remote.git/pushes"));
+    pushes.map_or(0, |pushes| pushes.lines().count())
+}
+
+// Goal: a claim of a free task wins although another claim holds the remote's ref lock, the
+// remote rejects its push, and the tip has not moved when it refetches. Method, driven by
+// markers rather than time:
+// 1. Claim A's update waits in `prepared`, holding the ref lock, until `release`.
+// 2. Claim B's first push (push 2) is rejected at the lock; it refetches the unmoved tip.
+// 3. B's second push (push 3) waits in pre-receive until `b-go`.
+// 4. The test then creates `release`, joins A (committed), creates `b-go` and joins B.
+// B's second push was built on the empty branch, so it is rejected; its third wins.
 #[test]
 fn a_claim_outlasts_another_claim_holding_the_ref_lock() {
     let (root, clones) = setup("contention", 2);
-    let script = r#"if [ "$1" = prepared ] && [ ! -e held ]; then touch held; sleep 1.5; fi"#;
-    install_hook(&root, "reference-transaction", script);
-    install_hook(&root, "pre-receive", "echo push >> pushes");
-    let held = root.join("remote.git/held");
-    let (first, second) = std::thread::scope(|scope| {
+    let hold = format!(
+        "{WAIT_FOR}\nif [ \"$1\" = prepared ] && [ ! -e holding ]; then\n  touch holding\n  \
+         wait_for release\nfi"
+    );
+    install_hook(&root, "reference-transaction", &hold);
+    let count = format!(
+        "{WAIT_FOR}\necho push >> pushes\n\
+         if [ \"$(wc -l < pushes)\" -eq 3 ]; then wait_for b-go; fi"
+    );
+    install_hook(&root, "pre-receive", &count);
+    let remote = root.join("remote.git");
+    std::thread::scope(|scope| {
         let first = scope.spawn(|| claims::claim(&clones[0], "origin", BOT, "t1", "agent: one"));
-        for _ in 0..1000 {
-            if held.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(held.exists(), "the first claim holds the ref lock");
-        let second = claims::claim(&clones[1], "origin", BOT, "t2", "agent: two");
-        (first.join().expect("the first claim finishes"), second)
+        wait_until("A holds the ref lock", || remote.join("holding").exists());
+        let second = scope.spawn(|| claims::claim(&clones[1], "origin", BOT, "t2", "agent: two"));
+        wait_until("B was rejected and pushed again", || pushes(&root) >= 3);
+        std::fs::write(remote.join("release"), "").expect("the marker is written");
+        let first = first.join().expect("claim A finishes");
+        assert_eq!(first, Ok(()), "the claim holding the lock wins");
+        std::fs::write(remote.join("b-go"), "").expect("the marker is written");
+        let second = second.join().expect("claim B finishes");
+        assert_eq!(second, Ok(()), "the claim that was rejected wins too");
     });
-    assert_eq!(first, Ok(()), "the claim holding the lock wins");
-    assert_eq!(second, Ok(()), "the claim that waited wins too");
-    let pushes = std::fs::read_to_string(root.join("remote.git/pushes")).expect("hook ran");
-    let pushes = pushes.lines().count();
-    assert!(pushes > 2, "the waiting claim was rejected at least once: {pushes} pushes");
+    assert_eq!(pushes(&root), 4, "A once; B rejected twice, then landed");
     assert_eq!(claimed(&clones[0]), ["t1=agent: one", "t2=agent: two"], "both claims are held");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }

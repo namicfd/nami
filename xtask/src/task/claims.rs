@@ -32,8 +32,8 @@ pub const PUSH_ATTEMPTS_MAX: u32 = 8;
 /// that a claim outlasts another push holding the remote's ref lock (about 2.4 s in all).
 const PAUSES_MILLISECONDS: [u64; 8] = [0, 25, 50, 100, 200, 400, 800, 800];
 
-/// Claim and release commits this process has built: part of each commit's nonce.
-static COMMITS_BUILT: AtomicU32 = AtomicU32::new(0);
+/// Unique tokens this process has made (for commit nonces and index names): part of each.
+static TOKENS_MADE: AtomicU32 = AtomicU32::new(0);
 
 /// One claimed task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,23 +325,33 @@ fn build_commit(
 }
 
 /// A line that sets this commit apart from every other claim or release, even one built on the
-/// same tip by the same identity in the same second: the process, a per-process count and a
-/// random value. Not the clock: whole seconds are what made commits collide (#32), and clippy
-/// bans reading it (ADR-0005); the random value already covers what a finer clock would.
+/// same tip by the same identity in the same second (#32).
 fn nonce() -> String {
-    let count = COMMITS_BUILT.fetch_add(1, Ordering::Relaxed);
-    assert!(count < u32::MAX, "a process builds fewer than 2^32 claim commits");
-    // A fresh `RandomState` has keys from the operating system's random source.
-    let random = RandomState::new().hash_one(count);
-    let nonce = format!("Nonce: {}-{count}-{random:016x}", std::process::id());
+    let nonce = format!("Nonce: {}", unique_token());
     assert!(!nonce.contains('\n'), "the nonce is one line");
     nonce
 }
 
-/// A path for a throwaway index inside the repository's git directory.
+/// A token no other call returns, in this process or another: the process, a per-process count
+/// and a random value. Not the clock: whole seconds are what made commits collide (#32), and
+/// clippy bans reading it (ADR-0005); the random value already covers what a finer clock would.
+fn unique_token() -> String {
+    let count = TOKENS_MADE.fetch_add(1, Ordering::Relaxed);
+    assert!(count < u32::MAX, "a process makes fewer than 2^32 tokens");
+    // A fresh `RandomState` has keys from the operating system's random source.
+    let random = RandomState::new().hash_one(count);
+    let token = format!("{}-{count}-{random:016x}", std::process::id());
+    let is_plain =
+        token.chars().all(|character| character.is_ascii_alphanumeric() || character == '-');
+    assert!(is_plain, "a token is safe in a file name and a commit message: {token}");
+    token
+}
+
+/// A path for a throwaway index inside the repository's git directory, unique to this call, so
+/// that two claims never share an index, even from two threads of one process.
 fn private_index(root: &Path, task: &str) -> Result<PathBuf, ClaimError> {
     let git_directory = git(root, &["rev-parse", "--absolute-git-dir"], &[], None)?;
-    let name = format!("nami-claim-{task}-{}.index", std::process::id());
+    let name = format!("nami-claim-{task}-{}.index", unique_token());
     Ok(Path::new(git_directory.trim()).join(name))
 }
 
@@ -375,7 +385,7 @@ fn run(mut command: Command, stdin: Option<&str>) -> std::io::Result<Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimError, commit_change, git, retry_reason};
+    use super::{ClaimError, commit_change, git, private_index, retry_reason};
 
     /// The bot's identity and a fixed clock: what makes two claims look the same (#32).
     const BOT: &[(&str, &str)] = &[
@@ -406,6 +416,8 @@ mod tests {
         let tree =
             |commit: &str| git(&root, &["rev-parse", &format!("{commit}^{{tree}}")], &[], None);
         assert_eq!(tree(&first), tree(&second), "only the message differs");
+        let index = |_| private_index(&root, "t").expect("the git directory is found");
+        assert_ne!(index(1), index(2), "two claims in one process never share an index");
         let (released, again) = (build(Some(&first), None), build(Some(&first), None));
         assert_ne!(released, again, "releases on one tip differ");
         let message = git(&root, &["log", "-1", "--format=%B", &first], &[], None);
