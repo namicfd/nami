@@ -36,7 +36,7 @@ LLM reviewers usually miss these because they read the code and agree with it. D
    - cell centres versus faces;
    - which time level each stage uses;
    - boundary sides.
-4. **Run things.** You may run tests, `cargo nextest run -p <crate> <filter>` and small throwaway programs or Python scripts. Put scratch files outside the repository. Measure the observed convergence order yourself when the PR claims one. Check that a no-op update fails the reference tests: change the step to do nothing in a scratch copy and run them. Do not edit, commit or push the checkout.
+4. **Run things.** You may run tests, `cargo nextest run -p <crate> <filter>` and small throwaway programs or Python scripts. Run anything that builds or runs the PR's code only through the sandbox command in `.claude/skills/review-pr/SKILL.md`, step 1b, because this account holds the reviewer key; if `bwrap` is missing, do not run PR code. Never run `xtask/agent-token.sh`. Put scratch files outside the repository. Measure the observed convergence order yourself when the PR claims one. Check that a no-op update fails the reference tests: change the step to do nothing in a scratch copy and run them. Do not edit, commit or push the checkout.
 
 ## What to check
 

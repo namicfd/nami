@@ -14,7 +14,7 @@ This review is the AI half of ADR-0008. It never approves, merges or pushes. Onl
 
 ## 1. Act as the reviewer app
 
-Every `gh` call in this skill runs as the reviewer app, `nami-reviewer[bot]`, never as the maintainer. Only its reviews and resolutions count for the `ratchet` check (ADR-0022); the authoring agents act as `nami-agent[bot]` and must not be able to stand in for it. Shell state does not carry over between commands, so prefix each one:
+Every `gh` call in this skill runs as the reviewer app, `nami-reviewer[bot]`, never as the maintainer. Once the ratchet lands (pending: ADR-0022 in #55, the `ratchet` check in #57), only this app's reviews, and only the threads it opened and resolved, count for that check. The authoring agents act as `nami-agent[bot]` and must not be able to stand in for it. Shell state does not carry over between commands, so prefix each one:
 
 ```sh
 GH_TOKEN=$(NAMI_AGENT_APP=reviewer xtask/agent-token.sh) gh ...
@@ -25,6 +25,22 @@ The reviewer key is only on the reviewer's account (`docs/operations/github-setu
 - Say so in your report.
 - You may still review as `nami-agent[bot]` with `GH_TOKEN=$(xtask/agent-token.sh)`, for the record, but the `ratchet` check will not count that review, so a rule-path PR then needs the code owner.
 - Never fall back to the user's account, and never copy the reviewer key into an authoring session.
+
+**When the key may be read.** Read it only while no PR code runs: in step 2, before the reviewers start, and in the posting steps 5 and 6, after every reviewer has finished and every sandbox has exited. Never mint a token while a reviewer, a test or a build of the PR is still running.
+
+## 1b. Run PR code only in the sandbox
+
+The PR's code (its tests, `just check`, `build.rs`, lints, `xtask`, throwaway programs that link it) runs as this account, which holds the reviewer key. So run it only through this command, which hides the key directory, drops the reviewer's variables and the token, and runs in its own PID namespace, so that nothing it starts outlives it:
+
+```sh
+bwrap --dev-bind / / --tmpfs "$HOME/.config/nami" --unsetenv NAMI_REVIEWER_KEY \
+  --unsetenv NAMI_REVIEWER_CLIENT_ID --unsetenv GH_TOKEN --unshare-pid --die-with-parent \
+  --chdir "$TMPDIR/nami-review-<n>" -- <command>
+```
+
+- **Pass it on.** Tell both reviewers to run every command that builds or runs PR code this way.
+- **Missing bubblewrap.** If `bwrap` is not installed, do not run PR code at all. Rely on CI's results and say so in the review body.
+- **Limits.** This hides the key from PR code; it does not stop a PR that escapes the sandbox, and it relies on the key being in `~/.config/nami`. See step 5b of `docs/operations/github-setup.md` for what holds and what does not.
 
 ## 2. Collect the PR
 

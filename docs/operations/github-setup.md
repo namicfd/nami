@@ -130,9 +130,21 @@ The bot's commit email is `<bot user id>+<app-slug>[bot]@users.noreply.github.co
 - **To rotate:** generate a new key in the app's settings, replace the file, then delete the old key there.
 - **If a key leaks:** delete it in the app's settings first. Tokens already issued expire within an hour.
 
-## 5b. The reviewer's GitHub App (ADR-0022)
+## 5b. The reviewer's GitHub App
 
-The `ratchet` check (ADR-0022, proposed) counts only reviews by a second app, `nami-reviewer[bot]`, and only threads that it resolved. Agents cannot stand in for it, because the authoring sessions never hold its key. Until it exists, `ratchet` gives no verdict on PRs that only change rule paths unless a code owner approves the head commit, so those still need your approval, as today: the safe default.
+This step is for the ratchet's review gate, which is pending: ADR-0022 in #55, the `ratchet` check and its `--reviewer` option in #57. Merge this step after those PRs. Once they land, the `ratchet` check counts only reviews by a second app, `nami-reviewer[bot]`, and only threads that it opened and resolved. Until the app exists, `ratchet` gives no verdict on PRs that only change rule paths unless a code owner approves the head commit. Those PRs therefore still need your approval, as today: the safe default.
+
+**What the separate identity protects against.**
+
+- **An honest authoring session acting as the reviewer by accident.** Such a session could post a review or resolve a thread as the reviewer. It cannot, because the reviewer's key is neither in its environment nor readable by its OS account.
+- **A review counted from the wrong identity.** The ratchet counts `nami-reviewer[bot]` only, never `nami-agent[bot]`, which every authoring session holds.
+
+**What it does not protect against.** Against the cases below, the separate identity is hardening only, as ADR-0022's threat model says for all deliberately deceptive code:
+
+- **PR code that runs in a review session.** During a review, the reviewer agents may run the PR's tests, `just check`, `build.rs` scripts and lints. That code runs as the reviewer account. Without the sandbox (point 5), it could read the key and post a clean review.
+- **An authoring account that can become the reviewer account.** This includes passwordless `sudo` or `su`, membership of `lxd` or `docker` (root-equivalent), `pkexec`, a cached sudo timestamp, and a launcher that switches user without a human. Such an account can read the key whatever its file mode.
+
+A reviewer hosted in CI, with the key as a secret of a workflow that runs no PR code, would remove both gaps. That is possible future work and is not built.
 
 1. **Create it** like the agents' app (step 5), named `nami-reviewer`, with **fewer permissions**:
 
@@ -144,13 +156,40 @@ The `ratchet` check (ADR-0022, proposed) counts only reviews by a second app, `n
 
    No contents write, no workflows, no issues: it never pushes. Give it no bypass and do not make it a code owner.
 2. **Install it** on this repository only.
-3. **Tell CI its login.** Settings → Secrets and variables → Actions → Variables → New repository variable: `NAMI_REVIEWER_LOGIN` = `nami-reviewer[bot]`. The `ratchet` job passes it to `--reviewer`. While the variable is unset, the review gate gives no verdict.
-4. **Keep the key away from authoring sessions.** Every authoring session can read the files of the user it runs as, so the reviewer's key must belong to another user:
-   - create a separate OS account (for example `nami-review`) on the machine that runs reviews, or use a separate machine or orchestrator secret;
-   - store the key there only, as `~/.config/nami/nami-reviewer.pem` with mode 600, or at `NAMI_REVIEWER_KEY`;
-   - set `NAMI_REVIEWER_CLIENT_ID` in that account's environment (`gh api apps/nami-reviewer --jq .client_id`);
-   - start `/review-pr` sessions as that account, in their own clone; never as the authoring user, and never put the reviewer key in `NAMI_AGENT_KEY`, a repository or a shared directory.
-5. **Check it.** As the reviewer account: `GH_TOKEN=$(NAMI_AGENT_APP=reviewer xtask/agent-token.sh) gh api repos/$REPO --jq .full_name`. As the authoring user, the same command must fail: it cannot read the key.
+3. **Tell CI its login** (used by #57's `ratchet` job): Settings → Secrets and variables → Actions → Variables → New repository variable `NAMI_REVIEWER_LOGIN` = `nami-reviewer[bot]`. While the variable is unset, the review gate gives no verdict.
+4. **Keep the key away from authoring sessions.**
+   - Create a separate OS account, for example `nami-review`, on the machine that runs reviews. Alternatively, use a separate machine or an orchestrator secret.
+   - Store the key only in that account, as `~/.config/nami/nami-reviewer.pem` with mode 600 in a directory with mode 700. Keep it at that path: the sandbox of point 5 hides that directory.
+   - Set `NAMI_REVIEWER_CLIENT_ID` in that account's environment. Find it with `gh api apps/nami-reviewer --jq .client_id`; it is not a secret.
+   - **The authoring account must not be able to become `nami-review`, or root.** That means no passwordless `sudo` or `su`, no `lxd` or `docker` group, no `pkexec` rule, and no sudo timestamp it can reuse. Remove the authoring account from those groups. If you cannot, run reviews and keep the key on a separate machine or as an orchestrator secret.
+   - Review sessions are started by a human, or by a process that the authoring account cannot drive. Never start them from the authoring account's orchestrator through a user switch that asks for no password.
+   - Never put the reviewer key in `NAMI_AGENT_KEY`, a repository or a shared directory.
+5. **Run PR code only in the sandbox.**
+   - The review-pr skill and both reviewer agents run PR code (tests, `just check`, throwaway programs) only through the sandbox command in `.claude/skills/review-pr/SKILL.md`, step 1b. That command uses bubblewrap to hide `~/.config/nami`, unset `NAMI_REVIEWER_KEY`, `NAMI_REVIEWER_CLIENT_ID` and `GH_TOKEN`, and run in its own PID namespace, so that nothing it starts outlives it.
+   - The review is posted only in the last step, after all PR code has finished. That step mints the token and is the only place that reads the key.
+   - **What holds:**
+     - PR code run through the sandbox cannot read the key or its variables;
+     - no process it started is still running when the key is read.
+   - **What does not hold:**
+     - running PR code outside the sandbox: this is an instruction to the agents, not a mechanism;
+     - a sandbox or kernel escape;
+     - point 4 not being met.
+6. **Check it.**
+   - As the reviewer account, this must print `namicfd/nami`:
+
+     ```sh
+     GH_TOKEN=$(NAMI_AGENT_APP=reviewer xtask/agent-token.sh) gh api repos/namicfd/nami --jq .full_name
+     ```
+
+   - As the authoring user, both of the following must fail. The client ID is set, so the first command fails only if the key itself cannot be read:
+
+     ```sh
+     NAMI_AGENT_APP=reviewer NAMI_REVIEWER_CLIENT_ID=$(gh api apps/nami-reviewer --jq .client_id) \
+       NAMI_REVIEWER_KEY=/home/nami-review/.config/nami/nami-reviewer.pem xtask/agent-token.sh jwt
+     sudo -n true
+     ```
+
+     The first must fail with `cannot read the reviewer app's private key`. The second must fail with `a password is required` or `not in the sudoers file`.
 
 `xtask/agent-token.sh` selects the app with `NAMI_AGENT_APP` (`agent` by default, or `reviewer`). The reviewer app only mints tokens; `env` and `git-credential` refuse it.
 

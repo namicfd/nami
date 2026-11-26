@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Acts as the agents' GitHub App, `nami-agent` (ADR-0008): mints short-lived tokens so that
-# agents push, open PRs and comment as `nami-agent[bot]`, never as the maintainer. Code-owner
-# review only works if the author of a PR is not the code owner.
+# Acts as one of nami's GitHub Apps and mints short-lived tokens for it (ADR-0008):
+# - `nami-agent` (the default): agents push, open PRs and comment as `nami-agent[bot]`, never
+#   as the maintainer. Code-owner review only works if the author of a PR is not the code owner.
+# - `nami-reviewer` (`NAMI_AGENT_APP=reviewer`): the AI review is posted as `nami-reviewer[bot]`,
+#   an identity that authoring sessions do not hold (pending ADR-0022, #55).
 #
 # Usage:
 #   xtask/agent-token.sh [token]             print an installation token (valid for 1 hour)
-#   xtask/agent-token.sh env                 print shell exports that make git and gh act as the bot
+#   xtask/agent-token.sh env                 print exports that make git and gh act as the bot
 #   xtask/agent-token.sh git-credential get  git credential helper (installed by `env`)
 #   xtask/agent-token.sh jwt                 print the app's own JWT (valid for 9 minutes)
 #
@@ -21,14 +23,16 @@
 #
 # Configuration, from the environment:
 #   NAMI_AGENT_APP           which app to act as: `agent` (default) or `reviewer`
-#   NAMI_AGENT_KEY           the agents' app's private key (default: ~/.config/nami/nami-agent.pem)
+#   NAMI_AGENT_KEY           the agents' app's private key
+#                            (default: ~/.config/nami/nami-agent.pem)
 #   NAMI_AGENT_CLIENT_ID     the agents' app's client ID (default: nami-agent's)
 #   NAMI_REVIEWER_KEY        the reviewer app's private key
 #                            (default: ~/.config/nami/nami-reviewer.pem)
-#   NAMI_REVIEWER_CLIENT_ID  the reviewer app's client ID (no default; set once the app exists)
+#   NAMI_REVIEWER_CLIENT_ID  the reviewer app's client ID (no default: set it once the app
+#                            exists)
 #   NAMI_AGENT_REPO          owner/name of the repository (default: namicfd/nami)
 #
-# The reviewer app, `nami-reviewer[bot]`, posts the AI review that the ratchet counts (ADR-0022).
+# The reviewer app posts the AI review that the ratchet would count (pending: #55, #57).
 # It only reads, reviews and resolves threads: `env` and `git-credential` refuse it, and it
 # never reads the agents' key or falls back to it. Its key lives where authoring sessions cannot
 # read it (docs/operations/github-setup.md, step 5b).

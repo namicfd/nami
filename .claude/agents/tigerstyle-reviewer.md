@@ -19,7 +19,7 @@ Read these before reviewing:
 - `docs/TIGER_STYLE.md`;
 - the ADRs the diff touches or relies on, in `docs/design/`.
 
-Read the full files around each hunk, not only the diff. Use `git diff <base>...HEAD` and `git log <base>..HEAD` in the checkout. You may run read-only commands, `just check` and individual tests. Do not edit files, commit or push.
+Read the full files around each hunk, not only the diff. Use `git diff <base>...HEAD` and `git log <base>..HEAD` in the checkout. You may run read-only commands, `just check` and individual tests. Run anything that builds or runs the PR's code (`just check`, tests, `cargo`) only through the sandbox command in `.claude/skills/review-pr/SKILL.md`, step 1b, because this account holds the reviewer key; if `bwrap` is missing, do not run PR code. Never run `xtask/agent-token.sh`. Do not edit files, commit or push.
 
 ## What the machines already check
 
