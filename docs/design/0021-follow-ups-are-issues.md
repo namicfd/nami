@@ -27,7 +27,7 @@ When an agent finds something that its task does not need fixed (a guardrail gap
 
 - **Body.** The file's `# ` heading is the title. The body has `- Found in: <task id or PR>`, `## What happened` and `## Proposed fix`. A guardrail gap's proposal names a rung of the ladder (ADR-0020).
 - **Kind.** Exactly one label of `guardrail-gap`, `bug` and `docs`.
-- **`needs-decision`.** The filer sets it when the fix is a choice that the maintainer makes: cost, policy, or one of several designs. Only a human removes it.
+- **`needs-decision`.** The filer sets it when the fix is a choice that the maintainer makes: cost, policy, or one of several designs. Only a human removes it (amended by point 7: on the bot's own issues, the bot may remove it after recording a code owner's decision).
 - **Duplicates.** Before filing, the command compares the title's words with those of the trusted open issues and prints the matches. If there are any, it stops, unless `--new` says that the agent read them and none is the same finding.
 - **Identity.** The command runs `gh`, so it files as whoever `GH_TOKEN` names. For agents that is `nami-agent[bot]` (`xtask/agent-token.sh`).
 - **Public.** An issue is as public as the code. It never contains credentials, personal details, or text copied from an untrusted source (point 2).
@@ -57,7 +57,7 @@ The repository is public, and anyone may open an issue or comment on one. Issue 
 - **The claim is the mutex.** Git accepts only fast-forward pushes to `claims`, so of two sessions that claim the same issue, exactly one wins, as for tasks. GitHub assignees are not used.
 - **Order.** `ready` lists plan tasks in plan order, then issues, oldest first. A session without an assigned task takes the first entry it can claim.
 - **Partial lists fail.** When GitHub cannot be reached, `ready` prints the plan tasks and exits non-zero, naming the problem. A partial list is never presented as a complete one.
-- **`needs-decision` stays until a human removes it.** `ready` and `claim` read the issue's timeline. If the label was ever applied, its removal must come from a trusted human, not the bot.
+- **`needs-decision` stays until a human removes it.** `ready` and `claim` read the issue's timeline. If the label was ever applied, its removal must come from a trusted human, not the bot (amended by point 7: on an issue that the bot opened, a bot removal also counts if a code owner's decision record backs it).
 - **An issue that needs more than one small PR goes back.** The worker releases the claim, comments why, and adds `needs-decision`. The maintainer or the planner turns it into a plan (ADR-0011) and closes the issue with a link to the plan.
 - **A duplicate found later** is closed by the worker, with a link to the issue it keeps.
 
@@ -86,9 +86,9 @@ The workflow `queue` files an issue `PR #<n> failed in the merge queue (run <id>
 - **If anyone else opened #n,** agents do not push to it. The issue says that a human rebases it, and it carries `needs-decision`, so `cargo xtask task ready` does not list it.
 - **The issue quotes only checked text.** The queue ran the PRs' own code and workflow files, so the run's logs and its job and step names are untrusted (point 2). The issue names jobs and steps only by names that `main`'s `.github/workflows/ci.yml` defines, reports codes only as tidy's rule IDs and the dylint lints' names, and builds its links from the repository name and IDs. The fixer reads the log through the link.
 
-### 7. Amendment (Proposed, 2026-11-26): the bot removes `needs-decision` after it records a code owner's decision
+### 7. Amendment (Proposed, 2026-11-26): the bot removes `needs-decision` from its own issues after it records a code owner's decision
 
-The maintainer makes most decisions in a conversation with a session, not on GitHub, so a decided issue waited for a click (issue #65). Points 1 and 3 change: the bot may also remove `needs-decision`, right after it posts a decision record.
+The maintainer makes most decisions in a conversation with a session, not on GitHub, so a decided issue waited for a click (issue #65). Points 1 and 3 change for issues that the bot opened: there, the bot may also remove `needs-decision`, after it posts a decision record. On an issue that a code owner opened, only a code owner removes the label, as before.
 
 - **The record** is a comment by the bot of exactly these four lines:
 
@@ -99,16 +99,25 @@ The maintainer makes most decisions in a conversation with a session, not on Git
   Source: <the session or PR where it was decided>
   ```
 
-- **When the bot's removal counts.** The bot's latest comment posted no later than the removal is a record in this form, it was not edited after the removal, its date is a calendar day, and its decider is a code owner in `.github/CODEOWNERS` on `main`. GitHub's times have whole seconds, so a record from the same second as the removal counts. Any other removal by the bot, and any removal by someone who is not a code owner, still does not count. A code owner's removal counts as before, and adding the label again reopens the question.
-- **`cargo xtask issue decide <n> --by <login> --date <YYYY-MM-DD> --source <text> <decision.md>`** posts the record, then removes the label. It refuses unless the issue is trusted and has `needs-decision`, and `--by` is a code owner. The date is an option because xtask reads no clock (`SystemTime::now` is banned, ADR-0005), and because a decision may be recorded on a later day. `issue show` marks the record.
-- **This rests on agent honesty.** Every agent holds the bot's key, so an agent could record a decision that nobody made. The threat model already assumes honest agents: the bot can file an issue without `needs-decision` in the first place, and nothing checks that it should have. The record makes the claim checkable: it names who decided, when and where, and the maintainer reopens the question by adding the label again.
+- **When the bot's removal counts.** All of these hold:
+  - the bot opened the issue;
+  - the bot's latest comment posted no later than the removal is a record in this form;
+  - that comment was posted after the latest addition of `needs-decision` before the removal, and it was not edited after the removal;
+  - its decider is a code owner in `.github/CODEOWNERS` on `main`. A login ending in `[bot]` never is, even if `CODEOWNERS` names it;
+  - its date is a calendar day, no later than the day the comment was posted (UTC).
+
+  Any other removal by the bot, and any removal by someone who is not a code owner, still does not count. A code owner's removal counts as before. Adding the label again reopens the question, and only a record posted after the re-addition answers it.
+- **Ties.** GitHub's times have whole seconds, and the two ties go opposite ways. A record from the same second as the removal counts, because `issue decide` posts the record and then removes the label at once. A record from the same second as the latest addition does not: it may be older than the question, so the tie is broken closed. A removal with no addition on record does not count either.
+- **`cargo xtask issue decide <n> --by <login> --date <YYYY-MM-DD> --source <text> <decision.md>`** posts the record, then removes the label. It refuses unless the bot opened the issue, the issue has `needs-decision`, and `--by` is a code owner. The date is an option because xtask reads no clock (`SystemTime::now` is banned, ADR-0005), and because a decision may be recorded on a later day. `issue show` marks the record.
+- **This rests on agent honesty, on the bot's own issues only.** Every agent holds the bot's key, so an agent could record a decision that nobody made and lift the label. On the bot's own issues that adds no new exposure: the threat model already trusts the bot to file an issue with or without `needs-decision`, and nothing checks that choice. An issue that a code owner opened is different. There `needs-decision` keeps it from agents, however dishonest or prompt-injected a session is, and this amendment keeps that protection: a bot removal never counts there. Every decided issue that prompted this (#25, #48, #59) was filed by the bot. The record makes each lifted label auditable: it names who decided, when and where, and the maintainer reopens the question by adding the label again.
+- **Limits.** Comments that were deleted are invisible. If a bot comment that is not a record sits between a record and the removal, deleting it makes the older record count again. Like the record itself, this rests on agent honesty.
 
 ## Enforcement
 
 - `cargo xtask issue file`: the body's sections, one kind label, and the duplicate search.
 - `cargo xtask issue show`: the trust filter on the issue and its comments.
-- `cargo xtask task ready` and `claim`: trusted, open, labelled, no `needs-decision` unless a code owner removed it, or the bot removed it right after a decision record by a code owner (point 7), unclaimed; then the claims branch.
-- `cargo xtask issue decide` (point 7): it posts the record only on a trusted issue with `needs-decision`, for a code owner, and then removes the label. The record's form is parsed strictly, and tests cover each near miss.
+- `cargo xtask task ready` and `claim`: trusted, open, labelled, unclaimed, and no `needs-decision` unless a code owner removed it or, on an issue that the bot opened, the bot removed it with a decision record that a code owner made, posted after the label's latest addition and no later than the removal (point 7); then the claims branch.
+- `cargo xtask issue decide` (point 7): it posts the record only on an issue that the bot opened and that has `needs-decision`, for a code owner, and then removes the label. The record's form is parsed strictly, and tests cover each near miss, including a stale record from before a re-addition and both same-second ties.
 - The plan rules in tidy: a plan task ID never starts with `issue-`.
 - `cargo xtask pr-body`: the `Follow-up issues` section, and `Fixes #<number>` on an issue's branch.
 - `.claude/settings.json`: deny rules for reading issues with `gh` directly. A speed bump, not a guarantee.
@@ -120,6 +129,7 @@ The maintainer makes most decisions in a conversation with a session, not on Git
   - whether an agent files an issue when it should. As before, the PR description forces an explicit `None`, and the sampled audits (ADR-0008) look for a `None` that is wrong;
   - whether a filing agent copied untrusted text into an issue;
   - whether a decision record states a decision that the code owner made (point 7). It rests on agent honesty;
+  - deleted comments (point 7). Deleting a bot comment that sits between a record and the removal makes the older record count again;
   - two sessions that file the same finding within the same minute. The worker closes the duplicate.
 
 ## Consequences
