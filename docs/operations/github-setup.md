@@ -142,13 +142,35 @@ The `env` block in `.claude/settings.json` makes every Claude Code session in th
 - the bot as author and committer of every commit;
 - an empty `credential.helper` first, which switches off the user's own helpers such as the macOS keychain, then `xtask/agent-token.sh git-credential`, found at run time through `git rev-parse --show-toplevel`, which hands git a fresh token for each operation;
 - a rewrite of `git@github.com:` remotes to HTTPS, so a clone made over SSH pushes as the bot too;
-- `GIT_TERMINAL_PROMPT=0`, so a missing key fails at once instead of waiting for a password.
+- `GIT_TERMINAL_PROMPT=0`, so a missing key fails at once instead of waiting for a password;
+- `GH_CONFIG_DIR` and `DBUS_SESSION_BUS_ADDRESS`, which hide a human's gh login from the session (below).
 
 Agents therefore run plain commands: `git push origin <branch>`. Claude Code refuses git commands that inject configuration, such as `git -c credential.helper=...`, in worktree-isolated sessions, and plain commands are what it accepts. For gh, which reads no git configuration, agents prefix each command: `GH_TOKEN=$(xtask/agent-token.sh) gh ...`.
 
 The only thing a machine provides is the private key (step 5). The settings apply from the next session that starts; a running session keeps its environment. They need git 2.31 or newer for `GIT_CONFIG_COUNT`.
 
 **If a push or a token is refused, stop and ask the maintainer.** Do not retry with another spelling of the command, and never fall back to a human's SSH key or keychain.
+
+### The maintainer's own login stays outside agent sessions
+
+A gh command without the prefix would otherwise use whatever login gh finds on the machine, which is the maintainer's. A forgotten prefix, a token script that printed nothing, or text that bash ran as commands is enough. On 2026-11-26 a heredoc ended early, and `gh variable set` wrote a repository variable as the maintainer (issue #69). The maintainer keeps their login, and uses it outside Claude Code: in a terminal of their own, not in a session in this repository.
+
+gh looks for a token for github.com in this order: `GH_TOKEN`, `GITHUB_TOKEN`, `hosts.yml` in its configuration directory, and last the system keyring, where `gh auth login` keeps a token for the host even when `hosts.yml` names no one. What enforces it:
+
+- **`GH_CONFIG_DIR=/nonexistent/nami-agents-have-no-gh-login`.** gh finds no `hosts.yml` and so no stored login. The path is absolute, so it is the same in every worktree and directory. It lies below a directory that does not exist and that only root could create, so nothing can log in there. gh with `GH_TOKEN` works as before, and git does not read this directory.
+- **`DBUS_SESSION_BUS_ADDRESS=disabled:`.** On Linux the keyring is the Secret Service on the session bus. An address with no known transport makes gh's keyring lookup fail. It also cuts off other keyring helpers, which no agent needs.
+- **The session-start hook** (`cargo xtask hook session-start`, `xtask/src/hook/github_login.rs`) runs gh without `GH_TOKEN` and `GITHUB_TOKEN`. `gh auth status` must report no login, and `gh auth token` must find no token. The second also sees the keyring, which `gh auth status` does not list. If `GH_TOKEN` or `GITHUB_TOKEN` is set, it must be an installation token (`ghs_`). If gh can still reach a login, the hook **stops the session** and tells the human and the agent which source it found. If the check cannot tell, for example because gh is missing or answers in an unknown way, it warns and the session goes on.
+
+A gh command without the prefix then fails:
+
+```console
+$ gh api user
+To get started with GitHub CLI, please run:  gh auth login
+```
+
+**macOS.** gh reads the keychain through `/usr/bin/security`, and no variable can hide it. If the session-start hook stops a session for a token in the keyring, move the login out of the keychain: run `gh auth logout`, then `gh auth login --insecure-storage`. The login is then kept only in `~/.config/gh/hosts.yml`, which sessions do not see. The other way is to run agents as a separate macOS user that has no gh login.
+
+**If the hook stops a session for a stored login,** the session did not get the `env` block: it was started outside this repository's Claude Code settings, or by a launcher that sets its own environment. Start it as described here, or give the launcher the same variables (below).
 
 ### Other launchers
 
@@ -159,7 +181,7 @@ eval "$(xtask/agent-token.sh env)"   # this shell and its children now act as na
 claude -p "..."
 ```
 
-`env` exports the variables above, with the script's absolute path as the helper, plus a `GH_TOKEN` that expires after an hour. Run it again for longer sessions. An orchestrator that cannot run a command at launch can copy the `env` block from `.claude/settings.json` as it stands, and set `NAMI_AGENT_KEY` if the key is not at the default path.
+`env` exports the git variables above, with the script's absolute path as the helper, plus a `GH_TOKEN` that expires after an hour. Run it again for longer sessions. It does not yet export `GH_CONFIG_DIR` and `DBUS_SESSION_BUS_ADDRESS` (issue #71): set them as `.claude/settings.json` does, or a gh command whose token is empty uses the maintainer's login. An orchestrator that cannot run a command at launch can copy the `env` block from `.claude/settings.json` as it stands, and set `NAMI_AGENT_KEY` if the key is not at the default path.
 
 `xtask/agent-token.sh` alone prints one token, and `jwt` prints the app's own JWT for debugging.
 
@@ -227,11 +249,13 @@ GH_TOKEN=$(xtask/agent-token.sh) gh api installation/repositories --jq '[.reposi
 gh api "repos/$REPO/rulesets" --jq '.[] | {name, enforcement}'
 ```
 
-In a new Claude Code session, check that the settings reached the shell. The username must be `x-access-token`; anything else means a human's credentials would be used:
+In a new Claude Code session, check that the settings reached the shell. The username must be `x-access-token`; anything else means a human's credentials would be used. `gh api user` must fail with "gh auth login", and the same call with the bot's token must work:
 
 ```sh
 git var GIT_AUTHOR_IDENT
 printf 'protocol=https\nhost=github.com\n\n' | git credential fill | grep '^username'
+gh api user
+GH_TOKEN=$(xtask/agent-token.sh) gh api "repos/$REPO" --jq .full_name
 ```
 
 Then try the flow end to end:
