@@ -24,7 +24,7 @@ permissions: {}
 # runs after a newer one. Each run rebuilds `bot/passes` from its own main, and reconciles the
 # PR, so whatever the last run leaves is right.
 concurrency:
-  group: passes
+  group: passes-${{ github.ref }}
   cancel-in-progress: false
 
 env:
