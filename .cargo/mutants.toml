@@ -8,5 +8,5 @@ exclude_re = [
     "(doctor|dylint|pr)\\.rs.*(replace|in) (run|run_protected|run_body)\\b",
     "(task|issue|queue)\\.rs.*(replace|in) run\\b",
     # `Gh` runs `gh api`; its parsing is tested on JSON, and the trait on fakes.
-    "(github|forge)\\.rs.*\\bGh\\b",
+    "(github|forge|passes)\\.rs.*\\bGh\\b",
 ]
