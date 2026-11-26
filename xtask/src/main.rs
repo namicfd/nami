@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         ["hook", event] => xtask::hook::run(event),
         ["task", rest @ ..] => xtask::task::run(rest),
         ["issue", rest @ ..] => xtask::issue::run(rest),
+        ["queue", rest @ ..] => xtask::queue::run(rest),
         _ => {
             eprintln!("usage: cargo xtask tidy [--file <path> | --root <dir> [--policy <dir>]]");
             eprintln!("       | rules [--write]");
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "       | hook <post-edit|stop|session-start> | task <command> | issue <command>"
             );
+            eprintln!("       | queue <command>");
             ExitCode::FAILURE
         }
     }

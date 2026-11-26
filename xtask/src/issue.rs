@@ -253,7 +253,7 @@ impl Draft {
 }
 
 /// Files `draft`, unless a trusted open issue may already record it.
-fn file(
+pub(crate) fn file(
     draft: &Draft,
     options: &FileOptions<'_>,
     github: &dyn GitHub,

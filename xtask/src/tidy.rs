@@ -15,7 +15,7 @@
 //! the reader how to fix it.
 
 pub mod cli;
-mod docs;
+pub(crate) mod docs;
 #[cfg(test)]
 mod fixtures;
 mod lints;

@@ -177,14 +177,14 @@ pub fn parse_lines(text: &str) -> Result<Vec<Value>, String> {
 }
 
 /// The text at `path` below `value`: `["user", "login"]` is `value.user.login`.
-fn string_at(value: &Value, path: &[&str]) -> Result<String, String> {
+pub(crate) fn string_at(value: &Value, path: &[&str]) -> Result<String, String> {
     let found = path.iter().try_fold(value, |inner, key| inner.get(key));
     let text = found.and_then(Value::as_str);
     text.map(str::to_owned).ok_or_else(|| format!("GitHub sent no string at `{}`", path.join(".")))
 }
 
 /// A string field that GitHub may send as `null`: an issue or comment without text.
-fn optional_string(value: &Value, key: &str) -> Result<String, String> {
+pub(crate) fn optional_string(value: &Value, key: &str) -> Result<String, String> {
     match value.get(key) {
         None | Some(Value::Null) => Ok(String::new()),
         Some(Value::String(text)) => Ok(text.clone()),
@@ -213,7 +213,8 @@ impl Gh {
         Self { root: root.to_path_buf() }
     }
 
-    fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
+    /// Runs `gh api` with `arguments`, and `input` on stdin; returns what gh printed.
+    pub(crate) fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
         let mut command = Command::new("gh");
         let _ = command.arg("api").args(arguments).current_dir(&self.root);
         let _ = command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -239,11 +240,13 @@ impl Gh {
         ))
     }
 
-    fn list(&self, path: &str) -> Result<Vec<Value>, String> {
+    /// Every entry of a paginated listing at `path`.
+    pub(crate) fn list(&self, path: &str) -> Result<Vec<Value>, String> {
         parse_lines(&self.api(&["--paginate", path, "--jq", ".[]"], None)?)
     }
 
-    fn one(&self, arguments: &[&str], input: Option<&str>) -> Result<Value, String> {
+    /// One JSON value from `gh api`.
+    pub(crate) fn one(&self, arguments: &[&str], input: Option<&str>) -> Result<Value, String> {
         let text = self.api(arguments, input)?;
         json::parse(&text).map_err(|error| format!("gh printed invalid JSON: {}", error.message))
     }
