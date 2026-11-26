@@ -59,6 +59,9 @@ const EDIT_CHECK_SECONDS_MAX: u32 = 60;
 /// Seconds the stop gate may take (hook timeout: 600). A cold gate took 114 seconds.
 const GATE_SECONDS_MAX: u32 = 480;
 
+/// Seconds a killed check may take to end before the hook stops waiting for it.
+const REAP_SECONDS_MAX: u32 = 5;
+
 /// Milliseconds between two polls of a check for its end.
 const POLL_INTERVAL_MILLISECONDS: u32 = 20;
 
@@ -260,10 +263,25 @@ fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
         return Ok(status);
     }
     let group = kill_process_group(child);
-    let killed = match (child.wait(), group) {
+    // The reap is bounded too, so that a child the kill did not reach cannot hang the hook.
+    let mut reaped = Err("it did not end after the kill".to_owned());
+    for _ in 0..polls_in(REAP_SECONDS_MAX) {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                reaped = Ok(status);
+                break;
+            }
+            Ok(None) => std::thread::sleep(interval),
+            Err(error) => {
+                reaped = Err(format!("cannot be waited for: {error}"));
+                break;
+            }
+        }
+    }
+    let killed = match (reaped, group) {
         (Ok(status), Ok(())) => status.to_string(),
         (Ok(status), Err(error)) => format!("{status}; {error}"),
-        (Err(error), _) => format!("cannot be waited for: {error}"),
+        (Err(error), _) => error,
     };
     let seconds = polls_max * POLL_INTERVAL_MILLISECONDS / 1000;
     Err(format!("did not finish within {seconds} seconds and was killed ({killed})"))
