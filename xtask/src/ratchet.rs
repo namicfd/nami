@@ -16,18 +16,28 @@
 //! Without a subcommand, both run in one process, for local use and the tests. See [`cli`] for
 //! the options.
 //!
+//! **Two classes.** Each rule-path diff is additive or an edit ([`class`]). An additive diff
+//! adds rules and leaves every existing item as it is; it passes on the ratchet's checks
+//! alone. An edit changes existing rule code; every check still runs, and the review gate also
+//! needs the reviewer app's approval of the head commit, or until the app exists (#59) a code
+//! owner's. The reason: every honest loosening that the review of #57 found edited existing
+//! rule code together with its tests, which mutation testing cannot see, and the independent
+//! review caught each one.
+//!
 //! **Threat model.** The ratchet is sound against honest mistakes, within what it checks. Its
 //! `syn` checks are sound for files in the dialect of [`dialect`], and a rule-path file outside
 //! it gives no verdict: for those files, the rule tables, scopes, allowed lists, the presence of
 //! each `check_*` call site, and the lints' levels and registrations are what the compiler
-//! builds, and the constants, the code that reads the environment or files, and the functions
-//! that decide whether a ban row applies to a path or a name are the base's. That the other
-//! rule code applies its rules as written, and that a call that is present also runs, the
-//! corpus shows at the paths it plants each case at (its own, two drawn ones in its scope, and
-//! for a firing case one in each crate, each crate's tests, `xtask`, `lints`, `tools` and
-//! `docs`, wherever the base reports the same), and mutation testing shows for every changed
-//! hunk. A coded rule narrowed to a single file or a deeper directory that no placement
-//! reaches is not shown.
+//! builds. For an additive diff, the existing rule code is the base's, token for token, and
+//! the new code can neither shadow it nor reach its state; that the new rules fire as their
+//! cases say, the corpus, end to end and mutation testing of the new code show. Residual risk
+//! there: new code that misbehaves through a path the class does not see, such as interior
+//! mutability behind a shared reference, and a new rule that fires too little, which only
+//! makes the guardrails less strict than they could be, never less strict than the base. For
+//! an edit, soundness rests on the independent reviewer; the checks catch what they can (a
+//! removed row or call, a case that no longer fires where the corpus plants it, a missed
+//! mutant), and a narrowing that neither the corpus nor the edited tests meet is the residual
+//! risk the reviewer carries.
 //! Against head code written to deceive, the rest is defence in depth only; the reviewer app,
 //! sampled audits and the trusted core back it. The reviewer app is the bot that
 //! `NAMI_REVIEWER_LOGIN` names, and the review it posts runs in CI (pending #59), where no
@@ -43,8 +53,10 @@
 //! **Exit code.** 0: pass, also when paths outside the rule paths changed (`pass, outside the
 //! rule paths`: CODEOWNERS decides on those). 1: fail, at least one finding. 2: no verdict:
 //! bad arguments, a tool that could not run or answer, an output that cannot be read, or a
-//! change the ratchet cannot vouch for (no mutant, no reviewer app) where no code owner reviews.
+//! change the ratchet cannot vouch for (no mutant, no reviewer app, an edit
+//! without its approval) where no code owner reviews.
 
+pub mod class;
 pub mod cli;
 mod corpus;
 pub mod dialect;
@@ -206,6 +218,9 @@ pub struct Verdict {
     pub unproven_after: Vec<String>,
     /// The commits judged, as `base..head`, for the summary.
     pub range: String,
+    /// Whether the rule-path diff is additive or edits existing rule code; `None` when no rule
+    /// path changed.
+    pub class: Option<class::Class>,
     /// What the summary should say besides the findings: counts, skipped checks and why.
     pub notes: Vec<String>,
 }
@@ -225,20 +240,24 @@ impl Verdict {
         self.line_with(&self.unproven_after)
     }
 
+    /// The verdict line with `unproven`, naming the class when a rule path changed:
+    /// `ratchet: pass (additive)`, `ratchet: no verdict (edit), ..`.
     fn line_with(&self, unproven: &[String]) -> String {
+        let class =
+            self.class.as_ref().map_or(String::new(), |class| format!(" ({})", class.name()));
         if !self.findings.is_empty() {
-            format!("ratchet: fail, {} finding(s)", self.findings.len())
+            format!("ratchet: fail{class}, {} finding(s)", self.findings.len())
         } else if !unproven.is_empty() {
             format!(
-                "ratchet: no verdict, {} thing(s) unproven; the code owner decides",
+                "ratchet: no verdict{class}, {} thing(s) unproven; the code owner decides",
                 unproven.len()
             )
         } else if self.outside.is_empty() {
-            "ratchet: pass".to_owned()
+            format!("ratchet: pass{class}")
         } else {
             format!(
-                "ratchet: pass, outside the rule paths: {} changed path(s) that CODEOWNERS \
-                 decides on",
+                "ratchet: pass{class}, outside the rule paths: {} changed path(s) that \
+                 CODEOWNERS decides on",
                 self.outside.len()
             )
         }
@@ -267,6 +286,14 @@ impl Verdict {
         lines.push(format!("- ... and would after ADR-0022: {}", self.owner_reviews_after));
         lines.push(format!("- A code owner approved the head commit: {}", self.owner_approved));
         lines.push(format!("- Checks run: {ran}"));
+        if let Some(class) = &self.class {
+            lines.push(format!(
+                "- Class: {} ({} change(s) to existing rule code)",
+                class.name(),
+                class.edits.len()
+            ));
+            lines.extend(class.edits.iter().map(|edit| format!("- **Edit:** {edit}")));
+        }
         lines.extend(self.notes.iter().map(|note| format!("- {note}")));
         lines.extend(self.unproven_after.iter().map(|what| format!("- **Unproven:** {what}")));
         if !self.outside.is_empty() {
@@ -499,35 +526,68 @@ fn judge_proof(
         );
         return Ok(());
     }
+    let class = class::classify(base, head, &verdict.rule_paths)?;
+    // What mutation testing could not show. For an edit, the reviewer app's approval stands in
+    // for it: a test edited with the code it tests pins the edit, so mutants prove little there.
+    let mut uncovered = Vec::new();
     if tools.mutants {
+        let rule_paths = verdict.rule_paths.clone();
         let judged =
-            mutants::judge(base, head, &verdict.rule_paths.clone(), observed, &tools.work)?;
+            mutants::judge(base, head, &rule_paths, observed, &tools.work, &class.dispatch)?;
         verdict.notes.extend(judged.notes);
-        for what in judged.unproven {
-            verdict.unprovable(what);
-        }
+        uncovered = judged.unproven;
         verdict.add(Check::Mutants, judged.findings);
     } else {
         verdict.unprovable("mutation testing was skipped (`--no-mutants`)".to_owned());
     }
-    match &tools.review {
-        Some(source) => match &source.reviewer {
-            Some(reviewer) => {
-                let gate = review::check(source.reviews, source.pull, &source.head, reviewer)?;
-                verdict.add(Check::Review, gate.findings);
-                for what in gate.unproven {
-                    verdict.unprovable(what);
-                }
-            }
-            None => verdict.unprovable(format!(
-                "no reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}), so no review \
-                 independent of the author is shown; the reviewer runs in CI (pending #59)",
-                review::REVIEWER_APP
-            )),
-        },
-        None => verdict.unprovable("the review check was skipped (`--no-review`)".to_owned()),
+    let approved = review_gate(tools, verdict)?;
+    if class.is_edit() && approved {
+        verdict.notes.push(format!(
+            "An edit to existing rule code: the reviewer app approved the head commit, which \
+             stands in for the {} hunk(s) without a mutant of their own.",
+            uncovered.len()
+        ));
+    } else {
+        if class.is_edit() {
+            let more = class.edits.len() - 1;
+            let first = class.edits.first().cloned().unwrap_or_default();
+            verdict.unprovable(format!(
+                "edit to existing rule code needs the reviewer app's approval or a code \
+                 owner's: {first}{}",
+                if more == 0 { String::new() } else { format!(" (and {more} more)") }
+            ));
+        }
+        for what in uncovered {
+            verdict.unprovable(what);
+        }
     }
+    verdict.class = Some(class);
     Ok(())
+}
+
+/// The review gate ([`review::check`]): its findings and what it could not show go into
+/// `verdict`. Returns true if the reviewer app approved the head commit, which an edit to
+/// existing rule code needs.
+fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> Result<bool, String> {
+    let Some(source) = &tools.review else {
+        verdict.unprovable("the review check was skipped (`--no-review`)".to_owned());
+        return Ok(false);
+    };
+    let Some(reviewer) = &source.reviewer else {
+        verdict.unprovable(format!(
+            "no reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}), so no review \
+             independent of the author is shown; the reviewer runs in CI (pending #59)",
+            review::REVIEWER_APP
+        ));
+        return Ok(false);
+    };
+    let gate = review::check(source.reviews, source.pull, &source.head, reviewer)?;
+    let clean = gate.findings.is_empty() && gate.unproven.is_empty();
+    verdict.add(Check::Review, gate.findings);
+    for what in gate.unproven {
+        verdict.unprovable(what);
+    }
+    Ok(gate.approved && clean)
 }
 
 /// Observes and judges in one process: for local runs and the tests.

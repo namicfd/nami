@@ -4,11 +4,14 @@
 //! literal, a deleted line or a moved statement makes no mutant, and another function's mutant
 //! does not test it. So every changed hunk must contain a mutant, one whose span starts on one
 //! of its lines, or be one that cannot change what a rule reports: a hunk of comments and blank
-//! lines only, or a hunk inside the test module or inside a constant or static, which the
-//! dialect holds to the base ([`super::dialect::fixed`]). The registry is read as data, so its
-//! hunks need no mutant, but each changed field of a row must be one that the rule-set check
-//! compares or one that only documents ([`super::dialect::registry::unproven_rows`]). Any other
-//! hunk, a pure deletion among them, is unproven.
+//! lines only, a hunk inside the test module, or a hunk of dispatch calls, which the new
+//! rule's case shows to run ([`super::class::dispatch`]). The registry's tables are read as
+//! data, so their hunks need no mutant. Any other hunk, a pure deletion among them, is unproven.
+//!
+//! A mutant on a line says only that the head's tests pin the head's behaviour there: a test
+//! edited together with the code it tests pins the edit. So for an edit to existing rule code
+//! ([`super::class`]), the reviewer app's approval stands in for a hunk without a mutant, and
+//! the per-hunk rule is what an additive diff's new code has to meet.
 
 use super::dialect;
 use std::path::Path;
@@ -98,8 +101,7 @@ pub fn hunks(base: &Path, head: &Path, relative: &str, work: &Path) -> Result<Ve
     }
 }
 
-/// The line ranges of `text` where a change needs no mutant: the test module, and every
-/// constant and static.
+/// The line ranges of `text` where a change needs no mutant: the test module.
 ///
 /// # Errors
 ///
@@ -107,38 +109,15 @@ pub fn hunks(base: &Path, head: &Path, relative: &str, work: &Path) -> Result<Ve
 pub fn exempt_ranges(relative: &str, text: &str) -> Result<Vec<(u32, u32)>, String> {
     let file =
         syn::parse_file(text).map_err(|error| format!("{relative} does not parse: {error}"))?;
-    let mut finder = Constants { ranges: Vec::new() };
-    for item in &file.items {
-        if matches!(item, syn::Item::Mod(module) if dialect::is_test_module(module)) {
-            finder.ranges.push(lines_of(item.span()));
-        } else {
-            syn::visit::Visit::visit_item(&mut finder, item);
-        }
-    }
-    Ok(finder.ranges)
-}
-
-fn lines_of(span: proc_macro2::Span) -> (u32, u32) {
     let line = |position: usize| u32::try_from(position).unwrap_or(u32::MAX);
-    (line(span.start().line), line(span.end().line))
-}
-
-struct Constants {
-    ranges: Vec<(u32, u32)>,
-}
-
-impl<'ast> syn::visit::Visit<'ast> for Constants {
-    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        self.ranges.push(lines_of(node.span()));
-    }
-
-    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        self.ranges.push(lines_of(node.span()));
-    }
-
-    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
-        self.ranges.push(lines_of(node.span()));
-    }
+    let ranges: Vec<(u32, u32)> = file
+        .items
+        .iter()
+        .filter(|item| matches!(item, syn::Item::Mod(module) if dialect::is_test_module(module)))
+        .map(|item| (line(item.span().start().line), line(item.span().end().line)))
+        .collect();
+    assert!(ranges.len() <= file.items.len(), "one range per test module");
+    Ok(ranges)
 }
 
 /// True for a line that a comment or nothing makes up.
@@ -192,8 +171,8 @@ mod tests {
     }
 
     // Goal: a hunk contains a mutant only if one starts on an added line; a pure deletion
-    // contains none; comments, and changes inside the test module or a constant on both sides,
-    // need none.
+    // contains none; comments, and changes inside the test module on both sides, need none. A
+    // constant is no exemption: a changed constant is an edit.
     #[test]
     fn coverage_is_per_hunk() {
         let changed = hunk(5, &["a", "b"], 5, &["c"]);
@@ -208,7 +187,7 @@ mod tests {
         let text = "const A: u8 = 1;\nfn f() {\n    const B: u8 = 2;\n}\n\
                     #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n\
                     static C: u8 = 3;\nstruct S;\nimpl S {\n    const D: u8 = 4;\n}\n";
-        let expected = vec![(1, 1), (3, 3), (5, 8), (9, 9), (12, 12)];
+        let expected = vec![(5, 8)];
         assert_eq!(exempt_ranges("m.rs", text), Ok(expected));
     }
 }

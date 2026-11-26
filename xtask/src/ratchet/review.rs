@@ -12,6 +12,10 @@
 //! even when the later commits are fixes: the reviewer re-reviews the new head and resolves the
 //! threads that are fixed then.
 //!
+//! An edit to existing rule code ([`super::class`]) needs more: the app's latest decision must
+//! be an approval of the head commit ([`Gate::approved`]). Until the app exists (#59), a code
+//! owner's approval of the head stands in, as for everything else the ratchet cannot prove.
+//!
 //! The gate counts the reviews that bot posts, whatever posts them. The review is meant to run
 //! in CI (pending #59), where no authoring session holds the app's key; the gate itself does
 //! not depend on where the review ran.
@@ -202,6 +206,9 @@ pub struct Gate {
     pub findings: Vec<Finding>,
     /// No review of the head by the reviewer.
     pub unproven: Vec<String>,
+    /// True if the reviewer's latest decision is an approval of the head commit: what an edit
+    /// to existing rule code needs besides the rest of the gate (ADR-0022).
+    pub approved: bool,
 }
 
 /// Whether the reviewer's requests for changes stand.
@@ -300,6 +307,9 @@ pub fn check(
     let reviewed_head = own.iter().any(|review| {
         review.commit == judged && (review.state == COMMENTED || review.state == APPROVED)
     });
+    let approved = latest_decision(&all, &app)
+        .is_some_and(|decision| decision.state == APPROVED && decision.commit == judged);
+    assert!(reviewed_head || !approved, "an approval of the head is a review of it");
     match objection(&own, &reviews.dismissed(pull)?) {
         Objection::Standing => report(format!(
             "{reviewer} requests changes on this pull request; fix them, and have it review the \
@@ -314,6 +324,7 @@ pub fn check(
     for problem in thread_problems(&reviews.threads(pull)?, reviewer) {
         report(problem);
     }
+    gate.approved = approved;
     if !reviewed_head {
         gate.unproven.push(format!(
             "{reviewer} has not reviewed the head commit {judged} of #{pull}, so no review \
@@ -655,6 +666,29 @@ mod tests {
             "the author's app is never the reviewer"
         );
         assert!(check(&good, 7, "b", "nami-reviewer").is_err(), "the reviewer is an app");
+    }
+
+    // Goal: the gate shows an approval, which an edit to existing rule code needs, only when the
+    // reviewer's latest decision approves the head: not a comment, not an approval of an earlier
+    // commit, not one that a later request for changes or a dismissal replaced, and not an
+    // approval by someone else; a later comment leaves the approval standing.
+    #[test]
+    fn an_approval_counts_only_as_the_latest_decision_on_the_head() {
+        let approved = |reviews: Vec<Review>| check(&fixed(reviews, vec![]), 7, "b", REVIEWER_APP);
+        let head = review(reviewer(), "b", "APPROVED");
+        assert!(approved(vec![head.clone()]).unwrap().approved);
+        let commented = vec![head.clone(), review(reviewer(), "b", "COMMENTED")];
+        assert!(approved(commented).unwrap().approved, "a comment decides nothing");
+        let refused = [
+            vec![review(reviewer(), "b", "COMMENTED")],
+            vec![review(reviewer(), "a", "APPROVED"), review(reviewer(), "b", "COMMENTED")],
+            vec![head.clone(), review(reviewer(), "b", "CHANGES_REQUESTED")],
+            vec![review(reviewer(), "b", "DISMISSED")],
+            vec![review(Actor::user("owner"), "b", "APPROVED")],
+        ];
+        for (index, reviews) in refused.into_iter().enumerate() {
+            assert!(!approved(reviews).unwrap().approved, "case {index}");
+        }
     }
 
     // Goal: a user account that took the reviewer app's name is not the reviewer: its review,

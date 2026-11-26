@@ -4,14 +4,15 @@
 //! a slice of struct literals of its row type, `PLANNED` a slice of `planned(..)` calls, and
 //! every argument a string literal, `&[..]` of string literals, or an enum variant with its
 //! full type path. No attribute sits inside a table, and the tables carry doc comments only.
-//! Everything else in the registry, the row types and enums and their code included, must be
-//! token for token what the base has: a change there needs the code owner.
+//! Everything else in the registry, the row types and enums and their code included, is rule
+//! code like any other: a change there makes the diff an edit ([`super::super::class`]), which
+//! the reviewer app or a code owner has to approve.
 //!
-//! A change to the rows needs no mutant only where the rule-set check proves it: every field
-//! that changes must be one that check compares ([`COMPARED`]) or one that only documents
-//! ([`DOCUMENTATION`]); any other is unproven ([`unproven_rows`]).
+//! A change to the rows is additive only where the rule-set check proves it: every field that
+//! changes must be one that check compares ([`COMPARED`]) or one that only documents
+//! ([`DOCUMENTATION`]); any other makes the diff an edit ([`unproven_rows`]).
 
-use super::{is_doc, is_test_module, outside, parse};
+use super::{is_doc, outside, parse};
 use proc_macro2::TokenStream;
 use std::collections::{BTreeMap, BTreeSet};
 use syn::spanned::Spanned;
@@ -47,15 +48,20 @@ const PLANNED_FIELDS: [&str; 4] = ["id", "mechanism", "description", "reference"
 pub const ENUMS: [(&str, &[&str]); 2] =
     [("RuleKind", &["Source", "Workspace"]), ("BanScope", &["Everywhere", "NamiCrates"])];
 
-/// Checks the head's registry against the dialect, with `base_text` as the base's registry.
+/// True for one of the registry's tables, which the data checks read row by row.
+#[must_use]
+pub fn is_table(item: &syn::Item) -> bool {
+    matches!(item, syn::Item::Const(constant)
+        if ROW_TYPES.iter().any(|(name, _)| constant.ident == name))
+}
+
+/// Checks the head's registry against the dialect.
 ///
 /// # Errors
 ///
-/// No verdict: either file does not parse, or the head is outside the dialect.
-pub fn check(base_text: &str, head_text: &str) -> Result<(), String> {
+/// No verdict: the file does not parse, or is outside the dialect.
+pub fn check(head_text: &str) -> Result<(), String> {
     let head = parse(REGISTRY, head_text)?;
-    let base = syn::parse_file(base_text)
-        .map_err(|error| format!("the base's {REGISTRY} does not parse: {error}"))?;
     if !head.attrs.iter().all(is_doc) {
         return Err(outside(REGISTRY, "a file attribute other than a doc comment"));
     }
@@ -78,39 +84,8 @@ pub fn check(base_text: &str, head_text: &str) -> Result<(), String> {
             "tables other than RULES, PATH_BANS, MACRO_BANS and PLANNED, once each",
         ));
     }
-    let (before, after) = (others(base_text, &base)?, others(head_text, &head)?);
-    if before != after {
-        let changed =
-            after.iter().zip(&before).position(|(head_item, base_item)| head_item != base_item);
-        let at = changed.unwrap_or(before.len().min(after.len()));
-        return Err(outside(
-            REGISTRY,
-            &format!(
-                "a change outside the tables (item {} of {} differs from the base's)",
-                at + 1,
-                after.len()
-            ),
-        ));
-    }
+    assert!(seen.len() == ROW_TYPES.len(), "each table was read once");
     Ok(())
-}
-
-/// Every item but the tables and the test module, as normalised token text.
-fn others(text: &str, file: &syn::File) -> Result<Vec<String>, String> {
-    let mut found = Vec::new();
-    for item in &file.items {
-        let is_table = matches!(item, syn::Item::Const(constant)
-            if ROW_TYPES.iter().any(|(name, _)| constant.ident == name));
-        let is_tests = matches!(item, syn::Item::Mod(module) if is_test_module(module));
-        if !is_table && !is_tests {
-            let range = item.span().byte_range();
-            let source = text.get(range).ok_or("an item's span lies outside its file")?;
-            let tokens: TokenStream =
-                source.parse().map_err(|error| format!("an item does not lex: {error}"))?;
-            found.push(tokens.to_string());
-        }
-    }
-    Ok(found)
 }
 
 /// One table: `pub const NAME: &[Type] = &[row, ..];` with doc comments only.

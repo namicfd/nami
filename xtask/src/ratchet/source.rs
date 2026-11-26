@@ -6,15 +6,12 @@
 //! Mutation testing makes no mutant for a changed table row. These checks cover the registry's
 //! tables as data: every base row must be in the head unchanged or narrowed in what it permits,
 //! and every base `check_*` call site must still be there. That is a statement about the
-//! tables and the call sites, not about what tidy enforces. How the rule modules apply a ban
-//! row is code, so the functions that decide whether a row applies to a path or a name are held
-//! to the base ([`super::dialect::fixed`]). The rest of their code the corpus shows only at the
-//! paths where it plants a case, one per scope class for a firing case
-//! ([`super::plant::scope_placements`]), and mutation testing per changed hunk
-//! ([`super::hunks`]). Only the fields these checks compare, and those that only document, are
-//! covered: a change to any other field of a row is unproven
-//! ([`super::dialect::registry::unproven_rows`]). A table in a form this module does not read
-//! is no verdict, never a pass.
+//! tables and the call sites, not about what tidy enforces. How the rule modules apply a row is
+//! code: an additive diff leaves that code as it is ([`super::class`]), and a diff that edits it
+//! needs the reviewer app's approval, or a code owner's. Only the fields these checks compare,
+//! and those that only document, are covered: a change to any other field of a row makes the
+//! diff an edit ([`super::dialect::registry::unproven_rows`]). A table in a form this module
+//! does not read is no verdict, never a pass.
 
 use super::dialect;
 use super::{Check, Finding};
@@ -283,7 +280,7 @@ pub fn check_calls(relative: &str, text: &str) -> Result<BTreeSet<(String, Strin
 ///
 /// Returns what is unreadable: no verdict.
 pub fn check(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
-    dialect::check_head(base, head)?;
+    dialect::check_head(head)?;
     let read = |root: &Path, relative: &str| -> Result<String, String> {
         read_optional(root, relative)?.ok_or_else(|| format!("{relative} is missing"))
     };
@@ -541,21 +538,28 @@ mod tests {
     }
 
     // Goal: a field names a variant of its own enum, and the rule-set check holds the head's
-    // registry to the dialect: a change outside the tables is no verdict, though the tables
-    // read the same.
+    // registry to the dialect: an attribute inside a table is no verdict. A change outside the
+    // tables reads the same tables, so the rule-set check finds nothing, and the diff is an
+    // edit, which the reviewer app or a code owner approves.
     #[test]
     fn the_registry_is_read_in_the_dialect() {
         let base = real_registry();
         let wrong_enum = base.replacen("kind: RuleKind::Source", "kind: BanScope::Everywhere", 1);
         assert!(parse_registry(&wrong_enum).unwrap_err().contains("`RuleKind::<variant>`"));
         let trees = crate::tidy::scratch::Scratch::new("ratchet-source-dialect");
+        let (base_root, head_root) = (trees.root().join("base"), trees.root().join("head"));
         trees.write(&format!("base/{}", super::REGISTRY), &base);
+        let hidden = base.replacen("    Rule {", "    #[cfg(any())]\n    Rule {", 1);
+        trees.write(&format!("head/{}", super::REGISTRY), &hidden);
+        let error = super::check(&base_root, &head_root).unwrap_err();
+        assert!(error.contains("outside the dialect"), "{error}");
         let narrowed =
             base.replace("self == Self::Everywhere || scope.is_nami()", "scope.is_nami()");
         trees.write(&format!("head/{}", super::REGISTRY), &narrowed);
-        let error =
-            super::check(&trees.root().join("base"), &trees.root().join("head")).unwrap_err();
-        assert!(error.contains("outside the dialect"), "{error}");
+        assert_eq!(super::check(&base_root, &head_root), Ok(Vec::new()));
+        let paths = [super::REGISTRY.to_owned()];
+        let class = crate::ratchet::class::classify(&base_root, &head_root, &paths).unwrap();
+        assert!(class.edits[0].contains("`BanScope::includes` changed"), "{:?}", class.edits);
     }
 
     // Goal: a registry in another form is unreadable, never an empty table.

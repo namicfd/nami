@@ -248,6 +248,8 @@ fn nami_tree(root: &Path) {
 struct FakeReviews {
     reviewer: &'static str,
     commit: &'static str,
+    /// The state of the reviewer's review: `COMMENTED` or `APPROVED`.
+    state: &'static str,
     resolved_by: Option<&'static str>,
     /// An approval: who, and on which commit.
     approval: Option<(&'static str, &'static str)>,
@@ -257,9 +259,14 @@ struct FakeReviews {
 const REVIEWED: FakeReviews = FakeReviews {
     reviewer: REVIEWER_APP,
     commit: "head",
+    state: "COMMENTED",
     resolved_by: Some(REVIEWER_APP),
     approval: None,
 };
+
+/// The reviewer app approved the head and resolved its one thread: what an edit to existing
+/// rule code needs.
+const APPROVED: FakeReviews = FakeReviews { state: "APPROVED", ..REVIEWED };
 
 /// An app for a login with `[bot]`, a user for any other.
 fn actor(login: &str) -> Actor {
@@ -271,7 +278,7 @@ impl Reviews for FakeReviews {
         Ok(Pull { head: "head".to_owned(), author: Actor::app(AUTHOR_APP) })
     }
     fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
-        let state = "COMMENTED".to_owned();
+        let state = self.state.to_owned();
         let commit = self.commit.to_owned();
         let mut reviews = vec![Review { id: 1, author: actor(self.reviewer), commit, state }];
         if let Some((author, approved_commit)) = self.approval {
@@ -377,18 +384,20 @@ fn replaced(text: &str, from: &str, to: &str) -> String {
 }
 
 // Goal: a head that only tightens passes: an extra lint place, a new fixture, and a head that
-// the reviewer app reviewed with its thread resolved give no finding, and every check ran.
+// the reviewer app approved with its thread resolved give no finding, and every check ran.
+// The fake lint library is a data file, so a changed one is an edit to existing rule code.
 #[test]
 fn a_pure_tightening_passes() {
     let case = Case::new("tightening");
     write(&case.head(), "lints/src/fake-lint.txt", "2:5\n4:1\n1:1\n");
     write(&case.head(), "xtask/fixtures/tidy/new-rule.fires.fixture", "// path: a.rs\n");
-    let verdict = case.run(NOTHING, "any");
+    let tools = case.tools(NOTHING, "any", NOTHING, &APPROVED);
+    let verdict = check(&case.base(), &case.head(), &tools).unwrap();
     assert_eq!(found(&verdict), Vec::new(), "{}", verdict.summary());
     let all =
         [Check::RuleSet, Check::TidyCorpus, Check::LintCorpus, Check::EndToEnd, Check::Review];
     assert!(all.iter().all(|check| verdict.checks.contains(check)), "{:?}", verdict.checks);
-    assert_eq!(verdict.line(), "ratchet: pass", "{}", verdict.summary());
+    assert_eq!(verdict.line(), "ratchet: pass (edit)", "{}", verdict.summary());
 }
 
 // Goal: a head whose tidy no longer reports a rule on the base's firing fixture fails, in the
@@ -406,32 +415,18 @@ fn a_loosened_tidy_rule_fails() {
     assert!(verdict.line().starts_with("ratchet: fail"));
 }
 
-// Goal: the review's exploit gives no verdict: a changed constant in a rule module, next to an
-// unrelated change that does get a mutant. And a hunk without a mutant of its own is
-// unproven, though another hunk of the same workspace has one.
+// Goal: an edit to existing rule code, here a changed literal in a function of `text.rs`, is
+// "no verdict (edit)" while the reviewer app has only commented, whatever mutation testing
+// shows; the summary lists the edit and both verdict lines name the class. The reviewer app's
+// approval of the head settles it, and stands in for a hunk without a mutant of its own; so
+// does a code owner's approval. A hunk without a mutant is still unproven without them,
+// though another hunk of the same workspace has one.
 #[test]
-fn a_changed_constant_and_a_hunk_without_a_mutant_are_not_proven() {
-    let case = Case::new("constant");
-    let (rules, text) = ("xtask/src/tidy/rust_source.rs", "xtask/src/tidy/text.rs");
-    for module in [rules, text] {
-        write(&case.base(), module, &real(module));
-        write(&case.head(), module, &real(module));
-    }
-    let message = "expect(\"source files have fewer than 2^32 lines\")";
-    let reworded = "expect(\"source files have far fewer than 2^32 lines\")";
-    write(&case.head(), text, &replaced(&real(text), message, reworded));
-    let tolerance = "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-6;";
-    // Fewer literals are tolerances now: a looser rule, and the head's own unit test that
-    // pinned the old value is edited with it.
-    let looser = "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-9;";
-    let (pinned, repinned) = ("{ x < 1.0e-6 }", "{ x < 1.0e-9 }");
-    let edited = replaced(&replaced(&real(rules), tolerance, looser), pinned, repinned);
-    write(&case.head(), rules, &edited);
-    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
-    let error = check(&case.base(), &case.head(), &tools).unwrap_err();
-    assert!(error.contains("a constant or static that is not the base's"), "{error}");
+fn an_edit_needs_the_reviewer_app_s_approval() {
+    let case = Case::new("edit");
+    let text = "xtask/src/tidy/text.rs";
+    write(&case.base(), text, &real(text));
     for tree in [case.base(), case.head()] {
-        fs::remove_file(tree.join(rules)).unwrap();
         for kind in ["fires", "passes"] {
             for id in ["debt-marker", "test-goal"] {
                 let fixture = format!("xtask/fixtures/tidy/{id}.{kind}.fixture");
@@ -439,17 +434,37 @@ fn a_changed_constant_and_a_hunk_without_a_mutant_are_not_proven() {
             }
         }
     }
-    let covered = check(&case.base(), &case.head(), &tools).unwrap();
-    assert!(covered.unproven.is_empty(), "a mutant in the hunk: {}", covered.summary());
+    let message = "expect(\"source files have fewer than 2^32 lines\")";
+    let reworded = "expect(\"source files have far fewer than 2^32 lines\")";
+    write(&case.head(), text, &replaced(&real(text), message, reworded));
+    let line = real(text).lines().position(|line| line.contains(message)).unwrap() + 1;
+    let commented =
+        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &REVIEWED));
+    let commented = commented.unwrap();
+    assert_eq!(commented.unproven.len(), 1, "{}", commented.summary());
+    let edit = "edit to existing rule code needs the reviewer app's approval or a code owner's";
+    assert!(commented.unproven[0].starts_with(edit), "{}", commented.summary());
+    assert!(commented.line().starts_with("ratchet: no verdict (edit), 1"), "{}", commented.line());
+    let shown = commented.summary();
+    assert!(shown.contains("- Class: edit (1 change(s)") && shown.contains("- **Edit:** "));
+    assert!(shown.contains("after ADR-0022 (rule paths unowned): `ratchet: no verdict (edit)"));
     write(&case.head(), "src/fake-mutants.txt", "xtask/src/tidy/text.rs:1:1: elsewhere\n");
     write(&case.base(), "src/fake-mutants.txt", "xtask/src/tidy/text.rs:1:1: elsewhere\n");
+    let uncovered = format!("text.rs:{line} contains no mutant");
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     let verdict = check(&case.base(), &case.head(), &tools).unwrap();
-    let uncovered =
-        verdict.unproven.iter().any(|what| what.contains("text.rs:47 contains no mutant"));
-    assert!(uncovered, "{}", verdict.summary());
+    assert!(verdict.unproven.iter().any(|what| what.contains(&uncovered)), "{}", verdict.summary());
     let per_hunk = verdict.unproven.iter().all(|what| !what.contains("yields no mutant"));
     assert!(per_hunk, "a workspace with a mutant is judged per hunk: {}", verdict.summary());
-    assert!(verdict.line().starts_with("ratchet: no verdict"), "{}", verdict.summary());
+    let approved =
+        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &APPROVED));
+    let approved = approved.unwrap();
+    assert!(approved.unproven.is_empty(), "{}", approved.summary());
+    assert_eq!(approved.line(), "ratchet: pass (edit)");
+    assert!(approved.notes.iter().any(|note| note.contains("stands in for the 1 hunk(s)")));
+    let owner = FakeReviews { approval: Some(("owner", "head")), ..REVIEWED };
+    let owned = check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &owner));
+    assert_eq!(owned.unwrap().line(), "ratchet: pass (edit)", "a code owner's approval");
 }
 
 // Goal: a data-only change that the rule-set check covers passes without a mutant: a new rule
@@ -765,6 +780,7 @@ fn mutation_results_are_read_strictly() {
 fn only_the_reviewer_app_counts() {
     let case = Case::new("reviewer");
     let own = FakeReviews {
+        state: "COMMENTED",
         approval: None,
         reviewer: AUTHOR_APP,
         commit: "head",
@@ -779,6 +795,7 @@ fn only_the_reviewer_app_counts() {
     let cleared = check(&case.base(), &case.head(), &approving).unwrap();
     assert!(cleared.unproven.is_empty(), "an owner's approval clears it: {}", cleared.summary());
     let resolved = FakeReviews {
+        state: "COMMENTED",
         approval: None,
         reviewer: REVIEWER_APP,
         commit: "head",
@@ -894,7 +911,7 @@ fn the_head_xtask_is_built_from_the_head() {
     let mut tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     tools.head_xtask = None;
     let verdict = check(&case.base(), &case.head(), &tools).expect("a verdict");
-    assert_eq!(verdict.line(), "ratchet: pass", "{}", verdict.summary());
+    assert_eq!(verdict.line(), "ratchet: pass (additive)", "{}", verdict.summary());
     assert!(case.head().join("target/debug/xtask").is_file(), "built in the head");
     write(&case.head(), "broken-build", "");
     let error = check(&case.base(), &case.head(), &tools).expect_err("no verdict");
@@ -936,7 +953,7 @@ fn the_command_line_reports_the_verdict_in_its_exit_code() {
     let loose_args = ["--no-review", "--head-xtask", loose_path.as_str()];
     let (code, line) = run(&base, &honest_args);
     assert_eq!(code, Some(0), "{line}");
-    assert!(line.starts_with("ratchet: pass, outside the rule paths: 1"), "{line}");
+    assert!(line.starts_with("ratchet: pass (additive), outside the rule paths: 1"), "{line}");
     let (loose_code, loose_line) = run(&base, &loose_args);
     assert_eq!(loose_code, Some(1), "{loose_line}");
     let observations = case.place.path("observations.json");
@@ -981,7 +998,7 @@ fn a_code_owner_approval_stands_in_for_what_is_unproven() {
     assert_eq!(unapproved.unproven.len(), 2, "{}", unapproved.summary());
     let approved = verdict(Some(("owner", "head")));
     assert!(approved.owner_approved && approved.unproven.is_empty(), "{}", approved.summary());
-    assert_eq!(approved.line(), "ratchet: pass");
+    assert_eq!(approved.line(), "ratchet: pass (additive)");
     assert!(approved.notes.iter().any(|note| note.contains("approval of the head stands in")));
     assert_eq!(verdict(Some(("owner", "earlier"))).unproven.len(), 2, "an earlier commit");
     assert_eq!(verdict(Some(("someone", "head"))).unproven.len(), 2, "not a code owner");

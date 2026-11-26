@@ -12,8 +12,8 @@
 //! no verdict. A changed hunk without a mutant of its own proves nothing either, because a
 //! changed constant or a deleted line makes none ([`super::hunks`]). The registry's tables are
 //! the exception: the rule-set check reads them as data, so a change to them alone passes with
-//! no mutant, as long as every field it changes is one that check compares or one that only
-//! documents ([`super::dialect::registry::unproven_rows`]).
+//! no mutant; a changed field that the data checks do not prove makes the diff an edit
+//! ([`super::class`]).
 
 use super::observations::{Observations, Run};
 use super::{Check, Finding, Tools};
@@ -107,7 +107,8 @@ pub struct Judged {
     pub unproven: Vec<String>,
 }
 
-/// Judges the recorded mutation runs. `Err` is no verdict.
+/// Judges the recorded mutation runs. `dispatch` holds the head lines of the dispatch calls
+/// by file, whose hunks need no mutant of their own. `Err` is no verdict.
 ///
 /// # Errors
 ///
@@ -119,6 +120,7 @@ pub fn judge(
     rule_paths: &[String],
     observations: &Observations,
     work: &Path,
+    dispatch: &BTreeMap<String, Vec<(u32, u32)>>,
 ) -> Result<Judged, String> {
     let mut judged = Judged::default();
     for workspace in &WORKSPACES {
@@ -133,19 +135,14 @@ pub fn judge(
         judged
             .notes
             .push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
-        // A hunk that the data checks cover (a registry row whose changed fields they compare
-        // or that only document) needs no mutant, so a data-only change passes with none;
-        // every other hunk needs one of its own.
+        // The registry's tables are data, which the rule-set check reads, so a data-only change
+        // passes with no mutant; every other hunk needs one of its own.
         let starts =
             if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
         let mut uncovered = Vec::new();
         for path in changed_sources(rule_paths, workspace) {
-            uncovered.extend(uncovered_hunks(base, head, path, &starts, work)?);
-        }
-        if rule_paths.iter().any(|path| path == super::source::REGISTRY)
-            && super::source::REGISTRY.starts_with(workspace.sources)
-        {
-            uncovered.extend(unproven_rows(base, head)?);
+            let calls = dispatch.get(path.as_str()).map_or(&[][..], Vec::as_slice);
+            uncovered.extend(uncovered_hunks(base, head, path, &starts, work, calls)?);
         }
         assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
         if count > 0 {
@@ -162,24 +159,8 @@ pub fn judge(
     Ok(judged)
 }
 
-/// The registry rows whose change no data check proves ([`dialect::registry::unproven_rows`]).
-///
-/// # Errors
-///
-/// No verdict: the registry is missing in either tree, or unreadable.
-fn unproven_rows(base: &Path, head: &Path) -> Result<Vec<String>, String> {
-    let registry = super::source::REGISTRY;
-    let read = |root: &Path| -> Result<String, String> {
-        super::source::read_optional(root, registry)?
-            .ok_or_else(|| format!("{registry} is missing in {}", root.display()))
-    };
-    let unproven = super::dialect::registry::unproven_rows(&read(base)?, &read(head)?)?;
-    assert!(unproven.iter().all(|item| item.contains(registry)), "each item names the registry");
-    Ok(unproven)
-}
-
 /// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, whose
-/// tables the rule-set check reads as data, and whose rows [`unproven_rows`] judges.
+/// tables the rule-set check reads as data, and whose other changes are edits.
 fn changed_sources<'a>(rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
     rule_paths
         .iter()
@@ -225,13 +206,15 @@ fn mutant_starts(run: &Run, directory: &str) -> Result<BTreeMap<String, Vec<u32>
     Ok(starts)
 }
 
-/// Every hunk of `path` that needs a mutant and contains none, as an unproven item.
+/// Every hunk of `path` that needs a mutant and contains none, as an unproven item. `calls` are
+/// the head lines of its dispatch calls, which need none.
 fn uncovered_hunks(
     base: &Path,
     head: &Path,
     path: &str,
     starts: &BTreeMap<String, Vec<u32>>,
     work: &Path,
+    calls: &[(u32, u32)],
 ) -> Result<Vec<String>, String> {
     let ranges = |root: &Path| -> Result<Vec<(u32, u32)>, String> {
         match super::source::read_optional(root, path)? {
@@ -239,7 +222,8 @@ fn uncovered_hunks(
             None => Ok(Vec::new()),
         }
     };
-    let (base_ranges, head_ranges) = (ranges(base)?, ranges(head)?);
+    let (base_ranges, mut head_ranges) = (ranges(base)?, ranges(head)?);
+    head_ranges.extend_from_slice(calls);
     let lines = starts.get(path).map_or(&[][..], Vec::as_slice);
     let mut unproven = Vec::new();
     for hunk in super::hunks::hunks(base, head, path, work)? {

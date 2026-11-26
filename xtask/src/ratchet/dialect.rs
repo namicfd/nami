@@ -13,8 +13,7 @@
 //! - **The registry** ([`registry`]): the tables `RULES`, `PATH_BANS`, `MACRO_BANS` and
 //!   `PLANNED`, written as slices of struct literals or `planned(..)` calls whose arguments are
 //!   string literals, `&[..]` of string literals, or enum variants written with their full type
-//!   path (`BanScope::Everywhere`); doc comments only on the tables and nothing inside them; an
-//!   inline `#[cfg(test)] mod tests`; and every other item token for token as in the base.
+//!   path (`BanScope::Everywhere`); doc comments only on the tables and nothing inside them.
 //! - **A rule module** ([`rules`]): the attributes `doc`, `derive`, `must_use`, `inline` and
 //!   `expect` on items, fields and variants only, and `#[cfg(test)]` only on an inline
 //!   `mod tests`, which the readers skip; no other module; no item macro and no macro but the
@@ -27,8 +26,11 @@
 //!   module; each lint declared at the top of a file with `declare_lint!` or
 //!   `declare_tool_lint!` in the form `pub NAME, Level, "description"`, and no other binding
 //!   of its name.
+//!
+//! The dialect makes the readings sound; it does not keep existing code as it was. Whether a
+//! diff changes existing rule code at all is the class's question ([`super::class`]): an edit
+//! needs the reviewer app's approval, or a code owner's.
 
-pub mod fixed;
 pub mod lints;
 pub mod registry;
 pub mod rules;
@@ -51,7 +53,7 @@ fn outside(relative: &str, problem: &str) -> String {
 }
 
 /// Every identifier in `stream`, macro bodies included, in order.
-fn identifiers(stream: TokenStream) -> Vec<proc_macro2::Ident> {
+pub(crate) fn identifiers(stream: TokenStream) -> Vec<proc_macro2::Ident> {
     let mut pending: Vec<TokenTree> = stream.into_iter().collect();
     pending.reverse();
     let mut found = Vec::new();
@@ -158,36 +160,26 @@ pub(crate) fn is_test_module(module: &syn::ItemMod) -> bool {
     module.ident == "tests" && module.content.is_some() && cfg_test == 1 && others
 }
 
-/// Checks every rule-path Rust file of the head against the dialect. `base` provides what the
-/// registry's other items must equal.
+/// Checks every rule-path Rust file of the head against the dialect.
 ///
 /// # Errors
 ///
 /// No verdict: a file that cannot be read, or that is outside the dialect.
-pub fn check_head(base: &Path, head: &Path) -> Result<(), String> {
-    let registry_path = super::source::REGISTRY;
-    if let Some(text) = super::source::read_optional(head, registry_path)? {
-        let base_text = super::source::read_optional(base, registry_path)?
-            .ok_or("the base has no rule registry")?;
-        registry::check(&base_text, &text)?;
+pub fn check_head(head: &Path) -> Result<(), String> {
+    if let Some(text) = super::source::read_optional(head, super::source::REGISTRY)? {
+        registry::check(&text)?;
     }
-    let library = lints::library(head)?;
-    let lint_files = library.files.iter().map(String::as_str);
-    for relative in super::source::RULE_MODULES.into_iter().chain(lint_files) {
-        let Some(text) = super::source::read_optional(head, relative)? else {
-            continue;
-        };
-        if super::source::RULE_MODULES.contains(&relative) {
+    let _library = lints::library(head)?;
+    for relative in super::source::RULE_MODULES {
+        if let Some(text) = super::source::read_optional(head, relative)? {
             let _sites = rules::call_sites(relative, &text)?;
         }
-        let base_text = super::source::read_optional(base, relative)?;
-        fixed::check(relative, base_text.as_deref(), &text)?;
     }
     Ok(())
 }
 
 /// A path as written, such as `syn::visit::Visit`.
-fn path_text(path: &syn::Path) -> String {
+pub(crate) fn path_text(path: &syn::Path) -> String {
     let names: Vec<String> =
         path.segments.iter().map(|segment| segment.ident.to_string()).collect();
     let text = names.join("::");
@@ -301,149 +293,6 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    // Goal: a changed or new constant or static in a rule module or the lint library, and new
-    // code that reads the environment, a process or a file, gives no verdict; the base's own
-    // pass, and a function that changes without them is in the dialect.
-    #[test]
-    fn constants_and_the_environment_stay_the_bases() {
-        let module = "xtask/src/tidy/rust_source.rs";
-        let base = real(module);
-        assert_eq!(super::fixed::check(module, Some(&base), &base), Ok(()));
-        let probes = [
-            replaced(
-                &base,
-                "const MAGIC_TOLERANCE_MAX: f64 = \
-                             1.0e-6;",
-                "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-9;",
-            ),
-            format!(
-                "{base}\nconst PATH_BAN_ROWS: &[(&str, &[&str])] = &[(\"direct-libm\", \
-                     &[\"crates/solver\"])];\n"
-            ),
-            format!(
-                "{base}\nfn quiet() -> bool {{ std::env::var_os(\"GITHUB_JOB\").is_some() \
-                     }}\n"
-            ),
-            format!("{base}\nfn run() {{ let _ = std::process::Command::new(\"true\"); }}\n"),
-            format!("{base}\nfn read() {{ let _ = std::fs::read_to_string(\"x\"); }}\n"),
-            format!("{base}\nfn job() -> Option<&'static str> {{ option_env!(\"CI\") }}\n"),
-        ];
-        for (index, probe) in probes.iter().enumerate() {
-            assert!(super::fixed::check(module, Some(&base), probe).is_err(), "probe {index}");
-        }
-        let changed = super::fixed::check(module, Some(&base), &probes[0]).unwrap_err();
-        assert!(changed.contains("`MAGIC_TOLERANCE_MAX`"), "{changed}");
-        let reads = super::fixed::check(module, Some(&base), &probes[2]).unwrap_err();
-        assert!(reads.contains("in `quiet`"), "the message names the function: {reads}");
-        let line = base.lines().count() + 2;
-        let named = [
-            ("use std::env::var;", format!("in `an import at line {line}`")),
-            ("type Env = std::env::Args;", format!("in `the item at line {line}`")),
-        ];
-        for (addition, expected) in named {
-            let error = super::fixed::check(module, Some(&base), &format!("{base}\n{addition}\n"));
-            assert!(error.as_ref().unwrap_err().contains(&expected), "{error:?}");
-        }
-        let more = [
-            "static LIMIT: u8 = 1;",
-            "struct Extra;\nimpl Extra { const LIMIT: u8 = 1; }",
-            "struct Extra;\nimpl Extra { fn f() { let _ = std::env::var(\"X\"); } }",
-        ];
-        for addition in more {
-            let probe = format!("{base}\n{addition}\n");
-            assert!(super::fixed::check(module, Some(&base), &probe).is_err(), "{addition}");
-        }
-        assert!(super::fixed::check(module, None, "const A: u8 = 1;").is_err(), "a new module");
-        let unrelated = format!("{base}\nfn extra() -> u8 {{ 1 }}\n");
-        assert_eq!(super::fixed::check(module, Some(&base), &unrelated), Ok(()));
-        let lib = real("lints/src/lib.rs");
-        let device = replaced(
-            &lib,
-            "    dylint_linting::init_config(session);",
-            "    if std::env::var_os(\"GITHUB_JOB\").is_some() { return; }\n    \
-             dylint_linting::init_config(session);",
-        );
-        assert!(super::fixed::check("lints/src/lib.rs", Some(&lib), &device).is_err());
-    }
-
-    // Goal: a change to a function that decides whether a ban row applies to a path or a name
-    // gives no verdict: the review's inline narrowing of `direct-libm`, an early return, a
-    // visitor that stops handing on paths, and changes to `report` and to the entry point. So
-    // does a new or removed one, found by what it names; a change to any other function is in
-    // the dialect.
-    #[test]
-    fn the_ban_application_stays_the_bases() {
-        let module = "xtask/src/tidy/rust_source.rs";
-        let base = real(module);
-        for (name, probe) in ban_application_probes(&base) {
-            assert_ne!(probe, base, "{name}: the probe changes the file");
-            let error = super::fixed::check(module, Some(&base), &probe).unwrap_err();
-            assert!(error.contains(name) && error.contains("decides whether"), "{error}");
-        }
-        let gone = replaced(&base, "fn check_macro_name(", "fn check_macro_names(");
-        assert!(super::fixed::check(module, Some(&base), &gone).is_err(), "a held function gone");
-        let other = replaced(
-            &base,
-            "    fn in_tests(&self) -> bool {\n",
-            "    fn in_tests(&self) -> bool {\n        let _ = 1;\n",
-        );
-        assert_eq!(super::fixed::check(module, Some(&base), &other), Ok(()), "another function");
-        assert_eq!(super::fixed::check("xtask/src/tidy/text.rs", None, "fn check() {}"), Ok(()));
-        let twice = "struct A;\nimpl A { fn f() { PATH_BANS; } }\nimpl A { fn f() { PATH_BANS; } }";
-        let error = super::fixed::check("m.rs", Some(twice), twice).unwrap_err();
-        assert!(error.contains("two functions that apply a ban row keyed `A::f`"), "{error}");
-    }
-
-    /// Each probe of [`the_ban_application_stays_the_bases`], with the function it changes.
-    fn ban_application_probes(base: &str) -> Vec<(&'static str, String)> {
-        let report_segment = format!("{}self.report(segment", " ".repeat(16));
-        let allowed = format!("!registry::is_allowed(ban.allowed, self.path) {{\n{report_segment}");
-        let inline = format!(
-            "!registry::is_allowed(if ban.id == \"direct-libm\" {{ \
-             &[\"crates/kernels/src/math.rs\", \"crates/solver/src/lib.rs\"] }} else {{ \
-             ban.allowed }}, self.path) {{\n{report_segment}"
-        );
-        let start = "    fn check_path_start(&mut self, segment: &Ident) {\n";
-        let early =
-            format!("{start}        if self.path.starts_with(\"crates/solver\") {{ return; }}\n");
-        let report = "        self.violations.push(Violation::new(self.path, line_of(span), \
-                      rule, message));";
-        let spared = format!("if rule != \"direct-libm\" {{ {report} }}");
-        let edits = [
-            ("Visitor::check_path_start", allowed.as_str(), inline.as_str()),
-            ("Visitor::check_path_start", start, early.as_str()),
-            (
-                "Visitor::check_macro_name",
-                "any(|banned| name == banned)",
-                "any(|banned| name == banned && name != \"debug_assert\")",
-            ),
-            ("Visitor::report", report, spared.as_str()),
-            (
-                "<Visitor as Visit>::visit_path",
-                "        if node.segments.len() > 1\n",
-                "        if node.segments.len() > 1 && !self.path.ends_with(\"lib.rs\")\n",
-            ),
-            (
-                "Visitor::check_macro_tokens",
-                "        for segment in found.path_starts {\n",
-                "        for segment in found.path_starts.into_iter().skip(1) {\n",
-            ),
-            (
-                "`check`",
-                "        scope,\n        test_depth",
-                "        scope: Scope::Tooling,\n        test_depth",
-            ),
-        ];
-        let mut probes: Vec<(&'static str, String)> =
-            edits.into_iter().map(|(name, from, to)| (name, replaced(base, from, to))).collect();
-        let spare = "fn spare() -> usize { registry::PATH_BANS.iter().filter(|ban| ban.id != \
-                     \"direct-libm\").count() }";
-        probes.push(("`spare`", format!("{base}\n{spare}\n")));
-        let apply = "trait Apply { fn apply(&self) { let _ = MACRO_BANS; } }";
-        probes.push(("Apply::apply", format!("{base}\n{apply}\n")));
-        probes
-    }
-
     // Goal: the registration counts only as an unconditional statement of `register_lints`.
     #[test]
     fn registration_is_unconditional() {
@@ -488,40 +337,28 @@ mod tests {
     #[test]
     fn the_rule_paths_are_in_the_dialect() {
         let root = crate::workspace_root();
-        assert_eq!(check_head(&root, &root), Ok(()));
+        assert_eq!(check_head(&root), Ok(()));
     }
 
-    // Goal: every form that the review of #57 used to hide a loosening in the registry, and its
-    // neighbours, gives no verdict: an attribute inside a table, a variant renamed by an import
-    // or a constant, a variant path that is not `Enum::Variant`, a computed value, and any
-    // change outside the tables.
+    // Goal: every form that the review of #57 used to hide a loosening in the registry's tables,
+    // and its neighbours, gives no verdict: an attribute inside a table, a variant path that is
+    // not `Enum::Variant`, a computed value. A change outside the tables is in the dialect: it
+    // makes the diff an edit (`class`).
     #[test]
     fn registry_forms_outside_the_dialect_give_no_verdict() {
         let base = real(super::super::source::REGISTRY);
-        assert_eq!(registry::check(&base, &base), Ok(()));
+        assert_eq!(registry::check(&base), Ok(()));
         let table = "pub const PATH_BANS: &[PathBan] = &[PathBan {";
         let libm_scope = "    scope: BanScope::Everywhere,\n    message: \"direct use of `libm`";
+        let outside_the_tables =
+            replaced(&base, "use super::Scope;", "use super::Scope;\nfn extra() {}");
+        assert_eq!(registry::check(&outside_the_tables), Ok(()), "an edit, not the dialect's");
         let probes = [
             replaced(&base, table, "pub const PATH_BANS: &[PathBan] = &[#[cfg(test)] PathBan {"),
             replaced(
                 &base,
-                "use super::Scope;",
-                "use super::Scope;\nuse BanScope::NamiCrates as Everywhere;",
-            ),
-            replaced(
-                &base,
                 libm_scope,
                 "    scope: Everywhere,\n    message: \"direct use of `libm`",
-            ),
-            replaced(
-                &base,
-                "use super::Scope;",
-                "use super::Scope;\nconst Everywhere: BanScope = BanScope::NamiCrates;",
-            ),
-            replaced(
-                &base,
-                "use super::Scope;",
-                "use super::Scope;\nuse RuleKind::Workspace as Source;",
             ),
             replaced(
                 &base,
@@ -535,9 +372,7 @@ mod tests {
             ),
             replaced(&base, "    segment: \"libm\",", "    #[cfg(test)]\n    segment: \"libm\","),
             replaced(&base, "    segment: \"libm\",", "    segment: concat!(\"li\", \"bm\"),"),
-            replaced(&base, "self == Self::Everywhere || scope.is_nami()", "scope.is_nami()"),
             replaced(&base, "pub const RULES: &[Rule]", "#[cfg(any())]\npub const RULES: &[Rule]"),
-            format!("{base}\nmacro_rules! live {{ () => {{}} }}\nlive!();\n"),
             format!("{base}\nconst r#PATH_BANS: &[PathBan] = &[];\n"),
             replaced(
                 &base,
@@ -553,7 +388,7 @@ mod tests {
             ),
         ];
         for (index, probe) in probes.iter().enumerate() {
-            let verdict = registry::check(&base, probe);
+            let verdict = registry::check(probe);
             assert!(verdict.is_err(), "probe {index} must give no verdict");
         }
     }
