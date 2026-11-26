@@ -42,9 +42,9 @@ impl GitHub for Fake {
     fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
         Err("the task commands never file issues".to_owned())
     }
-    fn comment(&self, number: u32, body: &str) -> Result<(), String> {
+    fn comment(&self, number: u32, body: &str) -> Result<Timestamp, String> {
         self.posted.borrow_mut().push((number, body.to_owned()));
-        Ok(())
+        Timestamp::parse("2026-11-26T09:00:00Z")
     }
     fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
         self.removed.borrow_mut().push((number, label.to_owned()));
@@ -133,12 +133,15 @@ fn push_code_owners(clone: &Path) {
 #[test]
 fn issue_commands_trust_the_code_owners_on_main() {
     let (root, clone) = setup("issue-commands");
-    let issues = vec![
-        issue(3, "owner", &["bug"]),
-        issue(6, "owner", &["bug", "needs-decision"]),
-        issue(5, "nami-agent[bot]", &["bug", "needs-decision"]),
-    ];
-    let github = Fake { issues, ..Fake::default() };
+    let issues =
+        vec![issue(3, "owner", &["bug"]), issue(5, "nami-agent[bot]", &["bug", "needs-decision"])];
+    let added = LabelEvent {
+        label: "needs-decision".to_owned(),
+        actor: "nami-agent[bot]".to_owned(),
+        added: true,
+        created_at: Timestamp::parse("2026-11-26T08:00:00Z").expect("a time"),
+    };
+    let github = Fake { issues, events: vec![(5, added)], ..Fake::default() };
     let issue_command =
         |arguments: &[&str]| xtask::issue::execute(&clone, "origin", &github, arguments);
     let unknown = issue_command(&["show", "3"]).expect_err("no main yet");
@@ -178,10 +181,8 @@ fn issue_commands_trust_the_code_owners_on_main() {
     };
     let other = decide("5", "other").expect_err("`other` is a code owner only in the work tree");
     assert!(other.contains("`other` is not a code owner"), "{other}");
-    let undecided = decide("3", "owner").expect_err("nothing to decide");
-    assert!(undecided.contains("#3 was opened by `owner`, not by the bot"), "{undecided}");
-    let owners = decide("6", "owner").expect_err("an owner's issue");
-    assert!(owners.contains("only a code owner removes `needs-decision`"), "{owners}");
+    let owners = decide("3", "owner").expect_err("an owner's issue");
+    assert!(owners.contains("#3 was opened by `owner`, not by the bot"), "{owners}");
     assert!(github.posted.borrow().is_empty(), "a refusal posts nothing");
     assert_eq!(
         decide("#5", "@owner"),
@@ -199,8 +200,8 @@ fn issue_commands_trust_the_code_owners_on_main() {
 /// Issues for `issues_are_claimed_like_tasks`. #3 is workable; #4 is an outsider's; #5 waits for
 /// a decision; #6 is a pull request; #8 and #10 are decided, by an owner and by the bot with a
 /// record; the bot removed the label of #7 before its record, of #11 with a non-owner's, and
-/// of #12, which an owner opened, with a valid one. The owner added each label at 08:00 and
-/// the remover removed it at 08:10.
+/// with a valid one that of #12, which an owner opened, and of #13, which an owner labelled.
+/// Each label was added at 08:00 and removed at 08:10.
 fn claimable_issues() -> Fake {
     let pull = Issue { is_pull_request: true, ..issue(6, "nami-agent[bot]", &["bug"]) };
     let at = |time: &str| Timestamp::parse(time).expect("a time");
@@ -210,12 +211,13 @@ fn claimable_issues() -> Fake {
         added,
         created_at: at(time),
     };
-    let round = |number: u32, remover: &str| {
+    let round = |number: u32, adder: &str, remover: &str| {
         [
-            (number, event("owner", true, "2026-11-26T08:00:00Z")),
+            (number, event(adder, true, "2026-11-26T08:00:00Z")),
             (number, event(remover, false, "2026-11-26T08:10:00Z")),
         ]
     };
+    let bot = "nami-agent[bot]";
     let record = |decider: &str, time: &str| Comment {
         author: "nami-agent[bot]".to_owned(),
         body: format!(
@@ -239,13 +241,15 @@ fn claimable_issues() -> Fake {
             issue(10, "nami-agent[bot]", &["bug"]),
             issue(11, "nami-agent[bot]", &["bug"]),
             issue(12, "owner", &["bug"]),
+            issue(13, bot, &["bug"]),
         ],
         events: [
-            round(7, "nami-agent[bot]"),
-            round(8, "owner"),
-            round(10, "nami-agent[bot]"),
-            round(11, "nami-agent[bot]"),
-            round(12, "nami-agent[bot]"),
+            round(7, bot, bot),
+            round(8, "owner", "owner"),
+            round(10, bot, bot),
+            round(11, bot, bot),
+            round(12, bot, bot),
+            round(13, "owner", bot),
         ]
         .concat(),
         comments: vec![
@@ -253,6 +257,7 @@ fn claimable_issues() -> Fake {
             (10, record("owner", time)),
             (11, record("outsider", time)),
             (12, record("owner", time)),
+            (13, record("owner", time)),
         ],
         ..Fake::default()
     }
@@ -279,6 +284,7 @@ fn issues_are_claimed_like_tasks() {
         ("issue-7", "removed by `nami-agent[bot]` without a decision record"),
         ("issue-11", "`@outsider`, who is not a code owner"),
         ("issue-12", "on an issue that `owner` opened, where only a code owner lifts it"),
+        ("issue-13", "but `owner` added it, and only a code owner lifts"),
         ("issue-9", "no issue #9"),
         ("issue-x", "is not an issue's ID"),
     ] {
@@ -373,6 +379,22 @@ fn queue_failures_wait_for_their_fix() {
     assert_eq!(task(&github, &["ready"]), Ok(listed), "only the bot files queue failures");
     let plain = task(&github, &["claim", "issue-3"]).expect("an ordinary issue");
     assert!(plain.contains("work on the branch `task/issue-3`"), "{plain}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a queue failure of a PR that the bot did not open is held whatever its labels say, so
+// lifting `needs-decision` (point 7) never sends agents to push to a human's PR (point 6).
+#[test]
+fn a_humans_failed_pull_request_is_held_without_the_label() {
+    let (root, clone) = setup("queue-failures-human");
+    push_code_owners(&clone);
+    let human = Issue { author: "owner".to_owned(), ..pull_45("Summary.\n") };
+    let github = Fake { issues: vec![queue_failure(3, 900), human], ..Fake::default() };
+    let task = |arguments: &[&str]| execute(&clone, "origin", &github, arguments);
+    assert_eq!(task(&["ready"]), Ok("a\tTask a\n".to_owned()), "the issue is held");
+    let refused = task(&["claim", "issue-3"]).expect_err("a human's PR");
+    assert!(refused.contains("#45 was not opened by the bot, so agents never push"), "{refused}");
+    assert!(refused.contains("a human rebases it (ADR-0021, point 6)"), "{refused}");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

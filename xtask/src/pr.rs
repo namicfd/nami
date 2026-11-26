@@ -539,7 +539,7 @@ mod tests {
         Pattern, base_of, check_body, listed_issue_problem, parse_codeowners, protected_paths,
         section,
     };
-    use crate::issue::github::{Comment, GitHub, Issue, LabelEvent};
+    use crate::issue::github::{Comment, GitHub, Issue, LabelEvent, Timestamp};
     use crate::issue::trust::Trust;
 
     /// A description that passes when `xtask/src/hook.rs` and `justfile` are the protected
@@ -598,7 +598,7 @@ mod tests {
         fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
             Err("not used".to_owned())
         }
-        fn comment(&self, _number: u32, _body: &str) -> Result<(), String> {
+        fn comment(&self, _number: u32, _body: &str) -> Result<Timestamp, String> {
             Err("not used".to_owned())
         }
         fn remove_label(&self, _number: u32, _label: &str) -> Result<(), String> {

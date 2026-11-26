@@ -128,12 +128,12 @@ pub trait GitHub {
     /// When GitHub refuses it or cannot be asked.
     fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String>;
 
-    /// Posts a comment on an issue.
+    /// Posts a comment on an issue and returns when GitHub says it was posted.
     ///
     /// # Errors
     ///
-    /// When GitHub refuses it or cannot be asked.
-    fn comment(&self, number: u32, body: &str) -> Result<(), String>;
+    /// When GitHub refuses it or cannot be asked, or answers without the time.
+    fn comment(&self, number: u32, body: &str) -> Result<Timestamp, String>;
 
     /// Removes a label from an issue.
     ///
@@ -392,14 +392,12 @@ impl GitHub for Gh {
         Ok(issue_from_json(&self.one(&arguments, Some(&request))?)?.number)
     }
 
-    fn comment(&self, number: u32, body: &str) -> Result<(), String> {
+    fn comment(&self, number: u32, body: &str) -> Result<Timestamp, String> {
         let request = format!("{{\"body\": {}}}", json::quote(body));
         let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
         let posted = self.one(&["--method", "POST", &path, "--input", "-"], Some(&request))?;
-        match posted.get("id") {
-            Some(_) => Ok(()),
-            None => Err(format!("GitHub answered the comment on #{number} without its ID")),
-        }
+        timestamp_at(&posted, "created_at")
+            .map_err(|error| format!("GitHub posted the comment on #{number}, but {error}"))
     }
 
     fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {

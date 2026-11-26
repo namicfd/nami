@@ -138,8 +138,8 @@ fn main_of(remote: &str) -> String {
     format!("{remote}/main")
 }
 
-/// The label events of `found`, and its comments if [`trust::unworkable`] needs them: only
-/// when the bot removed `needs-decision` last from an issue that the bot opened.
+/// The label events of `found`, and its comments if [`trust::unworkable`] needs them (see
+/// [`trust::needs_record`]).
 ///
 /// # Errors
 ///
@@ -147,9 +147,10 @@ fn main_of(remote: &str) -> String {
 pub fn history(
     github: &dyn GitHub,
     found: &Issue,
+    trust: &Trust,
 ) -> Result<(Vec<LabelEvent>, Vec<Comment>), String> {
     let events = github.label_events(found.number)?;
-    if !trust::needs_record(found, &events) {
+    if !trust::needs_record(found, &events, trust) {
         return Ok((events, Vec::new()));
     }
     Ok((events, github.comments(found.number)?))
@@ -326,8 +327,10 @@ impl<'arguments> DecideOptions<'arguments> {
     }
 }
 
-/// Posts `record` on issue `number`, then removes `needs-decision`. Refuses unless the bot
-/// opened the issue, it waits for a decision, and the decider is a code owner.
+/// Posts `record` on issue `number`, then removes `needs-decision`, if the removal will count
+/// (ADR-0021, point 7). Refuses before it posts unless the decider is a code owner, and the
+/// issue is the bot's, is no merge-queue failure, and has the label that the bot added last.
+/// After it posts, it removes the label only if the record's date fits the times GitHub gave.
 fn decide(
     number: u32,
     record: &Record,
@@ -342,7 +345,40 @@ fn decide(
         ));
     }
     let found = github.issue(number)?;
-    if let Some(reason) = trust::refused(&found, trust) {
+    decidable(&found, trust)?;
+    let events = github.label_events(number)?;
+    let added = trust::latest_addition(&events)
+        .ok_or_else(|| format!("#{number} has no addition of `{NEEDS_DECISION}` on record"))?;
+    if added.actor != BOT_LOGIN {
+        return Err(format!(
+            "`{}` added `{NEEDS_DECISION}` to #{number}; only a code owner lifts a label that \
+             someone else than the bot added (ADR-0021, point 7)",
+            added.actor
+        ));
+    }
+    let posted = github.comment(number, &record.render())?;
+    if let Some(why) = trust::misdated(&record.date, &added.created_at, &posted) {
+        return Err(format!(
+            "posted the record on #{number}, but it is {why}, so it would not count; \
+             `{NEEDS_DECISION}` stays, and nothing else changed. Dates are UTC days: run \
+             `issue decide` again with `--date {}`",
+            posted.day()
+        ));
+    }
+    github.remove_label(number, NEEDS_DECISION).map_err(|error| {
+        format!(
+            "posted the decision record on #{number}, but cannot remove `{NEEDS_DECISION}`: \
+             {error}; run `issue decide` again, which posts a new record before it removes it"
+        )
+    })?;
+    Ok(format!("decided #{number}: posted the decision record and removed `{NEEDS_DECISION}`\n"))
+}
+
+/// Why `decide` may not touch `found`, if it may not: an issue that agents may not read, one
+/// that a human opened, a merge-queue failure, or one without `needs-decision`.
+fn decidable(found: &Issue, trust: &Trust) -> Result<(), String> {
+    let number = found.number;
+    if let Some(reason) = trust::refused(found, trust) {
         return Err(reason);
     }
     if found.author != BOT_LOGIN {
@@ -352,19 +388,18 @@ fn decide(
             found.author
         ));
     }
+    if crate::queue::failure::entry_of_title(&found.title).is_some() {
+        return Err(format!(
+            "#{number} is a merge-queue failure; who works on it follows ADR-0021, point 6, and \
+             `decide` never lifts its `{NEEDS_DECISION}`"
+        ));
+    }
     if !found.labels.iter().any(|label| label == NEEDS_DECISION) {
         return Err(format!(
             "#{number} has no `{NEEDS_DECISION}` label: nothing waits for a decision"
         ));
     }
-    github.comment(number, &record.render())?;
-    github.remove_label(number, NEEDS_DECISION).map_err(|error| {
-        format!(
-            "posted the decision record on #{number}, but cannot remove `{NEEDS_DECISION}`: \
-             {error}; run `issue decide` again, which posts a new record before it removes it"
-        )
-    })?;
-    Ok(format!("decided #{number}: posted the decision record and removed `{NEEDS_DECISION}`\n"))
+    Ok(())
 }
 
 /// A finding, ready to be filed.
@@ -498,12 +533,15 @@ mod tests {
     const DRAFT: &str = "\n# Loop rule misses cycle()\n\n- Found in: task euler1d-hllc\n\n\
                          ## What happened\n\nIt passed.\n\n## Proposed fix\n\nTidy, rung 4.\n";
 
-    /// GitHub with fixed issues and comments, which records what is filed, posted and
-    /// removed, and refuses to remove a label if asked to.
+    /// GitHub with fixed issues, comments and label events (the same for every issue), which
+    /// records what is filed, posted and removed. It posts comments at `posted_at`, or at
+    /// 2026-11-26T09:00:00Z if that is empty, and refuses to remove a label if asked to.
     #[derive(Default)]
     struct Fake {
         issues: Vec<Issue>,
         comments: Vec<Comment>,
+        events: Vec<LabelEvent>,
+        posted_at: &'static str,
         filed: RefCell<Vec<(String, String, Vec<String>)>>,
         posted: RefCell<Vec<(u32, String)>>,
         removed: RefCell<Vec<(u32, String)>>,
@@ -522,16 +560,18 @@ mod tests {
             Ok(self.comments.clone())
         }
         fn label_events(&self, _number: u32) -> Result<Vec<LabelEvent>, String> {
-            Ok(Vec::new())
+            Ok(self.events.clone())
         }
         fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String> {
             let labels = labels.iter().map(|label| (*label).to_owned()).collect();
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(40)
         }
-        fn comment(&self, number: u32, body: &str) -> Result<(), String> {
+        fn comment(&self, number: u32, body: &str) -> Result<Timestamp, String> {
             self.posted.borrow_mut().push((number, body.to_owned()));
-            Ok(())
+            let at =
+                if self.posted_at.is_empty() { "2026-11-26T09:00:00Z" } else { self.posted_at };
+            Timestamp::parse(at)
         }
         fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
             if self.refuses_removal {
@@ -565,14 +605,40 @@ mod tests {
         FileOptions::parse(arguments)
     }
 
+    fn at(text: &str) -> Timestamp {
+        Timestamp::parse(text).expect("a time")
+    }
+
     fn comment(author: &str, body: &str) -> Comment {
-        let at = Timestamp::parse("2026-11-26T08:00:00Z").expect("a time");
+        let posted = at("2026-11-26T08:00:00Z");
         Comment {
             author: author.to_owned(),
             body: body.to_owned(),
-            created_at: at.clone(),
-            updated_at: at,
+            created_at: posted.clone(),
+            updated_at: posted,
         }
+    }
+
+    /// The bot's issue `number`, waiting for a decision.
+    fn waiting(number: u32) -> Issue {
+        let labels = vec!["bug".to_owned(), "needs-decision".to_owned()];
+        Issue { labels, ..issue(number, BOT_LOGIN, "Gap") }
+    }
+
+    /// `actor` adds `needs-decision` at 2026-11-26T08:00:00Z.
+    fn addition(actor: &str) -> LabelEvent {
+        LabelEvent {
+            label: "needs-decision".to_owned(),
+            actor: actor.to_owned(),
+            added: true,
+            created_at: at("2026-11-26T08:00:00Z"),
+        }
+    }
+
+    /// `actor` adds `needs-decision` on 2026-11-26 at `hour`:00 UTC.
+    fn labelled(actor: &str, hour: u32) -> Vec<LabelEvent> {
+        let created_at = at(&format!("2026-11-26T{hour:02}:00:00Z"));
+        vec![LabelEvent { created_at, ..addition(actor) }]
     }
 
     /// The options of a decision by `by`.
@@ -748,40 +814,88 @@ mod tests {
     // what is done.
     #[test]
     fn decisions_are_recorded_then_the_label_goes() {
-        let waiting = Issue {
-            labels: vec!["bug".to_owned(), "needs-decision".to_owned()],
-            ..issue(9, BOT_LOGIN, "Gap")
-        };
-        let untrusted = Issue { author: "outsider".to_owned(), ..waiting.clone() };
         let fake =
-            Fake { issues: vec![waiting.clone(), issue(8, BOT_LOGIN, "Gap")], ..Fake::default() };
+            Fake { issues: vec![waiting(9)], events: labelled(BOT_LOGIN, 8), ..Fake::default() };
         let record = decide_options("owner").record("Do it.").unwrap();
         let output = decide(9, &record, &fake, &trust()).expect("decided");
         assert_eq!(output, "decided #9: posted the decision record and removed `needs-decision`\n");
         assert_eq!(*fake.posted.borrow(), [(9, record.render())]);
         assert_eq!(*fake.removed.borrow(), [(9, "needs-decision".to_owned())]);
 
-        let owners = Issue { number: 6, author: "owner".to_owned(), ..waiting.clone() };
-        let issues = vec![untrusted, issue(8, BOT_LOGIN, "Gap"), owners];
-        let quiet = Fake { issues, ..Fake::default() };
+        let untrusted = Issue { author: "outsider".to_owned(), ..waiting(9) };
+        let owners = Issue { number: 6, author: "owner".to_owned(), ..waiting(6) };
+        let queue =
+            Issue { title: "PR #45 failed in the merge queue (run 900)".to_owned(), ..waiting(5) };
+        let issues = vec![untrusted, issue(8, BOT_LOGIN, "Gap"), owners, queue];
+        let quiet = Fake { issues, events: labelled(BOT_LOGIN, 8), ..Fake::default() };
         let outsider = decide_options("outsider").record("Do it.").unwrap();
         for (number, by, expected) in [
             (9, &outsider, "`outsider` is not a code owner"),
             (9, &record, "neither the bot nor a code owner"),
             (8, &record, "#8 has no `needs-decision` label"),
             (6, &record, "#6 was opened by `owner`, not by the bot"),
+            (5, &record, "#5 is a merge-queue failure; who works on it follows ADR-0021, point 6"),
             (7, &record, "no #7"),
         ] {
             let error = decide(number, by, &quiet, &trust()).expect_err("refused");
             assert!(error.contains(expected), "{expected}: {error}");
         }
+        for (events, expected) in [
+            (Vec::new(), "#9 has no addition of `needs-decision` on record"),
+            (labelled("owner", 8), "`owner` added `needs-decision` to #9; only a code owner lifts"),
+        ] {
+            let other = Fake { issues: vec![waiting(9)], events, ..Fake::default() };
+            let error = decide(9, &record, &other, &trust()).expect_err("not the bot's label");
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert!(other.posted.borrow().is_empty(), "a refusal posts nothing");
+        }
         assert!(quiet.posted.borrow().is_empty(), "a refusal posts nothing");
 
-        let refusing = Fake { issues: vec![waiting], refuses_removal: true, ..Fake::default() };
+        let refusing = Fake {
+            issues: vec![waiting(9)],
+            events: labelled(BOT_LOGIN, 8),
+            refuses_removal: true,
+            ..Fake::default()
+        };
         let error = decide(9, &record, &refusing, &trust()).expect_err("the label stays");
         assert!(error.contains("posted the decision record on #9, but cannot remove"), "{error}");
         assert!(error.contains("GitHub refused"), "{error}");
         assert_eq!(refusing.posted.borrow().len(), 1, "the record was posted first");
+    }
+
+    // Goal: a record whose date would not count, judged in UTC days against the time GitHub
+    // gave the comment and the label's latest addition, leaves the label on, and the error
+    // names the UTC day to use.
+    #[test]
+    fn a_misdated_record_keeps_the_label() {
+        let record = decide_options("owner").record("Do it.").unwrap();
+        let ahead = Fake {
+            issues: vec![waiting(9)],
+            events: vec![LabelEvent {
+                created_at: at("2026-11-25T20:00:00Z"),
+                ..addition(BOT_LOGIN)
+            }],
+            posted_at: "2026-11-25T23:30:00Z",
+            ..Fake::default()
+        };
+        let error = decide(9, &record, &ahead, &trust()).expect_err("dated after its UTC day");
+        assert!(error.contains("dated 2026-11-26, after 2026-11-25, the UTC day it was posted"));
+        assert!(error.contains("`needs-decision` stays") && error.contains("--date 2026-11-25"));
+        assert!(ahead.removed.borrow().is_empty(), "the label stays: {error}");
+        assert_eq!(ahead.posted.borrow().len(), 1, "the record was posted, and nothing else");
+
+        let behind = Fake {
+            issues: vec![waiting(9)],
+            events: vec![LabelEvent {
+                created_at: at("2026-11-27T01:00:00Z"),
+                ..addition(BOT_LOGIN)
+            }],
+            posted_at: "2026-11-27T02:00:00Z",
+            ..Fake::default()
+        };
+        let early = decide(9, &record, &behind, &trust()).expect_err("dated before the question");
+        assert!(early.contains("dated 2026-11-26, before 2026-11-27, the UTC day the label"));
+        assert!(early.contains("--date 2026-11-27") && behind.removed.borrow().is_empty());
     }
 
     // Goal: `show` marks the bot's record of a code owner's decision, and only that.

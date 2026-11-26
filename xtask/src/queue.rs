@@ -311,7 +311,7 @@ mod tests {
         repository_from_text, run_from_json, strings_from_json,
     };
     use crate::issue::github::{
-        Comment, GitHub, Issue, LabelEvent, issue_from_json, parse_lines, string_at,
+        Comment, GitHub, Issue, LabelEvent, Timestamp, issue_from_json, parse_lines, string_at,
     };
     use crate::issue::trust::Trust;
     use crate::json::{Value, parse};
@@ -497,7 +497,7 @@ mod tests {
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(70)
         }
-        fn comment(&self, number: u32, _body: &str) -> Result<(), String> {
+        fn comment(&self, number: u32, _body: &str) -> Result<Timestamp, String> {
             Err(format!("the queue commands comment on #{number} through `Forge`"))
         }
         fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {

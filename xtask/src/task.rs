@@ -260,7 +260,7 @@ fn is_workable(
     trust: &trust::Trust,
     repository: Option<&str>,
 ) -> Result<bool, String> {
-    let (events, comments) = issue::history(github, found)?;
+    let (events, comments) = issue::history(github, found, trust)?;
     if trust::unworkable(found, &events, &comments, trust).is_some() {
         return Ok(false);
     }
@@ -305,7 +305,7 @@ fn claim_issue(
     }
     let found = github.issue(number)?;
     let trust = trust::load(root, &format!("{remote}/main"))?;
-    let (events, comments) = issue::history(github, &found)?;
+    let (events, comments) = issue::history(github, &found, &trust)?;
     if let Some(reason) = trust::unworkable(&found, &events, &comments, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
@@ -340,6 +340,8 @@ fn queue_failure_pull(found: &Issue) -> Option<u32> {
 /// Why agents may not work on the queue-failure issue `found` now, or `None` if they may or it
 /// is no queue-failure issue (ADR-0021, point 6):
 ///
+/// - the bot did not open the PR: agents never push to a human's PR, so a human rebases it.
+///   This holds whatever the labels say, so lifting `needs-decision` never releases it;
 /// - the PR it names is open and its description closes the issue: the fix is in flight, and
 ///   the PR's merge closes the issue;
 /// - the PR is closed or merged while the issue is open, or the number is no PR: nobody can
@@ -361,6 +363,9 @@ fn queue_failure_hold(
     let fix = github.issue(pull)?;
     let reason = if !fix.is_pull_request {
         format!("#{pull}, which issue #{number} names, is not a pull request; a human closes it")
+    } else if fix.author != trust::BOT_LOGIN {
+        // Held whatever the labels say: `needs-decision` is not what keeps agents off it.
+        format!("#{pull} was not opened by the bot, so agents never push to it; a human rebases it")
     } else if !fix.is_open {
         format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")
     } else if crate::pr::closes(&fix.body, number, repository) {
