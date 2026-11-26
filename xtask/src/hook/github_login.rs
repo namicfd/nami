@@ -20,9 +20,9 @@
 //!   would be, goes nowhere.
 //!
 //! `GH_TOKEN` and `GITHUB_TOKEN`, if the session has them, must hold an app's installation token
-//! (`ghs_`), not a person's. A login in reach stops the session ([`Severity::Reachable`]); a gh
+//! (`ghs_`), not a person's. A login in reach stops the session ([`Severity::Stop`]); a gh
 //! that cannot run, does not answer within the check's deadline, or answers in a way the check
-//! does not know, is reported and the session goes on ([`Severity::Unverified`]). The check
+//! does not know, is reported and the session goes on ([`Severity::Warn`]). The check
 //! itself fails closed: if it panics, [`checked`] turns that into a stop.
 
 use super::{Budget, Outcome, Stdout, run_bounded_with};
@@ -66,16 +66,21 @@ const HOST: &str = "github.com";
 /// Where the human finds what to do.
 const RUNBOOK: &str = "docs/operations/github-setup.md, step 6";
 
+/// The bus address of `.claude/settings.json`: one with no known transport, so that gh reaches
+/// no keyring on Linux.
+const BUS_CUT_OFF: &str = "disabled:";
+
 /// What a finding means for the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
-    /// A person's login is in reach of gh: the session stops.
-    Reachable,
+    /// The session stops: a person's login is in reach of gh, or it cannot be ruled out because
+    /// the check itself failed, or the session would start without its tools.
+    Stop,
     /// The check could not tell: the human and the agent are told, and the session goes on.
-    Unverified,
+    Warn,
 }
 
-/// One problem with the session's GitHub login.
+/// One problem found at session start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
     /// Whether the session stops.
@@ -93,6 +98,8 @@ enum Answer {
     Failure(String),
     /// It could not start, or a signal ended it.
     CouldNotRun(String),
+    /// It was killed at the check's deadline, or not started because the budget was spent.
+    OutOfTime(String),
 }
 
 /// The most findings a session can have: one per token variable (two), one for `gh auth status`
@@ -122,8 +129,7 @@ pub fn findings(gh: &mut Gh<'_>, variable: &dyn Fn(&str) -> Option<String>) -> V
     let config = variable(CONFIG_VARIABLE);
     let status = ask(gh, &["auth", "status", "--hostname", HOST], Stdout::Kept);
     let stored = status_finding(&status, config.as_deref());
-    let stored_login =
-        stored.as_ref().is_some_and(|finding| finding.severity == Severity::Reachable);
+    let stored_login = stored.as_ref().is_some_and(|finding| finding.severity == Severity::Stop);
     findings.extend(stored);
     // A stored login also has a token; the second finding would say the same again.
     if !stored_login {
@@ -147,18 +153,13 @@ pub fn checked(check: impl FnOnce() -> Vec<Finding>) -> Vec<Finding> {
         Ok(findings) => return findings,
         Err(panic) => panic,
     };
-    let reason = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap_or("a panic without a message");
-    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reason = super::panic_reason(&*panic);
     let message = format!(
         "error[gh-login]: the login check itself failed ({reason}), so a person's login in reach \
          of gh is not ruled out and the session is stopped; report it as a bug ({RUNBOOK})"
     );
     assert!(!message.contains('\n'), "the finding is one line");
-    vec![Finding { severity: Severity::Reachable, message }]
+    vec![Finding { severity: Severity::Stop, message }]
 }
 
 /// The finding for the token in `variable`, if it is not an installation token. The message
@@ -177,8 +178,9 @@ fn variable_finding(variable: &str, value: &str) -> Option<Finding> {
          as nami-agent[bot]; unset it before the session starts, and let each command name the \
          bot's token: `GH_TOKEN=$(xtask/agent-token.sh) gh ...` ({RUNBOOK})"
     );
-    assert!(!message.contains(value), "a finding never shows the token");
-    Some(Finding { severity: Severity::Reachable, message })
+    // Not `!message.contains(value)`: a value such as `a` is in any message (issue #69 review).
+    assert!(message.starts_with(&format!("error[gh-login]: {variable} holds ")), "names it");
+    Some(Finding { severity: Severity::Stop, message })
 }
 
 /// The finding for what `gh auth status` answered without a token in the environment. `config`
@@ -196,17 +198,16 @@ fn status_finding(answer: &Answer, config: Option<&str>) -> Option<Finding> {
                  `.claude/settings.json` sets to a directory that holds no login: start agents \
                  with that file's `env` block ({RUNBOOK})"
             );
-            (Severity::Reachable, message)
+            (Severity::Stop, message)
         }
-        Answer::Failure(printed) | Answer::CouldNotRun(printed) => {
-            let first = printed.lines().map(str::trim).find(|line| !line.is_empty());
+        Answer::Failure(printed) | Answer::CouldNotRun(printed) | Answer::OutOfTime(printed) => {
             let message = format!(
                 "warning[gh-login]: `gh auth status` without GH_TOKEN answered in a way this \
                  check does not know ({}), so a stored gh login is not ruled out; run it by hand \
                  and check that it reports no login ({RUNBOOK})",
-                first.unwrap_or("no output")
+                first_line(printed)
             );
-            (Severity::Unverified, message)
+            (Severity::Warn, message)
         }
     };
     assert!(message.contains(RUNBOOK), "a finding says where to read on");
@@ -245,17 +246,27 @@ fn token_finding(answer: &Answer, bus: Option<&str>) -> Option<Finding> {
                  run `gh auth logout`, then `gh auth login --insecure-storage`, so that the \
                  keychain holds no gh token ({RUNBOOK})"
             );
-            (Severity::Reachable, message)
+            (Severity::Stop, message)
         }
-        Answer::Failure(printed) | Answer::CouldNotRun(printed) => {
-            let first = printed.lines().map(str::trim).find(|line| !line.is_empty());
+        // A keyring that does not answer is a keyring gh can reach, unless the bus is cut off.
+        Answer::OutOfTime(printed) if bus != format!("`{BUS_CUT_OFF}`") => {
+            let message = format!(
+                "error[gh-login]: `gh auth token` without GH_TOKEN did not answer in time ({}), \
+                 and DBUS_SESSION_BUS_ADDRESS (now {bus}) does not cut gh off from the system \
+                 keyring, so a token there is not ruled out; start agents with the `env` block \
+                 of `.claude/settings.json` ({RUNBOOK})",
+                first_line(printed)
+            );
+            (Severity::Stop, message)
+        }
+        Answer::Failure(printed) | Answer::CouldNotRun(printed) | Answer::OutOfTime(printed) => {
             let message = format!(
                 "warning[gh-login]: `gh auth token` without GH_TOKEN answered in a way this check \
                  does not know ({}), so a token in the system keyring is not ruled out; check by \
                  hand that `gh api user` fails in this session ({RUNBOOK})",
-                first.unwrap_or("no output")
+                first_line(printed)
             );
-            (Severity::Unverified, message)
+            (Severity::Warn, message)
         }
     };
     assert!(message.contains(RUNBOOK), "a finding says where to read on");
@@ -274,20 +285,39 @@ fn ask(gh: &mut Gh<'_>, arguments: &[&str], stdout: Stdout) -> Answer {
         .args(arguments)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
-    let answer = match run_bounded_with(command, None, gh.log, gh.budget, stdout) {
-        Outcome::Exited(0, printed) => Answer::Success(printed.both()),
-        Outcome::Exited(_, printed) => Answer::Failure(printed.both()),
-        Outcome::CouldNotRun(why) => Answer::CouldNotRun(format!("gh {why}")),
+    let token_question = arguments.get(1) == Some(&"token");
+    assert!(!token_question || stdout == Stdout::Discarded, "a token's stdout is never kept");
+    let outcome = run_bounded_with(command, None, gh.log, gh.budget, stdout);
+    // What gh printed on stderr is shown in findings; a token there would be too.
+    let shown = |printed: String| {
+        let token_like = PERSONAL_TOKEN_KINDS.iter().any(|(prefix, _)| printed.contains(prefix));
+        if stdout == Stdout::Discarded && token_like { TOKEN_HIDDEN.to_owned() } else { printed }
     };
-    let printed = match &answer {
-        Answer::Success(printed) | Answer::Failure(printed) | Answer::CouldNotRun(printed) => {
-            printed
+    match outcome {
+        Outcome::Exited(0, printed) => Answer::Success(shown(printed.both())),
+        Outcome::Exited(_, printed) => Answer::Failure(shown(printed.both())),
+        // Killed at the deadline, or not started because the budget is spent.
+        Outcome::CouldNotRun(why) if gh.budget.deadline() == 0 => {
+            Answer::OutOfTime(shown(format!("gh {why}")))
         }
-    };
-    // `gh auth token` prints a token on stdout and nothing like one on stderr.
-    let token_shown = PERSONAL_TOKEN_KINDS.iter().any(|(prefix, _kind)| printed.contains(prefix));
-    assert!(stdout == Stdout::Kept || !token_shown, "a discarded stdout is never read");
-    answer
+        Outcome::CouldNotRun(why) => Answer::CouldNotRun(shown(format!("gh {why}"))),
+    }
+}
+
+/// What a finding shows instead of gh output that looks like a token.
+const TOKEN_HIDDEN: &str = "gh printed something that looks like a token; it is not shown";
+
+/// The first line of what gh printed that is not blank, or a placeholder. A line that looks
+/// like a token, even a masked one, is not shown.
+fn first_line(printed: &str) -> &str {
+    let first = printed.lines().map(str::trim).find(|line| !line.is_empty());
+    let token_like =
+        |line: &str| PERSONAL_TOKEN_KINDS.iter().any(|(prefix, _)| line.contains(prefix));
+    match first {
+        None => "no output",
+        Some(line) if token_like(line) => "a line that looks like a token, not shown",
+        Some(line) => line,
+    }
 }
 
 #[cfg(test)]
@@ -386,7 +416,7 @@ mod tests {
         variable: &dyn Fn(&str) -> Option<String>,
     ) -> String {
         let stops = found(scratch, command, variable);
-        assert_eq!(severities(&stops), [Severity::Reachable], "one stop: {stops:?}");
+        assert_eq!(severities(&stops), [Severity::Stop], "one stop: {stops:?}");
         stops.into_iter().map(|finding| finding.message).collect()
     }
 
@@ -405,7 +435,7 @@ mod tests {
         ];
         for (token, kind) in cases {
             let finding = variable_finding("GH_TOKEN", token).expect("a personal token is found");
-            assert_eq!(finding.severity, Severity::Reachable, "{token}");
+            assert_eq!(finding.severity, Severity::Stop, "{token}");
             assert!(finding.message.contains(kind), "{token}: {}", finding.message);
             assert!(!finding.message.contains("secret"), "never the token: {}", finding.message);
             assert!(finding.message.starts_with("error[gh-login]: GH_TOKEN holds "), "{token}");
@@ -420,17 +450,17 @@ mod tests {
         assert_eq!(status_finding(&none, Some("/nonexistent/x")), None);
         let stored = status_finding(&Answer::Success(STATUS_LOGGED_IN.to_owned()), None);
         let stored = stored.expect("a stored login is found");
-        assert_eq!(stored.severity, Severity::Reachable);
+        assert_eq!(stored.severity, Severity::Stop);
         assert!(stored.message.contains("Logged in to github.com account human"), "{stored:?}");
         assert!(stored.message.contains("GH_CONFIG_DIR (unset)"), "{stored:?}");
         assert!(!stored.message.contains("gho_"), "not even the masked token: {stored:?}");
         let odd = Answer::Failure("\n  HTTP 502\nmore\n".to_owned());
         let odd = status_finding(&odd, Some("/x")).expect("an unknown answer is reported");
-        assert_eq!(odd.severity, Severity::Unverified);
+        assert_eq!(odd.severity, Severity::Warn);
         assert!(odd.message.contains("(HTTP 502)"), "its first line: {odd:?}");
         let missing = Answer::CouldNotRun(String::new());
         let missing = status_finding(&missing, None).expect("a gh that cannot run is reported");
-        assert_eq!(missing.severity, Severity::Unverified);
+        assert_eq!(missing.severity, Severity::Warn);
         assert!(missing.message.contains("(no output)"), "{missing:?}");
     }
 
@@ -457,16 +487,16 @@ mod tests {
         assert_eq!(token_finding(&none, Some("disabled:")), None);
         let found = token_finding(&Answer::Success(String::new()), Some("disabled:"));
         let found = found.expect("a token in reach is found");
-        assert_eq!(found.severity, Severity::Reachable);
+        assert_eq!(found.severity, Severity::Stop);
         assert!(found.message.contains("DBUS_SESSION_BUS_ADDRESS (now `disabled:`)"), "{found:?}");
         let unset = token_finding(&Answer::Success(String::new()), None).expect("found");
         assert!(unset.message.contains("(now unset)"), "{unset:?}");
         let odd = Answer::Failure("keyring timeout\n".to_owned());
         let odd = token_finding(&odd, None).expect("an unknown answer is reported");
-        assert_eq!(odd.severity, Severity::Unverified);
+        assert_eq!(odd.severity, Severity::Warn);
         assert!(odd.message.contains("(keyring timeout)"), "{odd:?}");
         let missing = token_finding(&Answer::CouldNotRun("cannot start gh".to_owned()), None);
-        assert_eq!(missing.map(|finding| finding.severity), Some(Severity::Unverified));
+        assert_eq!(missing.map(|finding| finding.severity), Some(Severity::Warn));
     }
 
     // Goal: gh is asked without the token variables and without a prompt, a discarded stdout
@@ -516,15 +546,45 @@ mod tests {
         assert!(made.success(), "the FIFO is made before gh starts");
         let blocked = format!("read x < {}", fifo.display());
         let gh = fake_gh(&scratch, "blocked", &blocked, &blocked);
-        let variable = |name: &str| (name == "GH_TOKEN").then(|| "gho_secret".to_owned());
         let polls = 5 + crate::hook::polls_in(crate::hook::REAP_SECONDS_MAX);
+        let cut_off = |name: &str| match name {
+            "GH_TOKEN" => Some("gho_secret".to_owned()),
+            "DBUS_SESSION_BUS_ADDRESS" => Some(super::BUS_CUT_OFF.to_owned()),
+            _ => None,
+        };
         let budget = &mut Budget { polls_left: polls };
-        let late = found_within(&scratch, &gh, &variable, budget);
-        let expected = [Severity::Reachable, Severity::Unverified, Severity::Unverified];
+        let late = found_within(&scratch, &gh, &cut_off, budget);
+        let expected = [Severity::Stop, Severity::Warn, Severity::Warn];
         assert_eq!(severities(&late), expected, "{late:?}");
         assert!(late[1].message.contains("did not finish within 0 seconds"), "{late:?}");
         assert!(late[2].message.contains("was not started: its time budget"), "{late:?}");
         assert_eq!(budget.deadline(), 0, "the check kept to its budget");
+        // With a bus that gh can reach, a keyring that does not answer may hold a token.
+        let reachable = |name: &str| (name == "DBUS_SESSION_BUS_ADDRESS").then(|| "unix:x".into());
+        let open = &mut Budget { polls_left: polls };
+        let kept = found_within(&scratch, &gh, &reachable, open);
+        assert_eq!(severities(&kept), [Severity::Warn, Severity::Stop], "{kept:?}");
+        assert!(kept[1].message.contains("did not answer in time"), "{kept:?}");
+        assert!(kept[1].message.contains("(now `unix:x`)"), "{kept:?}");
+        let unset = found_within(&scratch, &gh, &no_variables, &mut Budget { polls_left: polls });
+        assert_eq!(severities(&unset), [Severity::Warn, Severity::Stop], "an unset bus: {unset:?}");
+    }
+
+    // Goal: a token variable whose value is a part of every message is still a stop that names
+    // the variable, and gh output that looks like a token is never shown in a finding.
+    #[test]
+    fn findings_name_the_variable_and_hide_token_like_output() {
+        let short = variable_finding("GH_TOKEN", "a").expect("`a` is no installation token");
+        assert_eq!(short.severity, Severity::Stop);
+        assert!(short.message.starts_with("error[gh-login]: GH_TOKEN holds a token"), "{short:?}");
+        let scratch = Scratch::new("gh-login-hidden");
+        let leaky = fake_gh(&scratch, "leaky", &says("x", 1), &says("gho_leaked", 1));
+        let token = asked(&scratch, &leaky, &["auth", "token"], Stdout::Discarded);
+        assert_eq!(token, Answer::Failure(super::TOKEN_HIDDEN.to_owned()), "{token:?}");
+        let status = Answer::Failure("\n  - Token: gho_****\n".to_owned());
+        let shown = status_finding(&status, None).expect("an unknown answer is reported");
+        assert!(!shown.message.contains("gho_"), "not even a masked token: {shown:?}");
+        assert!(shown.message.contains("(a line that looks like a token, not shown)"), "{shown:?}");
     }
 
     // Goal: every source at once gives the most findings there can be, and the check still
@@ -536,9 +596,9 @@ mod tests {
         let both = |name: &str| Some(format!("ghp_{name}"));
         let every = found(&scratch, &odd, &both);
         assert_eq!(every.len(), super::FINDINGS_MAX, "{every:?}");
-        let tokens = [Severity::Reachable, Severity::Reachable];
+        let tokens = [Severity::Stop, Severity::Stop];
         assert_eq!(severities(&every)[..2], tokens, "the tokens: {every:?}");
-        let unsure = [Severity::Unverified, Severity::Unverified];
+        let unsure = [Severity::Warn, Severity::Warn];
         assert_eq!(severities(&every)[2..], unsure, "and gh: {every:?}");
     }
 
@@ -546,12 +606,12 @@ mod tests {
     // message on one line; a check that returns is passed through.
     #[test]
     fn a_check_that_panics_stops_the_session() {
-        let fine = Finding { severity: Severity::Unverified, message: "warning".to_owned() };
+        let fine = Finding { severity: Severity::Warn, message: "warning".to_owned() };
         let kept = fine.clone();
         assert_eq!(super::checked(move || vec![kept]), [fine]);
         assert_eq!(super::checked(Vec::new), []);
         let failed = super::checked(|| panic!("broken\n  check"));
-        assert_eq!(severities(&failed), [Severity::Reachable], "{failed:?}");
+        assert_eq!(severities(&failed), [Severity::Stop], "{failed:?}");
         assert!(failed[0].message.contains("failed (broken check)"), "{failed:?}");
         let formatted = super::checked(|| panic!("{} {}", "formatted", 7));
         assert!(formatted[0].message.contains("(formatted 7)"), "{formatted:?}");
@@ -595,7 +655,7 @@ mod tests {
         );
         assert_eq!(found(&scratch, &none, &no_variables), []);
         let token = fake_gh(&scratch, "token", &says(STATUS_NONE, 1), &old("exit 0"));
-        assert_eq!(severities(&found(&scratch, &token, &no_variables)), [Severity::Reachable]);
+        assert_eq!(severities(&found(&scratch, &token, &no_variables)), [Severity::Stop]);
     }
 
     // Goal: the session environment that this check guards is still there: `GH_CONFIG_DIR` is
@@ -617,7 +677,7 @@ mod tests {
         assert!(!config.exists(), "it holds no login: {}", config.display());
         let parent = config.parent().expect("an absolute path below the root has a parent");
         assert!(!parent.exists(), "and nothing below `/` can create it: {}", parent.display());
-        assert_eq!(variable(super::BUS_VARIABLE).as_deref(), Some("disabled:"), "no bus");
+        assert_eq!(variable(super::BUS_VARIABLE).as_deref(), Some(super::BUS_CUT_OFF), "no bus");
         for token in super::TOKEN_VARIABLES {
             assert_eq!(variable(token), None, "the settings name no token: {token}");
         }

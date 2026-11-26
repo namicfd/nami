@@ -169,6 +169,11 @@ pub fn run(event: &str) -> ExitCode {
     let mut payload = String::new();
     if let Err(error) = io::stdin().read_to_string(&mut payload) {
         eprintln!("hook {}: cannot read stdin: {error}", event.name());
+        if event == Event::SessionStart {
+            // Unchecked is not a pass: stop the session, and exit 0 so that the stop is read.
+            print!("{}", session_start_failed("reading the hook's input", &error.to_string()));
+            return ExitCode::SUCCESS;
+        }
         return ExitCode::FAILURE;
     }
     let project = std::env::var_os(PROJECT_VARIABLE).filter(|project| !project.is_empty());
@@ -352,7 +357,8 @@ fn polls_in(seconds: u32) -> u32 {
 /// A budget counts polls, not wall-clock time (ADR-0005). Each poll sleeps
 /// [`POLL_INTERVAL_MILLISECONDS`], and the sleeps' overrun, the time `try_wait` takes, the git
 /// calls around the runs and the fallback check all come out of the headroom that the hook keeps
-/// below Claude Code's timeout: 40 seconds after an edit, 120 at stop.
+/// below Claude Code's timeout: 40 seconds after an edit, 120 at stop, and at session start what
+/// the doctor's 30 seconds and the login check's 30 leave of 120.
 #[derive(Debug)]
 struct Budget {
     polls_left: u32,
@@ -693,89 +699,176 @@ fn stop_failed(attempts: Option<&Path>, stop_hook_active: bool, output_tail: &st
     }
 }
 
+/// Session start. It always exits 0 once it has a report: Claude Code reads a hook's JSON only
+/// after exit 0, and a stop it does not read is no stop. Every problem is therefore a finding in
+/// the report, and every failure of the hook itself a fixed stop ([`session_start_failed`]).
 fn session_start(root: Option<&Path>) -> ExitCode {
-    let status = match export_cargo_bin() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("hook session-start: cannot extend the file CLAUDE_ENV_FILE names: {error}");
-            ExitCode::FAILURE
+    let mut findings: Vec<github_login::Finding> =
+        export_cargo_bin().err().map(|error| env_file_finding(&error)).into_iter().collect();
+    let report = match doctor_within(root, DOCTOR_SECONDS_MAX) {
+        Err(reason) => session_start_failed("the doctor", &reason),
+        Ok(doctor) => {
+            // The login check fails closed: a panic in it is a finding that stops the session.
+            findings.extend(github_login::checked(|| login_findings(root)));
+            let output = std::panic::catch_unwind(|| session_start_output(&doctor, &findings));
+            output
+                .unwrap_or_else(|panic| session_start_failed("the report", &panic_reason(&*panic)))
         }
     };
-    // The login check fails closed: whatever goes wrong in it, or in the report around it,
-    // stops the session rather than letting it start unchecked.
-    let report = std::panic::catch_unwind(|| session_start_report(root));
-    print!("{}", report.unwrap_or_else(|_panic| SESSION_START_FAILED.to_owned()));
-    status
+    assert!(report.is_empty() || report.ends_with('\n'), "the report ends its last line");
+    print!("{report}");
+    ExitCode::SUCCESS
 }
 
 /// A panic that would print nothing, or exit 101, would let the session start unchecked.
 const _: () = assert!(cfg!(panic = "unwind"), "the session-start hook catches its own panics");
 
-/// What session start prints when building its report panicked: a stop, for the human and the
-/// agent, since the login check is not known to have passed.
-const SESSION_START_FAILED: &str = concat!(
-    r#"{"continue":false,"stopReason":"Session stopped: the session-start hook failed, so it "#,
-    r#"is not known whether gh can reach a person's GitHub login "#,
-    r#"(docs/operations/github-setup.md, step 6). Report it as a bug.","#,
-    r#""systemMessage":"error[gh-login]: the session-start hook failed before it could check "#,
-    r#"gh's login; the session is stopped"}"#,
-    "\n"
-);
+/// The finding for an env file that session start cannot extend: the session would start
+/// without `$HOME/.cargo/bin` on its `PATH`, so it stops.
+fn env_file_finding(error: &io::Error) -> github_login::Finding {
+    let error = error.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+    let message = format!(
+        "error[session-start]: cannot add `$HOME/.cargo/bin` to the session's PATH through the \
+         file that CLAUDE_ENV_FILE names ({error}), so `just` and `cargo` would not be found; \
+         make that file writable, then start a new session"
+    );
+    assert!(!message.contains('\n'), "a finding is one line");
+    github_login::Finding { severity: github_login::Severity::Stop, message }
+}
 
-/// The doctor's findings and the login check, as [`session_start_output`] prints them.
-fn session_start_report(root: Option<&Path>) -> String {
-    // A doctor finding informs; it never fails the hook.
-    let doctor = root.map_or_else(Vec::new, crate::doctor::findings);
+/// The login check of this session, with the real gh and environment.
+fn login_findings(root: Option<&Path>) -> Vec<github_login::Finding> {
     let log = root.map_or_else(
         || std::env::temp_dir().join(format!("nami-gh-login-{}.log", std::process::id())),
         |root| output_log(root, "gh-login"),
     );
-    let logins = github_login::checked(|| {
-        let command = || Command::new("gh");
-        let budget = &mut Budget::of_seconds(LOGIN_CHECK_SECONDS_MAX);
-        let mut gh = github_login::Gh { command: &command, log: &log, budget };
-        github_login::findings(&mut gh, &|name| std::env::var(name).ok())
-    });
-    let report = session_start_output(&doctor, &logins);
-    assert!(logins.is_empty() || report.starts_with('{'), "a login finding is reported as JSON");
-    report
+    let command = || Command::new("gh");
+    let budget = &mut Budget::of_seconds(LOGIN_CHECK_SECONDS_MAX);
+    let mut gh = github_login::Gh { command: &command, log: &log, budget };
+    github_login::findings(&mut gh, &|name| std::env::var(name).ok())
 }
+
+/// The doctor's findings for `root`, or none outside a checkout. A doctor that takes longer than
+/// `seconds` is left behind with a warning, so that its unbounded commands cannot push the hook
+/// past its timeout. `Err` is the message of a doctor that panicked.
+fn doctor_within(root: Option<&Path>, seconds: u32) -> Result<Vec<String>, String> {
+    let Some(root) = root.map(Path::to_path_buf) else {
+        return Ok(Vec::new());
+    };
+    let finished = within(seconds, move || crate::doctor::findings(&root))?;
+    Ok(finished.unwrap_or_else(|| {
+        vec![format!(
+            "warning[doctor]: the doctor did not finish within {seconds} seconds, so the tools \
+             are unchecked; run `cargo xtask doctor` by hand"
+        )]
+    }))
+}
+
+/// Runs `work` on a thread of its own and waits for it in polls of
+/// [`POLL_INTERVAL_MILLISECONDS`], up to `seconds`. `Ok(None)` if it is still running then: the
+/// thread is left behind, and ends with the process. `Err` is the message of a panic.
+fn within<T: Send + 'static>(
+    seconds: u32,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<Option<T>, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _sent = sender.send(work());
+    });
+    let interval = Duration::from_millis(u64::from(POLL_INTERVAL_MILLISECONDS));
+    let mut ended = false;
+    for _ in 0..polls_in(seconds) {
+        match receiver.try_recv() {
+            Ok(result) => return Ok(Some(result)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::sleep(interval),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                ended = true;
+                break;
+            }
+        }
+    }
+    if let Ok(result) = receiver.try_recv() {
+        return Ok(Some(result));
+    }
+    if !ended {
+        return Ok(None);
+    }
+    // The sender is gone without a result: the work panicked.
+    match worker.join() {
+        Err(panic) => Err(panic_reason(&*panic)),
+        Ok(()) => Err("it ended without a result".to_owned()),
+    }
+}
+
+/// The message of a panic, on one line.
+fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
+    let reason = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("a panic without a message");
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!reason.contains('\n'), "the reason is one line");
+    reason
+}
+
+/// What session start prints when `stage` of it failed for `reason`: a stop, for the human and
+/// the agent, since the login check is not known to have passed.
+fn session_start_failed(stage: &str, reason: &str) -> String {
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stop = format!(
+        "Session stopped: {stage} of the session-start hook failed ({reason}), so it is not \
+         known whether gh can reach a person's GitHub login (docs/operations/github-setup.md, \
+         step 6). Report it as a bug."
+    );
+    let message =
+        format!("error[session-start]: {stage} failed ({reason}); the session is stopped");
+    let (stop, message) = (crate::json::quote(&stop), crate::json::quote(&message));
+    let output =
+        format!("{{\"continue\":false,\"stopReason\":{stop},\"systemMessage\":{message}}}\n");
+    assert!(output.lines().count() == 1, "the stop is one line of JSON");
+    output
+}
+
+/// Seconds that the doctor may take (hook timeout: 120). Its commands are not bounded one by
+/// one; past this, the hook goes on without it.
+const DOCTOR_SECONDS_MAX: u32 = 30;
 
 /// Seconds that the gh calls of the login check may take together, each run's reap after a kill
 /// included (hook timeout: 120). gh waits up to 60 seconds for a keyring that does not answer;
-/// a check that runs out of time cannot tell, and says so.
+/// a check that runs out of time cannot tell, and says so, unless the keyring is in reach.
 const LOGIN_CHECK_SECONDS_MAX: u32 = 30;
 
-/// Why a session whose gh can reach a person's login is stopped, for the human.
-const LOGIN_STOP_REASON: &str = "Session stopped: gh can reach a person's GitHub login, so a gh \
-                                 command without the bot's token would act as that person. Fix \
-                                 what the session-start hook reports, then start a new session \
-                                 (docs/operations/github-setup.md, step 6).";
+/// Why a session is stopped at its start, for the human.
+const STOP_REASON: &str = "Session stopped: the session-start hook found a problem that must be \
+                           fixed before an agent works here, such as a person's GitHub login in \
+                           reach of gh. Fix what it reports, then start a new session \
+                           (docs/operations/github-setup.md, step 6).";
 
 /// What the session-start hook prints. Claude Code adds plain stdout to the agent's context, so
-/// without a login finding that is the doctor's findings, one per line. With one, it is a JSON
-/// object: every finding goes to the agent (`additionalContext`), the login findings also go to
-/// the human (`systemMessage`), and a login in reach stops the session (`continue: false`).
+/// without a finding that is the doctor's findings, one per line. With one, it is a JSON
+/// object: every finding goes to the agent (`additionalContext`), the findings also go to
+/// the human (`systemMessage`), and a stop finding stops the session (`continue: false`).
 ///
 /// A session start cannot be blocked otherwise, and the stop is kept for a login that gh does
 /// reach: the environment is the guard, and this check only proves that it holds. A check that
 /// cannot tell is reported and the session goes on, so that a new gh cannot halt every session.
-fn session_start_output(doctor: &[String], logins: &[github_login::Finding]) -> String {
+fn session_start_output(doctor: &[String], findings: &[github_login::Finding]) -> String {
     let mut context: Vec<&str> = doctor.iter().map(String::as_str).collect();
-    if logins.is_empty() {
+    if findings.is_empty() {
         let mut lines = context.join("\n");
         if !lines.is_empty() {
             lines.push('\n');
         }
         return lines;
     }
-    let human: Vec<&str> = logins.iter().map(|finding| finding.message.as_str()).collect();
+    let human: Vec<&str> = findings.iter().map(|finding| finding.message.as_str()).collect();
     context.extend(&human);
-    let stops = logins.iter().any(|finding| finding.severity == github_login::Severity::Reachable);
+    let stops = findings.iter().any(|finding| finding.severity == github_login::Severity::Stop);
     let mut fields = Vec::new();
     if stops {
         fields.push(r#""continue":false"#.to_owned());
-        fields.push(format!(r#""stopReason":{}"#, crate::json::quote(LOGIN_STOP_REASON)));
+        fields.push(format!(r#""stopReason":{}"#, crate::json::quote(STOP_REASON)));
     }
     fields.push(format!(r#""systemMessage":{}"#, crate::json::quote(&human.join("\n"))));
     fields.push(format!(
@@ -787,7 +880,7 @@ fn session_start_output(doctor: &[String], logins: &[github_login::Finding]) -> 
     let parsed = crate::json::parse(&output);
     let proceeds = parsed.as_ref().ok().and_then(|value| value.get("continue")?.as_bool());
     assert!(parsed.is_ok(), "the session-start output is JSON: {output}");
-    assert_eq!(proceeds, stops.then_some(false), "the output stops exactly when a login is found");
+    assert_eq!(proceeds, stops.then_some(false), "the output stops exactly for a stop finding");
     output
 }
 
@@ -1419,10 +1512,12 @@ mod tests {
             assert!(stop <= timeout(event), "{stop} s exceed the {event} hook's timeout");
         }
         assert_eq!((timeout("PostToolUse"), timeout("Stop")), (120, 600), "the timeouts read");
-        // The doctor's commands are not bounded; they take a few seconds, the rest is theirs.
-        let login = seconds(worst(super::LOGIN_CHECK_SECONDS_MAX)) + OWN_WORK_SECONDS_MIN;
-        let start = timeout("SessionStart");
-        assert!(2 * login <= start, "{login} s leave too little of the {start} s session start");
+        // Session start: the doctor, then the login check, then the hook's own work.
+        let doctor = seconds(worst(super::DOCTOR_SECONDS_MAX));
+        let login = seconds(worst(super::LOGIN_CHECK_SECONDS_MAX));
+        let start = doctor + login + OWN_WORK_SECONDS_MIN;
+        let limit = timeout("SessionStart");
+        assert!(start <= limit, "{start} s exceed the session-start hook's {limit} s timeout");
     }
 
     // Goal: every event name round-trips, and anything else is not an event.
@@ -1583,7 +1678,7 @@ mod tests {
         assert_eq!(session_start_output(&doctor, &[]), "error[doctor]: a\nerror[doctor]: b\n");
         assert_eq!(session_start_output(&[], &[]), "");
         let finding = |severity, message: &str| Finding { severity, message: message.to_owned() };
-        let unsure = [finding(Severity::Unverified, "warning[gh-login]: \"odd\"")];
+        let unsure = [finding(Severity::Warn, "warning[gh-login]: \"odd\"")];
         let printed = session_start_output(&doctor, &unsure);
         let output = crate::json::parse(&printed).expect("the output is one JSON object");
         assert!(output.get("continue").is_none(), "an unverified login does not stop: {printed}");
@@ -1595,28 +1690,57 @@ mod tests {
         let context = specific.get("additionalContext").and_then(crate::json::Value::as_str);
         let expected = "error[doctor]: a\nerror[doctor]: b\nwarning[gh-login]: \"odd\"";
         assert_eq!(context, Some(expected), "the agent sees every finding");
-        let both = [unsure[0].clone(), finding(Severity::Reachable, "error[gh-login]: x")];
+        let both = [unsure[0].clone(), finding(Severity::Stop, "error[gh-login]: x")];
         let stopping = session_start_output(&[], &both);
         let stopped = crate::json::parse(&stopping).expect("the output is one JSON object");
         let stop = stopped.get("continue").and_then(crate::json::Value::as_bool);
         assert_eq!(stop, Some(false), "a login in reach stops the session: {stopping}");
         let reason = stopped.get("stopReason").and_then(crate::json::Value::as_str);
-        assert_eq!(reason, Some(super::LOGIN_STOP_REASON));
+        assert_eq!(reason, Some(super::STOP_REASON));
         let told = stopped.get("systemMessage").and_then(crate::json::Value::as_str);
         assert_eq!(told, Some("warning[gh-login]: \"odd\"\nerror[gh-login]: x"));
     }
 
-    // Goal: what session start prints when its report panicked is a stop that Claude Code can
-    // read: one JSON object with `continue: false` and a message for the human.
+    // Goal: what session start prints when a stage of it failed is a stop that Claude Code can
+    // read: one line of JSON with `continue: false`, naming the stage and the reason, on one
+    // line even if the reason spans several, for the human and in the stop reason.
     #[test]
     fn a_failed_session_start_stops_the_session() {
-        let failed = super::SESSION_START_FAILED;
-        assert!(failed.ends_with("}\n"), "one line: {failed}");
-        let output = crate::json::parse(failed).expect("the fallback is JSON");
+        let failed = super::session_start_failed("the doctor", "broken \"quoted\"\n  doctor");
+        assert!(failed.ends_with("}\n") && failed.lines().count() == 1, "one line: {failed}");
+        let output = crate::json::parse(&failed).expect("the stop is JSON");
         let stop = output.get("continue").and_then(crate::json::Value::as_bool);
         assert_eq!(stop, Some(false), "it stops the session: {failed}");
         let told = output.get("systemMessage").and_then(crate::json::Value::as_str);
-        assert!(told.is_some_and(|told| told.starts_with("error[gh-login]: ")), "{failed}");
-        assert!(output.get("stopReason").is_some(), "and says why: {failed}");
+        let expected = "error[session-start]: the doctor failed (broken \"quoted\" doctor); the \
+                        session is stopped";
+        assert_eq!(told, Some(expected), "{failed}");
+        let reason = output.get("stopReason").and_then(crate::json::Value::as_str).unwrap();
+        assert!(reason.contains("the doctor of the session-start hook failed (broken"), "{reason}");
+    }
+
+    // Goal: work that ends in time is returned, work that panics is its panic's message on one
+    // line, and work that outlives the deadline is left behind. Method: the slow work blocks on
+    // a channel that the test holds and closes only after the deadline.
+    #[test]
+    fn work_is_waited_for_within_its_deadline() {
+        assert_eq!(super::within(1, || 7), Ok(Some(7)));
+        let panicked = super::within(1, || -> u32 { panic!("doctor\n  broke") });
+        assert_eq!(panicked, Err("doctor broke".to_owned()));
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let slow = super::within(1, move || blocked.recv().is_err());
+        assert_eq!(slow, Ok(None), "still running at the deadline");
+        drop(release);
+        assert_eq!(super::doctor_within(None, 1), Ok(Vec::new()), "no checkout, no doctor");
+    }
+
+    // Goal: an env file that cannot be extended is a stop finding that names the file's
+    // variable and the error, on one line.
+    #[test]
+    fn an_env_file_that_cannot_be_extended_stops_the_session() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied\n here");
+        let finding = super::env_file_finding(&error);
+        assert_eq!(finding.severity, super::github_login::Severity::Stop);
+        assert!(finding.message.contains("CLAUDE_ENV_FILE names (denied here)"), "{finding:?}");
     }
 }

@@ -194,6 +194,11 @@ impl Scratch {
     /// Runs `xtask hook <event>` in the checkout, as `.claude/settings.json` does in the project
     /// directory, with `payload` on stdin and the fake `just` and `cargo` first on `PATH`.
     fn hook(&self, event: &str, payload: &str, environment: &[(&str, &Path)]) -> Output {
+        self.hook_bytes(event, payload.as_bytes(), environment)
+    }
+
+    /// [`Scratch::hook`] with any bytes on stdin, UTF-8 or not.
+    fn hook_bytes(&self, event: &str, payload: &[u8], environment: &[(&str, &Path)]) -> Output {
         // Read at run time, not with `env!`: under sccache a compile-time path can name the
         // binary of another worktree (#30).
         let xtask = std::env::var_os("CARGO_BIN_EXE_xtask")
@@ -214,7 +219,7 @@ impl Scratch {
             .spawn()
             .expect("xtask starts");
         let mut stdin = child.stdin.take().expect("stdin is piped");
-        stdin.write_all(payload.as_bytes()).expect("xtask reads its payload");
+        stdin.write_all(payload).expect("xtask reads its payload");
         drop(stdin);
         child.wait_with_output().expect("xtask finishes")
     }
@@ -497,6 +502,50 @@ fn session_start_stops_a_session_with_a_person_s_gh_login() {
     let context = specific.get("additionalContext").and_then(xtask::json::Value::as_str).unwrap();
     assert!(context.starts_with("error[doctor]: "), "the doctor's findings stay: {context}");
     assert!(context.ends_with(told), "and the agent is told too: {context}");
+}
+
+/// The `continue` field and the `systemMessage` of what session start printed, and its exit
+/// code, which must be 0 for Claude Code to read the JSON at all.
+fn session_start_stop(output: Output) -> (Option<bool>, String) {
+    assert_eq!(output.status.code(), Some(0), "Claude Code reads JSON only after exit 0");
+    let stdout = String::from_utf8(output.stdout).expect("the hook prints UTF-8");
+    let printed = xtask::json::parse(&stdout).expect("the hook prints one JSON object");
+    let stop = printed.get("continue").and_then(xtask::json::Value::as_bool);
+    let told = printed.get("systemMessage").and_then(xtask::json::Value::as_str);
+    (stop, told.unwrap_or_default().to_owned())
+}
+
+// Goal: an env file that session start cannot extend does not turn the hook's exit code into a
+// failure that hides its JSON: the hook exits 0, and stops the session for both the env file
+// and a personal token. Method: the reviewer's case, a read-only CLAUDE_ENV_FILE and a fake
+// `ghp_` token in GH_TOKEN.
+#[test]
+fn session_start_stops_with_exit_0_when_the_env_file_is_read_only() {
+    let scratch = Scratch::new("session-start-read-only");
+    let env_file = scratch.directory.join("env");
+    fs::write(&env_file, "").expect("the scratch directory is writable");
+    fs::set_permissions(&env_file, fs::Permissions::from_mode(0o444)).expect("it is ours");
+    let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, scratch.root().display());
+    let environment = [
+        ("CLAUDE_ENV_FILE", env_file.as_path()),
+        ("NAMI_SESSION_PATH", Path::new("/usr/bin:/bin")),
+        ("GH_TOKEN", Path::new("ghp_notarealtokenxyz")),
+    ];
+    let (stop, told) = session_start_stop(scratch.hook("session-start", &payload, &environment));
+    assert_eq!(stop, Some(false), "the session is stopped: {told}");
+    assert!(told.contains("error[gh-login]: GH_TOKEN holds a classic personal"), "{told}");
+    assert!(told.contains("error[session-start]: cannot add `$HOME/.cargo/bin`"), "{told}");
+    assert!(!told.contains("notarealtoken"), "the token is never shown: {told}");
+}
+
+// Goal: a session-start payload that cannot be read stops the session with exit 0, and names
+// the stage that failed. Method: bytes that are not UTF-8 on stdin.
+#[test]
+fn session_start_stops_when_its_input_cannot_be_read() {
+    let scratch = Scratch::new("session-start-bad-input");
+    let (stop, told) = session_start_stop(scratch.hook_bytes("session-start", &[0xff, 0xfe], &[]));
+    assert_eq!(stop, Some(false), "unchecked is not a pass: {told}");
+    assert!(told.starts_with("error[session-start]: reading the hook's input failed"), "{told}");
 }
 
 /// The calls the fake `cargo` recorded in `checkout`:
