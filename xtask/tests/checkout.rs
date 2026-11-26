@@ -174,11 +174,15 @@ impl Scratch {
     /// Runs `xtask hook <event>` in the checkout, as `.claude/settings.json` does in the project
     /// directory, with `payload` on stdin and the fake `just` and `cargo` first on `PATH`.
     fn hook(&self, event: &str, payload: &str, environment: &[(&str, &Path)]) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        // Read at run time, not with `env!`: under sccache a compile-time path can name the
+        // binary of another worktree (#30).
+        let xtask = std::env::var_os("CARGO_BIN_EXE_xtask")
+            .expect("cargo and nextest set CARGO_BIN_EXE_xtask when they run a test");
+        let mut child = Command::new(&xtask)
             .args(["hook", event])
             .current_dir(self.root())
             .env("PATH", self.path())
-            .env("NAMI_TEST_XTASK", env!("CARGO_BIN_EXE_xtask"))
+            .env("NAMI_TEST_XTASK", &xtask)
             .env_remove("CLAUDE_PROJECT_DIR")
             .envs(environment.iter().copied())
             .stdin(Stdio::piped())
