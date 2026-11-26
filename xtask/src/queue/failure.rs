@@ -432,6 +432,8 @@ mod tests {
         let codes = codes_in_log(log, &vocabulary());
         assert_eq!(codes, Codes { rules: set(&["adr-number"]), lints: set(&["nami_recursion"]) });
         assert_eq!(codes_in_log(HOSTILE, &vocabulary()), Codes::default());
+        let one_side = codes_in_log("xnami_recursion nami_float_reduction_y", &vocabulary());
+        assert_eq!(one_side, Codes::default(), "a lint name inside a longer word is not a lint");
         let lint_at_ends = codes_in_log("nami_float_reduction", &vocabulary());
         assert_eq!(lint_at_ends.lints, set(&["nami_float_reduction"]), "at both ends of the log");
     }
