@@ -1,7 +1,7 @@
 # Layout prototype: 3D Euler in three layouts, against Athena++
 
 Measured input for `docs/ARCHITECTURE.md` § 4(a) and the ADR that will amend ADR-0003. The code
-is on the branch `research/layout-prototype` (commit `2f971e5`, directory
+is on the branch `research/layout-prototype` (commits `2f971e5` and `f25084c`, directory
 `research/layout-prototype/`, with a README that says how to reproduce every number here). That
 branch is not merged.
 
@@ -15,7 +15,8 @@ branch is not merged.
 - **The layouts give bitwise-identical output,** and the L1 errors after one wave period match
   Athena++'s to all seven printed digits, at 64³ and at 128³.
 - **With `kernels::math::sqrt` exactly as it is today, nami fails the target:** 0.10× (SoA) and
-  0.07× (AoS) of Athena++. Two properties of `sqrt`, not the layout, cause this:
+  0.07× (AoS) of Athena++ in the main campaign, or 0.9× in a rebuild that differs only in
+  inlining. Either way it is below 1.0×, and which of the two you get is not under control. Two properties of `sqrt`, not the layout, cause this:
   1. `libm::sqrt` with the `arch` feature is an inline-asm legacy-SSE `sqrtsd`. In a function that
      also runs AVX code, every call pays an SSE/AVX transition penalty (about 10× here). It is
      also opaque to LLVM, so it can never vectorise.
@@ -28,6 +29,10 @@ branch is not merged.
 - **1.0× Athena++ is reachable,** with room to spare, but only after a decision on `sqrt`
   (below). The determinism rules themselves cost 13 to 15% (the `algebraic_*` data point), which
   matches ADR-0005's estimate of 5 to 15%.
+- **Block sizes known at compile time buy nothing.** SoA with const-generic dimensions
+  (`Soa<Fixed<64>>`) and SoA with the same sizes given at runtime produce the same machine code,
+  within one or two instructions per function, and run at the same speed: median ratio 0.99 to
+  1.01 in every configuration and size.
 
 ## Setup
 
@@ -193,6 +198,45 @@ Single runs outside the campaign, same machine, 64³:
 
 Raw data: `research/layout-prototype/results/raw.tsv` on the prototype branch.
 
+### Compile-time against runtime block size (SoA only)
+
+`soa-const` is the SoA code with the block dimensions as a const generic (`Soa<Fixed<64>>`,
+`Soa<Fixed<128>>`), so every row length and trip count is a compile-time constant after
+inlining. `soa` is the same code with the sizes given at runtime. A separate campaign (commit
+`f25084c`, 5 interleaved repetitions, Athena++ in every repetition, load average median 2.6,
+max 8.5) compared the two. Bits are identical (`cd8c234f981d50dc` at 64³ over one period).
+
+| Size | Config | soa (runtime) | soa-const | const / runtime, per repetition | soa-const ratio to Athena++ |
+|---|---|---|---|---|---|
+| 64³ | A | 6.65 (6.57–6.67) | 6.68 (6.56–6.75) | 1.003 (0.999–1.013) | 0.93× |
+| 64³ | B | 6.70 (6.16–6.75) | 6.74 (6.03–6.75) | 1.000 (0.979–1.008) | 0.93× |
+| 64³ | C | 13.71 (13.28–13.92) | 13.59 (13.19–13.91) | 0.993 (0.978–1.033) | 1.92× |
+| 128³ | A | 6.03 (5.28–6.40) | 6.03 (5.84–6.42) | 1.007 (0.952–1.106) | 0.91× |
+| 128³ | B | 6.39 (5.46–6.40) | 6.34 (5.81–6.38) | 0.999 (0.966–1.064) | 0.94× |
+| 128³ | C | 11.79 (11.55–12.16) | 11.78 (11.54–12.29) | 0.999 (0.996–1.011) | 1.76× |
+
+(Mzc/s, median with min–max. Athena++'s SIMD build ran at 7.22 at 64³ and 6.72 at 128³ in this
+campaign.)
+
+- **Same code.** The sweep functions of `Soa<Shape>`, `Soa<Fixed<64>>` and `Soa<Fixed<128>>`
+  have the same instruction mix and sizes to within two instructions (for example 2346 against
+  2346 instructions and 4 `vsqrtpd ymm` in each transverse sweep under C). LLVM keeps the same
+  4-wide vector loop with a scalar remainder whether or not it knows the trip count. The loop
+  bodies (one HLLC per face) are far too large to unroll fully, and the row lengths (n + 1,
+  n + 2 faces) are not multiples of 4 anyway.
+- **Same speed.** The per-repetition ratio is 1.00 within ±1% at the medians. The spread
+  (0.95 to 1.11) is background noise and is symmetric.
+- **So const generics are not a performance argument.** Whether block sizes are fixed at compile
+  time can be decided on other grounds (AMR blocks of one size, the cost of monomorphising every
+  size, binary size).
+- **Side finding.** This build also marks the row accessors `#[inline(always)]` (they were
+  `#[inline]`). That alone moves configuration A's SoA from 0.72 to 6.65 Mzc/s: the faithful libm
+  build is fast here, at the speed of B. The arithmetic and the instruction counts of the hot
+  loops are unchanged. Only the placement of calls, and with them `vzeroupper`, relative to libm's
+  legacy `sqrtsd` changes. Rebuilding commit `2f971e5` reproduces 0.71 Mzc/s, and the new build
+  gives 6.49 in the same minute. This confirms finding 2 below: with `libm::sqrt` under
+  `x86-64-v3`, a 9× swing in speed follows from inlining decisions that look unrelated.
+
 ## Vectorisation
 
 From `objdump -d` of the benchmark binaries (`tools/vecstats.py`, which counts instructions per
@@ -226,7 +270,8 @@ Findings:
    AVX code. Adding any opaque call to the loop (for example the phase timers) also hides the
    penalty, because LLVM emits `vzeroupper` before calls. This makes performance depend on
    inlining decisions. A fast faithful build of the hybrid (6 Mzc/s) is no argument for the
-   hybrid.
+   hybrid. The const-generic campaign shows the same swing for SoA: marking the row accessors
+   `#[inline(always)]` takes configuration A from 0.72 to 6.65 Mzc/s.
 3. **No stable `no_std` route gives a vectorisable sqrt today:**
    - `f64::sqrt` needs `std` (and clippy bans it);
    - `core::f64::math::sqrt` is unstable (`core_float_math`) on 1.100;
@@ -284,12 +329,16 @@ is small (12.3 against 14.1 Mzc/s).
        penalty but still does not vectorise.
 
      Until then, `libm::sqrt` with `arch` under `x86-64-v3` is a performance hazard that depends
-     on inlining. Measured without the per-call asserts, the libm backends reach at most
+     on inlining: 0.7 or 6.6 Mzc/s for the same SoA arithmetic. Measured without the per-call asserts, the libm backends reach at most
      0.86 Mzc/s (D) or 3.2 Mzc/s (G).
 3. **Determinism costs about 13 to 15%** on this problem (`algebraic_*` in PLM and HLLC: 16.2
    against 14.1 Mzc/s at 64³, 14.2 against 12.3 at 128³). That is inside ADR-0005's estimate,
    and nami still beats Athena++'s fast-math build by 1.9× while staying bitwise deterministic.
    No reason to revisit ADR-0005.
+
+4. **Block dimensions at compile time are optional.** Const generics change neither the code
+   nor the speed (within ±1%), so § 4(c) can choose fixed or runtime block sizes for other
+   reasons.
 
 ## What I could not measure
 
