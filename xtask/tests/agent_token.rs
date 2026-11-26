@@ -53,3 +53,51 @@ fn jwt_is_well_formed_and_verifies() {
     assert_eq!(numbers[1] - numbers[0], 600, "GitHub allows at most 10 minutes");
     assert!(lines[1].ends_with(r#""iss":"Iv-test-client"}"#), "issuer is the client ID");
 }
+
+/// Runs `agent-token.sh request` for the repository `owner/name`, with `NAMI_AGENT_PERMISSIONS`
+/// set to `permissions`, or unset for `None`. Returns its status, stdout and stderr.
+fn request(permissions: Option<&str>) -> (bool, String, String) {
+    let script = xtask::workspace_root().join("xtask/agent-token.sh");
+    let mut command = Command::new(script);
+    let _ = command.arg("request").env("NAMI_AGENT_REPO", "owner/name");
+    let _ = match permissions {
+        Some(permissions) => command.env("NAMI_AGENT_PERMISSIONS", permissions),
+        None => command.env_remove("NAMI_AGENT_PERMISSIONS"),
+    };
+    let output = command.output().expect("the script starts");
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("output is UTF-8");
+    (output.status.success(), text(output.stdout), text(output.stderr))
+}
+
+// Goal: without `NAMI_AGENT_PERMISSIONS`, the token request names only the repository, so the
+// token has all of the app's permissions, as before.
+#[test]
+fn the_token_request_names_only_the_repository_by_default() {
+    let expected = "{\"repositories\":[\"name\"]}\n".to_owned();
+    assert_eq!(request(None), (true, expected.clone(), String::new()));
+    assert_eq!(request(Some("")).1, expected, "empty means unset");
+}
+
+// Goal: `NAMI_AGENT_PERMISSIONS` narrows the token: the request carries the object as given.
+#[test]
+fn permissions_narrow_the_token_request() {
+    let (ok, body, _) = request(Some(r#"{"issues": "write", "actions": "read"}"#));
+    assert!(ok, "a JSON object is accepted");
+    let permissions = "{\"issues\":\"write\",\"actions\":\"read\"}";
+    assert_eq!(body, format!("{{\"repositories\":[\"name\"],\"permissions\":{permissions}}}\n"));
+}
+
+// Goal: a value that is not a JSON object stops the script with a message that shows the form,
+// and no request is printed.
+#[test]
+fn bad_permissions_are_an_error() {
+    for bad in ["issues=write", "[\"issues\"]", "\"write\"", "{\"issues\":", "null"] {
+        let (ok, body, error) = request(Some(bad));
+        assert!(!ok, "{bad} is refused");
+        assert!(body.is_empty(), "{bad}: nothing is printed: {body}");
+        assert!(
+            error.contains("NAMI_AGENT_PERMISSIONS must be a JSON object, such as"),
+            "{bad}: {error}"
+        );
+    }
+}

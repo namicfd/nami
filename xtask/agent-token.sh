@@ -8,6 +8,7 @@
 #   xtask/agent-token.sh env                 print shell exports that make git and gh act as the bot
 #   xtask/agent-token.sh git-credential get  git credential helper (installed by `env`)
 #   xtask/agent-token.sh jwt                 print the app's own JWT (valid for 9 minutes)
+#   xtask/agent-token.sh request             print the token request's body; asks GitHub nothing
 #
 # In an agent runner:
 #   eval "$(xtask/agent-token.sh env)"
@@ -142,5 +143,6 @@ case "${1:-token}" in
   env) env_exports ;;
   git-credential) git_credential "${2:-}" ;;
   jwt) jwt ;;
-  *) fail "unknown command '$1'; use token, env, git-credential or jwt" ;;
+  request) token_request && echo ;;
+  *) fail "unknown command '$1'; use token, env, git-credential, jwt or request" ;;
 esac
