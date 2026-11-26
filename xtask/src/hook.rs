@@ -8,8 +8,9 @@
 //!   needs only that file: Rust sources, manifests, ADRs and the style guide.
 //! - `stop`: runs `just check dylint` before an agent or subagent may finish, unless the working
 //!   state is the unchanged base or has already passed.
-//! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH` and reports tools whose
-//!   version is not the pinned one.
+//! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH`, reports tools whose
+//!   version is not the pinned one, and stops a session whose gh can reach a person's GitHub
+//!   login ([`github_login`]).
 //!
 //! # Which checkout, and whose rules
 //!
@@ -58,6 +59,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
+
+pub mod github_login;
 
 /// Exit code that makes Claude Code show stderr to the agent.
 const EXIT_FEEDBACK: u8 = 2;
@@ -671,14 +674,53 @@ fn session_start(root: Option<&Path>) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    if let Some(root) = root {
-        // Claude Code adds stdout to the agent's context. A finding informs; it never fails the
-        // hook.
-        for finding in crate::doctor::findings(root) {
-            println!("{finding}");
-        }
-    }
+    // A doctor finding informs; it never fails the hook.
+    let doctor = root.map_or_else(Vec::new, crate::doctor::findings);
+    let gh = || Command::new("gh");
+    let logins = github_login::findings(&gh, &|name| std::env::var(name).ok());
+    print!("{}", session_start_output(&doctor, &logins));
     status
+}
+
+/// Why a session whose gh can reach a person's login is stopped, for the human.
+const LOGIN_STOP_REASON: &str = "Session stopped: gh can reach a person's GitHub login, so a gh \
+                                 command without the bot's token would act as that person. Fix \
+                                 what the session-start hook reports, then start a new session \
+                                 (docs/operations/github-setup.md, step 6).";
+
+/// What the session-start hook prints. Claude Code adds plain stdout to the agent's context, so
+/// without a login finding that is the doctor's findings, one per line. With one, it is a JSON
+/// object: every finding goes to the agent (`additionalContext`), the login findings also go to
+/// the human (`systemMessage`), and a login in reach stops the session (`continue: false`).
+///
+/// A session start cannot be blocked otherwise, and the stop is kept for a login that gh does
+/// reach: the environment is the guard, and this check only proves that it holds. A check that
+/// cannot tell is reported and the session goes on, so that a new gh cannot halt every session.
+fn session_start_output(doctor: &[String], logins: &[github_login::Finding]) -> String {
+    let mut context: Vec<&str> = doctor.iter().map(String::as_str).collect();
+    if logins.is_empty() {
+        let mut lines = context.join("\n");
+        if !lines.is_empty() {
+            lines.push('\n');
+        }
+        return lines;
+    }
+    let human: Vec<&str> = logins.iter().map(|finding| finding.message.as_str()).collect();
+    context.extend(&human);
+    let stops = logins.iter().any(|finding| finding.severity == github_login::Severity::Reachable);
+    let mut fields = Vec::new();
+    if stops {
+        fields.push(r#""continue":false"#.to_owned());
+        fields.push(format!(r#""stopReason":{}"#, crate::json::quote(LOGIN_STOP_REASON)));
+    }
+    fields.push(format!(r#""systemMessage":{}"#, crate::json::quote(&human.join("\n"))));
+    fields.push(format!(
+        r#""hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":{}}}"#,
+        crate::json::quote(&context.join("\n"))
+    ));
+    assert!(fields.len() >= 2, "the human and the agent are both told");
+    assert!(context.len() == doctor.len() + logins.len(), "the agent is told everything");
+    format!("{{{}}}\n", fields.join(","))
 }
 
 /// Appends [`CARGO_BIN_EXPORT`] to the file that `CLAUDE_ENV_FILE` names, unless the session's
@@ -1456,5 +1498,39 @@ mod tests {
         assert_eq!(super::env_file_addition("export A=1"), Some(format!("\n{export}\n")));
         assert_eq!(super::env_file_addition(&format!("export A=1\n{export}\n")), None);
         assert_eq!(super::env_file_addition(&format!("  {export}")), None);
+    }
+
+    // Goal: without a login finding, session start prints the doctor's findings as plain lines;
+    // with one, a JSON object that tells the agent everything and the human the login findings,
+    // and that stops the session only for a login in reach.
+    #[test]
+    fn session_start_stops_only_for_a_login_in_reach() {
+        use super::github_login::{Finding, Severity};
+        use super::session_start_output;
+        let doctor = vec!["error[doctor]: a".to_owned(), "error[doctor]: b".to_owned()];
+        assert_eq!(session_start_output(&doctor, &[]), "error[doctor]: a\nerror[doctor]: b\n");
+        assert_eq!(session_start_output(&[], &[]), "");
+        let finding = |severity, message: &str| Finding { severity, message: message.to_owned() };
+        let unsure = [finding(Severity::Unverified, "warning[gh-login]: \"odd\"")];
+        let printed = session_start_output(&doctor, &unsure);
+        let output = crate::json::parse(&printed).expect("the output is one JSON object");
+        assert!(output.get("continue").is_none(), "an unverified login does not stop: {printed}");
+        let message = output.get("systemMessage").and_then(crate::json::Value::as_str);
+        assert_eq!(message, Some("warning[gh-login]: \"odd\""), "the human sees the finding");
+        let specific = output.get("hookSpecificOutput").expect("the agent's part");
+        let event = specific.get("hookEventName").and_then(crate::json::Value::as_str);
+        assert_eq!(event, Some("SessionStart"));
+        let context = specific.get("additionalContext").and_then(crate::json::Value::as_str);
+        let expected = "error[doctor]: a\nerror[doctor]: b\nwarning[gh-login]: \"odd\"";
+        assert_eq!(context, Some(expected), "the agent sees every finding");
+        let both = [unsure[0].clone(), finding(Severity::Reachable, "error[gh-login]: x")];
+        let stopping = session_start_output(&[], &both);
+        let stopped = crate::json::parse(&stopping).expect("the output is one JSON object");
+        let stop = stopped.get("continue").and_then(crate::json::Value::as_bool);
+        assert_eq!(stop, Some(false), "a login in reach stops the session: {stopping}");
+        let reason = stopped.get("stopReason").and_then(crate::json::Value::as_str);
+        assert_eq!(reason, Some(super::LOGIN_STOP_REASON));
+        let told = stopped.get("systemMessage").and_then(crate::json::Value::as_str);
+        assert_eq!(told, Some("warning[gh-login]: \"odd\"\nerror[gh-login]: x"));
     }
 }

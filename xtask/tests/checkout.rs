@@ -74,6 +74,21 @@ echo "// formatted by ${RUSTUP_TOOLCHAIN:-the pinned toolchain}"
 cat
 "#;
 
+/// A stand-in for `gh`: it knows no login and no token, as in an agent session, unless
+/// `gh-login` exists, when it answers every question like a gh with a person's stored login.
+const FAKE_GH: &str = r#"#!/bin/sh
+if [ -e gh-login ]; then
+    echo "  ✓ Logged in to github.com account human (/home/human/.config/gh/hosts.yml)"
+    exit 0
+fi
+case "$1 $2" in
+    'auth status') echo "You are not logged into any GitHub hosts. To log in, ..." >&2 ;;
+    'auth token') echo "no oauth token found for github.com" >&2 ;;
+    *) echo "unexpected: $*" >&2 ;;
+esac
+exit 1
+"#;
+
 /// Runs git in `directory` with a fixed identity and without the user's hooks or signing.
 fn git_output(directory: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
@@ -117,7 +132,12 @@ impl Scratch {
         scratch.commit("base");
         fs::create_dir_all(scratch.directory.join("bin"))
             .expect("the scratch directory is writable");
-        let tools = [("just", FAKE_JUST), ("cargo", FAKE_CARGO), ("rustfmt", FAKE_RUSTFMT)];
+        let tools = [
+            ("just", FAKE_JUST),
+            ("cargo", FAKE_CARGO),
+            ("rustfmt", FAKE_RUSTFMT),
+            ("gh", FAKE_GH),
+        ];
         for (tool_name, script) in tools {
             let tool = scratch.directory.join("bin").join(tool_name);
             fs::write(&tool, script).expect("the scratch directory is writable");
@@ -448,6 +468,32 @@ fn session_start_extends_path_and_reports_findings() {
     assert_eq!(fs::read_to_string(&env_file).unwrap(), export, "the export is appended");
     assert_eq!(start("/usr/bin:/bin").status.code(), Some(0), "the hook succeeds again");
     assert_eq!(fs::read_to_string(&env_file).unwrap(), export, "but only once");
+}
+
+// Goal: a session whose gh can reach a person's login is stopped at its start, and both the
+// human and the agent are told why. Method: the fake gh on the hook's `PATH` answers like a gh
+// with a stored login while `gh-login` exists in the checkout.
+#[test]
+fn session_start_stops_a_session_with_a_person_s_gh_login() {
+    let scratch = Scratch::new("session-start-gh-login");
+    scratch.write("gh-login", "");
+    let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, scratch.root().display());
+    let home = std::env::var("HOME").expect("HOME is set");
+    let session_path = format!("{home}/.cargo/bin");
+    let environment = [("NAMI_SESSION_PATH", Path::new(&session_path))];
+    let output = scratch.hook("session-start", &payload, &environment);
+    assert_eq!(output.status.code(), Some(0), "Claude Code reads JSON only after exit 0");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let printed = xtask::json::parse(&stdout).expect("the hook prints one JSON object");
+    let stop = printed.get("continue").and_then(xtask::json::Value::as_bool);
+    assert_eq!(stop, Some(false), "the session is stopped: {stdout}");
+    let told = printed.get("systemMessage").and_then(xtask::json::Value::as_str).unwrap();
+    assert!(told.starts_with("error[gh-login]: `gh auth status` without GH_TOKEN"), "{told}");
+    assert!(told.contains("account human"), "the human learns whose login it is: {told}");
+    let specific = printed.get("hookSpecificOutput").expect("the agent's part");
+    let context = specific.get("additionalContext").and_then(xtask::json::Value::as_str).unwrap();
+    assert!(context.starts_with("error[doctor]: "), "the doctor's findings stay: {context}");
+    assert!(context.ends_with(told), "and the agent is told too: {context}");
 }
 
 /// The calls the fake `cargo` recorded in `checkout`:

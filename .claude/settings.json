@@ -23,7 +23,9 @@
     "GIT_CONFIG_KEY_1": "credential.helper",
     "GIT_CONFIG_VALUE_1": "!\"$(git rev-parse --show-toplevel)/xtask/agent-token.sh\" git-credential",
     "GIT_CONFIG_KEY_2": "url.https://github.com/.insteadOf",
-    "GIT_CONFIG_VALUE_2": "git@github.com:"
+    "GIT_CONFIG_VALUE_2": "git@github.com:",
+    "GH_CONFIG_DIR": "/nonexistent/nami-agents-have-no-gh-login",
+    "DBUS_SESSION_BUS_ADDRESS": "disabled:"
   },
   "hooks": {
     "SessionStart": [
