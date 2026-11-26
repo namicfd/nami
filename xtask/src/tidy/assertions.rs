@@ -186,6 +186,13 @@ mod tests {
             function_with_lines("d", 8, 1),
         );
         assert_eq!(stats(&tests, Scope::Crate), AssertionStats { functions: 2, assertions: 2 });
+        let modules = format!(
+            "mod inner {{ {} }}\n#[cfg(unix)]\nmod unix {{ {} }}",
+            function_with_lines("e", 8, 1),
+            function_with_lines("f", 8, 0),
+        );
+        let counted = stats(&modules, Scope::Crate);
+        assert_eq!(counted, AssertionStats { functions: 2, assertions: 1 }, "other modules count");
         assert_eq!(stats(&function_with_lines("a", 8, 0), Scope::Tooling), AssertionStats::zero());
         assert_eq!(stats("fn a( {", Scope::Crate), AssertionStats::zero(), "does not parse");
     }
