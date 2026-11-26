@@ -135,14 +135,15 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   alone, with no review needed; an open request for changes or thread by the reviewer app still
   blocks it. Write a new rule this way when you can: add its code beside the old, leave existing
   functions, constants and tests as they are, and give a new type only plain `impl`s in its own
-  file, of a new trait or of `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Default` or `Display`.
-  Don't nest an `impl`, trait, module or `macro_rules!` in a function, and don't use
-  `include_str!`, `file!` or `env!`, not even in a test.
+  file, of any trait, with lifetime parameters used only in the trait path and the method
+  signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Don't nest an `impl`,
+  trait, module or `macro_rules!` in a function, and don't use `include_str!`, `file!` or
+  `env!`, not even in a test.
 - **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
-  member of an existing `impl`; an `impl` with generics, in another file than its type, or of a
-  visitor trait such as `Visit` or `LateLintPass` (so a new lint's pass `impl` is an edit). It
-  waits for the reviewer app's approval of its head commit (#59), and until that app exists for a
-  code owner's. Say in the PR description why the edit does not loosen the rule.
+  member of an existing `impl`; an `impl` in another file than its type, with type or const
+  parameters, or with a `where` clause. It waits for the reviewer app's approval of its head
+  commit (#59), and until that app exists for a code owner's. Say in the PR description why the
+  edit does not loosen the rule.
 
 Run the check yourself first, inside a checkout of `main`:
 `cargo xtask ratchet --base . --head <your tree> --no-review`. Without a review, it reports the

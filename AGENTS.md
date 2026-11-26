@@ -143,7 +143,8 @@ The protected paths are:
   the rule paths (ADR-0022): the files that define what a tidy rule or a dylint lint reports, their
   fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths is either:
   - **additive** (new rules beside the old code, new fixtures and UI cases, new rows): it merges
-    on the required `ratchet` check's proof alone, with no review needed. The check proves that
+    on the required `ratchet` check's proof alone, with no review needed, even before the
+    reviewer app exists. The check proves that
     every case `main` writes down still holds, the rule tables only narrow, and mutation testing
     misses nothing; an open request for changes or thread by the reviewer app
     (`NAMI_REVIEWER_LOGIN`, not the agents' bot) still blocks it;
