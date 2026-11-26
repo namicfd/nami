@@ -172,7 +172,18 @@ pub fn run(event: &str) -> ExitCode {
     let root = hook_root(event, &payload, project.as_deref().map(Path::new));
     match event {
         Event::PostEdit => root.map_or(ExitCode::SUCCESS, |root| post_edit(&root, &payload)),
-        Event::Stop => root.map_or(ExitCode::SUCCESS, |root| stop(&root, &payload)),
+        Event::Stop => {
+            if let Some(root) = root {
+                stop(&root, &payload)
+            } else {
+                // Not a failure: a session may stop anywhere. But the human should know.
+                eprintln!(
+                    "hook stop: no nami checkout was found around the session's directory, so \
+                     this stop was not gated"
+                );
+                ExitCode::SUCCESS
+            }
+        }
         Event::SessionStart => session_start(root.as_deref()),
     }
 }
@@ -1206,7 +1217,10 @@ mod tests {
         let toolchain = std::fs::read_to_string(workspace.join("rust-toolchain.toml")).unwrap();
         scratch.write("rust-toolchain.toml", &toolchain);
         scratch.write("xtask/README", "tooling\n");
-        scratch.write("src/lib.rs", "fn a() {}\n");
+        // Unformatted, and with a debt marker that tidy reports. The marker is put together
+        // here so that this file does not carry it.
+        let debt = ["TO", "DO"].concat();
+        scratch.write("src/lib.rs", &format!("fn a( ) {{}} // {debt} later\n"));
         let root = scratch.root();
         let mut fifo = std::process::Command::new("mkfifo");
         assert!(fifo.arg(root.join("f")).status().unwrap().success(), "the FIFO is made");
@@ -1225,10 +1239,12 @@ mod tests {
         let file = root.join("src/lib.rs");
         let payload = format!(r#"{{"tool_input":{{"file_path":"{}"}}}}"#, file.display());
         let exit = check_edit(root, &payload, Some(work));
-        assert!(is(exit, ExitCode::SUCCESS), "this process checked the file: {exit:?}");
+        let feedback = ExitCode::from(EXIT_FEEDBACK);
+        assert!(is(exit, feedback), "this process checked the file and found the marker: {exit:?}");
         assert!(!marker.exists(), "the worktree's check was not started: the budget was spent");
         let formatted = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(formatted, "fn a() {}\n", "and this process's rustfmt formatted it");
+        let expected = format!("fn a() {{}} // {debt} later\n");
+        assert_eq!(formatted, expected, "and this process's rustfmt rewrote it");
     }
 
     // Goal: runs that share a budget never take longer than it, reaps included: what one run

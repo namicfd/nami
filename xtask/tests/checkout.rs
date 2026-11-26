@@ -403,7 +403,11 @@ fn stop_without_a_session_follows_stop_hook_active() {
     assert!(state.is_empty(), "no counter and no pass are stored: {state:?}");
 
     let outside = scratch.hook("stop", r#"{"session_id":"s1","cwd":"/"}"#, &[]);
-    assert_eq!(outside.status.code(), Some(0), "not a nami checkout: nothing to gate");
+    let outside_stderr = String::from_utf8_lossy(&outside.stderr);
+    assert_eq!(outside.status.code(), Some(0), "not a nami checkout: {outside_stderr}");
+    let note = "hook stop: no nami checkout was found around the session's directory, so this \
+                stop was not gated\n";
+    assert_eq!(outside_stderr, note, "the stop says that it was not gated");
     assert_eq!(scratch.gate_runs(), 2, "and the gate does not run for it");
 }
 
