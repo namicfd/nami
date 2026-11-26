@@ -184,7 +184,8 @@ The job is safe to give the key because:
 
 - it runs on `workflow_run`, which takes the workflow file and xtask from `main`, never from a PR;
 - the key sits in an environment that only `main` may use, so a PR that edits a workflow to read it is refused;
-- the key is in the job's environment only until it is written to a file, which is deleted once the token is minted;
+- the key is in the environment of one step only, which writes it to a file. The next step mints the token from the file and deletes it before xtask starts, and a last step that always runs deletes it if anything failed in between;
+- it files only for runs of `.github/workflows/ci.yml`, so a workflow that a PR adds under the name `ci` triggers nothing;
 - `NAMI_AGENT_PERMISSIONS` narrows its token to `issues: write`, and `actions`, `contents` and `pull_requests` read, and the token expires within an hour.
 
 The other job in that workflow, `adr clashes (advisory)`, comments with the workflow's own token and needs no setup.
