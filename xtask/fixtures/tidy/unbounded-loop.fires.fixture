@@ -1,5 +1,6 @@
 // path: crates/solver/src/example.rs
-//! Loops without a fixed upper bound: `loop`, `while`, and `for` over a range without an end.
+//! Loops without a fixed upper bound: `loop`, `while`, and `for` over a range or an iterator
+//! without an end.
 
 fn wait_forever() {
     loop {}
@@ -15,4 +16,24 @@ fn count_steps() {
 
 fn count_even_steps() {
     for _step in (0_u32..).step_by(2) {}
+}
+
+fn repeat_forever() {
+    for _value in core::iter::repeat(1.0_f64) {}
+}
+
+fn cycle_forever(values: &[f64]) {
+    for _value in values.iter().cycle() {}
+}
+
+fn cycle_through_the_trait(values: &[f64]) {
+    for _value in Iterator::cycle(values.iter()) {}
+}
+
+fn chain_forever(values: &[f64]) {
+    for _value in values.iter().chain(core::iter::repeat(&1.0_f64)) {}
+}
+
+fn count_successors() {
+    for _step in core::iter::successors(Some(0_u32), |step| step.checked_add(1)) {}
 }

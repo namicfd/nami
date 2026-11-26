@@ -39,7 +39,7 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `tasks-json` | workspace | Every `tasks.json` is valid JSON with one `tasks` array, and every task has exactly the six fields of the schema. | ADR-0011 |
 | `test-goal` | source | Every test starts with a comment that states its goal. | TIGER_STYLE.md, Comments, docs and commits |
 | `unasserted-function` | source | A function in a nami crate longer than 10 lines contains an assertion. | ADR-0004 |
-| `unbounded-loop` | source | No `loop`, no `while`, and no `for` over a range without an end unless `take` or `zip` bounds it: every loop has a fixed upper bound. | TIGER_STYLE.md, Put a limit on everything |
+| `unbounded-loop` | source | No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, unless `take` or `zip` bounds it: every loop has a fixed upper bound. | TIGER_STYLE.md, Put a limit on everything |
 | `unsafe` | source | `unsafe` appears only in `crates/alloc-guard`. | ADR-0014 |
 | `usize` | source | In nami crates, `usize` appears in function signatures, fields, public constants and statics, and type aliases only in `base::index`. Trait impls and const generics are exempt. | ADR-0002 |
 | `vec-field` | source | No `Vec` anywhere inside a field type in nami crates: fixed-size storage is `Box<[T]>`. | ADR-0003 |
