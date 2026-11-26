@@ -127,13 +127,12 @@ pub fn unworkable(
     if issue.labels.iter().any(|label| label == NEEDS_DECISION) {
         return Some(format!("#{number} waits for the maintainer's decision (`{NEEDS_DECISION}`)"));
     }
-    open_decision(issue, events, comments, trust).map(|why| {
-        format!(
-            "#{number} {why}; it still waits for a decision. A code owner removes the label, or \
-             the bot with `cargo xtask issue decide` (ADR-0021, point 7)"
-        )
-    })
+    open_decision(issue, events, comments, trust).map(|why| format!("#{number} {why}"))
 }
+
+/// The end of a reason why a removal of `needs-decision` does not count: what does count.
+const REMOVAL_FIX: &str = "it still waits for a decision. A code owner removes the label, or \
+                           the bot with `cargo xtask issue decide` (ADR-0021, point 7)";
 
 /// True when the comments decide whether the last removal of `needs-decision` counts: the bot
 /// removed the label last, and [`bot_owns_label`] holds.
@@ -192,7 +191,8 @@ pub fn bot_owns_label<'events>(
 /// a code owner, or by the bot with the [`answering_record`].
 ///
 /// A label that the events say is on, but that the issue does not carry, left without a
-/// removal on record: someone renamed or deleted the repository's label. That fails closed.
+/// removal on record. The repository's label may have been renamed or deleted, or the label
+/// added between the read of the issue and the read of its events. Either way it fails closed.
 fn open_decision(
     issue: &Issue,
     events: &[LabelEvent],
@@ -204,8 +204,10 @@ fn open_decision(
         let is_on = issue.labels.iter().any(|label| label == NEEDS_DECISION);
         return (!is_on).then(|| {
             format!(
-                "lost `{NEEDS_DECISION}` without a removal on record: the label vanished, so it \
-                 was renamed or deleted"
+                "does not carry `{NEEDS_DECISION}`, but its last label event adds it and no \
+                 removal is on record, so it still waits for a decision. If the repository's \
+                 `{NEEDS_DECISION}` label is gone, a code owner restores it; otherwise a code \
+                 owner adds the label to the issue again and decides (ADR-0021, point 7)"
             )
         });
     }
@@ -214,7 +216,7 @@ fn open_decision(
     }
     if last.actor != BOT_LOGIN {
         return Some(format!(
-            "had `{NEEDS_DECISION}` removed by `{}`, who is not a code owner",
+            "had `{NEEDS_DECISION}` removed by `{}`, who is not a code owner; {REMOVAL_FIX}",
             last.actor
         ));
     }
@@ -222,7 +224,7 @@ fn open_decision(
     answer.err().map(|why| {
         format!(
             "had `{NEEDS_DECISION}` removed by `{BOT_LOGIN}` without a decision record that \
-             counts: {why}"
+             counts: {why}; {REMOVAL_FIX}"
         )
     })
 }
@@ -603,8 +605,10 @@ mod tests {
         let trust = trust();
         let added = history(&[("owner", 2)]);
         let gone = unworkable(&issue(BOT_LOGIN, &["bug"]), &added, &[], &trust).expect("open");
-        assert!(gone.contains("lost `needs-decision` without a removal on record"), "{gone}");
-        assert!(gone.contains("renamed or deleted"), "{gone}");
+        assert!(gone.starts_with("#7 does not carry `needs-decision`, but its last"), "{gone}");
+        assert!(gone.contains("no removal is on record, so it still waits"), "{gone}");
+        assert!(gone.contains("a code owner restores it; otherwise a code owner adds"), "{gone}");
+        assert!(!gone.contains("cargo xtask issue decide"), "decide cannot help: {gone}");
         let on = unworkable(&issue(BOT_LOGIN, &["bug", "needs-decision"]), &added, &[], &trust);
         assert!(on.expect("on").contains("waits for the maintainer"));
 

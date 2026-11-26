@@ -388,7 +388,9 @@ fn decide(
 
 /// Whether `posted` would be the record that counts if the bot removed `needs-decision` from
 /// `found` now. It reads the label events and comments again, after posting, so that a label
-/// that someone touched meanwhile is never removed.
+/// that someone touched before this second read is never removed. A touch between the second
+/// read and the removal is not seen here; `ready` and `claim` then fail closed (ADR-0021, point
+/// 7, Limits).
 ///
 /// # Errors
 ///
