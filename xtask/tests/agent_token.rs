@@ -76,6 +76,15 @@ fn verified(directory: &Path, jwt: &str) -> Vec<String> {
 /// Runs `agent-token.sh` with `arguments` and only the given environment, in a temporary home
 /// that is removed afterwards. Returns whether it succeeded, its stdout and its stderr.
 fn run_script(arguments: &[&str], environment: &[(&str, &OsStr)]) -> (bool, String, String) {
+    run_script_with_input(arguments, environment, "")
+}
+
+/// Like [`run_script`], with `input` on the script's stdin.
+fn run_script_with_input(
+    arguments: &[&str],
+    environment: &[(&str, &OsStr)],
+    input: &str,
+) -> (bool, String, String) {
     let home = scratch("agent-token-home");
     let script = xtask::workspace_root().join("xtask/agent-token.sh");
     let mut command = Command::new(script);
@@ -83,14 +92,40 @@ fn run_script(arguments: &[&str], environment: &[(&str, &OsStr)]) -> (bool, Stri
         .args(arguments)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &home);
+        .env("HOME", &home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     for (name, value) in environment {
         let _set = command.env(name, value);
     }
-    let output = command.output().expect("the script starts");
+    let mut child = command.spawn().expect("the script starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    std::io::Write::write_all(&mut stdin, input.as_bytes()).expect("the input is written");
+    drop(stdin);
+    let output = child.wait_with_output().expect("the script ends");
     std::fs::remove_dir_all(&home).expect("temporary home is removable");
     let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("output is UTF-8");
     (output.status.success(), text(output.stdout), text(output.stderr))
+}
+
+/// Installs the fake curl in `directory/bin`, and returns a `PATH` that finds it first. The
+/// fake records into `directory`, which `NAMI_FAKE_DIR` must name.
+fn fake_github(directory: &Path) -> std::ffi::OsString {
+    let fakes = directory.join("bin");
+    std::fs::create_dir_all(&fakes).expect("fake directory is writable");
+    std::fs::write(fakes.join("curl"), FAKE_CURL).expect("the fake curl is written");
+    let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+    std::fs::set_permissions(fakes.join("curl"), executable).expect("the fake is executable");
+    let mut path = fakes.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+/// The requests that the fake curl recorded in `directory`, one per line, or none.
+fn recorded_requests(directory: &Path) -> String {
+    std::fs::read_to_string(directory.join("requests")).unwrap_or_default()
 }
 
 // Goal: `agent-token.sh jwt` prints a JWT whose header and payload are what GitHub expects
@@ -253,14 +288,7 @@ fn the_ci_app_signs_with_its_own_key() {
     let agent_key = directory.join("agent.pem");
     generate_key(&key);
     generate_key(&agent_key);
-    let fakes = directory.join("bin");
-    std::fs::create_dir_all(&fakes).expect("fake directory is writable");
-    std::fs::write(fakes.join("curl"), FAKE_CURL).expect("the fake curl is written");
-    let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
-    std::fs::set_permissions(fakes.join("curl"), executable).expect("the fake is executable");
-    let mut path = fakes.into_os_string();
-    path.push(":");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let path = fake_github(&directory);
     let environment = [
         ("NAMI_AGENT_APP", OsStr::new("ci")),
         ("NAMI_CI_KEY", key.as_os_str()),
@@ -291,9 +319,9 @@ fn the_ci_app_signs_with_its_own_key() {
     std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
 }
 
-// Goal: `NAMI_AGENT_APP=ci` refuses `env`, and fails without its own key or client ID even
-// when the agents' key and client ID are valid: it never falls back to them. An unknown app
-// fails.
+// Goal: `NAMI_AGENT_APP=ci` refuses `env` and `git-credential`, and fails without its own key
+// or client ID even when the agents' key and client ID are valid: it never falls back to
+// them. An unknown app fails.
 #[test]
 fn the_ci_app_never_falls_back_to_the_agents_key() {
     let directory = scratch("ci-fallback");
@@ -306,8 +334,11 @@ fn the_ci_app_never_falls_back_to_the_agents_key() {
     let agent = ("NAMI_AGENT_KEY", agent_key.as_os_str());
     let agent_client = ("NAMI_AGENT_CLIENT_ID", OsStr::new("Iv-agent"));
     let narrowed = ("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#));
-    let (exported, _, refusal) = run_script(&["env"], &[app, ci_key, ci_client, narrowed]);
-    assert!(!exported && refusal.contains("for the agents' app only"), "{refusal}");
+    for command in [&["env"][..], &["git-credential", "get"]] {
+        let (exported, out, refusal) = run_script(command, &[app, ci_key, ci_client, narrowed]);
+        let refused = !exported && out.is_empty() && refusal.contains("for the agents' app only");
+        assert!(refused, "{command:?}: {refusal}");
+    }
     let empty_key = ("NAMI_CI_KEY", OsStr::new(""));
     let missing_key = ("NAMI_CI_KEY", nowhere.as_os_str());
     let cases: [(Vec<(&str, &OsStr)>, &str); 5] = [
@@ -325,4 +356,74 @@ fn the_ci_app_never_falls_back_to_the_agents_key() {
         assert!(!ok && body.is_empty() && error.contains(expected), "{expected}: {error}");
     }
     std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
+}
+
+/// What git sends a credential helper before it talks to GitHub over HTTPS.
+const CREDENTIAL_REQUEST: &str = "protocol=https\nhost=github.com\n\n";
+
+// Goal: `git-credential get` and `env` never hand out a token that a refusal stopped. They
+// mint inside a command substitution, where bash does not keep `set -e`, so a refusal there
+// must still end the script (review of #64). Each case exits non-zero, prints no credential or
+// token, and the fake GitHub records no token request. Method: a valid key and a fake curl
+// that would mint; a narrowed control run shows that it would.
+#[test]
+fn git_credential_and_env_never_skip_a_refusal() {
+    let directory = scratch("credential-refusals");
+    let key = directory.join("key.pem");
+    generate_key(&key);
+    let path = fake_github(&directory);
+    let common = [
+        ("NAMI_AGENT_REPO", OsStr::new("owner/name")),
+        ("NAMI_FAKE_DIR", directory.as_os_str()),
+        ("PATH", path.as_os_str()),
+        ("NAMI_AGENT_KEY", key.as_os_str()),
+        ("NAMI_CI_KEY", key.as_os_str()),
+        ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci")),
+    ];
+    let ci = ("NAMI_AGENT_APP", OsStr::new("ci"));
+    let in_actions = ("GITHUB_ACTIONS", OsStr::new("true"));
+    let in_ci = ("CI", OsStr::new("true"));
+    let unnarrowed = [None, Some(""), Some("{}")];
+    for permissions in unnarrowed {
+        assert_refused(&directory, &common, &[ci], permissions);
+        assert_refused(&directory, &common, &[ci, in_actions], permissions);
+        assert_refused(&directory, &common, &[in_ci], permissions);
+    }
+    for permissions in [Some("{}"), Some("issues=write")] {
+        assert_refused(&directory, &common, &[], permissions);
+    }
+    let mut environment = common.to_vec();
+    environment.push(("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#)));
+    let (minted, credential, refusal) =
+        run_script_with_input(&["git-credential", "get"], &environment, CREDENTIAL_REQUEST);
+    assert!(minted && refusal.is_empty(), "the narrowed control mints: {refusal}");
+    assert_eq!(credential, "username=x-access-token\npassword=ghs_fake\n");
+    let (exported, exports, failure) = run_script(&["env"], &environment);
+    assert!(exported && exports.starts_with("export GH_TOKEN='ghs_fake'\n"), "{failure}");
+    assert_eq!(recorded_requests(&directory).matches("access_tokens").count(), 2, "two mints");
+    std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
+}
+
+/// Asserts that `git-credential get` and `env`, with `common` and `setup` in the environment
+/// and `NAMI_AGENT_PERMISSIONS` set to `permissions` (unset for `None`), exit non-zero, print
+/// no credential or token, and leave no token request in the fake GitHub in `directory`.
+fn assert_refused(
+    directory: &Path,
+    common: &[(&str, &OsStr)],
+    setup: &[(&str, &OsStr)],
+    permissions: Option<&str>,
+) {
+    for command in [&["git-credential", "get"][..], &["env"]] {
+        let mut environment = common.to_vec();
+        environment.extend_from_slice(setup);
+        environment.extend(permissions.map(|value| ("NAMI_AGENT_PERMISSIONS", OsStr::new(value))));
+        let (ok, out, error) = run_script_with_input(command, &environment, CREDENTIAL_REQUEST);
+        let case = format!("{setup:?}, {permissions:?}, {command:?}");
+        assert!(!ok && error.starts_with("agent-token: "), "{case}: refused: {error}");
+        for leak in ["password=", "GH_TOKEN", "ghs_fake"] {
+            assert!(!out.contains(leak), "{case}: no {leak} in {out}");
+        }
+        let requests = recorded_requests(directory);
+        assert!(!requests.contains("access_tokens"), "{case}: no token minted: {requests}");
+    }
 }

@@ -42,7 +42,13 @@
 #                           rule 2). `{}` narrows nothing and is always refused.
 #
 # Needs bash, openssl, curl and jq.
-set -euo pipefail
+#
+# Every refusal must end the script. Outside POSIX mode, bash turns `set -e` off inside a
+# command substitution, so a `fail` there ends only the subshell. Bash 4.4 and later keep it on
+# with `inherit_errexit`; bash 3.2 (macOS) has no such option, so every command substitution
+# below also checks its own status with `|| exit 1`.
+set -o errexit -o nounset -o pipefail
+shopt -s inherit_errexit 2>/dev/null || true
 
 fail() {
   echo "agent-token: $*" >&2
@@ -94,12 +100,12 @@ base64url() {
 jwt() {
   [[ -r "$key" ]] || fail "cannot read the $app app's private key at $key"
   local now header payload signature
-  now=$(date +%s)
-  header=$(printf '{"alg":"RS256","typ":"JWT"}' | base64url)
+  now=$(date +%s) || exit 1
+  header=$(printf '{"alg":"RS256","typ":"JWT"}' | base64url) || exit 1
   payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$client_id" |
-    base64url)
+    base64url) || exit 1
   signature=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -binary -sign "$key" |
-    base64url)
+    base64url) || exit 1
   printf '%s.%s.%s\n' "$header" "$payload" "$signature"
 }
 
@@ -127,7 +133,8 @@ github() {
 # permissions.
 token_request() {
   local request
-  request=$(jq -cn --arg name "${repo#*/}" '{repositories: [$name]}')
+  local count
+  request=$(jq -cn --arg name "${repo#*/}" '{repositories: [$name]}') || exit 1
   if [[ -z "$permissions" ]]; then
     ! must_narrow || fail "CI and the CI app must narrow the token: set" \
       "NAMI_AGENT_PERMISSIONS to the permissions the job needs, such as" \
@@ -139,7 +146,8 @@ token_request() {
     'if ($permissions | type) == "object" then . + {permissions: $permissions} else error end' \
     <<<"$request" 2>/dev/null) ||
     fail "NAMI_AGENT_PERMISSIONS must be a JSON object, such as '{\"issues\":\"write\"}'"
-  [[ $(jq '.permissions | length' <<<"$request") -gt 0 ]] ||
+  count=$(jq '.permissions | length' <<<"$request") || exit 1
+  [[ "$count" -gt 0 ]] ||
     fail "NAMI_AGENT_PERMISSIONS is {}, which narrows nothing; name the permissions" \
       "the token needs, such as '{\"issues\":\"write\"}'"
   printf '%s' "$request"
@@ -148,9 +156,9 @@ token_request() {
 # An installation token, scoped to this one repository.
 token() {
   local app_jwt installation request
-  request=$(token_request)
-  app_jwt=$(jwt)
-  installation=$(github GET "/repos/$repo/installation" "$app_jwt" | jq -r '.id')
+  request=$(token_request) || exit 1
+  app_jwt=$(jwt) || exit 1
+  installation=$(github GET "/repos/$repo/installation" "$app_jwt" | jq -r '.id') || exit 1
   [[ "$installation" =~ ^[0-9]+$ ]] || fail "unexpected installation ID '$installation'"
   github POST "/app/installations/$installation/access_tokens" "$app_jwt" "$request" |
     jq -re '.token'
@@ -158,9 +166,13 @@ token() {
 
 # The git credential helper protocol: answer `get` for https://github.com, ignore the rest.
 # Tokens are minted on demand and never stored, so `store` and `erase` have nothing to do.
+# The token is minted, and its status checked, before anything is printed.
 git_credential() {
+  [[ "$app" == "agent" ]] ||
+    fail "'git-credential' pushes as the agents, so it is for the agents' app only; a CI job" \
+      "mints one narrowed token with 'token' (ADR-0023, rule 2)"
   [[ "${1:-}" == "get" ]] || return 0
-  local line host="" protocol=""
+  local line host="" protocol="" password
   while IFS= read -r line && [[ -n "$line" ]]; do
     case "$line" in
       host=*) host=${line#host=} ;;
@@ -168,7 +180,8 @@ git_credential() {
     esac
   done
   [[ "$protocol" == "https" && "$host" == "github.com" ]] || return 0
-  printf 'username=x-access-token\npassword=%s\n' "$(token)"
+  password=$(token) || exit 1
+  printf 'username=x-access-token\npassword=%s\n' "$password"
 }
 
 # Exports for a shell whose git and gh act as the bot. The empty `credential.helper` first
@@ -178,8 +191,9 @@ env_exports() {
   [[ "$app" == "agent" ]] ||
     fail "'env' makes git commit as nami-agent[bot], so it is for the agents' app only"
   local self gh_token
-  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-  gh_token=$(token)
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" ||
+    exit 1
+  gh_token=$(token) || exit 1
   cat <<EOF
 export GH_TOKEN='$gh_token'
 export GIT_AUTHOR_NAME='$bot_name' GIT_COMMITTER_NAME='$bot_name'
