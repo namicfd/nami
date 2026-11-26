@@ -202,8 +202,8 @@ fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Strin
     match ready_issues(root, remote, github, &current) {
         Ok((issues, left_out)) if left_out.is_empty() => Ok(ready + &issues),
         Ok((issues, left_out)) => Err(format!(
-            "{} issue(s) left out because their state is unknown, so this list is incomplete; \
-             the rest of the list:\n{ready}{issues}",
+            "{} issue(s) left out because their state is unknown or cannot be checked, so this \
+             list is incomplete; the rest of the list:\n{ready}{issues}",
             left_out.len()
         )),
         Err(error) => Err(format!(
@@ -214,8 +214,9 @@ fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Strin
 }
 
 /// The issues that agents may work on and nobody holds, oldest first, as `ready` lines, and
-/// the numbers of the issues left out because a lookup failed. Each of those is named on
-/// stderr; one failed lookup leaves out only its own issue.
+/// the numbers of the issues left out because their state is unknown (a lookup failed) or
+/// cannot be checked (a CI app's issue without the scope to check it). Each of those is named
+/// on stderr; one failed lookup leaves out only its own issue.
 fn ready_issues(
     root: &Path,
     remote: &str,

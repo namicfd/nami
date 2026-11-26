@@ -680,8 +680,8 @@ fn a_failed_lookup_leaves_out_only_its_issue() {
     let ready = execute(&clone, "origin", &github, &["ready"]).expect_err("incomplete");
     assert_eq!(
         ready,
-        "1 issue(s) left out because their state is unknown, so this list is incomplete; the \
-         rest of the list:\na\tTask a\nissue-5\tIssue 5\n"
+        "1 issue(s) left out because their state is unknown or cannot be checked, so this list \
+         is incomplete; the rest of the list:\na\tTask a\nissue-5\tIssue 5\n"
     );
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
