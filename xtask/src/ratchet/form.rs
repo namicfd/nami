@@ -302,4 +302,22 @@ mod tests {
         );
         assert!(check("m.rs", "fn a( {", Strictness::RuleModule).is_err(), "does not parse");
     }
+
+    // Goal: only exactly `#[cfg(test)]` passes, and a table name is refused wherever it could
+    // be bound: a static, an associated constant, a pattern.
+    #[test]
+    fn every_binding_of_a_table_name_counts() {
+        for other in ["#[cfg(unix)]\nfn a() {}", "#[cfg(test = \"x\")]\nfn a() {}"] {
+            assert!(check("m.rs", other, Strictness::RuleModule).is_err(), "{other}");
+        }
+        let bindings = [
+            ("static RULES: &[u8] = &[];", "a static"),
+            ("impl A { const MACRO_BANS: u8 = 0; }", "an associated constant"),
+            ("fn a() { let PATH_BANS = 1; }", "a binding"),
+        ];
+        for (text, kind) in bindings {
+            let error = check("m.rs", text, Strictness::RuleModule).unwrap_err();
+            assert!(error.contains(kind), "{text}: {error}");
+        }
+    }
 }

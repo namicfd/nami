@@ -536,6 +536,8 @@ mod tests {
             assert!(error.contains("symbolic link"), "{error}");
         }
         assert!(read_optional(root, "lints/src").unwrap_err().contains("not a regular file"));
+        let below_a_file = read_optional(root, "lints/src/lib.rs/a.rs").unwrap_err();
+        assert!(below_a_file.contains("cannot read"), "only a missing file is none");
     }
 
     fn real_registry() -> String {
@@ -660,11 +662,12 @@ mod tests {
     #[test]
     fn check_calls_are_found() {
         let text = "fn a() { check_x(); helper(); }\nimpl V { fn b(&mut self) { self.check_y(1); \
-                    super::check_z(); } }";
+                    super::check_z(); } }\nmod inner { fn c() { check_w(); } }";
         let found = check_calls("m.rs", text).unwrap();
         let pairs: Vec<(&str, &str)> =
             found.iter().map(|(f, c)| (f.as_str(), c.as_str())).collect();
-        assert_eq!(pairs, [("a", "check_x"), ("b", "check_y"), ("b", "check_z")]);
+        let expected = [("a", "check_x"), ("b", "check_y"), ("b", "check_z"), ("c", "check_w")];
+        assert_eq!(pairs, expected, "a module that is not test code counts");
         let real =
             std::fs::read_to_string(crate::workspace_root().join("xtask/src/tidy/rust_source.rs"))
                 .unwrap();
