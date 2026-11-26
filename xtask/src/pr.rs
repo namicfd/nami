@@ -189,6 +189,7 @@ fn without_comments(text: &str) -> String {
 /// Checks a PR description. Returns one line per problem, and nothing if it is complete.
 ///
 /// `protected` holds the protected paths that the PR changes, and `branch` is the PR's branch.
+/// `repository` is this repository's `owner/name`, if known, for `Fixes <owner>/<name>#<n>`.
 /// `issue_problem` says why an issue that the description lists is not a follow-up issue, or
 /// `None` if it is one; it is asked about each number under `## Follow-up issues`.
 #[must_use]
@@ -196,11 +197,12 @@ pub fn check_body(
     body: &str,
     protected: &[String],
     branch: &str,
+    repository: Option<&str>,
     issue_problem: impl Fn(u32) -> Option<String>,
 ) -> Vec<String> {
     let follow_ups = section(body, HEADING_FOLLOW_UPS);
     let mut problems = follow_up_problems(follow_ups.as_deref(), issue_problem);
-    problems.extend(closing_problem(body, branch));
+    problems.extend(closing_problem(body, branch, repository));
     let listed = section(body, HEADING_PROTECTED);
     problems.extend(protected_file_problems(listed.as_deref(), protected));
     problems.iter().map(|problem| format!("error[pr-body]: {problem}")).collect()
@@ -268,10 +270,10 @@ fn issue_numbers(text: &str) -> Vec<u32> {
 
 /// On the branch of a claimed issue, `task/issue-<number>`, the description must close it, so
 /// that the merge marks the issue as done (ADR-0021).
-fn closing_problem(body: &str, branch: &str) -> Option<String> {
+fn closing_problem(body: &str, branch: &str, repository: Option<&str>) -> Option<String> {
     let id = branch.strip_prefix(TASK_BRANCH_PREFIX)?;
     let number = crate::issue::number_of_id(id).ok().flatten()?;
-    (!closes(body, number)).then(|| {
+    (!closes(body, number, repository)).then(|| {
         format!(
             "the branch `{branch}` works on issue #{number}, but the description does not close \
              it; add the line `Fixes #{number}` (ADR-0021)"
@@ -279,17 +281,25 @@ fn closing_problem(body: &str, branch: &str) -> Option<String> {
     })
 }
 
+/// Markdown emphasis that may wrap a closing word or the issue reference: `**Fixes #3**`.
+const EMPHASIS: [char; 2] = ['*', '_'];
+
 /// True if the PR description `body` closes issue `number` on merge: a closing word such as
-/// `Fixes`, then `#<number>`, outside HTML comments.
+/// `Fixes`, then `#<number>`, or `<owner>/<name>#<number>` when `repository` is this
+/// repository's `owner/name`, outside HTML comments. Emphasis around either word counts, as on
+/// GitHub. A reference to another repository's issue closes nothing here.
 #[must_use]
-pub fn closes(body: &str, number: u32) -> bool {
-    let reference = format!("#{number}");
+pub fn closes(body: &str, number: u32, repository: Option<&str>) -> bool {
+    let local = format!("#{number}");
+    let qualified = repository.map(|slug| format!("{}#{number}", slug.to_ascii_lowercase()));
     let visible = without_comments(body);
     let words: Vec<&str> = visible.split_whitespace().collect();
     words.array_windows().any(|[word, next]| {
-        let word = word.trim_end_matches(':').to_ascii_lowercase();
-        let next = next.trim_end_matches(['.', ',', ';', ')']);
-        CLOSING_WORDS.contains(&word.as_str()) && next == reference
+        let word = word.trim_matches(EMPHASIS).trim_end_matches(':').trim_matches(EMPHASIS);
+        let next = next.trim_matches(EMPHASIS).trim_end_matches(['.', ',', ';', ')']);
+        let next = next.trim_matches(EMPHASIS).to_ascii_lowercase();
+        CLOSING_WORDS.contains(&word.to_ascii_lowercase().as_str())
+            && (next == local || qualified.as_ref() == Some(&next))
     })
 }
 
@@ -399,7 +409,8 @@ pub fn body_problems(
     let base = base_of(options).expect("changed_protected accepted the options");
     // Loaded only when the description lists an issue: `None` needs neither git nor GitHub.
     let trust = OnceCell::new();
-    check_body(body, &protected, branch, |number| {
+    let repository = crate::issue::github::repository_of(root, "origin");
+    check_body(body, &protected, branch, repository.as_deref(), |number| {
         match trust.get_or_init(|| trust::load(root, base)) {
             Ok(trust) => listed_issue_problem(github, trust, number),
             Err(error) => Some(error.clone()),
@@ -663,8 +674,8 @@ mod tests {
     #[test]
     fn complete_body_passes() {
         let protected = paths(&["justfile", "xtask/src/hook.rs"]);
-        assert_eq!(check_body(BODY, &protected, "work", exists), Vec::<String>::new());
-        let problems = check_body("", &protected, "work", exists);
+        assert_eq!(check_body(BODY, &protected, "work", None, exists), Vec::<String>::new());
+        let problems = check_body("", &protected, "work", None, exists);
         assert_eq!(problems.len(), 2, "one per missing section: {problems:?}");
         for problem in &problems {
             assert!(problem.starts_with("error[pr-body]: the section `## "), "{problem}");
@@ -678,7 +689,7 @@ mod tests {
     #[test]
     fn follow_ups_may_be_none() {
         for none in ["None", "none", "NONE.", "  None.  ", "<!-- say why -->\n\nNone\n"] {
-            let problems = check_body(&body_with_follow_ups(none), &[], "work", exists);
+            let problems = check_body(&body_with_follow_ups(none), &[], "work", None, exists);
             assert_eq!(problems, Vec::<String>::new(), "`{none}` means no follow-ups");
         }
     }
@@ -698,14 +709,19 @@ mod tests {
         ];
         for follow_ups in passing {
             let body = body_with_follow_ups(&follow_ups);
-            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+            assert_eq!(
+                check_body(&body, &[], "work", None, exists),
+                Vec::<String>::new(),
+                "{body}"
+            );
         }
         let more_footers = format!("None.\n{footer}\n\n---\n<!-- end -->\n{footer}\n");
         let body = body_with_follow_ups(&more_footers);
-        assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+        assert_eq!(check_body(&body, &[], "work", None, exists), Vec::<String>::new(), "{body}");
         let failing = [format!("\n{footer}"), format!("\n---\n\n{footer}"), "---".to_owned()];
         for follow_ups in failing {
-            let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
+            let problems =
+                check_body(&body_with_follow_ups(&follow_ups), &[], "work", None, exists);
             assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
             assert!(problems[0].contains("names no issue; write `None`, or"), "{problems:?}");
         }
@@ -721,12 +737,13 @@ mod tests {
             Some(paths(&["- #12", middle, "- #13"]))
         );
         let follow_ups = format!("- #12\n{middle}\n- #13");
-        let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
+        let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", None, exists);
         assert_eq!(problems.len(), 2, "#3 and #13 are checked: {problems:?}");
         assert!(problems[0].contains("#3, listed under"), "{problems:?}");
         assert!(problems[1].contains("#13, listed under"), "{problems:?}");
         let after_none = format!("None.\n{middle}\n---\nA footer.");
-        let none_problems = check_body(&body_with_follow_ups(&after_none), &[], "work", exists);
+        let none_problems =
+            check_body(&body_with_follow_ups(&after_none), &[], "work", None, exists);
         assert_eq!(none_problems.len(), 1, "{none_problems:?}");
         let expected = format!("says `None` and then `{middle}`;");
         assert!(none_problems[0].contains(&expected), "{none_problems:?}");
@@ -744,7 +761,7 @@ mod tests {
             ("None.\n\n---\n\n- #12", "- #12"),
         ];
         for (follow_ups, extra) in cases {
-            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", None, exists);
             assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
             let expected = format!("says `None` and then `{extra}`;");
             assert!(problems[0].contains(&expected), "{problems:?}");
@@ -767,20 +784,55 @@ mod tests {
             "### Details",
         ];
         for follow_ups in no_issue {
-            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", None, exists);
             assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
             assert!(problems[0].contains("names no issue; write `None`, or"), "{problems:?}");
         }
         for follow_ups in ["See #12.", "- #12 (the loop rule)", "#12#12"] {
             let body = body_with_follow_ups(follow_ups);
-            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+            assert_eq!(
+                check_body(&body, &[], "work", None, exists),
+                Vec::<String>::new(),
+                "{body}"
+            );
         }
         let follow_ups = "- #13\n- #12, #11\n- #13 again\n";
-        let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+        let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", None, exists);
         assert_eq!(problems.len(), 2, "one per wrong issue, each once: {problems:?}");
         assert!(problems[0].contains("#11, listed under"), "{problems:?}");
         assert!(problems[1].contains("#13, listed under"), "{problems:?}");
         assert!(problems[1].contains("is not a follow-up issue: it is not #12;"), "{problems:?}");
+    }
+
+    // Goal: the closing forms that GitHub honours count: emphasis around the keyword or the
+    // reference, and `owner/name#n` for this repository only, in any case. A comment, another
+    // repository's issue, and a qualified reference when the repository is unknown do not.
+    #[test]
+    fn closing_forms_that_github_honours() {
+        let here = Some("namicfd/nami");
+        for text in [
+            "**Fixes #3**",
+            "**Fixes** #3",
+            "_Fixes_ #3.",
+            "**Fixes:** **#3**",
+            "Closes namicfd/nami#3",
+            "Fixes NamiCFD/Nami#3.",
+            "*Resolves namicfd/nami#3*",
+        ] {
+            assert!(super::closes(text, 3, here), "`{text}` closes #3");
+        }
+        for text in [
+            "<!-- **Fixes #3** -->",
+            "Fixes other/repo#3",
+            "Fixes namicfd/nami#30",
+            "Fixes namicfd/nami3",
+            "**Fixes #30**",
+            "Fixes **#",
+        ] {
+            assert!(!super::closes(text, 3, here), "`{text}` does not close #3");
+        }
+        assert!(!super::closes("Fixes namicfd/nami#3", 3, None), "unknown repository");
+        assert!(super::closes("**Fixes #3**", 3, None), "a local reference needs no repository");
     }
 
     // Goal: on a claimed issue's branch the description closes that issue, with any of GitHub's
@@ -789,7 +841,7 @@ mod tests {
     fn issue_branches_close_their_issue() {
         let closes = |text: &str, branch: &str| {
             let body = format!("{text}\n\n{}", body_with_follow_ups("None"));
-            check_body(&body, &[], branch, exists).is_empty()
+            check_body(&body, &[], branch, None, exists).is_empty()
         };
         for text in ["Fixes #12", "fixes: #12.", "Work.\nCloses #12)", "RESOLVED #12,", "fix #12"] {
             assert!(closes(text, "task/issue-12"), "`{text}` closes #12");
@@ -802,7 +854,13 @@ mod tests {
             assert!(closes("", branch), "`{branch}` is not a claimed issue's branch");
         }
         let body = body_with_follow_ups("None");
-        let problems = check_body(&body, &[], "task/issue-12", exists);
+        let qualified = format!("Fixes NamiCFD/Nami#12\n\n{body}");
+        let repository = Some("namicfd/nami");
+        assert_eq!(
+            check_body(&qualified, &[], "task/issue-12", repository, exists),
+            Vec::<String>::new()
+        );
+        let problems = check_body(&body, &[], "task/issue-12", None, exists);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("add the line `Fixes #12` (ADR-0021)"), "{problems:?}");
     }
@@ -824,7 +882,7 @@ mod tests {
     fn protected_paths_must_be_listed() {
         let protected = paths(&["Cargo.toml", "xtask/src/hook.rs"]);
         let is_complete = |listed: &str| {
-            check_body(&body_with_protected(listed), &protected, "work", exists).is_empty()
+            check_body(&body_with_protected(listed), &protected, "work", None, exists).is_empty()
         };
         assert!(is_complete("- `Cargo.toml`: x\n- `xtask/src/hook.rs`: y"), "each path itself");
         assert!(is_complete("Cargo.toml, xtask/."), "a directory, then a full stop");
@@ -836,7 +894,7 @@ mod tests {
         assert!(!is_complete("Cargo.toml and task/"), "a directory that only ends the same");
         assert!(!is_complete("Cargo.toml <!-- xtask/ -->"), "a comment lists nothing");
 
-        let problems = check_body(&body_with_protected("xtask/"), &protected, "work", exists);
+        let problems = check_body(&body_with_protected("xtask/"), &protected, "work", None, exists);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0]
@@ -852,7 +910,11 @@ mod tests {
         for body in
             [body_with_protected("None"), body_with_protected(""), body_with_follow_ups("None")]
         {
-            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+            assert_eq!(
+                check_body(&body, &[], "work", None, exists),
+                Vec::<String>::new(),
+                "{body}"
+            );
         }
     }
 

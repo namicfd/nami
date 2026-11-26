@@ -200,6 +200,31 @@ fn as_number(value: &Value) -> Option<u32> {
     digits.parse().ok().filter(|number| *number > 0)
 }
 
+/// The GitHub repository, `owner/name`, that `remote` of the checkout at `root` points to, or
+/// `None` if git cannot tell or the remote is not on GitHub.
+#[must_use]
+pub fn repository_of(root: &Path, remote: &str) -> Option<String> {
+    let url = crate::task::claims::git(root, &["remote", "get-url", remote], &[], None).ok()?;
+    repository_of_url(url.trim())
+}
+
+/// The `owner/name` of a GitHub remote URL: `https://github.com/owner/name(.git)`,
+/// `git@github.com:owner/name(.git)` or `ssh://git@github.com/owner/name(.git)`.
+#[must_use]
+pub fn repository_of_url(url: &str) -> Option<String> {
+    let path = ["https://github.com/", "git@github.com:", "ssh://git@github.com/"]
+        .iter()
+        .find_map(|prefix| url.strip_prefix(prefix))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let is_part = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    };
+    let (owner, name) = path.split_once('/')?;
+    (is_part(owner) && is_part(name)).then(|| path.to_owned())
+}
+
 /// [`GitHub`] through `gh api`, run in a checkout of the repository.
 #[derive(Debug, Clone)]
 pub struct Gh {
@@ -367,6 +392,33 @@ mod tests {
         assert_eq!(event("unlabeled", "null"), Ok(Some(label("ghost", false))));
         assert_eq!(event("closed", r#"{"login": "a"}"#), Ok(None));
         assert!(event("labeled", "{}").is_err(), "an actor without a login");
+    }
+
+    // Goal: a GitHub remote URL in each of git's forms names its `owner/name`; another host or
+    // a malformed path names nothing. This checkout's remote is on GitHub.
+    #[test]
+    fn remote_urls_name_their_repository() {
+        for url in [
+            "https://github.com/namicfd/nami",
+            "https://github.com/namicfd/nami/",
+            "https://github.com/namicfd/nami.git",
+            "git@github.com:namicfd/nami.git",
+            "ssh://git@github.com/namicfd/nami",
+        ] {
+            assert_eq!(super::repository_of_url(url).as_deref(), Some("namicfd/nami"), "{url}");
+        }
+        for url in [
+            "https://gitlab.com/namicfd/nami",
+            "https://github.com/namicfd",
+            "https://github.com/namicfd/nami/tree",
+            "https://github.com//nami",
+            "https://github.com/a b/nami",
+            "/tmp/remote.git",
+        ] {
+            assert_eq!(super::repository_of_url(url), None, "{url}");
+        }
+        let root = crate::workspace_root();
+        assert_eq!(super::repository_of(&root, "no-such-remote"), None);
     }
 
     // Goal: `gh --jq '.[]'` output becomes one value per line; blank lines are skipped, and a
