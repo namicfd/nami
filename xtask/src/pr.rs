@@ -721,14 +721,14 @@ mod tests {
     fn the_real_codeowners_is_the_ratchets_flip() {
         let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))
             .expect("CODEOWNERS is readable");
-        let owned: String = text
+        let owned_lines: Vec<&str> = text
             .lines()
             .filter(|line| {
                 let mut words = line.split_whitespace().take_while(|word| !word.starts_with('#'));
                 words.next().is_none() || words.next().is_some()
             })
-            .map(|line| format!("{line}\n"))
             .collect();
+        let owned = owned_lines.join("\n");
         let flipped = crate::ratchet::scope::flipped_codeowners(&owned);
         assert_eq!(parse_codeowners(&flipped), parse_codeowners(&text));
     }
