@@ -18,8 +18,10 @@ env:
 
 jobs:
   # Advisory early warning: one comment on the PR, kept up to date, that names the ADR numbers
-  # it adds which `main` or another open PR also uses, and who renumbers (ADR-0000). It posts
-  # as the workflow's own token. A fork's PR gets a read-only token, so it is skipped.
+  # it adds which `main` or another open PR also uses, and who renumbers. The clash checker
+  # (xtask/src/queue/clashes.rs) says that whichever PR lands second renumbers, and ADR-0021,
+  # point 6, that a PR the clash fails in the queue renumbers on its own branch. It posts as
+  # the workflow's own token. A fork's PR gets a read-only token, so it is skipped.
   adr-clashes:
     name: adr clashes (advisory)
     if: >-
@@ -46,16 +48,29 @@ jobs:
         run: cargo xtask queue clashes --pr "$PR_NUMBER" --comment
 
   # Ownership of queue failures: when the required checks fail on a merge-queue branch and the
-  # PR has really left the queue, file an issue of kind `bug` for it, as nami-agent[bot], so
-  # that `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on
-  # its own branch (ADR-0021, point 6). One issue per failed run: the title names the run, so a
-  # re-run of it finds its open issue and files nothing. No concurrency group: two runs file
-  # two different issues, and a group could cancel a pending job and lose a failure.
+  # PR has really left the queue, file an issue of kind `bug` for it, as nami-ci[bot], so that
+  # `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on its
+  # own branch (ADR-0021, point 6). Agents trust nami-ci[bot] for exactly this issue title
+  # (ADR-0023). One issue per failed run: the title names the run, so a re-run of it finds its
+  # open issue and files nothing. No concurrency group: two runs file two different issues, and
+  # a group could cancel a pending job and lose a failure.
   #
-  # `workflow_run` runs main's version of this file and of xtask, never a PR's, so the bot's
-  # key never meets a PR's code. The key lives in the `nami-agent` environment, which only
-  # main may use (docs/operations/github-setup.md, step 8). The token is narrowed to what the
-  # job needs: read the run, its jobs and logs, the PR and the repository; write issues.
+  # The job follows ADR-0023's rules for a job that holds a bot key:
+  # - `workflow_run` runs main's version of this file and of xtask, never a PR's, and the
+  #   checkout has no `ref:`, so the CI app's key never meets a PR's code (rule 4);
+  # - the key is the secret NAMI_CI_PRIVATE_KEY of the `nami-ci` environment, which only main
+  #   may use (rule 1; docs/operations/github-setup.md, step 8);
+  # - one step has the secret in its environment, and the key file is deleted before xtask
+  #   starts (rule 3);
+  # - two tokens, each narrow (rule 2). Every read (the run, its jobs and logs, the PR, its
+  #   merge-queue entry, the repository's contents) uses the workflow's own token, GH_TOKEN,
+  #   with the read permissions below: nami-ci has no Actions permission. The CI app's token,
+  #   NAMI_FILING_TOKEN, is narrowed to `issues: write` and does only the filing;
+  # - no cache is restored (rule 5). Main's caches are written by jobs without a key, which run
+  #   the build scripts and tests of code that no human may have read, so the job does not use
+  #   ./.github/actions/setup. It builds xtask from a clean checkout, with the toolchain that
+  #   rust-toolchain.toml pins and the crates that Cargo.lock pins, and needs no cargo tools:
+  #   openssl, curl, jq and gh are the runner's.
   queue-failure:
     name: file queue failure
     if: >-
@@ -65,45 +80,52 @@ jobs:
       github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: nami-agent
+    environment: nami-ci
     permissions:
+      actions: read
       contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
       - name: Fetch main
         run: git fetch --quiet --no-tags --depth=1 origin main:refs/remotes/origin/main
       - name: Build xtask
         run: cargo build --quiet --locked --package xtask
       # The secret is in this step's environment only. Later steps' processes never have it in
       # theirs: they get the file, which is deleted as soon as the token is minted.
-      - name: Write the bot's key
+      - name: Write the CI app's key
         env:
-          NAMI_AGENT_PRIVATE_KEY: ${{ secrets.NAMI_AGENT_PRIVATE_KEY }}
+          NAMI_CI_PRIVATE_KEY: ${{ secrets.NAMI_CI_PRIVATE_KEY }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
-          if [[ -z "${NAMI_AGENT_PRIVATE_KEY}" ]]; then
-            echo "::error::The nami-agent environment has no NAMI_AGENT_PRIVATE_KEY secret, so" \
-              "the failure of run ${RUN_ID} cannot be filed as the bot; see" \
+          if [[ -z "${NAMI_CI_PRIVATE_KEY}" ]]; then
+            echo "::error::The nami-ci environment has no NAMI_CI_PRIVATE_KEY secret, so the" \
+              "failure of run ${RUN_ID} cannot be filed as nami-ci[bot]; see" \
               "docs/operations/github-setup.md, step 8"
             exit 1
           fi
-          (umask 077 && printf '%s\n' "${NAMI_AGENT_PRIVATE_KEY}" > "${RUNNER_TEMP}/nami-agent.pem")
+          (umask 077 && printf '%s\n' "${NAMI_CI_PRIVATE_KEY}" > "${RUNNER_TEMP}/nami-ci.pem")
       - name: cargo xtask queue failed
         env:
-          NAMI_AGENT_PERMISSIONS: >-
-            {"issues":"write","actions":"read","contents":"read","pull_requests":"read"}
+          GH_TOKEN: ${{ github.token }}
+          NAMI_AGENT_APP: ci
+          NAMI_CI_CLIENT_ID: ${{ vars.NAMI_CI_CLIENT_ID }}
+          NAMI_AGENT_PERMISSIONS: '{"issues":"write"}'
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
-          key="${RUNNER_TEMP}/nami-agent.pem"
+          key="${RUNNER_TEMP}/nami-ci.pem"
           trap 'rm -f "${key}"' EXIT
-          GH_TOKEN=$(NAMI_AGENT_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
+          NAMI_FILING_TOKEN=$(NAMI_CI_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
             xtask/agent-token.sh)
           # The key file is gone before xtask starts.
           rm -f "${key}"
-          echo "::add-mask::${GH_TOKEN}"
-          export GH_TOKEN
+          echo "::add-mask::${NAMI_FILING_TOKEN}"
+          export NAMI_FILING_TOKEN
           cargo xtask queue failed --run "${RUN_ID}"
-      - name: Delete the bot's key
+      - name: Delete the CI app's key
         if: always()
-        run: rm -f "${RUNNER_TEMP}/nami-agent.pem"
+        run: rm -f "${RUNNER_TEMP}/nami-ci.pem"
