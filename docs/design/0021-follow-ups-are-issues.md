@@ -77,7 +77,10 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 
 The workflow `queue` files an issue `PR #<n> failed in the merge queue`, of kind `bug`, when the required checks fail on PR #n's merge-queue branch and #n has left the queue: it is open, not merged, not queued, and no newer queue run tested it (issue #51). Most such failures are clashes that git merged without a conflict, such as two ADRs with one number. Only #n's own branch can take the fix: a rebase or a renumber of #n itself. A new PR would repeat the change and its review.
 
-- **If the bot opened #n,** the issue is work for agents, with one exception to point 3. The fixing session claims `issue-<m>` as usual, but works on #n's branch, not on `task/issue-<m>`. It rebases or renumbers, pushes to #n's branch, adds `Fixes #<m>` to #n's description, and adds #n to the merge queue again. #n's merge closes the issue. No PR comes from `task/issue-<m>`, so the claim goes stale after two hours, as point 3 says. A session that later claims the issue while #n is queued and says `Fixes #<m>` releases the claim and takes other work.
+- **If the bot opened #n,** the issue is work for agents, with three exceptions to point 3.
+  - **Where the work happens.** The fixing session claims `issue-<m>` as usual, but works on #n's branch, not on `task/issue-<m>`. It rebases or renumbers, pushes to #n's branch, adds `Fixes #<m>` to #n's description, and adds #n to the merge queue again. It keeps the claim. The issue closes when #n merges, through `Fixes #<m>`, or when a human closes it.
+  - **Backing off.** While #n is open and its description says `Fixes #<m>`, the fix is in flight, whether #n is queued or not: it may be waiting for CI or for the code owner. A session that finds the issue then takes no new work from it, and pushes nothing to #n.
+  - **Staleness.** A claim on the issue is stale only if #n has had no push since the claim and its description does not say `Fixes #<m>`. A PR from `task/issue-<m>` does not count: none is expected.
 - **If anyone else opened #n,** agents do not push to it. The issue says that a human rebases it, and it carries `needs-decision`, so `cargo xtask task ready` does not list it.
 - **The issue quotes only checked text.** The queue ran the PRs' own code and workflow files, so the run's logs and its job and step names are untrusted (point 2). The issue names jobs and steps only by names that `main`'s `.github/workflows/ci.yml` defines, reports codes only as tidy's rule IDs and the dylint lints' names, and builds its links from the repository name and IDs. The fixer reads the log through the link.
 
@@ -89,9 +92,11 @@ The workflow `queue` files an issue `PR #<n> failed in the merge queue`, of kind
 - The plan rules in tidy: a plan task ID never starts with `issue-`.
 - `cargo xtask pr-body`: the `Follow-up issues` section, and `Fixes #<number>` on an issue's branch.
 - `.claude/settings.json`: deny rules for reading issues with `gh` directly. A speed bump, not a guarantee.
-- `cargo xtask queue failed`, which `.github/workflows/queue.yml` runs as the bot (point 6): it files only for a PR that left the queue, finds an open issue by its exact title, quotes only the closed vocabulary, and adds `needs-decision` to a PR that the bot did not open.
+- `cargo xtask queue failed`, which `.github/workflows/queue.yml` runs as the bot (point 6): it files only for a run of `ci.yml` whose PR left the queue, finds an open issue by its exact title, quotes only the closed vocabulary, and adds `needs-decision` to the issue when the bot did not open the PR.
+- `cargo xtask task ready`, `claim` and `status` for the bot's queue-failure issues (point 6): `ready` leaves the issue out and `claim` refuses it while #n is open and its description closes the issue; `status` shows such a claim as waiting for #n to merge.
 - **No mechanism:**
   - whether the session that fixes a queue failure adds `Fixes #<m>` to the failing PR's description. `cargo xtask pr-body` checks `Fixes` only on `task/issue-<m>` branches;
+  - the staleness of a claim on a queue-failure issue. No command releases stale claims; whoever releases one by hand reads #n first (point 6);
   - whether an agent files an issue when it should. As before, the PR description forces an explicit `None`, and the sampled audits (ADR-0008) look for a `None` that is wrong;
   - whether a filing agent copied untrusted text into an issue;
   - two sessions that file the same finding within the same minute. The worker closes the duplicate.
