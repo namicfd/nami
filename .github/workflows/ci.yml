@@ -23,7 +23,8 @@ jobs:
     name: gate
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Reading pull requests lets check-pr tell the nami-ci bot's PR from any other.
+    # Reading pull requests lets check-pr tell the nami-ci bot's PR from any other: in the merge
+    # queue, and for a PR that sets `passes`. A PR's own head comes from the event.
     permissions:
       contents: read
       pull-requests: read
@@ -44,10 +45,18 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_REF: ${{ github.head_ref || github.event.merge_group.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           git fetch --quiet --no-tags --depth=1 origin "$BASE_SHA"
-          cargo xtask task check-pr "$BASE_SHA" "${HEAD_REF#refs/heads/}" "$PR_NUMBER"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            cargo xtask task check-pr "$BASE_SHA" "$HEAD_REF" "$PR_NUMBER" \
+              --author "$PR_AUTHOR" --head-repo "$PR_HEAD_REPO" --repo "$REPOSITORY"
+          else
+            cargo xtask task check-pr "$BASE_SHA" "${HEAD_REF#refs/heads/}" ""
+          fi
 
   # The dylint library's own UI tests: each lint fires where it must and stays silent elsewhere.
   lints:
