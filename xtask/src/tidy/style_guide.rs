@@ -44,9 +44,27 @@ const RETIRED_MECHANISMS: [(&str, &str); 2] = [
 const REFERENCE: &str = "(TIGER_STYLE.md, How rules are enforced)";
 
 /// Words and phrases, in lower case, that name a checking tool. Rule prose that names one is
-/// describing what the tool sees, which belongs in the registry (`doc-tool-name`).
-const TOOL_NAMES: [&str; 8] =
-    ["tidy", "clippy", "dylint", "rustfmt", "lints", "cargo-deny", "cargo deny", "the lint"];
+/// describing what the tool sees, which belongs in the registry (`doc-tool-name`). `just` is
+/// left out: it is an everyday English word.
+const TOOL_NAMES: [&str; 13] = [
+    "tidy",
+    "clippy",
+    "dylint",
+    "rustfmt",
+    "rustc",
+    "lints",
+    "nextest",
+    "miri",
+    "cargo-deny",
+    "cargo deny",
+    "cargo-mutants",
+    "cargo mutants",
+    "the lint",
+];
+
+/// The rules that read the style guide. A foreign gate (`--policy`) does not read the style
+/// guide at all, so it skips them all, `doc-tool-name` included.
+pub const STYLE_GUIDE_RULES: [&str; 2] = ["doc-tag", "doc-tool-name"];
 
 /// One mechanism tag in the style guide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +129,14 @@ fn rule_lines(text: &str) -> Vec<(u32, &str)> {
         let line_number = u32::try_from(line_index + 1).expect("documents have < 2^32 lines");
         found.push((line_number, line));
     }
-    assert!(found.len() <= text.lines().count(), "rule lines are lines of the text");
+    let first_heading = text.lines().position(|line| line.starts_with("## "));
+    let after_heading = |number: u32| {
+        first_heading.is_some_and(|index| usize::try_from(number).is_ok_and(|line| line > index))
+    };
+    assert!(
+        found.iter().all(|(number, _)| after_heading(*number)),
+        "rule lines start at the first `## ` heading"
+    );
     found
 }
 
@@ -133,12 +158,17 @@ pub fn check(relative: &Path, text: &str, mechanisms: &Mechanisms) -> Vec<Violat
     violations
 }
 
-/// The rule `doc-tool-name`: the prose of a rule, outside its tags, names no checking tool.
+/// The rule `doc-tool-name`: the prose of a rule names no checking tool, and no code span in it
+/// is a command of one. Other code spans, tags among them, are not prose.
 pub fn check_tool_names(relative: &Path, text: &str) -> Vec<Violation> {
     let mut violations = Vec::new();
     for (line_number, line) in rule_lines(text) {
-        let prose = without_tags(line).to_lowercase();
-        for name in TOOL_NAMES.iter().filter(|name| contains_word(&prose, name)) {
+        let lower = line.to_lowercase();
+        let (prose, spans) = split_code_spans(&lower);
+        let named = |name: &str| {
+            contains_word(&prose, name) || spans.iter().any(|span| is_command_of(span, name))
+        };
+        for name in TOOL_NAMES.into_iter().filter(|name| named(name)) {
             let message = format!(
                 "rule prose names the tool `{name}`; the tag already names the mechanism. Keep \
                  the rule, its reason and an example here, and put what the mechanism sees and \
@@ -152,26 +182,34 @@ pub fn check_tool_names(relative: &Path, text: &str) -> Vec<Violation> {
     violations
 }
 
-/// `line` with every backticked tag removed, so that `[tidy:usize]` is not prose.
-fn without_tags(line: &str) -> String {
+/// `line` split into its prose, with each code span replaced by a space, and the contents of
+/// its code spans. A backtick without a partner is prose.
+fn split_code_spans(line: &str) -> (String, Vec<&str>) {
+    let pieces: Vec<&str> = line.split('`').collect();
     let mut prose = String::with_capacity(line.len());
-    let mut rest = line;
-    for _ in 0..=line.len() {
-        let Some((before, after)) = rest.split_once("`[") else {
-            break;
-        };
-        prose.push_str(before);
-        match after.split_once("]`") {
-            Some((content, tail)) if is_tag(content) => rest = tail,
-            _ => {
-                prose.push_str("`[");
-                rest = after;
-            }
+    let mut spans = Vec::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        if index % 2 == 1 && index + 1 < pieces.len() {
+            spans.push(*piece);
+            prose.push(' ');
+        } else {
+            prose.push_str(piece);
         }
     }
-    prose.push_str(rest);
-    assert!(prose.len() <= line.len(), "removing tags never adds text");
-    prose
+    let enclosed = |span: &&str| line.contains(&format!("`{span}`"));
+    assert!(spans.iter().all(enclosed), "every code span lies between backticks in the line");
+    (prose, spans)
+}
+
+/// True if the code span `span` runs the tool `name`: the name alone or with arguments, also
+/// after `cargo ` or `cargo xtask `. `clippy.toml` and `clippy::float_cmp` do not.
+fn is_command_of(span: &str, name: &str) -> bool {
+    assert!(!name.is_empty(), "every span starts with the empty name");
+    let span = span.trim();
+    let command = span.strip_prefix("cargo xtask ").or_else(|| span.strip_prefix("cargo "));
+    [Some(span), command].into_iter().flatten().any(|text| {
+        text.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })
 }
 
 /// True if `phrase` occurs in `text` as whole words: not inside a longer identifier or word.
@@ -257,8 +295,8 @@ fn lint_table_advice(table: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mechanisms, Tag, check, check_tool_names, contains_word, is_tag, review_count};
-    use super::{tags, without_tags};
+    use super::{Mechanisms, STYLE_GUIDE_RULES, Tag, check, check_tool_names, contains_word};
+    use super::{is_command_of, is_tag, review_count, split_code_spans, tags};
     use crate::tidy::registry;
     use std::path::Path;
 
@@ -276,16 +314,16 @@ mod tests {
         }
     }
 
-    /// The messages that `doc-tag` reports for a rule line that carries `tags`.
-    /// A text that is not a tag, such as `[Tidy:usize]`, is prose, which `doc-tool-name`
-    /// judges; only the `doc-tag` findings are returned.
+    /// The messages that `doc-tag` reports for a rule line that carries `tags`. The findings
+    /// of `doc-tool-name`, which judges the same line, are dropped; any other rule fails.
     fn problems(tags: &str) -> Vec<String> {
         let text = format!("## Rules\n\n- A rule. {tags}\n");
         let violations = check(Path::new("docs/TIGER_STYLE.md"), &text, &mechanisms());
         assert!(violations.iter().all(|violation| violation.line == 3), "the tag's line");
-        let is_tag_rule = |rule: &str| rule == "doc-tag";
-        let tag_findings = violations.into_iter().filter(|violation| is_tag_rule(violation.rule));
-        tag_findings.map(|violation| violation.message).collect()
+        let tag_findings: Vec<_> =
+            violations.into_iter().filter(|violation| violation.rule != "doc-tool-name").collect();
+        assert!(tag_findings.iter().all(|violation| violation.rule == "doc-tag"), "only doc-tag");
+        tag_findings.into_iter().map(|violation| violation.message).collect()
     }
 
     // Goal: every valid form passes: plain tags, and named tags whose target exists.
@@ -396,8 +434,10 @@ mod tests {
         assert_eq!(fired, ["doc-tool-name", "doc-tag"], "the style guide runs both rules");
         let text = "## Rules\n\n- A rule. The lint sees `sum`. `[review]`\n- Tidy checks it.\n\
                     - Clippy's `float_cmp` and rustfmt.\n- `cargo deny` and cargo-deny.\n\
-                    - The workspace lints, and dylint.\n";
-        assert_eq!(tool_names(text), [3, 4, 5, 5, 6, 6, 7, 7]);
+                    - The workspace lints, and dylint.\n\
+                    - `cargo xtask tidy --policy`, rustc, nextest, Miri, `cargo mutants`.\n\
+                    - `cargo clippy`, `cargo-mutants` and an open `tidy\n";
+        assert_eq!(tool_names(text), [3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8, 8, 8, 9, 9, 9]);
         let violations = check_tool_names(Path::new("docs/TIGER_STYLE.md"), text);
         assert!(violations[0].message.contains("`the lint`"), "{}", violations[0].message);
         assert!(violations[0].message.contains("registry.rs"), "names where the text goes");
@@ -413,19 +453,45 @@ mod tests {
             "# Title\n\nTidy checks the tags.\n\n## Rules\n\n\
              - Never silence a lint. `[tidy:expect-budget]` `[clippy:pedantic]`\n\
              - Untidy code, `tidying`, `my_clippy` and `lints_x`. `[dylint:nami_recursion]`\n\
+             - `clippy.toml`, `clippy::float_cmp`, `[Tidy:usize]` and `cargo fmt`.\n\
              {fence}rust\n// tidy and clippy in a code block\n{fence}\n"
         );
         assert_eq!(tool_names(&text), Vec::<u32>::new());
         assert_eq!(tool_names("- tidy before any heading\n"), Vec::<u32>::new());
     }
 
-    // Goal: removing tags keeps all other text, code spans in brackets included.
+    // Goal: a line splits into prose and code spans; a backtick without a partner is prose.
     #[test]
-    fn tags_are_removed_from_prose() {
-        assert_eq!(without_tags("A rule. `[tidy:usize]` `[review]`"), "A rule.  ");
-        assert_eq!(without_tags("A `[f64; NVAR]` state."), "A `[f64; NVAR]` state.");
-        assert_eq!(without_tags("Open `[tidy:x"), "Open `[tidy:x");
-        assert_eq!(without_tags(""), "");
+    fn code_spans_are_split_from_prose() {
+        let tagged = ("A rule.    ".to_owned(), vec!["[tidy:usize]", "[review]"]);
+        assert_eq!(split_code_spans("A rule. `[tidy:usize]` `[review]`"), tagged);
+        let open = ("Open   and tidy".to_owned(), vec!["a"]);
+        assert_eq!(split_code_spans("Open `a` and `tidy"), open, "an open backtick is prose");
+        assert_eq!(split_code_spans(""), (String::new(), Vec::new()));
+    }
+
+    // Goal: a code span is a tool's command only when it runs the tool, directly or through
+    // `cargo` or `cargo xtask`.
+    #[test]
+    fn commands_are_told_from_paths() {
+        assert!(is_command_of("tidy", "tidy"), "the name alone");
+        assert!(is_command_of(" cargo deny check ", "cargo deny"), "with arguments, trimmed");
+        assert!(is_command_of("cargo xtask tidy", "tidy"), "through cargo xtask");
+        assert!(is_command_of("cargo clippy --workspace", "clippy"), "through cargo");
+        assert!(!is_command_of("clippy.toml", "clippy"), "a file");
+        assert!(!is_command_of("clippy::float_cmp", "clippy"), "a path");
+        assert!(!is_command_of("tidying", "tidy"), "a longer word");
+        assert!(!is_command_of("cargo fmt", "tidy"), "another tool");
+    }
+
+    // Goal: the rules that read the style guide are registered, so the list that a foreign gate
+    // skips cannot go stale silently.
+    #[test]
+    fn style_guide_rules_are_registered() {
+        for id in STYLE_GUIDE_RULES {
+            assert!(registry::is_registered(id), "`{id}` must be a registered rule");
+        }
+        assert!(STYLE_GUIDE_RULES.is_sorted(), "keep the list sorted");
     }
 
     // Goal: a phrase matches only as whole words, at either end of the text too.

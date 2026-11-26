@@ -109,8 +109,10 @@ fn doc_lines_before(tokens: &[TokenTree]) -> Vec<String> {
         lines.push(line);
         rest = before;
     }
+    let stopped = !matches!(rest, [.., hash, TokenTree::Group(attribute)]
+        if tokens::is_punct(hash, '#') && doc_text(attribute).is_some());
+    assert!(stopped, "the walk takes every doc line before the declaration");
     lines.reverse();
-    assert!(lines.len() <= tokens.len() / 2, "each doc line takes two tokens");
     lines
 }
 
@@ -263,5 +265,20 @@ mod tests {
             real.iter().any(|(name, text)| name == "nami_recursion" && text.starts_with("Reports"))
         );
         assert_eq!(documented(&crate::workspace_root().join("no-such-dir")).unwrap(), []);
+    }
+
+    // Goal: every lint that gates says what it sees and misses, because docs/RULES.md shows
+    // that section and the style guide no longer does.
+    #[test]
+    fn every_enforced_lint_has_what_it_does() {
+        let root = crate::workspace_root();
+        let documented = documented(&root).unwrap();
+        let enforced: Vec<DylintLint> =
+            declared(&root).unwrap().into_iter().filter(DylintLint::is_enforced).collect();
+        assert!(!enforced.is_empty(), "the project declares lints that gate");
+        for lint in enforced {
+            let found = documented.iter().any(|(name, _)| *name == lint.name);
+            assert!(found, "`{}` needs a `### What it does` section in its doc", lint.name);
+        }
     }
 }

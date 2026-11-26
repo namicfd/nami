@@ -132,10 +132,17 @@ pub const RULES: &[Rule] = &[
         summary: "The rules of `docs/TIGER_STYLE.md` do not name a checking tool in their prose: \
                   the tag names the mechanism, and what it sees and misses is in the registry and \
                   in this document.",
-        detail: "Read from the first `## ` heading on, outside fenced code blocks and with the \
-                 tags removed, line by line and ignoring case: the words `tidy`, `clippy`, \
-                 `dylint`, `rustfmt`, `lints` and `cargo-deny`, and the phrases `cargo deny` and \
-                 `the lint`. Not seen: a phrase broken across two lines, and prose that describes \
+        detail: "Read from the first `## ` heading on, outside fenced code blocks, line by \
+                 line and ignoring case. It reports the words `tidy`, `clippy`, `dylint`, \
+                 `rustfmt`, `rustc`, `lints`, `nextest`, `miri`, `cargo-deny` and \
+                 `cargo-mutants`, and the phrases `cargo deny`, `cargo mutants` and `the lint`, \
+                 as whole words in the prose outside code spans. A code span counts when it is \
+                 a command of that tool: the name alone or followed by arguments, also after \
+                 `cargo ` or `cargo xtask `, such as `cargo xtask tidy`; so a tag, `clippy.toml` \
+                 and `clippy::float_cmp` are not reported. `just` is left out because it is an \
+                 everyday English word. Known false positives, which have to be reworded: \
+                 tidy as an English adjective, and lints as a verb. Not seen: a phrase \
+                 broken across two lines, a code span that spans lines, and prose that describes \
                  a check without naming its tool, such as a list of the syntax a rule reports. A \
                  foreign gate (`--policy`) skips the style guide, and this rule with it.",
         reference: "TIGER_STYLE.md, How rules are enforced",
@@ -298,11 +305,18 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "unbounded-loop",
         kind: RuleKind::Source,
-        summary: "No `loop`, no `while`, and no `for` over an iterator that never ends: every loop \
-                  has a fixed upper bound.",
-        detail: "A `for` is reported over a range without an end, over `repeat`, `repeat_with`, \
-                 `from_fn` or `successors` from `core::iter`, or over `cycle`, unless `take` or a \
-                 `zip` with a bounded iterator bounds it.",
+        summary: "No `loop`, no `while`, and no `for` over a range without an end or an endless \
+                  `core::iter` source: every loop has a fixed upper bound.",
+        detail: "Every `loop` and `while` is reported. A `for` is reported when its iterable, \
+                 under parentheses, references and any adaptor, starts from a range without an \
+                 end (`start..`), from `cycle()` (also as `Iterator::cycle`), or from `repeat`, \
+                 `repeat_with`, `from_fn` or `successors` called by a bare name or through a path \
+                 that ends in `iter::`, and no `take` follows that source. A `zip` is endless only \
+                 if both sides are, a `chain` if either side is. A bare `from_fn` imported from \
+                 elsewhere, such as `core::array::from_fn`, is reported too: call it by a \
+                 qualified path. An iterable nested more than 256 steps deep is reported. Not \
+                 seen, and for review: any other iterator that never ends, such as a custom one, \
+                 one held in a variable, or one returned by a function.",
         reference: "TIGER_STYLE.md, Put a limit on everything",
     },
     Rule {

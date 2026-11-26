@@ -206,12 +206,14 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
 /// runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by
 /// weakening its own gate.
 ///
-/// Two things differ from [`check`]:
+/// Three things differ from [`check`]:
 ///
 /// - the `#[expect]` budget is read from `policy_root`, not from the tree;
 /// - the rules in [`registry::REGISTRY_BOUND_RULES`] are skipped. They compare the tree's
 ///   documents with this binary's own registry, and a tree whose registry differs fails them by
-///   construction, which would make every guardrail change look like a loosening.
+///   construction, which would make every guardrail change look like a loosening;
+/// - the style guide is not read at all, so its rules (`style_guide::STYLE_GUIDE_RULES`) are
+///   skipped: `doc-tag`, and `doc-tool-name` too, although it does not depend on the registry.
 ///
 /// Every other rule runs as usual.
 ///
