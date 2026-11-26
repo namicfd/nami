@@ -28,6 +28,7 @@
 //!   `declare_tool_lint!` in the form `pub NAME, Level, "description"`, and no other binding
 //!   of its name.
 
+pub mod fixed;
 pub mod lints;
 pub mod registry;
 pub mod rules;
@@ -151,7 +152,7 @@ fn is_cfg_test(attribute: &syn::Attribute) -> bool {
 }
 
 /// True for an inline `mod tests { .. }` whose only attributes are docs and `#[cfg(test)]`.
-fn is_test_module(module: &syn::ItemMod) -> bool {
+pub(crate) fn is_test_module(module: &syn::ItemMod) -> bool {
     let cfg_test = module.attrs.iter().filter(|attribute| is_cfg_test(attribute)).count();
     let others = module.attrs.iter().all(|attribute| is_doc(attribute) || is_cfg_test(attribute));
     module.ident == "tests" && module.content.is_some() && cfg_test == 1 && others
@@ -170,12 +171,18 @@ pub fn check_head(base: &Path, head: &Path) -> Result<(), String> {
             .ok_or("the base has no rule registry")?;
         registry::check(&base_text, &text)?;
     }
-    for module in super::source::RULE_MODULES {
-        if let Some(text) = super::source::read_optional(head, module)? {
-            let _sites = rules::call_sites(module, &text)?;
+    let library = lints::library(head)?;
+    let lint_files = library.files.iter().map(String::as_str);
+    for relative in super::source::RULE_MODULES.into_iter().chain(lint_files) {
+        let Some(text) = super::source::read_optional(head, relative)? else {
+            continue;
+        };
+        if super::source::RULE_MODULES.contains(&relative) {
+            let _sites = rules::call_sites(relative, &text)?;
         }
+        let base_text = super::source::read_optional(base, relative)?;
+        fixed::check(relative, base_text.as_deref(), &text)?;
     }
-    let _library = lints::library(head)?;
     Ok(())
 }
 
@@ -292,6 +299,111 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             ["li", "bm", "libm", "x", "y", "d", "kept", "also"].map(str::to_owned).into();
         assert_eq!(found, expected);
+    }
+
+    // Goal: a changed or new constant or static in a rule module or the lint library, and new
+    // code that reads the environment, a process or a file, gives no verdict; the base's own
+    // pass, and a function that changes without them is in the dialect.
+    #[test]
+    fn constants_and_the_environment_stay_the_bases() {
+        let module = "xtask/src/tidy/rust_source.rs";
+        let base = real(module);
+        assert_eq!(super::fixed::check(module, Some(&base), &base), Ok(()));
+        let probes = [
+            replaced(
+                &base,
+                "const MAGIC_TOLERANCE_MAX: f64 = \
+                             1.0e-6;",
+                "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-9;",
+            ),
+            format!(
+                "{base}\nconst PATH_BAN_ROWS: &[(&str, &[&str])] = &[(\"direct-libm\", \
+                     &[\"crates/solver\"])];\n"
+            ),
+            format!(
+                "{base}\nfn quiet() -> bool {{ std::env::var_os(\"GITHUB_JOB\").is_some() \
+                     }}\n"
+            ),
+            format!("{base}\nfn run() {{ let _ = std::process::Command::new(\"true\"); }}\n"),
+            format!("{base}\nfn read() {{ let _ = std::fs::read_to_string(\"x\"); }}\n"),
+            format!("{base}\nfn job() -> Option<&'static str> {{ option_env!(\"CI\") }}\n"),
+        ];
+        for (index, probe) in probes.iter().enumerate() {
+            assert!(super::fixed::check(module, Some(&base), probe).is_err(), "probe {index}");
+        }
+        let changed = super::fixed::check(module, Some(&base), &probes[0]).unwrap_err();
+        assert!(changed.contains("`MAGIC_TOLERANCE_MAX`"), "{changed}");
+        let reads = super::fixed::check(module, Some(&base), &probes[2]).unwrap_err();
+        assert!(reads.contains("in `quiet`"), "the message names the function: {reads}");
+        let line = base.lines().count() + 2;
+        let named = [
+            ("use std::env::var;", format!("in `an import at line {line}`")),
+            ("type Env = std::env::Args;", format!("in `the item at line {line}`")),
+        ];
+        for (addition, expected) in named {
+            let error = super::fixed::check(module, Some(&base), &format!("{base}\n{addition}\n"));
+            assert!(error.as_ref().unwrap_err().contains(&expected), "{error:?}");
+        }
+        let more = [
+            "static LIMIT: u8 = 1;",
+            "struct Extra;\nimpl Extra { const LIMIT: u8 = 1; }",
+            "struct Extra;\nimpl Extra { fn f() { let _ = std::env::var(\"X\"); } }",
+        ];
+        for addition in more {
+            let probe = format!("{base}\n{addition}\n");
+            assert!(super::fixed::check(module, Some(&base), &probe).is_err(), "{addition}");
+        }
+        assert!(super::fixed::check(module, None, "const A: u8 = 1;").is_err(), "a new module");
+        let unrelated = format!("{base}\nfn extra() -> u8 {{ 1 }}\n");
+        assert_eq!(super::fixed::check(module, Some(&base), &unrelated), Ok(()));
+        let lib = real("lints/src/lib.rs");
+        let device = replaced(
+            &lib,
+            "    dylint_linting::init_config(session);",
+            "    if std::env::var_os(\"GITHUB_JOB\").is_some() { return; }\n    \
+             dylint_linting::init_config(session);",
+        );
+        assert!(super::fixed::check("lints/src/lib.rs", Some(&lib), &device).is_err());
+    }
+
+    // Goal: the registration counts only as an unconditional statement of `register_lints`.
+    #[test]
+    fn registration_is_unconditional() {
+        let registration = "    lint_store.register_lints(&[NAMI_RECURSION, \
+                            NAMI_FLOAT_REDUCTION]);";
+        let conditional = "    if session.is_nightly_build() {\n        \
+                           lint_store.register_lints(&[NAMI_RECURSION, \
+                           NAMI_FLOAT_REDUCTION]);\n    }";
+        let guarded =
+            library_with("ratchet-lints-if", |text| replaced(text, registration, conditional), &[]);
+        assert!(guarded.unwrap_err().contains("unconditional"), "an `if` around it");
+        let closure = "    let register = || lint_store.register_lints(&[NAMI_RECURSION, \
+                       NAMI_FLOAT_REDUCTION]);\n    register();";
+        let probe = library_with(
+            "ratchet-lints-closure",
+            |text| replaced(text, registration, closure),
+            &[],
+        );
+        assert!(probe.is_err(), "a closure around it");
+        let exits = [
+            "    if session.is_nightly_build() { return; }\n",
+            "    session.opts().map(|_| ()).ok()?;\n",
+            "    quiet!();\n",
+        ];
+        for (index, exit) in exits.iter().enumerate() {
+            let name = format!("ratchet-lints-exit-{index}");
+            let early = library_with(
+                &name,
+                |text| replaced(text, registration, &format!("{exit}{registration}")),
+                &[],
+            );
+            assert!(early.unwrap_err().contains("unconditional"), "{exit}");
+        }
+        let after = "    lint_store.register_lints(&[NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);\n    \
+                     if session.is_nightly_build() { return; }";
+        let late =
+            library_with("ratchet-lints-late", |text| replaced(text, registration, after), &[]);
+        assert!(late.is_ok(), "a way out after the registration: {late:?}");
     }
 
     // Goal: the real rule-path files are in the dialect, so the check never stops honest PRs.

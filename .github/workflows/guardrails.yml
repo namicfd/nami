@@ -146,7 +146,10 @@ jobs:
           name: ratchet-observations
           path: ${{ runner.temp }}/observations/
           if-no-files-found: ignore
-          retention-days: 7
+          # The longest that GitHub keeps an artifact of a public repository (90 days; a lower
+          # limit set for the repository caps it), so that a review run can judge a PR that
+          # stayed open that long. After that, a review run gives no verdict.
+          retention-days: 90
 
   # `ratchet` judges: the base's binary, built here from the base's own checkout, reads the
   # base's corpus from that checkout, the PR's source as data, and the observations. It runs no

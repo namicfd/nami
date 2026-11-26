@@ -47,9 +47,10 @@ exit "$code"
 /// A stand-in for cargo.
 /// - `cargo build` leaves a head xtask that is the real one, or fails while `broken-build`
 ///   exists.
-/// - `cargo mutants --list` lists the lines of `<dir>/src/fake-mutants.txt` (one mutant by
-///   default); a run writes `outcomes.json` and `missed.txt` from `<dir>/src/fake-missed.txt`, and
-///   leaves `missed.txt` out while `<dir>/src/no-missed-file` exists.
+/// - `cargo mutants --list` lists the lines of `<dir>/src/fake-mutants.txt`, or by default one
+///   mutant on the first added line of each hunk of the diff; a run writes `outcomes.json`, with
+///   each mutant's place, and `missed.txt` from `<dir>/src/fake-missed.txt`, and leaves
+///   `missed.txt` out while `<dir>/src/no-missed-file` exists.
 /// - `cargo dylint --path <tree>/lints ...` "lints" every `.rs` file of the package it runs in,
 ///   reporting each `line:column` of `<tree>/lints/src/fake-lint.txt` as JSON.
 /// - `cargo dylint --all -- --workspace ...`, which the head's `xtask dylint` runs, reports
@@ -73,22 +74,37 @@ if [ "$1" = mutants ]; then
         case "$1" in
             --output) output="$2"; shift ;;
             --dir) dir="$2"; shift ;;
+            --in-diff) diff="$2"; shift ;;
             --list) list=yes ;;
         esac
         shift
     done
     listing=$(mktemp)
-    echo "src/a.rs:1:1: fake" > "$listing"
+    awk '/^\+\+\+ /{file=substr($0,7); next} /^--- /{next}
+        /^@@/{split($3,a,","); line=substr(a[1],2)+0; first=1; next}
+        /^\+/{if (first) print file ":" line ":1: fake"; first=0; line++; next}
+        /^ /{line++}' "$diff" > "$listing"
     [ -e "$dir/src/fake-mutants.txt" ] && cp "$dir/src/fake-mutants.txt" "$listing"
     if [ "$list" = yes ]; then cat "$listing"; rm "$listing"; exit 0; fi
     total=$(grep -c . "$listing")
-    rm "$listing"
     missed=0
     [ -s "$dir/src/fake-missed.txt" ] && missed=$(grep -c . "$dir/src/fake-missed.txt")
     mkdir -p "$output/mutants.out"
-    counts='{"total_mutants":%s,"missed":%s,"caught":%s,"timeout":0,"unviable":0}'
+    entries=""
+    while IFS= read -r mutant; do
+        [ -n "$mutant" ] || continue
+        file=${mutant%%:*}; rest=${mutant#*:}; line=${rest%%:*}
+        summary=CaughtMutant
+        grep -qxF "$mutant" "$dir/src/fake-missed.txt" 2> /dev/null && summary=MissedMutant
+        span="{\"start\":{\"line\":$line,\"column\":1},\"end\":{\"line\":$line,\"column\":2}}"
+        scenario="{\"Mutant\":{\"file\":\"$file\",\"span\":$span}}"
+        entry="{\"scenario\":$scenario,\"summary\":\"$summary\"}"
+        entries="${entries:+$entries,}$entry"
+    done < "$listing"
+    rm "$listing"
+    counts='{"outcomes":[%s],"total_mutants":%s,"missed":%s,"caught":%s,"timeout":0,"unviable":0}'
     out="$output/mutants.out"
-    printf "$counts" "$total" "$missed" $((total - missed)) > "$out/outcomes.json"
+    printf "$counts" "$entries" "$total" "$missed" $((total - missed)) > "$out/outcomes.json"
     if [ ! -e "$dir/src/no-missed-file" ]; then
         : > "$out/missed.txt"
         [ -e "$dir/src/fake-missed.txt" ] && cp "$dir/src/fake-missed.txt" "$out/missed.txt"
@@ -200,7 +216,7 @@ fn nami_tree(root: &Path) {
         (
             "lints/src/lib.rs",
             "declare_lint! { pub NAMI_FAKE, Deny, \"a fake lint\" }\n\
-             fn register(store: &mut Store) { store.register_lints(&[NAMI_FAKE]); }\n"
+             fn register_lints(store: &mut Store) { store.register_lints(&[NAMI_FAKE]); }\n"
                 .to_owned(),
         ),
         ("lints/src/fake-lint.txt", "2:5\n4:1\n".to_owned()),
@@ -215,7 +231,14 @@ fn nami_tree(root: &Path) {
     for (relative, text) in files {
         write(root, relative, &text);
     }
-    for name in ["unbounded-loop.fires", "unbounded-loop.passes", "line-length.fires"] {
+    let names = [
+        "unbounded-loop.fires",
+        "unbounded-loop.passes",
+        "line-length.fires",
+        "direct-libm.fires",
+        "direct-libm.passes",
+    ];
+    for name in names {
         let fixture = format!("xtask/fixtures/tidy/{name}.fixture");
         write(root, &fixture, &real(&fixture));
     }
@@ -381,6 +404,68 @@ fn a_loosened_tidy_rule_fails() {
     let drawn = verdict.findings.iter().any(|finding| !finding.message.contains("example.rs"));
     assert!(drawn, "a placement drawn from the tree: {}", verdict.summary());
     assert!(verdict.line().starts_with("ratchet: fail"));
+}
+
+// Goal: the review's exploit gives no verdict: a changed constant in a rule module, next to an
+// unrelated change that does get a mutant. And a hunk without a mutant of its own is
+// unproven, though another hunk of the same workspace has one.
+#[test]
+fn a_changed_constant_and_a_hunk_without_a_mutant_are_not_proven() {
+    let case = Case::new("constant");
+    let (rules, text) = ("xtask/src/tidy/rust_source.rs", "xtask/src/tidy/text.rs");
+    for module in [rules, text] {
+        write(&case.base(), module, &real(module));
+        write(&case.head(), module, &real(module));
+    }
+    let message = "expect(\"source files have fewer than 2^32 lines\")";
+    let reworded = "expect(\"source files have far fewer than 2^32 lines\")";
+    write(&case.head(), text, &replaced(&real(text), message, reworded));
+    let tolerance = "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-6;";
+    // Fewer literals are tolerances now: a looser rule, and the head's own unit test that
+    // pinned the old value is edited with it.
+    let looser = "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-9;";
+    let (pinned, repinned) = ("{ x < 1.0e-6 }", "{ x < 1.0e-9 }");
+    let edited = replaced(&replaced(&real(rules), tolerance, looser), pinned, repinned);
+    write(&case.head(), rules, &edited);
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let error = check(&case.base(), &case.head(), &tools).unwrap_err();
+    assert!(error.contains("a constant or static that is not the base's"), "{error}");
+    for tree in [case.base(), case.head()] {
+        fs::remove_file(tree.join(rules)).unwrap();
+        for kind in ["fires", "passes"] {
+            for id in ["debt-marker", "test-goal"] {
+                let fixture = format!("xtask/fixtures/tidy/{id}.{kind}.fixture");
+                write(&tree, &fixture, &real(&fixture));
+            }
+        }
+    }
+    let covered = check(&case.base(), &case.head(), &tools).unwrap();
+    assert!(covered.unproven.is_empty(), "a mutant in the hunk: {}", covered.summary());
+    write(&case.head(), "src/fake-mutants.txt", "xtask/src/tidy/text.rs:1:1: elsewhere\n");
+    write(&case.base(), "src/fake-mutants.txt", "xtask/src/tidy/text.rs:1:1: elsewhere\n");
+    let verdict = check(&case.base(), &case.head(), &tools).unwrap();
+    let uncovered =
+        verdict.unproven.iter().any(|what| what.contains("text.rs:47 contains no mutant"));
+    assert!(uncovered, "{}", verdict.summary());
+    assert!(verdict.line().starts_with("ratchet: no verdict"), "{}", verdict.summary());
+}
+
+// Goal: a ban narrowed in code outside the scope of its case fails: the review's exploit, which
+// adds `crates/solver` to `direct-libm`'s exceptions through a private table, and the variant
+// that returns early for `crates/solver`. Each case that fires is also planted in every other
+// scope class of the tree, so the head meets a case in `crates/solver`, outside `kernels`.
+#[test]
+fn a_ban_narrowed_outside_the_scope_of_its_case_fails() {
+    for (name, only) in [("solver-table", "any"), ("solver-return", "--root")] {
+        let case = Case::new(name);
+        write(&case.head(), "crates/kernels/src/lib.rs", "//! The kernels.\n");
+        write(&case.base(), "crates/kernels/src/lib.rs", "//! The kernels.\n");
+        let verdict = case.run("crates/solver/.*error\\[direct-libm\\]", only);
+        let fixture = "xtask/fixtures/tidy/direct-libm.fires.fixture:";
+        let narrowed = verdict.findings.iter().filter(|finding| finding.place.starts_with(fixture));
+        assert!(narrowed.count() > 0, "{name}: {}", verdict.summary());
+        assert!(verdict.line().starts_with("ratchet: fail"), "{name}");
+    }
 }
 
 // Goal: a head whose tidy fires on the base's passing fixture fails: the rule would stall every
@@ -577,7 +662,7 @@ fn mutants_see_the_rule_path_diff_per_workspace() {
     let verdict = case.run(NOTHING, "any");
     assert_eq!(found(&verdict), vec![(Check::Mutants, "lints/src/extra.rs:1:22".to_owned())]);
     assert!(
-        verdict.notes.iter().any(|note| note == "Mutants in lints: 1, missed: 1."),
+        verdict.notes.iter().any(|note| note == "Mutants in lints: 2, missed: 1."),
         "{:?}",
         verdict.notes
     );

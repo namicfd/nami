@@ -18,9 +18,10 @@ env:
 
 jobs:
   # Only events that can change the review gate count: the reviewer app's reviews and thread
-  # resolutions, reviews by accounts with write access (the code owners among them), and
-  # dismissals, which only writers can make. Any other account's review leaves the verdict as
-  # it is: its job gets another name, so it never becomes the latest `ratchet` check.
+  # resolutions, reviews by accounts with write access (the code owners among them),
+  # dismissals, which only writers can make, and threads unresolved, which only the PR's author
+  # and writers can do. Any other account's review leaves the verdict as it is: its job gets
+  # another name, so it never becomes the latest `ratchet` check.
   classify:
     name: ratchet review (does this event count)
     runs-on: ubuntu-latest
@@ -46,6 +47,11 @@ jobs:
           if [ "${EVENT}" = pull_request_review ]; then
             case "${ASSOCIATION}" in OWNER | MEMBER | COLLABORATOR) counted=true ;; esac
             if [ "${ACTION}" = dismissed ]; then counted=true; fi
+          fi
+          # Only the PR's author and writers can unresolve a thread, and an app thread that is
+          # open again changes the gate.
+          if [ "${EVENT}" = pull_request_review_thread ] && [ "${ACTION}" = unresolved ]; then
+            counted=true
           fi
           echo "counted=${counted}" >> "${GITHUB_OUTPUT}"
 
@@ -73,7 +79,6 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
-      checks: read
     steps:
       - name: A review that cannot change the verdict
         if: needs.classify.outputs.counted != 'true'
@@ -114,25 +119,26 @@ jobs:
           fi
           echo "judge=${judge}" >> "${GITHUB_OUTPUT}"
           echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
-      - name: The previous verdict stands (the observed commit is gone)
+      # A previous verdict is never reused: a green one would hide a request for changes or a
+      # dismissed approval that came after it. Only a base branch without a ratchet skips, as
+      # `ratchet (head)` and `ratchet` in guardrails.yml do: there is nothing to judge with.
+      - name: No verdict (the observations or the observed commit are gone)
         if: needs.classify.outputs.counted == 'true' && steps.observed.outputs.judge != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          runs="repos/${GH_REPO}/commits/${PR_HEAD}/check-runs?check_name=ratchet&per_page=100"
-          latest='[.check_runs[] | select(.status == "completed")] | sort_by(.completed_at)'
-          conclusion=$(gh api "${runs}" --jq "${latest} | last | .conclusion // empty")
+          if git rev-parse --quiet --verify "origin/${BASE_REF}^{commit}" > /dev/null \
+            && ! git show "origin/${BASE_REF}:xtask/src/ratchet/cli.rs" 2> /dev/null \
+            | grep --quiet '"judge"'; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
           {
-            echo "The commit that was observed is gone, or is not the merge of this head: the"
-            echo "ratchet re-runs on the next push. The previous verdict: ${conclusion:-none}."
-          } >> "${GITHUB_STEP_SUMMARY}"
-          case "${conclusion}" in
-            success) exit 0 ;;
-            failure) exit 1 ;;
-            *) exit 2 ;;
-          esac
+            echo "ratchet: no verdict: the observations of this head, or the commit they observed,"
+            echo "can no longer be fetched. Re-run the \`guardrails\` workflow for this head (its"
+            echo "\`ratchet (head)\` job observes it again), or push."
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+          exit 2
       - name: Toolchains and the pinned dylint, installed in this job
         if: needs.classify.outputs.counted == 'true' && steps.observed.outputs.judge == 'true'
         working-directory: ${{ runner.temp }}/base

@@ -3,12 +3,15 @@
 //! cases (ADR-0022, §6). This is hardening, not proof.
 //!
 //! A drawn path counts only if the base's own tidy reports the same `(rule, line)` pairs there
-//! as at the case's virtual path, and the path lies in the same scope. One path overwrites a
-//! real file of the tree; the other is a new file with a random name in a real directory.
+//! as at the case's virtual path. Two paths lie in the case's own scope: one overwrites a real
+//! file of the tree, the other is a new file with a random name in a real directory. A firing
+//! case also goes to a new file in each scope class of the tree ([`scope_placements`]): each
+//! crate, each crate's tests, and `xtask`, `lints`, `tools` and `docs`, so that a rule narrowed
+//! in code to spare one of them meets the case there (review of #57, round 3).
 
 use super::tree::is_plain_relative;
 use crate::tidy::Scope;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Candidate paths tried per kind of placement before giving up on that kind.
@@ -150,6 +153,68 @@ pub fn placements(
     chosen
 }
 
+/// The top-level directories outside `crates/` that are a scope class each.
+const TOOLING_CLASSES: [&str; 4] = ["xtask", "lints", "tools", "docs"];
+
+/// The scope class of a directory relative to the root, if it has one: each crate's code
+/// (`crates/<name>`, `crates/kernels` among them), each crate's integration tests
+/// (`crates/<name>/tests`), and `xtask`, `lints`, `tools` and `docs`. A firing case is planted
+/// once in each, so that a rule narrowed in code to spare one crate, its tests or a tooling
+/// directory meets a case there. A narrowing to a single file or a deeper directory may still
+/// go unmet.
+fn scope_class(directory: &Path) -> Option<String> {
+    let parts: Vec<String> = directory
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let class = match parts.as_slice() {
+        [top, name, tests, ..] if top == "crates" && tests == "tests" => {
+            format!("crates/{name}/tests")
+        }
+        [top, name, ..] if top == "crates" => format!("crates/{name}"),
+        [top, ..] if TOOLING_CLASSES.contains(&top.as_str()) => top.clone(),
+        _ => return None,
+    };
+    assert!(directory.starts_with(&class), "a directory lies inside its class");
+    Some(class)
+}
+
+/// One path for a firing case in each scope class of the tree at `tree` ([`scope_class`]): a
+/// new file with a random name and the case's kind, in a directory of that class drawn from
+/// `files`, where tidy's walk reads it and the base's tidy reports `expected`, the same
+/// `(rule, line)` pairs as at the case's own path. A class where no drawn path holds gets none.
+#[must_use]
+pub fn scope_placements(
+    base: &Path,
+    tree: &Path,
+    virtual_path: &Path,
+    text: &str,
+    expected: &BTreeSet<(String, u32)>,
+    files: &[String],
+    rng: &mut Rng,
+) -> Vec<PathBuf> {
+    let name = virtual_path.file_name().map_or_default(|name| name.to_string_lossy());
+    let wanted = suffix(&name).to_owned();
+    let mut classes: BTreeMap<String, BTreeSet<&Path>> = BTreeMap::new();
+    for directory in files.iter().filter_map(|file| Path::new(file).parent()) {
+        if let Some(class) = scope_class(directory) {
+            let _new = classes.entry(class).or_default().insert(directory);
+        }
+    }
+    let mut chosen = Vec::new();
+    for directories in classes.values() {
+        let candidates: Vec<PathBuf> = directories
+            .iter()
+            .map(|directory| directory.join(format!("{}{wanted}", rng.stem())))
+            .filter(|file| wanted.starts_with('.') && crate::tidy::is_walked(tree, file))
+            .collect();
+        chosen.extend(first_that_holds(base, text, expected, &candidates, rng));
+    }
+    assert!(chosen.len() <= classes.len(), "at most one path a class");
+    assert!(chosen.iter().all(|path| is_plain_relative(path)), "the paths stay inside the tree");
+    chosen
+}
+
 /// A candidate, drawn at random up to [`TRIES_MAX`] times, where the base reports `expected`.
 fn first_that_holds(
     base: &Path,
@@ -260,5 +325,49 @@ mod tests {
         let alone =
             placements(&root, &root, path, text, &expected, &tooling_only, &mut Rng::new(3));
         assert_eq!(alone, [path], "tooling is another scope");
+    }
+
+    // Goal: each crate, each crate's tests and each tooling directory is a class of its own,
+    // and a firing case gets one path in every class where the base reports the same.
+    #[test]
+    fn a_firing_case_is_planted_in_every_class() {
+        let class = |directory: &str| super::scope_class(Path::new(directory));
+        assert_eq!(class("crates/solver/src/boundary"), Some("crates/solver".to_owned()));
+        assert_eq!(class("crates/solver"), Some("crates/solver".to_owned()));
+        assert_eq!(class("crates/solver/tests"), Some("crates/solver/tests".to_owned()));
+        assert_eq!(class("crates/kernels/src"), Some("crates/kernels".to_owned()));
+        assert_eq!(class("xtask/src/tidy"), Some("xtask".to_owned()));
+        assert_eq!(class("docs/design"), Some("docs".to_owned()));
+        assert_eq!(class("tools"), Some("tools".to_owned()));
+        assert_eq!(class(".github/workflows"), None);
+        assert_eq!(class("crates"), None);
+        let root = crate::workspace_root();
+        let text = "// path: crates/kernels/src/example.rs\nuse libm::sqrt;\n";
+        let path = Path::new("crates/kernels/src/example.rs");
+        let expected = reports_at(&root, path, text).unwrap();
+        assert!(expected.iter().any(|(rule, _)| rule == "direct-libm"), "{expected:?}");
+        let files: Vec<String> = [
+            "crates/kernels/src/reduce.rs",
+            "crates/solver/src/lib.rs",
+            "crates/base/src/lib.rs",
+            "crates/base/tests/index.rs",
+            "xtask/src/hook.rs",
+            ".github/workflows/a.rs",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let draw = |seed| {
+            let mut rng = Rng::new(seed);
+            super::scope_placements(&root, &root, path, text, &expected, &files, &mut rng)
+        };
+        let chosen = draw(3);
+        let prefixes =
+            ["crates/base/src/", "crates/base/tests/", "crates/kernels/src/", "crates/solver/src/"];
+        assert_eq!(chosen.len(), 5, "{chosen:?}");
+        for (place, prefix) in chosen.iter().zip(prefixes.iter().chain(&["xtask/src/"])) {
+            assert!(place.starts_with(prefix) && place.extension().is_some_and(|e| e == "rs"));
+        }
+        assert_eq!(chosen, draw(3), "the draw follows the seed");
+        assert_ne!(chosen, draw(4), "and differs with it");
     }
 }

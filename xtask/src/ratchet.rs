@@ -16,14 +16,21 @@
 //! Without a subcommand, both run in one process, for local use and the tests. See [`cli`] for
 //! the options.
 //!
-//! **Threat model.** The ratchet is sound against honest mistakes. Its `syn` checks are sound
-//! for files in the dialect of [`dialect`], and a rule-path file outside it gives no verdict:
-//! for those files, the rule tables, scopes, allowed lists, the presence of each `check_*` call
-//! site, and the lints' levels and registrations are what the compiler builds. Whether a call
-//! that is present also runs is for the corpus and mutation testing to show. Against head code
-//! written to deceive, the rest is defence in depth only; the reviewer app, sampled audits and
-//! the trusted core back it. The reviewer app is the bot that `NAMI_REVIEWER_LOGIN` names, and
-//! the review it posts runs in CI (pending #59), where no authoring session holds its key.
+//! **Threat model.** The ratchet is sound against honest mistakes, within what it checks. Its
+//! `syn` checks are sound for files in the dialect of [`dialect`], and a rule-path file outside
+//! it gives no verdict: for those files, the rule tables, scopes, allowed lists, the presence of
+//! each `check_*` call site, and the lints' levels and registrations are what the compiler
+//! builds, and the constants and the code that reads the environment or files are the base's.
+//! That the rule modules apply the tables as written, and that a call that is present also
+//! runs, the corpus shows at the paths it plants each case at (its own, two drawn ones in its
+//! scope, and for a firing case one in each crate, each crate's tests, `xtask`, `lints`, `tools`
+//! and `docs`, wherever the base reports the same), and mutation testing shows for every changed
+//! hunk. A narrowing to a single file or a deeper directory that no placement reaches is not
+//! shown.
+//! Against head code written to deceive, the rest is defence in depth only; the reviewer app,
+//! sampled audits and the trusted core back it. The reviewer app is the bot that
+//! `NAMI_REVIEWER_LOGIN` names, and the review it posts runs in CI (pending #59), where no
+//! authoring session holds its key.
 //!
 //! **One tree.** The observer and the judge read the same head: both refuse a head with a
 //! symbolic link, so the observer's scratch copy, which holds regular files only, has every
@@ -40,6 +47,7 @@
 pub mod cli;
 mod corpus;
 pub mod dialect;
+pub mod hunks;
 mod lint;
 mod mutants;
 pub mod observations;
@@ -491,7 +499,8 @@ fn judge_proof(
         return Ok(());
     }
     if tools.mutants {
-        let judged = mutants::judge(head, &verdict.rule_paths.clone(), observed)?;
+        let judged =
+            mutants::judge(base, head, &verdict.rule_paths.clone(), observed, &tools.work)?;
         verdict.notes.extend(judged.notes);
         for what in judged.unproven {
             verdict.unprovable(what);

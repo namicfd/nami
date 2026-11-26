@@ -38,6 +38,8 @@ pub struct Library {
     pub declarations: Vec<DylintLint>,
     /// The lower-case names passed to `register_lints(&[..])`.
     pub registered: BTreeSet<String>,
+    /// The files rustc compiles, relative to the root.
+    pub files: Vec<String>,
 }
 
 /// Reads the lint library below `root` after checking it against the dialect. A tree without
@@ -105,12 +107,14 @@ fn read_library(files: &[(String, syn::File)]) -> Result<Library, String> {
     }
     let names: BTreeSet<String> =
         library.declarations.iter().map(|lint| lint.name.to_uppercase()).collect();
+    let mut calls = 0_usize;
     for (relative, file) in files {
         let mut reader = Reader {
             names: &names,
             root: relative == ROOT,
             depth: 0,
             registered: BTreeSet::new(),
+            calls: 0,
             problem: None,
         };
         reader.visit_file(file);
@@ -118,9 +122,70 @@ fn read_library(files: &[(String, syn::File)]) -> Result<Library, String> {
             return Err(outside(relative, &problem));
         }
         library.registered.extend(reader.registered);
+        calls += reader.calls;
+        library.files.push(relative.clone());
+    }
+    let unconditional = files
+        .iter()
+        .find(|(relative, _)| relative == ROOT)
+        .map_or(0, |(_, file)| unconditional_registrations(file));
+    if calls != unconditional {
+        return Err(outside(
+            ROOT,
+            "a `register_lints` call that is not an unconditional statement of the function \
+             `register_lints` at the top of `lib.rs`",
+        ));
     }
     library.declarations.sort();
     Ok(library)
+}
+
+/// The `register_lints(..)` calls that are statements of their own at the top of the body of
+/// the top-level function `register_lints`, which dylint calls, with no statement before them
+/// that can leave the function (a `return`, a `?` or a macro): they always run.
+fn unconditional_registrations(file: &syn::File) -> usize {
+    let registering = file.items.iter().filter_map(|item| {
+        let syn::Item::Fn(function) = item else {
+            return None;
+        };
+        (function.sig.ident == "register_lints").then_some(function)
+    });
+    let mut count = 0_usize;
+    for function in registering {
+        let mut exits = Exits { found: false };
+        for statement in &function.block.stmts {
+            let registers = matches!(statement,
+                syn::Stmt::Expr(syn::Expr::MethodCall(call), Some(_))
+                    if call.method == "register_lints");
+            if registers && !exits.found {
+                count += 1;
+            }
+            exits.visit_stmt(statement);
+        }
+    }
+    count
+}
+
+/// Finds a way out of a function, or code the reader cannot see: a `return`, a `?` or a macro.
+struct Exits {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for Exits {
+    fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+        self.found = true;
+        visit::visit_expr_return(self, node);
+    }
+
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        self.found = true;
+        visit::visit_expr_try(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.found = true;
+        visit::visit_macro(self, node);
+    }
 }
 
 /// True for `declare_lint!` or `declare_tool_lint!`, by the last segment of the path.
@@ -177,6 +242,8 @@ struct Reader<'n> {
     /// Depth of items around the current one; 0 at the top of the file.
     depth: u32,
     registered: BTreeSet<String>,
+    /// The `register_lints` calls seen.
+    calls: usize,
     problem: Option<String>,
 }
 
@@ -303,6 +370,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if node.method == "register_lints" {
+            self.calls += 1;
             match registered_names(&node.args) {
                 Some(names) if self.root => self.registered.extend(names),
                 _ => self.flag(

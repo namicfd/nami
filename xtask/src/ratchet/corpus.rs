@@ -20,7 +20,6 @@ use super::observations::{Observations, Run};
 use super::plant::{self, Rng};
 use super::tree::{Scratch, is_plain_relative};
 use super::{Check, Finding};
-use crate::tidy::Scope;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -156,8 +155,22 @@ pub fn plan(
     for (index, fixture) in fixtures.iter().enumerate() {
         let text = plant::disguise(&fixture.text, rng);
         let expected = base_reports(base, fixture, &text)?;
-        let placements =
+        let mut placements =
             plant::placements(base, tree, &fixture.virtual_path, &text, &expected, files, rng);
+        if fixture.fires {
+            let more = plant::scope_placements(
+                base,
+                tree,
+                &fixture.virtual_path,
+                &text,
+                &expected,
+                files,
+                rng,
+            );
+            let new: Vec<PathBuf> =
+                more.into_iter().filter(|path| !placements.contains(path)).collect();
+            placements.extend(new);
+        }
         plantings.extend(placements.into_iter().map(|placement| Planting {
             fixture: index,
             placement,
@@ -318,9 +331,10 @@ fn judge_run(
 ) -> Result<Vec<Finding>, String> {
     let placement = Path::new(&run.placement);
     let plain = is_plain_relative(placement) && crate::tidy::is_walked(head, placement);
-    if !plain || Scope::of(placement) != Scope::of(&fixture.virtual_path) {
+    // The judge drew the placement itself; a path in another scope class is drawn on purpose.
+    if !plain {
         return Err(format!(
-            "{} was planted at {}, outside its scope or tidy's walk",
+            "{} was planted at {}, outside the tree or tidy's walk",
             fixture.file, run.placement
         ));
     }

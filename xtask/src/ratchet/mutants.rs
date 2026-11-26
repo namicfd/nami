@@ -111,9 +111,11 @@ pub struct Judged {
 /// No verdict: a missing run, an unexpected exit code, or an unreadable or inconsistent
 /// listing, `outcomes.json` or `missed.txt`.
 pub fn judge(
+    base: &Path,
     head: &Path,
     rule_paths: &[String],
     observations: &Observations,
+    work: &Path,
 ) -> Result<Judged, String> {
     let mut judged = Judged::default();
     for workspace in &WORKSPACES {
@@ -134,10 +136,94 @@ pub fn judge(
                  nothing about it (a changed constant or a deleted line makes none)",
                 workspace.name
             ));
+        } else {
+            let starts = mutant_starts(run, workspace.directory)?;
+            for path in changed_sources(rule_paths, workspace) {
+                judged.unproven.extend(uncovered_hunks(base, head, path, &starts, work)?);
+            }
         }
         judged.findings.extend(missed_findings(&missed, workspace.directory));
     }
     Ok(judged)
+}
+
+/// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, which
+/// the rule-set check reads as data.
+fn changed_sources<'a>(rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
+    rule_paths
+        .iter()
+        .filter(|path| path.starts_with(workspace.sources) && is_rust_source(path))
+        .filter(|path| path.as_str() != super::source::REGISTRY)
+        .collect()
+}
+
+/// The first line of every caught or missed mutant, by file relative to the root.
+fn mutant_starts(run: &Run, directory: &str) -> Result<BTreeMap<String, Vec<u32>>, String> {
+    let text = run.files.get(OUTCOMES).cloned().flatten().unwrap_or_default();
+    let outcomes =
+        json::parse(&text).map_err(|error| format!("{OUTCOMES} is not JSON: {}", error.message))?;
+    let list = outcomes.get("outcomes").and_then(Value::as_array).ok_or_else(|| {
+        format!("{OUTCOMES} of {} lists no outcomes, so no mutant can be placed", run.subject)
+    })?;
+    let mut starts: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for outcome in list {
+        let summary = outcome.get("summary").and_then(Value::as_str).unwrap_or_default();
+        let Some(mutant) = outcome.get("scenario").and_then(|scenario| scenario.get("Mutant"))
+        else {
+            continue;
+        };
+        if summary != "CaughtMutant" && summary != "MissedMutant" {
+            continue;
+        }
+        let file = mutant.get("file").and_then(Value::as_str);
+        let line = match mutant
+            .get("span")
+            .and_then(|span| span.get("start"))
+            .and_then(|start| start.get("line"))
+        {
+            Some(Value::Number(digits)) => digits.parse::<u32>().ok(),
+            _ => None,
+        };
+        let (Some(file), Some(line)) = (file, line) else {
+            return Err(format!("a mutant in {OUTCOMES} of {} has no file or line", run.subject));
+        };
+        let path =
+            if directory.is_empty() { file.to_owned() } else { format!("{directory}/{file}") };
+        starts.entry(path).or_default().push(line);
+    }
+    Ok(starts)
+}
+
+/// Every hunk of `path` that needs a mutant and contains none, as an unproven item.
+fn uncovered_hunks(
+    base: &Path,
+    head: &Path,
+    path: &str,
+    starts: &BTreeMap<String, Vec<u32>>,
+    work: &Path,
+) -> Result<Vec<String>, String> {
+    let ranges = |root: &Path| -> Result<Vec<(u32, u32)>, String> {
+        match super::source::read_optional(root, path)? {
+            Some(text) => super::hunks::exempt_ranges(path, &text),
+            None => Ok(Vec::new()),
+        }
+    };
+    let (base_ranges, head_ranges) = (ranges(base)?, ranges(head)?);
+    let lines = starts.get(path).map_or(&[][..], Vec::as_slice);
+    let mut unproven = Vec::new();
+    for hunk in super::hunks::hunks(base, head, path, work)? {
+        if super::hunks::is_exempt(&hunk, &head_ranges, &base_ranges)
+            || super::hunks::contains_mutant(&hunk, lines)
+        {
+            continue;
+        }
+        unproven.push(format!(
+            "the change at {path}:{} contains no mutant (a changed literal, a deleted line or a \
+             moved statement makes none), so mutation testing proves nothing about it",
+            hunk.head_first
+        ));
+    }
+    Ok(unproven)
 }
 
 /// Reads one mutation run: the number of mutants, and `missed.txt`. Everything must agree:

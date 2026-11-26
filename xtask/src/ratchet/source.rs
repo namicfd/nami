@@ -3,10 +3,14 @@
 //! declarations and registrations. Each file is first held to the dialect of [`super::dialect`],
 //! in which these readings are what the compiler builds.
 //!
-//! Mutation testing makes no mutant for a changed constant or a deleted line, and the corpus
-//! pins a ban at one or two paths. These checks close that gap for data: every base row must be
-//! in the head unchanged or narrowed in what it permits, and every base `check_*` call site must
-//! still be there. A table in a form this module does not read is no verdict, never a pass.
+//! Mutation testing makes no mutant for a changed table row. These checks cover the registry's
+//! tables as data: every base row must be in the head unchanged or narrowed in what it permits,
+//! and every base `check_*` call site must still be there. That is a statement about the
+//! tables and the call sites, not about what tidy enforces: how the rule modules apply a row is
+//! code, which the corpus shows only at the paths where it plants a case, one per scope class
+//! for a firing case ([`super::plant::scope_placements`]), and mutation testing per changed
+//! hunk ([`super::hunks`]). A narrowing to a single file that no placement reaches is not shown.
+//! A table in a form this module does not read is no verdict, never a pass.
 
 use super::dialect;
 use super::{Check, Finding};
