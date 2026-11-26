@@ -395,7 +395,7 @@ mod tests {
 
     // Goal: a registry row change needs no mutant if every field it changes is one the
     // rule-set check compares or one that only documents: a reworded message, summary,
-    // reference or description, a shrunk allowed list and a new ban row are covered.
+    // reference, description or detail, a shrunk allowed list and a new ban row are covered.
     #[test]
     fn registry_rows_are_covered_field_by_field() {
         let base = real(super::super::source::REGISTRY);
@@ -406,10 +406,12 @@ mod tests {
             replaced(
                 &base,
                 "summary: \"Every ADR is listed in `docs/design/README.md`.\",\n        \
-                 reference: \"ADR-0000\",",
-                "summary: \"Every ADR is listed.\",\n        reference: \"ADR-0001\",",
+                 detail: \"\",\n        reference: \"ADR-0000\",",
+                "summary: \"Every ADR is listed.\",\n        detail: \"Read from the index.\",\n  \
+                 \x20     reference: \"ADR-0001\",",
             ),
             replaced(&base, "proves that nothing allocates after init.", "proves it."),
+            replaced(&base, "so that `cfg_attr` and macro bodies are included.", "so."),
             replaced(&base, "allowed: &[\"crates/kernels/src/math.rs\"]", "allowed: &[]"),
             replaced(
                 &base,

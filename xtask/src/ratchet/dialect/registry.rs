@@ -38,8 +38,9 @@ pub const COMPARED: [(&str, &[&str]); 4] = [
     ("PLANNED", &[]),
 ];
 
-/// The fields that only tidy's violation messages and `docs/RULES.md` print.
-pub const DOCUMENTATION: [&str; 4] = ["message", "summary", "reference", "description"];
+/// The fields that only tidy's violation messages and `docs/RULES.md` print: `detail` (#66) is
+/// the "What it sees and misses" column there.
+pub const DOCUMENTATION: [&str; 5] = ["message", "summary", "reference", "description", "detail"];
 
 /// The parameters of `planned(..)`, in order.
 const PLANNED_FIELDS: [&str; 4] = ["id", "mechanism", "description", "reference"];
