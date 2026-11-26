@@ -6,12 +6,15 @@
 # - `nami-ci` (`NAMI_AGENT_APP=ci`): CI jobs file the issues that agents act on as
 #   `nami-ci[bot]` (ADR-0023). It never reads the agents' key or falls back to it, and `env`
 #   refuses it: its jobs mint one token and use it, and make no commits as the agents.
+# In CI (CI or GITHUB_ACTIONS is `true`), only the CI app may act: the agents' key never
+# reaches CI. In CI and for the CI app, every token is narrowed and `jwt` is refused.
 #
 # Usage:
 #   xtask/agent-token.sh [token]             print an installation token (valid for 1 hour)
 #   xtask/agent-token.sh env                 print shell exports that make git and gh act as the bot
 #   xtask/agent-token.sh git-credential get  git credential helper (installed by `env`)
-#   xtask/agent-token.sh jwt                 print the app's own JWT (valid for 9 minutes)
+#   xtask/agent-token.sh jwt                 print the app's own JWT (valid for 9 minutes; not
+#                                            in CI or for the CI app)
 #   xtask/agent-token.sh request             print the token request's body; asks GitHub nothing
 #
 # In an agent runner:
@@ -50,8 +53,22 @@ readonly api="https://api.github.com"
 readonly repo="${NAMI_AGENT_REPO:-namicfd/nami}"
 readonly permissions="${NAMI_AGENT_PERMISSIONS:-}"
 readonly app="${NAMI_AGENT_APP:-agent}"
+
+# True inside a CI run: GitHub Actions sets both variables to `true`.
+in_ci() {
+  [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" ]]
+}
+
+# True when the token must be narrowed and no JWT is printed: inside a CI run, and for the CI
+# app wherever it runs.
+must_narrow() {
+  in_ci || [[ "$app" == "ci" ]]
+}
+
 case "$app" in
   agent)
+    ! in_ci || fail "the agents' app never acts in CI, and its key stays on the agents'" \
+      "machines (ADR-0023); a CI job uses NAMI_AGENT_APP=ci"
     readonly key="${NAMI_AGENT_KEY:-$HOME/.config/nami/nami-agent.pem}"
     readonly client_id="${NAMI_AGENT_CLIENT_ID:-Iv23liAQwForBGxIuQZv}"
     ;;
@@ -67,12 +84,6 @@ esac
 # The bot's user ID (not the app ID) comes from `gh api 'users/nami-agent%5Bbot%5D' --jq .id`.
 readonly bot_name="nami-agent[bot]"
 readonly bot_email="360897210+nami-agent[bot]@users.noreply.github.com"
-
-# True when the token must be narrowed: inside a CI run, where GitHub Actions sets both
-# variables to `true`, and for the CI app wherever it runs.
-must_narrow() {
-  [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" || "$app" == "ci" ]]
-}
 
 base64url() {
   openssl base64 -A | tr '+/' '-_' | tr -d '='
@@ -184,7 +195,14 @@ case "${1:-token}" in
   token) token ;;
   env) env_exports ;;
   git-credential) git_credential "${2:-}" ;;
-  jwt) jwt ;;
+  jwt)
+    # The JWT mints tokens with every permission of the app, so it never leaves the script
+    # where tokens must be narrowed.
+    ! must_narrow || fail "'jwt' is refused in CI and for the CI app: a JWT can mint a token" \
+      "with every permission of the app (ADR-0023, rule 2); use 'token' with" \
+      "NAMI_AGENT_PERMISSIONS"
+    jwt
+    ;;
   request) token_request && echo ;;
   *) fail "unknown command '$1'; use token, env, git-credential, jwt or request" ;;
 esac

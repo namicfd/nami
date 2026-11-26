@@ -1,7 +1,9 @@
 //! `agent-token.sh` signs a well-formed GitHub App JWT for the agents' app (ADR-0008) and the
-//! CI app (ADR-0023), and refuses an unnarrowed token in CI.
+//! CI app (ADR-0023), refuses an unnarrowed token and a bare JWT in CI and for the CI app, and
+//! never acts as the agents' app in CI.
 
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn run(command: &mut Command) -> String {
@@ -27,44 +29,54 @@ openssl rsa -in "$1/key.pem" -pubout -out "$1/public.pem" 2> /dev/null
 printf %s.%s "$h" "$p" | openssl dgst -sha256 -verify "$1/public.pem" -signature "$1/signature"
 "#;
 
-// Goal: `agent-token.sh jwt` prints a JWT whose header and payload are what GitHub expects
-// (RS256, the client ID as issuer, a 10-minute window) and whose signature verifies against the
-// key. Method: sign with a throwaway key, then decode and verify independently with openssl.
-#[test]
-fn jwt_is_well_formed_and_verifies() {
-    let directory = std::env::temp_dir().join(format!("nami-agent-token-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("temporary directory is writable");
-    let key = directory.join("key.pem");
-    let _ = run(Command::new("openssl").args(["genrsa", "-out"]).arg(&key).arg("2048"));
-    let script = xtask::workspace_root().join("xtask/agent-token.sh");
-    let jwt = run(Command::new(script)
-        .arg("jwt")
-        .env("NAMI_AGENT_KEY", &key)
-        .env("NAMI_AGENT_CLIENT_ID", "Iv-test-client"));
-    let decoded =
-        run(Command::new("bash").args(["-c", VERIFY, "verify"]).arg(&directory).arg(&jwt));
-    std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
+/// Stands in for curl: records the bearer and each request (URL and body), and answers the
+/// installation lookup and the token request as GitHub would.
+const FAKE_CURL: &str = r#"#!/usr/bin/env bash
+set -eu
+IFS= read -r header
+printf '%s\n' "${header#Authorization: Bearer }" >> "$NAMI_FAKE_DIR/bearers"
+url="${!#}"
+data=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--data" ]; then data="$2"; fi
+  shift
+done
+printf '%s %s\n' "$url" "$data" >> "$NAMI_FAKE_DIR/requests"
+case "$url" in
+  */repos/owner/name/installation) printf '{"id":7}' ;;
+  */app/installations/7/access_tokens) printf '{"token":"ghs_fake"}' ;;
+  *) exit 22 ;;
+esac
+"#;
 
-    let lines: Vec<&str> = decoded.lines().collect();
+/// A new temporary directory, unique per call: `cargo test` runs the tests as threads of one
+/// process.
+fn scratch(name: &str) -> PathBuf {
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!("nami-{name}-{}-{call}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("temporary directory is writable");
+    directory
+}
+
+/// A throwaway RSA key at `path`.
+fn generate_key(path: &Path) {
+    let _ = run(Command::new("openssl").args(["genrsa", "-out"]).arg(path).arg("2048"));
+}
+
+/// The header, payload and verdict of `jwt`, verified against `directory/key.pem`.
+fn verified(directory: &Path, jwt: &str) -> Vec<String> {
+    let decoded =
+        run(Command::new("bash").args(["-c", VERIFY, "verify"]).arg(directory).arg(jwt.trim()));
+    let lines: Vec<String> = decoded.lines().map(str::to_owned).collect();
     assert_eq!(lines.len(), 3, "header, payload and verdict: {decoded}");
-    assert_eq!(lines[0], r#"{"alg":"RS256","typ":"JWT"}"#);
-    assert_eq!(lines[2], "Verified OK", "the signature must verify against the key");
-    let numbers: Vec<i64> =
-        lines[1].split([':', ',']).filter_map(|field| field.parse().ok()).collect();
-    assert_eq!(numbers.len(), 2, "payload has iat and exp: {}", lines[1]);
-    assert_eq!(numbers[1] - numbers[0], 600, "GitHub allows at most 10 minutes");
-    assert!(lines[1].ends_with(r#""iss":"Iv-test-client"}"#), "issuer is the client ID");
+    lines
 }
 
 /// Runs `agent-token.sh` with `arguments` and only the given environment, in a temporary home
 /// that is removed afterwards. Returns whether it succeeded, its stdout and its stderr.
 fn run_script(arguments: &[&str], environment: &[(&str, &OsStr)]) -> (bool, String, String) {
-    // Unique per call, since `cargo test` runs the tests as threads of one process.
-    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let home =
-        std::env::temp_dir().join(format!("nami-agent-token-home-{}-{call}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("temporary directory is writable");
+    let home = scratch("agent-token-home");
     let script = xtask::workspace_root().join("xtask/agent-token.sh");
     let mut command = Command::new(script);
     let _command = command
@@ -79,6 +91,30 @@ fn run_script(arguments: &[&str], environment: &[(&str, &OsStr)]) -> (bool, Stri
     std::fs::remove_dir_all(&home).expect("temporary home is removable");
     let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("output is UTF-8");
     (output.status.success(), text(output.stdout), text(output.stderr))
+}
+
+// Goal: `agent-token.sh jwt` prints a JWT whose header and payload are what GitHub expects
+// (RS256, the client ID as issuer, a 10-minute window) and whose signature verifies against the
+// key. Method: sign with a throwaway key, then decode and verify independently with openssl.
+#[test]
+fn jwt_is_well_formed_and_verifies() {
+    let directory = scratch("agent-token");
+    let key = directory.join("key.pem");
+    generate_key(&key);
+    let environment =
+        [("NAMI_AGENT_KEY", key.as_os_str()), ("NAMI_AGENT_CLIENT_ID", OsStr::new("Iv-test"))];
+    let (ok, jwt, error) = run_script(&["jwt"], &environment);
+    assert!(ok, "the agents' app signs outside CI: {error}");
+    let lines = verified(&directory, &jwt);
+    std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
+
+    assert_eq!(lines[0], r#"{"alg":"RS256","typ":"JWT"}"#);
+    assert_eq!(lines[2], "Verified OK", "the signature must verify against the key");
+    let numbers: Vec<i64> =
+        lines[1].split([':', ',']).filter_map(|field| field.parse().ok()).collect();
+    assert_eq!(numbers.len(), 2, "payload has iat and exp: {}", lines[1]);
+    assert_eq!(numbers[1] - numbers[0], 600, "GitHub allows at most 10 minutes");
+    assert!(lines[1].ends_with(r#""iss":"Iv-test"}"#), "issuer is the client ID");
 }
 
 /// Runs `agent-token.sh request` for the repository `owner/name`, outside CI, with
@@ -132,90 +168,160 @@ fn an_empty_permission_object_is_an_error() {
     }
 }
 
-// Goal: a token request without permissions, or with `{}`, is refused in CI, which GitHub
-// Actions marks with `CI` or `GITHUB_ACTIONS` set to `true`, and for the CI app outside CI
-// (ADR-0023, rule 2). A narrowed request is printed as outside CI, and another value of the
-// markers is not CI.
-#[test]
-fn ci_and_the_ci_app_must_narrow_the_token() {
-    let narrowed = "{\"repositories\":[\"name\"],\"permissions\":{\"issues\":\"write\"}}\n";
-    let repository = ("NAMI_AGENT_REPO", OsStr::new("owner/name"));
-    let ci_app = vec![
+/// The CI app's settings, with a key path that the commands under test never read.
+fn ci_app() -> Vec<(&'static str, &'static OsStr)> {
+    vec![
         ("NAMI_AGENT_APP", OsStr::new("ci")),
         ("NAMI_CI_KEY", OsStr::new("/the/key/is/not/read")),
         ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci")),
-    ];
-    let markers =
-        [vec![("CI", OsStr::new("true"))], vec![("GITHUB_ACTIONS", OsStr::new("true"))], ci_app];
-    for marker in markers {
-        let name = marker[0].0;
-        for (permissions, expected) in [
-            (None, "must narrow the token"),
-            (Some(""), "must narrow the token"),
-            (Some("{}"), "narrows nothing"),
-        ] {
-            let mut environment = marker.clone();
-            environment.push(repository);
-            environment
-                .extend(permissions.map(|value| ("NAMI_AGENT_PERMISSIONS", OsStr::new(value))));
-            let (ok, body, error) = run_script(&["request"], &environment);
-            assert!(!ok && body.is_empty(), "{name}, {permissions:?}: refused: {body}");
-            assert!(error.contains(expected), "{name}, {permissions:?}: {error}");
-        }
-        let mut environment = marker.clone();
-        environment.push(repository);
-        environment.push(("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#)));
-        let (ok, body, error) = run_script(&["request"], &environment);
-        assert!(ok && error.is_empty(), "{name}: a narrowed token is asked for: {error}");
-        assert_eq!(body, narrowed, "{name}");
-    }
+    ]
+}
+
+// Goal: in CI, which GitHub Actions marks with `CI` or `GITHUB_ACTIONS` set to `true`, the
+// agents' app never acts, whether `NAMI_AGENT_APP` is unset or `agent`: its key stays on the
+// agents' machines (ADR-0023). Every command is refused before a key is read. Another value
+// of the markers is not CI.
+#[test]
+fn the_agents_app_never_acts_in_ci() {
+    let repository = ("NAMI_AGENT_REPO", OsStr::new("owner/name"));
     for marker in ["CI", "GITHUB_ACTIONS"] {
+        for app in [None, Some("agent")] {
+            for command in ["token", "env", "git-credential", "jwt", "request"] {
+                let mut environment = vec![repository, (marker, OsStr::new("true"))];
+                environment.extend(app.map(|app| ("NAMI_AGENT_APP", OsStr::new(app))));
+                let (ok, body, error) = run_script(&[command], &environment);
+                assert!(!ok && body.is_empty(), "{marker}, {app:?}, {command}: {body}");
+                assert!(error.contains("the agents' app never acts in CI"), "{error}");
+            }
+        }
         let not_ci = [repository, (marker, OsStr::new("1"))];
         assert!(run_script(&["request"], &not_ci).0, "{marker}=1 is not GitHub Actions");
     }
 }
 
-// Goal: `NAMI_AGENT_APP=ci` signs with the CI app's key and client ID, refuses `env`, and
-// fails without its own key or client ID even when the agents' key and client ID are valid:
-// it never falls back to them. An unknown app fails. Method: one throwaway key for each app;
-// the JWT is decoded and verified independently with openssl against the CI app's key.
+// Goal: a token request without permissions, or with `{}`, is refused for the CI app, in CI
+// and outside it (ADR-0023, rule 2). A narrowed request is printed.
 #[test]
-fn the_ci_app_is_selected_and_kept_apart() {
-    let directory = std::env::temp_dir().join(format!("nami-ci-token-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("temporary directory is writable");
+fn the_ci_app_must_narrow_the_token() {
+    let narrowed = "{\"repositories\":[\"name\"],\"permissions\":{\"issues\":\"write\"}}\n";
+    let repository = ("NAMI_AGENT_REPO", OsStr::new("owner/name"));
+    for marker in [None, Some("CI"), Some("GITHUB_ACTIONS")] {
+        let mut base = ci_app();
+        base.push(repository);
+        base.extend(marker.map(|marker| (marker, OsStr::new("true"))));
+        for (permissions, expected) in [
+            (None, "must narrow the token"),
+            (Some(""), "must narrow the token"),
+            (Some("{}"), "narrows nothing"),
+        ] {
+            let mut environment = base.clone();
+            environment
+                .extend(permissions.map(|value| ("NAMI_AGENT_PERMISSIONS", OsStr::new(value))));
+            let (ok, body, error) = run_script(&["request"], &environment);
+            assert!(!ok && body.is_empty(), "{marker:?}, {permissions:?}: refused: {body}");
+            assert!(error.contains(expected), "{marker:?}, {permissions:?}: {error}");
+        }
+        let mut environment = base;
+        environment.push(("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#)));
+        let (ok, body, error) = run_script(&["request"], &environment);
+        assert!(ok && error.is_empty(), "{marker:?}: a narrowed token is asked for: {error}");
+        assert_eq!(body, narrowed, "{marker:?}");
+    }
+}
+
+// Goal: `jwt` is refused in CI and for the CI app, because a JWT mints tokens with every
+// permission of the app (ADR-0023, rule 2). Nothing is printed and no key is read.
+#[test]
+fn jwt_is_refused_in_ci_and_for_the_ci_app() {
+    for marker in [None, Some("CI"), Some("GITHUB_ACTIONS")] {
+        let mut environment = ci_app();
+        environment.extend(marker.map(|marker| (marker, OsStr::new("true"))));
+        let (ok, body, error) = run_script(&["jwt"], &environment);
+        assert!(!ok && body.is_empty(), "{marker:?}: refused: {body}");
+        assert!(error.contains("'jwt' is refused in CI and for the CI app"), "{error}");
+    }
+}
+
+// Goal: `NAMI_AGENT_APP=ci` mints its token with a JWT signed by the CI app's key, with the CI
+// app's client ID as issuer, while the agents' key and client ID are valid too, and asks for
+// the narrowed permissions only. Method: curl is replaced by a fake that records the bearer
+// and the requests; the bearer is decoded and verified independently with openssl.
+#[test]
+fn the_ci_app_signs_with_its_own_key() {
+    let directory = scratch("ci-token");
     let key = directory.join("key.pem");
     let agent_key = directory.join("agent.pem");
-    for path in [&key, &agent_key] {
-        let _ = run(Command::new("openssl").args(["genrsa", "-out"]).arg(path).arg("2048"));
-    }
+    generate_key(&key);
+    generate_key(&agent_key);
+    let fakes = directory.join("bin");
+    std::fs::create_dir_all(&fakes).expect("fake directory is writable");
+    std::fs::write(fakes.join("curl"), FAKE_CURL).expect("the fake curl is written");
+    let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+    std::fs::set_permissions(fakes.join("curl"), executable).expect("the fake is executable");
+    let mut path = fakes.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let environment = [
+        ("NAMI_AGENT_APP", OsStr::new("ci")),
+        ("NAMI_CI_KEY", key.as_os_str()),
+        ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci")),
+        ("NAMI_AGENT_KEY", agent_key.as_os_str()),
+        ("NAMI_AGENT_CLIENT_ID", OsStr::new("Iv-agent")),
+        ("NAMI_AGENT_REPO", OsStr::new("owner/name")),
+        ("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#)),
+        ("GITHUB_ACTIONS", OsStr::new("true")),
+        ("NAMI_FAKE_DIR", directory.as_os_str()),
+        ("PATH", path.as_os_str()),
+    ];
+    let (ok, token, error) = run_script(&["token"], &environment);
+    assert!(ok && error.is_empty(), "a narrowed token is minted: {error}");
+    assert_eq!(token, "ghs_fake\n");
+    let bearers = std::fs::read_to_string(directory.join("bearers")).expect("bearers recorded");
+    let bearers: Vec<&str> = bearers.lines().collect();
+    assert_eq!(bearers.len(), 2, "one JWT for each call: {bearers:?}");
+    assert_eq!(bearers[0], bearers[1], "the same JWT for both calls");
+    let lines = verified(&directory, bearers[0]);
+    assert!(lines[1].ends_with(r#""iss":"Iv-ci"}"#), "the CI app's client ID: {}", lines[1]);
+    assert_eq!(lines[2], "Verified OK", "signed with the CI app's key");
+    let requests = std::fs::read_to_string(directory.join("requests")).expect("requests");
+    let expected = "https://api.github.com/repos/owner/name/installation \n\
+                    https://api.github.com/app/installations/7/access_tokens \
+                    {\"repositories\":[\"name\"],\"permissions\":{\"issues\":\"write\"}}\n";
+    assert_eq!(requests, expected);
+    std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
+}
+
+// Goal: `NAMI_AGENT_APP=ci` refuses `env`, and fails without its own key or client ID even
+// when the agents' key and client ID are valid: it never falls back to them. An unknown app
+// fails.
+#[test]
+fn the_ci_app_never_falls_back_to_the_agents_key() {
+    let directory = scratch("ci-fallback");
+    let agent_key = directory.join("agent.pem");
+    generate_key(&agent_key);
     let nowhere = directory.join("no-ci-key.pem");
     let app = ("NAMI_AGENT_APP", OsStr::new("ci"));
-    let ci_key = ("NAMI_CI_KEY", key.as_os_str());
+    let ci_key = ("NAMI_CI_KEY", agent_key.as_os_str());
     let ci_client = ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci"));
     let agent = ("NAMI_AGENT_KEY", agent_key.as_os_str());
     let agent_client = ("NAMI_AGENT_CLIENT_ID", OsStr::new("Iv-agent"));
-    let complete = [app, ci_key, ci_client, agent, agent_client];
-    let (signed, jwt, signing) = run_script(&["jwt"], &complete);
-    assert!(signed, "the CI app's key signs: {signing}");
-    let decoded =
-        run(Command::new("bash").args(["-c", VERIFY, "verify"]).arg(&directory).arg(jwt.trim()));
-    let lines: Vec<&str> = decoded.lines().collect();
-    assert_eq!(lines.len(), 3, "header, payload and verdict: {decoded}");
-    assert!(lines[1].ends_with(r#""iss":"Iv-ci"}"#), "the CI app's client ID: {}", lines[1]);
-    assert_eq!(lines[2], "Verified OK", "signed with the CI app's key");
-    let (exported, _, refusal) = run_script(&["env"], &complete);
+    let narrowed = ("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#));
+    let (exported, _, refusal) = run_script(&["env"], &[app, ci_key, ci_client, narrowed]);
     assert!(!exported && refusal.contains("for the agents' app only"), "{refusal}");
     let empty_key = ("NAMI_CI_KEY", OsStr::new(""));
     let missing_key = ("NAMI_CI_KEY", nowhere.as_os_str());
     let cases: [(Vec<(&str, &OsStr)>, &str); 5] = [
-        (vec![app, ci_client, agent, agent_client], "NAMI_CI_KEY is not set"),
-        (vec![app, empty_key, ci_client, agent, agent_client], "NAMI_CI_KEY is not set"),
-        (vec![app, ci_key, agent, agent_client], "NAMI_CI_CLIENT_ID is not set"),
-        (vec![app, missing_key, ci_client, agent, agent_client], "the ci app's private key"),
+        (vec![app, ci_client, agent, agent_client, narrowed], "NAMI_CI_KEY is not set"),
+        (vec![app, empty_key, ci_client, agent, agent_client, narrowed], "NAMI_CI_KEY is not set"),
+        (vec![app, ci_key, agent, agent_client, narrowed], "NAMI_CI_CLIENT_ID is not set"),
+        (
+            vec![app, missing_key, ci_client, agent, agent_client, narrowed],
+            "cannot read the ci app's private key",
+        ),
         (vec![("NAMI_AGENT_APP", OsStr::new("other"))], "unknown app 'other'"),
     ];
     for (environment, expected) in cases {
-        let (ok, body, error) = run_script(&["jwt"], &environment);
+        let (ok, body, error) = run_script(&["token"], &environment);
         assert!(!ok && body.is_empty() && error.contains(expected), "{expected}: {error}");
     }
     std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
