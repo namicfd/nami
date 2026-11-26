@@ -548,14 +548,8 @@ fn judge_proof(
             uncovered.len()
         ));
     } else {
-        if class.is_edit() {
-            let more = class.edits.len() - 1;
-            let first = class.edits.first().cloned().unwrap_or_default();
-            verdict.unprovable(format!(
-                "edit to existing rule code needs the reviewer app's approval or a code \
-                 owner's: {first}{}",
-                if more == 0 { String::new() } else { format!(" (and {more} more)") }
-            ));
+        if let Some(what) = unapproved_edit(&class) {
+            verdict.unprovable(what);
         }
         for what in uncovered {
             verdict.unprovable(what);
@@ -563,6 +557,17 @@ fn judge_proof(
     }
     verdict.class = Some(class);
     Ok(())
+}
+
+/// What an edit to existing rule code leaves unproven without the reviewer app's approval: the
+/// first edit, and how many more the summary lists. `None` for an additive diff.
+fn unapproved_edit(class: &class::Class) -> Option<String> {
+    let (first, rest) = class.edits.split_first()?;
+    let more = if rest.is_empty() { String::new() } else { format!(" (and {} more)", rest.len()) };
+    Some(format!(
+        "edit to existing rule code needs the reviewer app's approval or a code owner's: \
+         {first}{more}"
+    ))
 }
 
 /// The review gate ([`review::check`]): its findings and what it could not show go into
@@ -732,6 +737,27 @@ mod tests {
         let mut approved = Verdict { owner_approved: true, ..Verdict::default() };
         approved.unprovable("no mutant".to_owned());
         assert!(approved.unproven.is_empty() && approved.unproven_after.is_empty());
+    }
+
+    // Goal: an edit leaves its first change unproven, counting the rest; an additive diff leaves
+    // nothing; and the verdict lines name the class.
+    #[test]
+    fn an_unapproved_edit_names_its_first_change() {
+        use super::class::Class;
+        assert_eq!(super::unapproved_edit(&Class::default()), None);
+        let one = Class { edits: vec!["a.rs: x".to_owned()], ..Class::default() };
+        let needs =
+            "edit to existing rule code needs the reviewer app's approval or a code owner's";
+        assert_eq!(super::unapproved_edit(&one), Some(format!("{needs}: a.rs: x")));
+        let three = Class { edits: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()], ..one };
+        assert_eq!(super::unapproved_edit(&three), Some(format!("{needs}: a (and 2 more)")));
+        let verdict = Verdict { class: Some(three), ..Verdict::default() };
+        assert_eq!(
+            (verdict.line(), verdict.line_after()),
+            ("ratchet: pass (edit)".to_owned(), "ratchet: pass (edit)".to_owned())
+        );
+        let additive = Verdict { class: Some(Class::default()), ..Verdict::default() };
+        assert_eq!(additive.line(), "ratchet: pass (additive)");
     }
 
     // Goal: the tail keeps the last non-blank lines on one line.

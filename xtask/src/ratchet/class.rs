@@ -912,6 +912,40 @@ mod tests {
         assert_edit(&edited("class-unsafe", RULES, &spared), "`Visitor::report_unsafe` changed");
     }
 
+    // Goal: the exploits of round 3 of #57's review are edits: a private table of exceptions, an
+    // early return in `check_path_start`, an exception inlined into its allowed list, and a
+    // condition added in `visit_path`.
+    #[test]
+    fn the_round_three_exploits_are_edits() {
+        let base = real(RULES);
+        let start = "    fn check_path_start(&mut self, segment: &Ident) {\n";
+        let early = "        if self.path.starts_with(\"crates/solver\") { return; }\n";
+        let allowed = "segment == ban.segment && applies && !registry::is_allowed(ban.allowed, \
+                       self.path)";
+        let inline = "segment == ban.segment && applies && !registry::is_allowed(if ban.id == \
+                      \"direct-libm\" { &[\"crates/kernels/src/math.rs\", \
+                      \"crates/solver/src/lib.rs\"] } else { ban.allowed }, self.path)";
+        let visit = "        if node.segments.len() > 1\n";
+        let table = "const PATH_BAN_ROWS: &[(&str, &[&str])] = &[(\"direct-libm\", \
+                     &[\"crates/solver\"])];";
+        let probes = [
+            (format!("{base}\n{table}\n"), "the new item `const PATH_BAN_ROWS` is a constant"),
+            (replaced(&base, start, &format!("{start}{early}")), "`Visitor::check_path_start`"),
+            (replaced(&base, allowed, inline), "`Visitor::check_path_start` changed"),
+            (
+                replaced(
+                    &base,
+                    visit,
+                    "        if node.segments.len() > 1 && !self.path.ends_with(\"lib.rs\")\n",
+                ),
+                "`<Visitor as Visit>::visit_path` changed",
+            ),
+        ];
+        for (index, (head, expected)) in probes.iter().enumerate() {
+            assert_edit(&edited(&format!("class-round-three-{index}"), RULES, head), expected);
+        }
+    }
+
     // Goal: round 4, thread 2: a guard added as the first statement of `check_tolerance`, which
     // cargo-mutants' whole-body mutant "covered", is an edit.
     #[test]
@@ -1092,6 +1126,9 @@ mod tests {
             "    visitor.violations.extend(line_of(&file));\n",
             "    visitor.violations.extend(extra_rule(&path));\n    extra_rule(&path);\n",
             "    visitor.violations.clear();\n",
+            "    visitor.violations.extend(extra_rule(&visitor.violations.split_off(0)));\n",
+            "    visitor.take().extend(extra_rule(&path));\n",
+            "    visitor.violations.extend(extra_rule(&<Path as Lookup>::ROOT));\n",
         ];
         for (index, call) in calls.iter().enumerate() {
             let head = format!("{}{rule}", replaced(&base, visit, &format!("{visit}{call}")));
@@ -1139,6 +1176,21 @@ mod tests {
             &[(lib, Some(&base), Some(&twice)), (extra, None, Some(module))],
         );
         assert_edit(&doubled, "a second time");
+        let wrappings = [
+            "Box::new(|_| Arc::new(NamiExtra))",
+            "Arc::new(|_| Box::new(NamiExtra))",
+            "Box::new(move |_| Box::new(NamiExtra))",
+            "Box::new(async |_| Box::new(NamiExtra))",
+            "Box::new(for<'a> |_| Box::new(NamiExtra))",
+            "Box::new(#[inline] |_| Box::new(NamiExtra))",
+        ];
+        for wrapped in wrappings {
+            let other = replaced(&head, "Box::new(|_| Box::new(NamiExtra))", wrapped);
+            let files =
+                [(lib, Some(base.as_str()), Some(other.as_str())), (extra, None, Some(module))];
+            let wrapped_class = class_of("class-lint-wrapped", &files);
+            assert_edit(&wrapped_class, "`register_lints` changed beyond a dispatch call");
+        }
         let reading =
             format!("{module}fn quiet() -> bool {{ std::env::var_os(\"CI\").is_some() }}\n");
         let sensitive = class_of(
@@ -1146,6 +1198,76 @@ mod tests {
             &[(lib, Some(&base), Some(&head)), (extra, None, Some(&reading))],
         );
         assert_edit(&sensitive, "names `env`");
+    }
+
+    // Goal: a new file may import names, but a glob, at any depth of the import tree, is an edit,
+    // because it can bring in names that shadow others.
+    #[test]
+    fn a_glob_import_is_an_edit() {
+        let path = "lints/src/extra.rs";
+        let plain = "use rustc_hir::{Expr, def::Res};\n";
+        assert!(!class_of("class-import", &[(path, None, Some(plain))]).is_edit());
+        for glob in ["use rustc_hir::*;\n", "use rustc_hir::{Expr, def::*};\n"] {
+            let class = class_of("class-glob", &[(path, None, Some(glob))]);
+            assert_edit(&class, "is an import into an existing module, or a glob");
+        }
+    }
+
+    // Goal: the comparison leaves out doc comments, outer and inner, and nothing else: a changed
+    // operator, an attribute or a delimiter changes the text; and a changed comparison in a
+    // rule is an edit.
+    #[test]
+    fn only_doc_comments_are_left_out() {
+        let normal = |text: &str| super::normal(text.parse().unwrap());
+        assert_eq!(normal("/// A doc.\nfn a() {}"), normal("fn a() {}"));
+        assert_eq!(normal("//! A doc.\n#![doc = \"x\"]\nfn a() {}"), normal("fn a() {}"));
+        assert_eq!(normal("#[doc(hidden)]\nfn a() {}"), normal("fn a() {}"));
+        let different = [
+            ("fn a() -> bool { 1 > 2 }", "fn a() -> bool { 1 >= 2 }"),
+            ("#[derive(Debug)]\nstruct A;", "struct A;"),
+            ("#[inline] fn a() {}", "fn a() {}"),
+            ("fn a() { (b) }", "fn a() { [b] }"),
+            ("fn a() { b! }", "fn a() { b }"),
+            ("#![no_std]\nfn a() {}", "fn a() {}"),
+            ("m! { # ! (doc) }", "m! {}"),
+            ("m! { # (doc) }", "m! {}"),
+        ];
+        for (before, after) in different {
+            assert_ne!(normal(before), normal(after), "{before}");
+        }
+        let check = "        if lines > FUNCTION_LINES_MAX {";
+        let head = replaced(&real(RULES), check, "        if lines >= FUNCTION_LINES_MAX {");
+        assert_edit(&edited("class-operator", RULES, &head), "`Visitor::check_body` changed");
+    }
+
+    // Goal: a changed signature or attribute of an existing function is an edit, though its
+    // body is the same; and a removed test module is named as such.
+    #[test]
+    fn headers_and_the_test_module_are_compared() {
+        let base = real(RULES);
+        let signature = "fn is_tolerance(value: f64) -> bool {";
+        let inlined = replaced(&base, signature, &format!("#[inline]\n{signature}"));
+        let expected = "the signature or attributes of `is_tolerance` changed";
+        assert_edit(&edited("class-header", RULES, &inlined), expected);
+        let start = base.find("#[cfg(test)]\nmod tests {").unwrap();
+        let untested = base.get(..start).unwrap();
+        let class = edited("class-no-tests", RULES, untested);
+        assert_edit(&class, "the item `the test module` is changed or removed");
+    }
+
+    // Goal: a new module is additive only as `mod name;` in an existing file, for a new file; an
+    // inline module, or a file module declared in a new file, is an edit.
+    #[test]
+    fn a_new_module_is_additive_only_as_a_new_file() {
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let declared = replaced(&base, "mod recursion;", "mod extra;\nmod recursion;");
+        let new = ("lints/src/extra.rs", None, Some("fn extra() {}\n"));
+        assert!(!class_of("class-mod", &[(lib, Some(&base), Some(&declared)), new]).is_edit());
+        let inline = format!("{base}\nmod extra {{}}\n");
+        assert_edit(&edited("class-mod-inline", lib, &inline), "is not a function");
+        let nested = [("lints/src/extra.rs", None, Some("mod deeper;\n"))];
+        assert_edit(&class_of("class-mod-nested", &nested), "is not a function");
     }
 
     // Goal: new fixtures and UI cases, and the regenerated rule list, are additive; a changed or
