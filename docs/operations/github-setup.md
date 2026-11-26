@@ -180,7 +180,7 @@ Which issues agents act on depends on who opened them, never on labels: only the
 
 Workflow tokens act as `github-actions[bot]`, whom agents do not trust (ADR-0021). A job whose output agents must act on therefore acts as the bot, through the same `xtask/agent-token.sh` as an agent's session. Today one job does: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch and the PR has really left the queue, it files an issue of kind `bug` for that PR, so that `cargo xtask task ready` lists it (issue #51, ADR-0021, point 6). Until the steps below are done, that job fails with an error that points here, and nothing is filed.
 
-The job is safe to give the key because:
+ADR-0023 sets the rules for every CI job that holds a bot's key. Read it before you add one, such as the CI-hosted reviewer (#59). This job follows them, so it is safe to give the key:
 
 - it runs on `workflow_run`, which takes the workflow file and xtask from `main`, never from a PR;
 - the key sits in an environment that only `main` may use, so a PR that edits a workflow to read it is refused;
