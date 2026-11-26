@@ -524,7 +524,7 @@ fn file(
     github: &dyn GitHub,
     trust: &Trust,
 ) -> Result<String, String> {
-    let number = file_number(draft, options, github, trust)?;
+    let number = file_number(draft, options, &github.open_issues()?, github, trust)?;
     Ok(format!(
         "filed #{number}: {}\nlist it as #{number} under `## Follow-up issues` in the PR \
          description\n",
@@ -532,16 +532,18 @@ fn file(
     ))
 }
 
-/// Files `draft` like [`file`], and returns the new issue's number. CI files this way: it has
-/// no PR description to list the issue in.
+/// Files `draft` like [`file`] through `filer`, and returns the new issue's number. `open` are
+/// the open issues that the duplicate search reads, so that `filer` only creates: CI reads
+/// them with the workflow's own token, and files with the CI app's (ADR-0023). CI files this
+/// way because it has no PR description to list the issue in.
 pub(crate) fn file_number(
     draft: &Draft,
     options: &FileOptions<'_>,
-    github: &dyn GitHub,
+    open: &[Issue],
+    filer: &dyn GitHub,
     trust: &Trust,
 ) -> Result<u32, String> {
-    let open = github.open_issues()?;
-    let duplicates = possible_duplicates(&draft.title, &open, trust);
+    let duplicates = possible_duplicates(&draft.title, open, trust);
     if !duplicates.is_empty() && !options.new {
         let list: Vec<String> =
             duplicates.iter().map(|issue| format!("  #{} {}", issue.number, issue.title)).collect();
@@ -556,7 +558,7 @@ pub(crate) fn file_number(
     if options.needs_decision {
         labels.push(NEEDS_DECISION);
     }
-    github.create(&draft.title, &draft.body, &labels)
+    filer.create(&draft.title, &draft.body, &labels)
 }
 
 /// The trusted open issues whose titles share at least half of the significant words of

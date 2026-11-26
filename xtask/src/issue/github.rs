@@ -342,9 +342,8 @@ impl Gh {
     #[must_use]
     pub fn with_token_from(root: &Path, variable: &'static str) -> Self {
         assert!(!variable.is_empty() && variable != "GH_TOKEN", "a variable other than GH_TOKEN");
-        let gh = Self { root: root.to_path_buf(), token_variable: Some(variable), hidden: None };
-        assert!(gh.token_variable.is_some(), "the token's variable is kept");
-        gh
+        assert!(!root.as_os_str().is_empty(), "gh runs in a checkout");
+        Self { root: root.to_path_buf(), token_variable: Some(variable), hidden: None }
     }
 
     /// This client, with `variable` removed from gh's environment, so that gh never acts as
@@ -373,7 +372,11 @@ impl Gh {
         if let Some(variable) = self.hidden {
             let _ = command.env_remove(variable);
         }
-        assert!(command.get_args().count() > arguments.len(), "`api` comes first");
+        let sees = |variable: &str| {
+            command.get_envs().any(|(name, value)| name == variable && value.is_some())
+        };
+        let leaked = [self.token_variable, self.hidden].into_iter().flatten().any(sees);
+        assert!(!leaked, "gh never sees the variable that holds another client's token");
         Ok(command)
     }
 
