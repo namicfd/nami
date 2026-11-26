@@ -103,10 +103,7 @@ impl Scratch {
     /// Runs `xtask hook <event>` with `payload` on stdin and the fake `just` first on `PATH`.
     fn hook(&self, event: &str, payload: &str, environment: &[(&str, &Path)]) -> Output {
         let path = std::env::var("PATH").expect("PATH is set");
-        // Read at run time: a compiled-in path may name another worktree's binary (#30).
-        let binary = std::env::var_os("CARGO_BIN_EXE_xtask")
-            .expect("cargo and nextest set CARGO_BIN_EXE_xtask when they run a test");
-        let mut child = Command::new(binary)
+        let mut child = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(["hook", event])
             .env("PATH", format!("{}:{path}", self.directory.join("bin").display()))
             .envs(environment.iter().copied())
