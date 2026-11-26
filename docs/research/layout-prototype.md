@@ -1,7 +1,7 @@
 # Layout prototype: 3D Euler in three layouts, against Athena++
 
 Measured input for `docs/ARCHITECTURE.md` § 4(a) and the ADR that will amend ADR-0003. The code
-is on the branch `research/layout-prototype` (commits `2f971e5` and `f25084c`, directory
+is on the branch `research/layout-prototype` (commits `2f971e5`, `f25084c` and `7d99172`, directory
 `research/layout-prototype/`, with a README that says how to reproduce every number here). That
 branch is not merged.
 
@@ -29,6 +29,10 @@ branch is not merged.
 - **1.0× Athena++ is reachable,** with room to spare, but only after a decision on `sqrt`
   (below). The determinism rules themselves cost 13 to 15% (the `algebraic_*` data point), which
   matches ADR-0005's estimate of 5 to 15%.
+- **Per-face checks can stay on in release builds** and keep the loop vectorised, if they are
+  deferred. Each face accumulates its checks into a flag without branching, and the flag is
+  asserted once per row. That costs 4 to 5% against no release checks (SoA), and gives the same
+  bits. See "Checks that stay on in release".
 - **Block sizes known at compile time buy nothing.** SoA with const-generic dimensions
   (`Soa<Fixed<64>>`) and SoA with the same sizes given at runtime produce the same machine code,
   within one or two instructions per function, and run at the same speed: median ratio 0.99 to
@@ -283,6 +287,60 @@ Findings:
    64³). A hybrid that wins would need explicit SIMD types (`std::simd`, unstable), which buys
    nothing over SoA rows that LLVM already vectorises.
 
+## Checks that stay on in release
+
+Configuration A/B's finding was that `math::sqrt`'s per-call `assert!` gives the HLLC loop an
+early exit, so it does not vectorise. Configuration C avoids that with `debug_assert!`, which
+turns the checks off in release. Two configurations test whether the checks can stay on in
+release (TigerStyle) and still vectorise:
+
+- **E** (`intrinsic-sqrt,deferred-checks`): `f64::sqrt` as in C, but every square root of the
+  per-face physics keeps the three checks of A/B: argument finite, argument ≥ 0, result ≥ 0.
+  Each check is accumulated without a branch (`ok &= value.is_finite() & (value >= 0.0)`,
+  `ok &= root >= 0.0`). The flag is asserted once after each row loop, with the sweep and the row
+  in the message: "Y-sweep, row (3, 7): a face failed its sqrt checks". The sound speed in the
+  conversion and dt loop feeds the existing per-block backstop flag the same way.
+- **E2** (`intrinsic-sqrt,deferred-result`, SoA): as E, but a failed row returns
+  `Err(RowFailure { sweep, row })`. The sweeps propagate it with `?`, and the stage asserts at
+  its end.
+
+E and E2 give the same bits as every other configuration (`cd8c234f981d50dc` at 64³ over one
+period, all layouts). A release-build test feeds one face of a 9-face row a negative pressure
+and checks that the row fails: E asserts, E2 returns the error.
+
+Campaign: 5 interleaved repetitions with Athena++ in each, pinned to one P-core. The machine was
+quiet (load average median 1.0, max 2.1). Figures are Mzc/s, median with min–max.
+
+| Size | Variant | C (no checks in release) | E (deferred, assert per row) | E2 (deferred, `Result` per row) | E / C, per repetition | E vs Athena++ |
+|---|---|---|---|---|---|---|
+| 64³ | soa | 13.91 (12.70–14.07) | 13.19 (12.84–13.31) | 13.03 (12.74–13.42) | 0.950 | 1.81× |
+| 128³ | soa | 12.61 (12.28–12.66) | 12.12 (12.01–12.18) | 11.87 (10.13–12.09) | 0.964 | 1.79× |
+| 64³ | aos | 8.51 (7.28–8.59) | 7.21 (6.85–7.23) | 7.23 (6.84–7.26) | 0.846 | 0.98× |
+| 128³ | aos | 7.68 (7.39–7.72) | 6.72 (6.65–6.72) | 6.70 (6.61–6.74) | 0.872 | 0.99× |
+
+(Athena++'s SIMD build: 7.34 at 64³ and 6.78 at 128³ in this campaign. E2/C per repetition:
+0.947 and 0.951 for SoA.)
+
+Vectorisation, from `tools/vecstats.py` on the E and E2 binaries:
+
+- The HLLC loop stays packed wherever it was packed in C. SoA's x and transverse sweeps and AoS's
+  x-sweep each keep their 4 `vsqrtpd ymm`.
+- The check costs about 190 extra instructions per sweep function: packed compares and `and`s
+  on the flag.
+- AoS's transverse sweep stays scalar, as in C. There the extra scalar compares cost more, which
+  is why AoS loses 13 to 15% and SoA 4 to 5%.
+
+**Conclusion.** Per-face checks can stay on in release by default without giving up
+vectorisation, provided they are deferred: accumulated without branching inside the row loop,
+and asserted (or returned as an error) once per row. For SoA the price is 3.6 to 5% of the step,
+and nami still runs at 1.8× Athena++'s fast-math build. Returning a `Result` per row instead of
+asserting changes nothing that matters (E2 is within about 2% of E), so whether a failed row is a `Result` or
+an assertion can be decided on design grounds. The price is in the diagnostics: the
+assertion names the row, not the face. Finding the face needs a cold path that rescans the row,
+which this prototype does not have. The pattern applies to any per-face check written as a
+comparison. An `assert!` inside the per-face loop (A, B) does not vectorise and stays at 0.9×
+Athena++ or below. An opt-out feature for these checks would buy about 4% (configuration C).
+
 ## Where the time goes
 
 Configuration C with per-phase timers (`Instant::now` around every row-level phase), pinned, on
@@ -316,10 +374,13 @@ is small (12.3 against 14.1 Mzc/s).
 2. **1.0× Athena++ per core looks reachable,** at about 1.9× for this problem, but only once
    `sqrt` is fixed. The ADR that amends ADR-0003 should decide, together with ADR-0004 and
    ADR-0005:
-   - **the per-call domain asserts in `kernels::math::sqrt`:** `debug_assert!` when called from
-     per-face loops, with the per-block backstop as the release-build guarantee. This is
-     ADR-0004's existing rule for per-cell checks. One option is a second entry point for hot
-     loops; another is making the existing one `debug_assert!`;
+   - **the per-call domain asserts in `kernels::math::sqrt`:** not an `assert!` per call in
+     per-face loops. Either deferred checks that stay on in release (configuration E: one
+     branch-free flag per row, asserted once per row, 4 to 5% for SoA), or `debug_assert!`
+     with the per-block backstop as the release-build guarantee (C, ADR-0004's current rule for
+     per-cell checks). E fits a "checks on by default, a feature to opt out" policy, and the
+     opt-out would buy about 4%. Either way, hot loops need an entry point other than today's
+     `math::sqrt`;
    - **a vectorisable, correctly rounded sqrt in `no_std` `kernels`.** Each option changes a
      rule:
      - `core::f64::math::sqrt` once stable;
@@ -329,8 +390,8 @@ is small (12.3 against 14.1 Mzc/s).
        penalty but still does not vectorise.
 
      Until then, `libm::sqrt` with `arch` under `x86-64-v3` is a performance hazard that depends
-     on inlining: 0.7 or 6.6 Mzc/s for the same SoA arithmetic. Measured without the per-call asserts, the libm backends reach at most
-     0.86 Mzc/s (D) or 3.2 Mzc/s (G).
+     on inlining: 0.7 or 6.6 Mzc/s for the same SoA arithmetic. Measured without the per-call
+     asserts, the libm backends reach at most 0.86 Mzc/s (D) or 3.2 Mzc/s (G).
 3. **Determinism costs about 13 to 15%** on this problem (`algebraic_*` in PLM and HLLC: 16.2
    against 14.1 Mzc/s at 64³, 14.2 against 12.3 at 128³). That is inside ADR-0005's estimate,
    and nami still beats Athena++'s fast-math build by 1.9× while staying bitwise deterministic.
