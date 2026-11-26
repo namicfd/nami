@@ -1,5 +1,6 @@
 //! Command-line entry points beyond plain `cargo xtask tidy`.
 //!
+//! - `cargo xtask tidy --file <path>` checks one file in the checkout around it.
 //! - `cargo xtask tidy --root <dir> [--policy <dir>]` checks another tree with this binary.
 //! - `cargo xtask rules [--write]` prints or writes `docs/RULES.md`.
 //!
@@ -27,6 +28,41 @@ pub fn tidy(root: &str, policy: Option<&str>) -> ExitCode {
         None => check(Path::new(root)),
     };
     report(result)
+}
+
+/// Exit code of `tidy --file` for a file that breaks a rule. Any other failure exits 1, so that
+/// the post-edit hook can tell "the file breaks a rule" from "the check did not run".
+pub const EXIT_VIOLATIONS: u8 = 2;
+
+/// Checks one file, named by an absolute path, with every tidy rule that needs only that file,
+/// in the nami checkout around it. This is the check the post-edit hook runs in another
+/// worktree, so that the worktree's own rules apply.
+pub fn tidy_file(file: &str) -> ExitCode {
+    let file = Path::new(file);
+    if !file.is_absolute() {
+        eprintln!("tidy --file: `{}` is not an absolute path", file.display());
+        return ExitCode::FAILURE;
+    }
+    let Some(root) = crate::hook::checkout_around(file) else {
+        eprintln!("tidy --file: {} is not in a nami checkout", file.display());
+        return ExitCode::FAILURE;
+    };
+    let relative = file.strip_prefix(&root).expect("the checkout is found above the file");
+    let result =
+        fs::read_to_string(file).and_then(|text| super::check_single_file(&root, relative, &text));
+    match result {
+        Ok(violations) if violations.is_empty() => ExitCode::SUCCESS,
+        Ok(violations) => {
+            for violation in &violations {
+                eprintln!("{violation}");
+            }
+            ExitCode::from(EXIT_VIOLATIONS)
+        }
+        Err(error) => {
+            eprintln!("tidy --file: cannot check {}: {error}", file.display());
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Prints `docs/RULES.md` as the registry generates it for the workspace at `root`, or writes
@@ -82,6 +118,26 @@ mod tests {
     /// `ExitCode` has no equality, so compare what it prints.
     fn is(code: ExitCode, expected: ExitCode) -> bool {
         format!("{code:?}") == format!("{expected:?}")
+    }
+
+    // Goal: `tidy --file` passes a clean file, exits `EXIT_VIOLATIONS` only for a file that
+    // breaks a rule, and 1 for anything it cannot check, so that the hook can tell them apart.
+    #[test]
+    fn tidy_file_tells_violations_from_failures() {
+        use super::{EXIT_VIOLATIONS, tidy_file};
+        let scratch = Scratch::new("cli-file");
+        scratch.write("rust-toolchain.toml", "[toolchain]\n");
+        scratch.write("xtask/README", "tooling\n");
+        scratch.write("notes.md", "notes\n");
+        scratch.write("a.snap.new", "draft\n");
+        let file = |name: &str| scratch.root().join(name).display().to_string();
+        assert!(is(tidy_file(&file("notes.md")), ExitCode::SUCCESS), "a clean file");
+        let violations = ExitCode::from(EXIT_VIOLATIONS);
+        assert!(is(tidy_file(&file("a.snap.new")), violations), "a file that breaks a rule");
+        assert!(is(tidy_file("notes.md"), ExitCode::FAILURE), "a relative path");
+        assert!(is(tidy_file(&file("missing.md")), ExitCode::FAILURE), "a file that is missing");
+        assert!(is(tidy_file("/notes.md"), ExitCode::FAILURE), "a file outside a checkout");
+        assert!(!is(violations, ExitCode::FAILURE), "the codes differ");
     }
 
     // Goal: the exit code says whether the tree is tidy. A tree with violations, a tree that

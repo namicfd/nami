@@ -9,6 +9,7 @@ fn main() -> ExitCode {
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match arguments.as_slice() {
         ["tidy"] => run_tidy(),
+        ["tidy", "--file", file] => xtask::tidy::cli::tidy_file(file),
         ["tidy", "--root", root] => xtask::tidy::cli::tidy(root, None),
         ["tidy", "--root", root, "--policy", policy] => xtask::tidy::cli::tidy(root, Some(policy)),
         ["rules"] => xtask::tidy::cli::rules(&xtask::workspace_root(), false),
@@ -21,7 +22,8 @@ fn main() -> ExitCode {
         ["task", rest @ ..] => xtask::task::run(rest),
         ["issue", rest @ ..] => xtask::issue::run(rest),
         _ => {
-            eprintln!("usage: cargo xtask tidy [--root <dir> [--policy <dir>]] | rules [--write]");
+            eprintln!("usage: cargo xtask tidy [--file <path> | --root <dir> [--policy <dir>]]");
+            eprintln!("       | rules [--write]");
             eprintln!(
                 "       | doctor | dylint | protected [--base <ref>] | pr-body [--base <ref>]"
             );
