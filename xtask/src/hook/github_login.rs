@@ -95,9 +95,10 @@ enum Answer {
     CouldNotRun(String),
 }
 
-/// The most findings a session can have: one per token variable, one for `gh auth status` and
-/// one for `gh auth token`.
-pub const FINDINGS_MAX: usize = TOKEN_VARIABLES.len() + 2;
+/// The most findings a session can have: one per token variable (two), one for `gh auth status`
+/// and one for `gh auth token`. Spelled out, since `2 + 2` and `2 * 2` cannot be told apart by a
+/// test; the test `every_source_can_have_a_finding` reaches it.
+pub const FINDINGS_MAX: usize = 4;
 
 /// How gh is run: the command that starts it, the log next to which a run's output is kept, and
 /// the time budget that every run of the check shares.
