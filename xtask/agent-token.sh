@@ -8,6 +8,7 @@
 #   xtask/agent-token.sh env                 print shell exports that make git and gh act as the bot
 #   xtask/agent-token.sh git-credential get  git credential helper (installed by `env`)
 #   xtask/agent-token.sh jwt                 print the app's own JWT (valid for 9 minutes)
+#   xtask/agent-token.sh request             print the token request's body; asks GitHub nothing
 #
 # In an agent runner:
 #   eval "$(xtask/agent-token.sh env)"
@@ -23,6 +24,8 @@
 #   NAMI_AGENT_KEY        the app's private key (default: ~/.config/nami/nami-agent.pem)
 #   NAMI_AGENT_CLIENT_ID  the app's client ID (default: nami-agent's)
 #   NAMI_AGENT_REPO       owner/name of the repository (default: namicfd/nami)
+#   NAMI_AGENT_PERMISSIONS  a JSON object that narrows the token to fewer permissions than the
+#                         app has, such as '{"issues":"write"}' (default: all of the app's)
 #
 # Needs bash, openssl, curl and jq.
 set -euo pipefail
@@ -31,6 +34,7 @@ readonly api="https://api.github.com"
 readonly key="${NAMI_AGENT_KEY:-$HOME/.config/nami/nami-agent.pem}"
 readonly client_id="${NAMI_AGENT_CLIENT_ID:-Iv23liAQwForBGxIuQZv}"
 readonly repo="${NAMI_AGENT_REPO:-namicfd/nami}"
+readonly permissions="${NAMI_AGENT_PERMISSIONS:-}"
 # The bot's user ID (not the app ID) comes from `gh api 'users/nami-agent%5Bbot%5D' --jq .id`.
 readonly bot_name="nami-agent[bot]"
 readonly bot_email="360897210+nami-agent[bot]@users.noreply.github.com"
@@ -77,14 +81,28 @@ github() {
   printf '%s' "$response"
 }
 
+# The body of the token request: this one repository, and the permissions if any are named.
+token_request() {
+  local request
+  request=$(jq -cn --arg name "${repo#*/}" '{repositories: [$name]}')
+  if [[ -n "$permissions" ]]; then
+    request=$(jq -c --argjson permissions "$permissions" \
+      'if ($permissions | type) == "object" then . + {permissions: $permissions} else error end' \
+      <<<"$request" 2>/dev/null) ||
+      fail "NAMI_AGENT_PERMISSIONS must be a JSON object, such as '{\"issues\":\"write\"}'"
+  fi
+  printf '%s' "$request"
+}
+
 # An installation token, scoped to this one repository.
 token() {
-  local app_jwt installation
+  local app_jwt installation request
+  request=$(token_request)
   app_jwt=$(jwt)
   installation=$(github GET "/repos/$repo/installation" "$app_jwt" | jq -r '.id')
   [[ "$installation" =~ ^[0-9]+$ ]] || fail "unexpected installation ID '$installation'"
-  github POST "/app/installations/$installation/access_tokens" "$app_jwt" \
-    "{\"repositories\":[\"${repo#*/}\"]}" | jq -re '.token'
+  github POST "/app/installations/$installation/access_tokens" "$app_jwt" "$request" |
+    jq -re '.token'
 }
 
 # The git credential helper protocol: answer `get` for https://github.com, ignore the rest.
@@ -125,5 +143,6 @@ case "${1:-token}" in
   env) env_exports ;;
   git-credential) git_credential "${2:-}" ;;
   jwt) jwt ;;
-  *) fail "unknown command '$1'; use token, env, git-credential or jwt" ;;
+  request) token_request && echo ;;
+  *) fail "unknown command '$1'; use token, env, git-credential, jwt or request" ;;
 esac

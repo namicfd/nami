@@ -905,6 +905,9 @@ impl GitHub for Issues {
     fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
         Err("not used".to_owned())
     }
+    fn is_queued(&self, _number: u32) -> Result<bool, String> {
+        Err("not used".to_owned())
+    }
 }
 
 // Goal: `pr-body` checks a description against the real changes, the code owners on the base

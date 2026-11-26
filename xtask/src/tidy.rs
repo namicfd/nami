@@ -15,10 +15,10 @@
 //! the reader how to fix it.
 
 pub mod cli;
-mod docs;
+pub(crate) mod docs;
 #[cfg(test)]
 mod fixtures;
-mod lints;
+pub(crate) mod lints;
 mod manifest;
 pub mod registry;
 mod rules_doc;

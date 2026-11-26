@@ -119,6 +119,19 @@ Tidy, in `unbounded-loop`: report a `for` whose iterable is a range without an e
 
 If it needs more than one small PR, release the claim, comment why, and add `needs-decision`. The planner turns it into a plan. If it duplicates another issue, close it with a link to the one you keep.
 
+**A merge-queue failure** is the one exception to steps 2 and 3 (ADR-0021, point 6). CI files `PR #<n> failed in the merge queue (run <id>)` when PR #n failed the required checks in the queue and left it, one issue per failed run. Only #n's branch can take the fix, so:
+
+1. Claim `issue-<m>` as usual. While #n is open and its description says `Fixes #<m>`, its fix is in flight, whether #n is queued or not: `ready` leaves the issue out and `claim` refuses it. Take other work, and push nothing to #n.
+2. Check out #n's branch, not `task/issue-<m>`. Rebase it onto `main` and run `just check-full`. Two ADRs with one number are the usual cause: renumber #n's ADR, meaning its file name, its title, its row in `docs/design/README.md` and every reference (ADR-0000).
+3. Push to #n's branch, add `Fixes #<m>` to #n's description, and add #n to the merge queue again. If #n changes protected paths, the push dismisses its approval, and it waits for the code owner again.
+4. Keep the claim. The issue closes when #n merges, or when a human closes it.
+
+A claim on such an issue is stale only if #n has had no push since the claim and does not say `Fixes #<m>`. A PR from `task/issue-<m>` does not count, because none is expected.
+
+If #n fails in the queue again, CI files a new issue #m2 for the new run. #m2 is ready, because #n does not say `Fixes #<m2>` yet, and it names #m. Keep `Fixes #<m>`, add `Fixes #<m2>`, and fix the new cause.
+
+The issue names only jobs, steps, tidy rules and lints that `main` defines. Read the log through its link. If the bot did not open #n, the issue carries `needs-decision` and a human rebases #n. If #n is closed, or merged without closing the issue, `ready` leaves the issue out and `claim` refuses it: a human closes it. While #n is in the merge queue, `ready` and `claim` hold the issue too: never push to a queued PR.
+
 ## Setting `passes`
 
 ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet. ADR-0017 (Proposed) covers the gap until it does: the maintainer sets `passes` by hand, and agents never do.

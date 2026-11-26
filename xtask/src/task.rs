@@ -17,8 +17,9 @@
 pub mod claims;
 pub mod plan;
 
-use crate::issue::github::{Gh, GitHub};
+use crate::issue::github::{Gh, GitHub, Issue};
 use crate::issue::{self, trust};
+use crate::queue;
 use claims::Claim;
 use plan::Task;
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,6 +166,7 @@ fn status(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Stri
         };
         lines.push(format!("{:<32} {:<10} {}\n", task.id, description, task.title));
     }
+    let repository = issue::github::repository_of(root, remote);
     for claim in &current {
         let Ok(Some(number)) = issue::number_of_id(&claim.task) else {
             continue;
@@ -172,7 +174,11 @@ fn status(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Stri
         // Titles are not printed: whether an issue is trusted is `issue show`'s business.
         let description = match github.issue(number) {
             Ok(found) if !found.is_open => "done: the issue is closed".to_owned(),
-            Ok(_) => claimed(claim),
+            Ok(found) => match queue_failure_hold(github, &found, repository.as_deref()) {
+                Ok(Some(reason)) => format!("{}; {reason}", claimed(claim)),
+                Ok(None) => claimed(claim),
+                Err(error) => format!("{}; its fix's state is unknown: {error}", claimed(claim)),
+            },
             Err(error) => format!("{}; its state is unknown: {error}", claimed(claim)),
         };
         lines.push(format!("{:<32} {description}\n", claim.task));
@@ -194,7 +200,12 @@ fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Strin
         .collect();
     let ready = ready.concat();
     match ready_issues(root, remote, github, &current) {
-        Ok(issues) => Ok(ready + &issues),
+        Ok((issues, left_out)) if left_out.is_empty() => Ok(ready + &issues),
+        Ok((issues, left_out)) => Err(format!(
+            "{} issue(s) left out because their state is unknown, so this list is incomplete; \
+             the rest of the list:\n{ready}{issues}",
+            left_out.len()
+        )),
         Err(error) => Err(format!(
             "cannot list the issues, so this list is incomplete: {error}\nthe plan tasks that \
              are ready:\n{ready}"
@@ -202,34 +213,57 @@ fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Strin
     }
 }
 
-/// The issues that agents may work on and nobody holds, oldest first, as `ready` lines.
+/// The issues that agents may work on and nobody holds, oldest first, as `ready` lines, and
+/// the numbers of the issues left out because a lookup failed. Each of those is named on
+/// stderr; one failed lookup leaves out only its own issue.
 fn ready_issues(
     root: &Path,
     remote: &str,
     github: &dyn GitHub,
     current: &[Claim],
-) -> Result<String, String> {
+) -> Result<(String, Vec<u32>), String> {
     let open = github.open_issues()?;
     let candidates: Vec<_> = open.iter().filter(|found| !found.is_pull_request).collect();
     if candidates.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), Vec::new()));
     }
     let trust = trust::load(root, &format!("{remote}/main"))?;
+    let repository = issue::github::repository_of(root, remote);
     let held: BTreeSet<&str> = current.iter().map(|claim| claim.task.as_str()).collect();
     let mut lines = Vec::new();
+    let mut left_out = Vec::new();
     for found in candidates {
         let id = issue::id_of(found.number);
         // The cheap checks first: label events cost one request per issue.
         if held.contains(id.as_str()) || trust::unworkable(found, &[], &trust).is_some() {
             continue;
         }
-        let events = github.label_events(found.number)?;
-        if trust::unworkable(found, &events, &trust).is_none() {
-            lines.push(format!("{id}\t{}\n", found.title));
+        match is_workable(github, found, &trust, repository.as_deref()) {
+            Ok(true) => lines.push(format!("{id}\t{}\n", found.title)),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("task: {id} is left out of the list: {error}");
+                left_out.push(found.number);
+            }
         }
     }
-    assert!(lines.len() <= open.len(), "at most every open issue is ready");
-    Ok(lines.concat())
+    assert!(lines.len() + left_out.len() <= open.len(), "each open issue is listed at most once");
+    Ok((lines.concat(), left_out))
+}
+
+/// True if agents may work on `found` now: its label history allows it, and it is no
+/// queue-failure issue that waits (ADR-0021, point 6).
+fn is_workable(
+    github: &dyn GitHub,
+    found: &Issue,
+    trust: &trust::Trust,
+    repository: Option<&str>,
+) -> Result<bool, String> {
+    let events = github.label_events(found.number)?;
+    if trust::unworkable(found, &events, trust).is_some() {
+        return Ok(false);
+    }
+    Ok(queue_failure_hold(github, found, repository)?.is_none())
 }
 
 fn claim(root: &Path, remote: &str, github: &dyn GitHub, id: &str) -> Result<String, String> {
@@ -274,13 +308,74 @@ fn claim_issue(
     if let Some(reason) = trust::unworkable(&found, &events, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
+    let repository = issue::github::repository_of(root, remote);
+    if let Some(reason) = queue_failure_hold(github, &found, repository.as_deref())? {
+        return Err(format!("cannot claim `{id}`: {reason}"));
+    }
     let holder = holder(root);
     claims::claim(root, remote, &[], id, &holder)
         .map_err(|error| format!("cannot claim `{id}`: {error}"))?;
-    Ok(format!(
-        "claimed {id}\nread it with `cargo xtask issue show {number}`, work on the branch \
-         `task/{id}`, and write `Fixes #{number}` in the PR description\n"
-    ))
+    let work = match queue_failure_pull(&found) {
+        Some(pull) => format!(
+            "fix it on #{pull}'s own branch, add `Fixes #{number}` to #{pull}'s description, \
+             re-queue #{pull}, and keep the claim: #{pull}'s merge closes the issue (ADR-0021, \
+             point 6)"
+        ),
+        None => format!(
+            "work on the branch `task/{id}`, and write `Fixes #{number}` in the PR \
+                         description"
+        ),
+    };
+    Ok(format!("claimed {id}\nread it with `cargo xtask issue show {number}`, {work}\n"))
+}
+
+/// The PR that `found` reports as failed in the merge queue, if the bot filed it with the
+/// title that `cargo xtask queue failed` gives (ADR-0021, point 6).
+fn queue_failure_pull(found: &Issue) -> Option<u32> {
+    let entry = queue::failure::entry_of_title(&found.title);
+    entry.map(|(pull, _)| pull).filter(|_| found.author == trust::BOT_LOGIN)
+}
+
+/// Why agents may not work on the queue-failure issue `found` now, or `None` if they may or it
+/// is no queue-failure issue (ADR-0021, point 6):
+///
+/// - the PR it names is open and its description closes the issue: the fix is in flight, and
+///   the PR's merge closes the issue;
+/// - the PR is closed or merged while the issue is open, or the number is no PR: nobody can
+///   push a fix there, and a human closes the issue;
+/// - the PR is in the merge queue: a push would take it out again. If it fails there, the
+///   new run gets its own issue.
+///
+/// `repository` is this repository's `owner/name`, for `Fixes <owner>/<name>#<n>`. Only whether
+/// the description closes the issue is read, never its text.
+fn queue_failure_hold(
+    github: &dyn GitHub,
+    found: &Issue,
+    repository: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(pull) = queue_failure_pull(found) else {
+        return Ok(None);
+    };
+    let number = found.number;
+    let fix = github.issue(pull)?;
+    let reason = if !fix.is_pull_request {
+        format!("#{pull}, which issue #{number} names, is not a pull request; a human closes it")
+    } else if !fix.is_open {
+        format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")
+    } else if crate::pr::closes(&fix.body, number, repository) {
+        format!(
+            "#{pull} says `Fixes #{number}`: the fix is in flight and #{pull}'s merge closes the \
+             issue, so take other work"
+        )
+    } else if github.is_queued(pull)? {
+        format!(
+            "#{pull} is in the merge queue, and agents never push to a queued PR; take other \
+             work, and if #{pull} fails again, CI files a new issue"
+        )
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(format!("{reason} (ADR-0021, point 6)")))
 }
 
 /// The text of a claim file: who holds the task and from which session.

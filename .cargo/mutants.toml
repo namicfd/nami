@@ -6,7 +6,7 @@ exclude_globs = ["xtask/src/main.rs"]
 exclude_re = [
     "hook\\.rs.*(replace|in) (run|post_edit)\\b",
     "(doctor|dylint|pr)\\.rs.*(replace|in) (run|run_protected|run_body)\\b",
-    "(task|issue)\\.rs.*(replace|in) run\\b",
+    "(task|issue|queue)\\.rs.*(replace|in) run\\b",
     # `Gh` runs `gh api`; its parsing is tested on JSON, and the trait on fakes.
-    "github\\.rs.*\\bGh\\b",
+    "(github|forge)\\.rs.*\\bGh\\b",
 ]

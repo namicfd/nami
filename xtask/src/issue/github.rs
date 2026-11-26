@@ -87,6 +87,13 @@ pub trait GitHub {
     ///
     /// When GitHub refuses it or cannot be asked.
     fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String>;
+
+    /// True while pull request `number` has an entry in the merge queue.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or does not have it.
+    fn is_queued(&self, number: u32) -> Result<bool, String>;
 }
 
 /// Reads an issue or pull request in the shape of GitHub's issues API.
@@ -177,14 +184,14 @@ pub fn parse_lines(text: &str) -> Result<Vec<Value>, String> {
 }
 
 /// The text at `path` below `value`: `["user", "login"]` is `value.user.login`.
-fn string_at(value: &Value, path: &[&str]) -> Result<String, String> {
+pub(crate) fn string_at(value: &Value, path: &[&str]) -> Result<String, String> {
     let found = path.iter().try_fold(value, |inner, key| inner.get(key));
     let text = found.and_then(Value::as_str);
     text.map(str::to_owned).ok_or_else(|| format!("GitHub sent no string at `{}`", path.join(".")))
 }
 
 /// A string field that GitHub may send as `null`: an issue or comment without text.
-fn optional_string(value: &Value, key: &str) -> Result<String, String> {
+pub(crate) fn optional_string(value: &Value, key: &str) -> Result<String, String> {
     match value.get(key) {
         None | Some(Value::Null) => Ok(String::new()),
         Some(Value::String(text)) => Ok(text.clone()),
@@ -200,6 +207,38 @@ fn as_number(value: &Value) -> Option<u32> {
     digits.parse().ok().filter(|number| *number > 0)
 }
 
+/// The GitHub repository, `owner/name`, that `remote` of the checkout at `root` points to, or
+/// `None` if git cannot tell or the remote is not on GitHub.
+///
+/// It is used to recognise `Fixes <owner>/<name>#<n>` as a reference to this repository. If
+/// `origin` points to a fork, the fork's name comes back, and a reference qualified with the
+/// base repository's name is not recognised: `pr-body` then asks for `Fixes #<n>`, and `task
+/// ready` lists a queue-failure issue whose PR closes it only in that form. In CI,
+/// `actions/checkout` sets `origin` to the repository that the workflow runs in, the base
+/// repository also for a PR from a fork, so CI reads the right name.
+#[must_use]
+pub fn repository_of(root: &Path, remote: &str) -> Option<String> {
+    let url = crate::task::claims::git(root, &["remote", "get-url", remote], &[], None).ok()?;
+    repository_of_url(url.trim())
+}
+
+/// The `owner/name` of a GitHub remote URL: `https://github.com/owner/name(.git)`,
+/// `git@github.com:owner/name(.git)` or `ssh://git@github.com/owner/name(.git)`.
+#[must_use]
+pub fn repository_of_url(url: &str) -> Option<String> {
+    let path = ["https://github.com/", "git@github.com:", "ssh://git@github.com/"]
+        .iter()
+        .find_map(|prefix| url.strip_prefix(prefix))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let is_part = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    };
+    let (owner, name) = path.split_once('/')?;
+    (is_part(owner) && is_part(name)).then(|| path.to_owned())
+}
+
 /// [`GitHub`] through `gh api`, run in a checkout of the repository.
 #[derive(Debug, Clone)]
 pub struct Gh {
@@ -213,7 +252,8 @@ impl Gh {
         Self { root: root.to_path_buf() }
     }
 
-    fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
+    /// Runs `gh api` with `arguments`, and `input` on stdin; returns what gh printed.
+    pub(crate) fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
         let mut command = Command::new("gh");
         let _ = command.arg("api").args(arguments).current_dir(&self.root);
         let _ = command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -239,11 +279,13 @@ impl Gh {
         ))
     }
 
-    fn list(&self, path: &str) -> Result<Vec<Value>, String> {
+    /// Every entry of a paginated listing at `path`.
+    pub(crate) fn list(&self, path: &str) -> Result<Vec<Value>, String> {
         parse_lines(&self.api(&["--paginate", path, "--jq", ".[]"], None)?)
     }
 
-    fn one(&self, arguments: &[&str], input: Option<&str>) -> Result<Value, String> {
+    /// One JSON value from `gh api`.
+    pub(crate) fn one(&self, arguments: &[&str], input: Option<&str>) -> Result<Value, String> {
         let text = self.api(arguments, input)?;
         json::parse(&text).map_err(|error| format!("gh printed invalid JSON: {}", error.message))
     }
@@ -282,6 +324,39 @@ impl GitHub for Gh {
         let arguments = ["--method", "POST", "repos/{owner}/{repo}/issues", "--input", "-"];
         Ok(issue_from_json(&self.one(&arguments, Some(&request))?)?.number)
     }
+
+    fn is_queued(&self, number: u32) -> Result<bool, String> {
+        is_queued_from_json(&self.queue_entry(number)?)
+    }
+}
+
+impl Gh {
+    /// GitHub's GraphQL answer to `pullRequest(number:) { mergeQueueEntry { state } }`.
+    pub(crate) fn queue_entry(&self, number: u32) -> Result<Value, String> {
+        let query = "query($owner: String!, $name: String!, $number: Int!) { \
+                     repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+                     mergeQueueEntry { state } } } }";
+        let number = format!("number={number}");
+        let query = format!("query={query}");
+        let arguments =
+            ["graphql", "-f", &query, "-F", "owner={owner}", "-F", "name={repo}", "-F", &number];
+        self.one(&arguments, None)
+    }
+}
+
+/// Reads whether a pull request has a merge-queue entry from the GraphQL answer to
+/// `pullRequest(number:) { mergeQueueEntry { state } }`.
+///
+/// # Errors
+///
+/// When the answer has no `mergeQueueEntry` field: a missing field is never "not queued".
+pub fn is_queued_from_json(graphql: &Value) -> Result<bool, String> {
+    let path = ["data", "repository", "pullRequest"];
+    let pull = path.iter().try_fold(graphql, |inner, key| inner.get(key));
+    let entry = pull
+        .and_then(|pull| pull.get("mergeQueueEntry"))
+        .ok_or_else(|| format!("GitHub sent no `{}.mergeQueueEntry`", path.join(".")))?;
+    Ok(*entry != Value::Null)
 }
 
 #[cfg(test)]
@@ -364,6 +439,41 @@ mod tests {
         assert_eq!(event("unlabeled", "null"), Ok(Some(label("ghost", false))));
         assert_eq!(event("closed", r#"{"login": "a"}"#), Ok(None));
         assert!(event("labeled", "{}").is_err(), "an actor without a login");
+    }
+
+    // Goal: a GitHub remote URL in each of git's forms names its `owner/name`; another host or
+    // a malformed path names nothing. This checkout's remote is on GitHub.
+    #[test]
+    fn remote_urls_name_their_repository() {
+        for url in [
+            "https://github.com/namicfd/nami",
+            "https://github.com/namicfd/nami/",
+            "https://github.com/namicfd/nami.git",
+            "git@github.com:namicfd/nami.git",
+            "ssh://git@github.com/namicfd/nami",
+        ] {
+            assert_eq!(super::repository_of_url(url).as_deref(), Some("namicfd/nami"), "{url}");
+        }
+        for url in [
+            "https://gitlab.com/namicfd/nami",
+            "https://github.com/namicfd",
+            "https://github.com/namicfd/nami/tree",
+            "https://github.com//nami",
+            "https://github.com/a b/nami",
+            "/tmp/remote.git",
+        ] {
+            assert_eq!(super::repository_of_url(url), None, "{url}");
+        }
+        let scratch = crate::tidy::scratch::Scratch::new("repository-of");
+        let git = |arguments: &[&str]| {
+            crate::task::claims::git(scratch.root(), arguments, &[], None).expect("git runs")
+        };
+        let _ = git(&["init", "--quiet"]);
+        let _ = git(&["remote", "add", "origin", "git@github.com:namicfd/nami.git"]);
+        let _ = git(&["remote", "add", "elsewhere", "https://gitlab.com/namicfd/nami"]);
+        assert_eq!(super::repository_of(scratch.root(), "origin").as_deref(), Some("namicfd/nami"));
+        assert_eq!(super::repository_of(scratch.root(), "elsewhere"), None, "not on GitHub");
+        assert_eq!(super::repository_of(scratch.root(), "no-such-remote"), None);
     }
 
     // Goal: `gh --jq '.[]'` output becomes one value per line; blank lines are skipped, and a

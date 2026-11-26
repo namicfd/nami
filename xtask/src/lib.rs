@@ -8,6 +8,7 @@ pub mod hook;
 pub mod issue;
 pub mod json;
 pub mod pr;
+pub mod queue;
 pub mod task;
 pub mod tidy;
 
