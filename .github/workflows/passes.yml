@@ -8,7 +8,8 @@
 # The two jobs are split as ADR-0023 asks. `acceptance` runs main's tests, with caches, and
 # holds no secret. `open passes PR` holds the bot's key, restores no cache and runs no test:
 # it builds xtask from a clean checkout of the same commit, and takes from `acceptance` only a
-# file of task IDs, which xtask reads as data and checks again.
+# file of task IDs, which xtask reads as data and checks again. Its reads act as the workflow's
+# own token, and only the push and the PR writes act as the app's (ADR-0023, rule 2).
 name: passes
 
 on:
@@ -17,6 +18,12 @@ on:
   workflow_dispatch:
 
 permissions: {}
+
+# One run at a time, the newest: an older run that finishes late could otherwise force-push
+# the flips of an older main over the newer run's.
+concurrency:
+  group: passes
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,12 +60,10 @@ jobs:
     timeout-minutes: 20
     # The key is a secret of this environment, which only main may use (ADR-0023, rule 1).
     environment: nami-ci
-    # One job at a time pushes `bot/passes`; a newer run waits instead of cancelling.
-    concurrency:
-      group: passes-open-pr
-      cancel-in-progress: false
+    # The workflow token does every read: whether each task's PR merged, and the open PR.
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -84,12 +89,15 @@ jobs:
             exit 1
           fi
           (umask 077 && printf '%s\n' "${NAMI_CI_PRIVATE_KEY}" > "${RUNNER_TEMP}/nami-ci.pem")
-      # The token can push branches and open PRs, nothing else. git pushes with it through an
-      # HTTP header in this step's environment, never in .git/config.
+      # The app's token can push branches and write PRs, nothing else. It is in
+      # NAMI_PASSES_TOKEN, which xtask hands only to the push (through a credential helper on
+      # that one git command) and to gh's PR writes; every gh read has it removed and acts as
+      # GH_TOKEN, the workflow's own token (xtask/src/task/pulls.rs).
       - name: cargo xtask task passes --open-pr
         env:
+          GH_TOKEN: ${{ github.token }}
           NAMI_AGENT_APP: ci
-          NAMI_AGENT_CLIENT_ID: ${{ vars.NAMI_CI_CLIENT_ID }}
+          NAMI_CI_CLIENT_ID: ${{ vars.NAMI_CI_CLIENT_ID }}
           NAMI_AGENT_PERMISSIONS: '{"contents":"write","pull_requests":"write"}'
           GIT_AUTHOR_NAME: nami-ci[bot]
           GIT_AUTHOR_EMAIL: 361707243+nami-ci[bot]@users.noreply.github.com
@@ -98,16 +106,12 @@ jobs:
         run: |
           key="${RUNNER_TEMP}/nami-ci.pem"
           trap 'rm -f "${key}"' EXIT
-          GH_TOKEN=$(NAMI_AGENT_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
+          NAMI_PASSES_TOKEN=$(NAMI_CI_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
             xtask/agent-token.sh)
           # The key file is gone before xtask starts.
           rm -f "${key}"
-          echo "::add-mask::${GH_TOKEN}"
-          export GH_TOKEN
-          basic=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 --wrap=0)
-          echo "::add-mask::${basic}"
-          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
-          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}"
+          echo "::add-mask::${NAMI_PASSES_TOKEN}"
+          export NAMI_PASSES_TOKEN
           target/debug/xtask task passes --open-pr "${RUNNER_TEMP}/passing/passing.json"
       - name: Delete the bot's key
         if: always()
