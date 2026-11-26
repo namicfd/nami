@@ -7,6 +7,12 @@
 //!
 //! The legend above the first `## ` heading describes the forms with placeholders, so tags are
 //! read from that heading on.
+//!
+//! A rule in the style guide states the rule, its reason and its tag, with an example where one
+//! helps. What a mechanism sees and misses lives in the registry (a rule's `detail`) or in a
+//! lint's `### What it does` doc, and `docs/RULES.md` shows it. Then tightening a rule changes
+//! only the rule paths, not the code-owned style guide (issue #53). The rule `doc-tool-name`
+//! holds that line: rule prose that names a checking tool is describing the tool.
 
 use super::{Violation, lints, manifest, registry};
 use std::fs;
@@ -36,6 +42,11 @@ const RETIRED_MECHANISMS: [(&str, &str); 2] = [
 
 /// Where the reason for the tag rules is written down.
 const REFERENCE: &str = "(TIGER_STYLE.md, How rules are enforced)";
+
+/// Words and phrases, in lower case, that name a checking tool. Rule prose that names one is
+/// describing what the tool sees, which belongs in the registry (`doc-tool-name`).
+const TOOL_NAMES: [&str; 8] =
+    ["tidy", "clippy", "dylint", "rustfmt", "lints", "cargo-deny", "cargo deny", "the lint"];
 
 /// One mechanism tag in the style guide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +86,18 @@ impl Mechanisms {
 /// first `## ` heading on, outside fenced code blocks.
 pub fn tags(text: &str) -> Vec<Tag<'_>> {
     let mut found = Vec::new();
+    for (line_number, line) in rule_lines(text) {
+        let spans = line.split("`[").skip(1).filter_map(|piece| piece.split_once("]`"));
+        let contents = spans.map(|(content, _rest)| content).filter(|content| is_tag(content));
+        found.extend(contents.map(|content| Tag { line: line_number, content }));
+    }
+    found
+}
+
+/// The lines of the rules, with their one-based numbers: from the first `## ` heading on,
+/// outside fenced code blocks.
+fn rule_lines(text: &str) -> Vec<(u32, &str)> {
+    let mut found = Vec::new();
     let mut in_rules = false;
     let mut in_code = false;
     for (line_index, line) in text.lines().enumerate() {
@@ -86,10 +109,9 @@ pub fn tags(text: &str) -> Vec<Tag<'_>> {
             continue;
         }
         let line_number = u32::try_from(line_index + 1).expect("documents have < 2^32 lines");
-        let spans = line.split("`[").skip(1).filter_map(|piece| piece.split_once("]`"));
-        let contents = spans.map(|(content, _rest)| content).filter(|content| is_tag(content));
-        found.extend(contents.map(|content| Tag { line: line_number, content }));
+        found.push((line_number, line));
     }
+    assert!(found.len() <= text.lines().count(), "rule lines are lines of the text");
     found
 }
 
@@ -98,9 +120,10 @@ pub fn review_count(text: &str) -> usize {
     tags(text).iter().filter(|tag| tag.content == REVIEW).count()
 }
 
-/// The rule `doc-tag`: every tag has a known form and names something that exists.
+/// The rules of the style guide: `doc-tag`, every tag has a known form and names something
+/// that exists, and `doc-tool-name` ([`check_tool_names`]).
 pub fn check(relative: &Path, text: &str, mechanisms: &Mechanisms) -> Vec<Violation> {
-    let mut violations = Vec::new();
+    let mut violations = check_tool_names(relative, text);
     for tag in tags(text) {
         if let Some(problem) = problem(tag.content, mechanisms) {
             let message = format!("{problem} {REFERENCE}");
@@ -108,6 +131,58 @@ pub fn check(relative: &Path, text: &str, mechanisms: &Mechanisms) -> Vec<Violat
         }
     }
     violations
+}
+
+/// The rule `doc-tool-name`: the prose of a rule, outside its tags, names no checking tool.
+pub fn check_tool_names(relative: &Path, text: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (line_number, line) in rule_lines(text) {
+        let prose = without_tags(line).to_lowercase();
+        for name in TOOL_NAMES.iter().filter(|name| contains_word(&prose, name)) {
+            let message = format!(
+                "rule prose names the tool `{name}`; the tag already names the mechanism. Keep \
+                 the rule, its reason and an example here, and put what the mechanism sees and \
+                 misses in the `detail` of its row in xtask/src/tidy/registry.rs, or in the \
+                 `### What it does` doc of a dylint lint, then run `cargo xtask rules --write` \
+                 {REFERENCE}"
+            );
+            violations.push(Violation::new(relative, line_number, "doc-tool-name", message));
+        }
+    }
+    violations
+}
+
+/// `line` with every backticked tag removed, so that `[tidy:usize]` is not prose.
+fn without_tags(line: &str) -> String {
+    let mut prose = String::with_capacity(line.len());
+    let mut rest = line;
+    for _ in 0..=line.len() {
+        let Some((before, after)) = rest.split_once("`[") else {
+            break;
+        };
+        prose.push_str(before);
+        match after.split_once("]`") {
+            Some((content, tail)) if is_tag(content) => rest = tail,
+            _ => {
+                prose.push_str("`[");
+                rest = after;
+            }
+        }
+    }
+    prose.push_str(rest);
+    assert!(prose.len() <= line.len(), "removing tags never adds text");
+    prose
+}
+
+/// True if `phrase` occurs in `text` as whole words: not inside a longer identifier or word.
+fn contains_word(text: &str, phrase: &str) -> bool {
+    assert!(!phrase.is_empty(), "an empty phrase is in every text");
+    let is_word = |character: char| character.is_alphanumeric() || "_-".contains(character);
+    text.match_indices(phrase).any(|(start, _)| {
+        let before = text.get(..start).and_then(|head| head.chars().next_back());
+        let after = text.get(start + phrase.len()..).and_then(|tail| tail.chars().next());
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
 }
 
 /// True if a backticked `[content]` is meant as a tag, not as code such as `[f64; NVAR]`: a
@@ -182,7 +257,8 @@ fn lint_table_advice(table: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mechanisms, Tag, check, is_tag, review_count, tags};
+    use super::{Mechanisms, Tag, check, check_tool_names, contains_word, is_tag, review_count};
+    use super::{tags, without_tags};
     use crate::tidy::registry;
     use std::path::Path;
 
@@ -201,12 +277,15 @@ mod tests {
     }
 
     /// The messages that `doc-tag` reports for a rule line that carries `tags`.
+    /// A text that is not a tag, such as `[Tidy:usize]`, is prose, which `doc-tool-name`
+    /// judges; only the `doc-tag` findings are returned.
     fn problems(tags: &str) -> Vec<String> {
         let text = format!("## Rules\n\n- A rule. {tags}\n");
         let violations = check(Path::new("docs/TIGER_STYLE.md"), &text, &mechanisms());
-        assert!(violations.iter().all(|violation| violation.rule == "doc-tag"));
         assert!(violations.iter().all(|violation| violation.line == 3), "the tag's line");
-        violations.into_iter().map(|violation| violation.message).collect()
+        let is_tag_rule = |rule: &str| rule == "doc-tag";
+        let tag_findings = violations.into_iter().filter(|violation| is_tag_rule(violation.rule));
+        tag_findings.map(|violation| violation.message).collect()
     }
 
     // Goal: every valid form passes: plain tags, and named tags whose target exists.
@@ -299,5 +378,67 @@ mod tests {
         assert_eq!(review_count(text), 2);
         assert_eq!(tags("`[review]` before any heading\n"), []);
         assert_eq!(review_count(""), 0);
+    }
+
+    /// The lines on which `doc-tool-name` reports a tool name in `text`, one per name.
+    fn tool_names(text: &str) -> Vec<u32> {
+        let violations = check_tool_names(Path::new("docs/TIGER_STYLE.md"), text);
+        assert!(violations.iter().all(|violation| violation.rule == "doc-tool-name"));
+        violations.into_iter().map(|violation| violation.line).collect()
+    }
+
+    // Goal: rule prose that names a checking tool is reported once per name and line, in any
+    // case, and the message says where the text goes instead.
+    #[test]
+    fn tool_names_in_rule_prose_are_reported() {
+        let both = check(Path::new("x.md"), "## R\n\n- Tidy sees it. `[tidy]`\n", &mechanisms());
+        let fired: Vec<&str> = both.iter().map(|violation| violation.rule).collect();
+        assert_eq!(fired, ["doc-tool-name", "doc-tag"], "the style guide runs both rules");
+        let text = "## Rules\n\n- A rule. The lint sees `sum`. `[review]`\n- Tidy checks it.\n\
+                    - Clippy's `float_cmp` and rustfmt.\n- `cargo deny` and cargo-deny.\n\
+                    - The workspace lints, and dylint.\n";
+        assert_eq!(tool_names(text), [3, 4, 5, 5, 6, 6, 7, 7]);
+        let violations = check_tool_names(Path::new("docs/TIGER_STYLE.md"), text);
+        assert!(violations[0].message.contains("`the lint`"), "{}", violations[0].message);
+        assert!(violations[0].message.contains("registry.rs"), "names where the text goes");
+        assert!(violations[0].message.ends_with("(TIGER_STYLE.md, How rules are enforced)"));
+    }
+
+    // Goal: tags, the legend, code blocks, and words that merely contain a tool name are not
+    // rule prose that names a tool.
+    #[test]
+    fn tags_code_and_longer_words_are_not_tool_names() {
+        let fence = "```";
+        let text = format!(
+            "# Title\n\nTidy checks the tags.\n\n## Rules\n\n\
+             - Never silence a lint. `[tidy:expect-budget]` `[clippy:pedantic]`\n\
+             - Untidy code, `tidying`, `my_clippy` and `lints_x`. `[dylint:nami_recursion]`\n\
+             {fence}rust\n// tidy and clippy in a code block\n{fence}\n"
+        );
+        assert_eq!(tool_names(&text), Vec::<u32>::new());
+        assert_eq!(tool_names("- tidy before any heading\n"), Vec::<u32>::new());
+    }
+
+    // Goal: removing tags keeps all other text, code spans in brackets included.
+    #[test]
+    fn tags_are_removed_from_prose() {
+        assert_eq!(without_tags("A rule. `[tidy:usize]` `[review]`"), "A rule.  ");
+        assert_eq!(without_tags("A `[f64; NVAR]` state."), "A `[f64; NVAR]` state.");
+        assert_eq!(without_tags("Open `[tidy:x"), "Open `[tidy:x");
+        assert_eq!(without_tags(""), "");
+    }
+
+    // Goal: a phrase matches only as whole words, at either end of the text too.
+    #[test]
+    fn phrases_match_whole_words() {
+        assert!(contains_word("tidy", "tidy"), "the whole text");
+        assert!(contains_word("so tidy checks", "tidy"), "between spaces");
+        assert!(contains_word("clippy's lint", "clippy"), "before an apostrophe");
+        assert!(contains_word("(tidy)", "tidy"), "between brackets");
+        assert!(!contains_word("untidy", "tidy"), "the end of a word");
+        assert!(!contains_word("tidying", "tidy"), "the start of a word");
+        assert!(!contains_word("cargo-deny-x", "cargo-deny"), "a dash continues a word");
+        assert!(!contains_word("my_tidy", "tidy"), "an underscore continues a word");
+        assert!(contains_word("untidy and tidy", "tidy"), "a later match counts");
     }
 }

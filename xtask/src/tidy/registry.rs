@@ -40,6 +40,11 @@ pub struct Rule {
     pub kind: RuleKind,
     /// One line that says what the rule requires.
     pub summary: &'static str,
+    /// What the rule sees and what it misses: its exact reach, its exemptions and its known
+    /// gaps, or empty if the summary says it all. This text lives here and in `docs/RULES.md`,
+    /// not in `docs/TIGER_STYLE.md`, which states only the rule, its reason and its tag, so that
+    /// tightening a rule changes only the rule paths (ADR-0022, pending; issue #53).
+    pub detail: &'static str,
     /// Where the reason is written down: an ADR, a `TIGER_STYLE.md` section or a document.
     pub reference: &'static str,
 }
@@ -52,6 +57,7 @@ pub const RULES: &[Rule] = &[
         id: "adr-index",
         kind: RuleKind::Source,
         summary: "Every ADR is listed in `docs/design/README.md`.",
+        detail: "",
         reference: "ADR-0000",
     },
     Rule {
@@ -59,42 +65,49 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "No two ADR files share a number, and an ADR's title repeats the number of its \
                   file name.",
+        detail: "",
         reference: "ADR-0000",
     },
     Rule {
         id: "adr-section",
         kind: RuleKind::Source,
         summary: "Every ADR has the six required sections.",
+        detail: "",
         reference: "ADR-0000",
     },
     Rule {
         id: "adr-status",
         kind: RuleKind::Source,
         summary: "Every ADR has a valid status line.",
+        detail: "",
         reference: "ADR-0000",
     },
     Rule {
         id: "assertion-density",
         kind: RuleKind::Workspace,
         summary: "Each nami crate averages at least two assertions per non-trivial function.",
+        detail: "",
         reference: "ADR-0004",
     },
     Rule {
         id: "async",
         kind: RuleKind::Source,
         summary: "No `async` functions or blocks: functions run to completion.",
+        detail: "",
         reference: "TIGER_STYLE.md, Control flow",
     },
     Rule {
         id: "debt-marker",
         kind: RuleKind::Source,
         summary: "No unfinished-work markers in Rust sources; unfinished work is a task.",
+        detail: "",
         reference: "TIGER_STYLE.md, Zero technical debt",
     },
     Rule {
         id: "default",
         kind: RuleKind::Source,
         summary: "No `Default` derives or impls in nami crates: every field is spelled out.",
+        detail: "",
         reference: "TIGER_STYLE.md, External events and control flow",
     },
     Rule {
@@ -102,6 +115,7 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped \
                   for other source code under its own name.",
+        detail: "`cargo deny` rejects a git override but not a path override.",
         reference: "ADR-0001",
     },
     Rule {
@@ -109,13 +123,29 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy \
                   rule, a lint that is switched on, or a planned mechanism that exists.",
+        detail: "",
+        reference: "TIGER_STYLE.md, How rules are enforced",
+    },
+    Rule {
+        id: "doc-tool-name",
+        kind: RuleKind::Source,
+        summary: "The rules of `docs/TIGER_STYLE.md` do not name a checking tool in their prose: \
+                  the tag names the mechanism, and what it sees and misses is in the registry and \
+                  in this document.",
+        detail: "Read from the first `## ` heading on, outside fenced code blocks and with the \
+                 tags removed, line by line and ignoring case: the words `tidy`, `clippy`, \
+                 `dylint`, `rustfmt`, `lints` and `cargo-deny`, and the phrases `cargo deny` and \
+                 `the lint`. Not seen: a phrase broken across two lines, and prose that describes \
+                 a check without naming its tool, such as a list of the syntax a rule reports. A \
+                 foreign gate (`--policy`) skips the style guide, and this rule with it.",
         reference: "TIGER_STYLE.md, How rules are enforced",
     },
     Rule {
         id: "expect-budget",
         kind: RuleKind::Workspace,
-        summary: "The number of `expect(...)` lint suppressions, counted on tokens so that \
-                  `cfg_attr` and macro bodies are included, equals `xtask/expect-budget.txt`.",
+        summary: "The number of `expect(...)` lint suppressions equals \
+                  `xtask/expect-budget.txt`.",
+        detail: "Counted on tokens, so that `cfg_attr` and macro bodies are included.",
         reference: "ADR-0006",
     },
     Rule {
@@ -123,38 +153,42 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "In nami crates outside tests, no `==` or `!=` with a float operand in a function \
                   whose name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is \
-                  silent. Without types, a float operand is a float literal, an `f32`/`f64` \
-                  constant such as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or \
-                  closure parameter declared `f32`/`f64` or an array or slice of them (or a \
-                  reference to one), indexed or not, until a `let`, closure, `match` arm or `for` \
-                  rebinds the name. Stricter than clippy on purpose: an exact `== 0.0` is reported \
-                  too. Not seen: fields, `Option<f64>`, untyped locals, call results, macro \
-                  arguments. A float parameter rebound by `if let` or `while let` is a false \
-                  positive.",
+                  silent.",
+        detail: "Without types, a float operand is a float literal, an `f32`/`f64` constant such \
+                 as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter \
+                 declared `f32`/`f64` or an array or slice of them (or a reference to one), \
+                 indexed or not, until a `let`, closure, `match` arm or `for` rebinds the name. \
+                 Stricter than clippy on purpose: an exact `== 0.0` is reported too. Not seen: \
+                 fields, `Option<f64>`, untyped locals, call results, macro arguments. A float \
+                 parameter rebound by `if let` or `while let` is a false positive.",
         reference: "ADR-0006",
     },
     Rule {
         id: "function-length",
         kind: RuleKind::Source,
         summary: "Functions are at most 70 physical lines, closures included.",
+        detail: "",
         reference: "TIGER_STYLE.md, Scope and size",
     },
     Rule {
         id: "ignore-reason",
         kind: RuleKind::Source,
         summary: "`#[ignore]` carries a reason.",
+        detail: "",
         reference: "ADR-0006",
     },
     Rule {
         id: "kernel-indirection",
         kind: RuleKind::Source,
         summary: "No `dyn` trait objects and no function pointers in `crates/kernels`.",
+        detail: "",
         reference: "ADR-0003",
     },
     Rule {
         id: "line-length",
         kind: RuleKind::Source,
         summary: "Lines in Rust sources are at most 100 columns.",
+        detail: "rustfmt cannot wrap long string literals or comments, so tidy checks the limit.",
         reference: "TIGER_STYLE.md, Style by the numbers",
     },
     Rule {
@@ -162,12 +196,14 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "In nami crates outside tests, a float literal in (0, 1e-6] appears only in the \
                   initialiser of a `const` item that has a doc comment.",
+        detail: "",
         reference: "TIGER_STYLE.md, Floating point",
     },
     Rule {
         id: "parse",
         kind: RuleKind::Source,
         summary: "Every Rust source file parses.",
+        detail: "",
         reference: "ADR-0006",
     },
     Rule {
@@ -175,18 +211,21 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Workspace,
         summary: "Every plan directory under `docs/exec-plans/` holds both `plan.md` and \
                   `tasks.json`.",
+        detail: "",
         reference: "ADR-0011",
     },
     Rule {
         id: "plan-section",
         kind: RuleKind::Workspace,
         summary: "Every task has a `### <id>` section in its plan's `plan.md`.",
+        detail: "",
         reference: "ADR-0011",
     },
     Rule {
         id: "plan-stage",
         kind: RuleKind::Workspace,
         summary: "A plan under `completed/` has no unfinished task.",
+        detail: "",
         reference: "ADR-0011",
     },
     Rule {
@@ -194,12 +233,14 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Workspace,
         summary: "Every planned mechanism has a task with the same id in a `tasks.json` under \
                   `docs/exec-plans/active/`.",
+        detail: "",
         reference: "ADR-0018",
     },
     Rule {
         id: "rules-doc",
         kind: RuleKind::Workspace,
         summary: "`docs/RULES.md` matches what `cargo xtask rules` generates from the registry.",
+        detail: "",
         reference: "ADR-0018",
     },
     Rule {
@@ -207,12 +248,14 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "Runtime and build dependencies of nami crates are `libm` and workspace crates \
                   only, and none is renamed with `package = \"...\"`.",
+        detail: "",
         reference: "ADR-0001",
     },
     Rule {
         id: "snapshot-draft",
         kind: RuleKind::Source,
         summary: "No unreviewed insta snapshots (`*.snap.new`).",
+        detail: "",
         reference: "ADR-0006",
     },
     Rule {
@@ -220,12 +263,14 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Workspace,
         summary: "Task ids are unique, every dependency exists, no task passes before its \
                   dependencies, and the dependencies form no cycle.",
+        detail: "",
         reference: "ADR-0011",
     },
     Rule {
         id: "task-owner-paths",
         kind: RuleKind::Workspace,
         summary: "Two unfinished tasks that can run at the same time own no common path.",
+        detail: "",
         reference: "ADR-0011",
     },
     Rule {
@@ -233,40 +278,46 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Workspace,
         summary: "Every `tasks.json` is valid JSON with one `tasks` array, and every task has \
                   exactly the six fields of the schema.",
+        detail: "",
         reference: "ADR-0011",
     },
     Rule {
         id: "test-goal",
         kind: RuleKind::Source,
         summary: "Every test starts with a comment that states its goal.",
+        detail: "",
         reference: "TIGER_STYLE.md, Comments, docs and commits",
     },
     Rule {
         id: "unasserted-function",
         kind: RuleKind::Source,
         summary: "A function in a nami crate longer than 10 lines contains an assertion.",
+        detail: "",
         reference: "ADR-0004",
     },
     Rule {
         id: "unbounded-loop",
         kind: RuleKind::Source,
-        summary: "No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, \
-                  `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, \
-                  unless `take` or `zip` bounds it: every loop has a fixed upper bound.",
+        summary: "No `loop`, no `while`, and no `for` over an iterator that never ends: every loop \
+                  has a fixed upper bound.",
+        detail: "A `for` is reported over a range without an end, over `repeat`, `repeat_with`, \
+                 `from_fn` or `successors` from `core::iter`, or over `cycle`, unless `take` or a \
+                 `zip` with a bounded iterator bounds it.",
         reference: "TIGER_STYLE.md, Put a limit on everything",
     },
     Rule {
         id: "unsafe",
         kind: RuleKind::Source,
         summary: "`unsafe` appears only in `crates/alloc-guard`.",
+        detail: "",
         reference: "ADR-0014",
     },
     Rule {
         id: "usize",
         kind: RuleKind::Source,
         summary: "In nami crates, `usize` appears in function signatures, fields, public constants \
-                  and statics, and type aliases only in `base::index`. Trait impls and const \
-                  generics are exempt.",
+                  and statics, and type aliases only in `base::index`.",
+        detail: "Trait impls and const generics are exempt.",
         reference: "ADR-0002",
     },
     Rule {
@@ -274,6 +325,7 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Source,
         summary: "No `Vec` anywhere inside a field type in nami crates: fixed-size storage is \
                   `Box<[T]>`.",
+        detail: "",
         reference: "ADR-0003",
     },
 ];
@@ -371,7 +423,9 @@ pub const PLANNED: &[Planned] = &[
     planned(
         "alloc-after-init",
         "test",
-        "A counting-allocator test around the time loop proves that nothing allocates after init.",
+        "A counting-allocator test around the time loop proves that nothing allocates after init. \
+         The counting allocator (`crates/alloc-guard`) already fails any test that allocates \
+         inside `assert_no_allocations`; wrapping the time loop in it is still to do.",
         "ADR-0003",
     ),
     planned(
@@ -515,12 +569,15 @@ mod tests {
         assert!(!is_sorted_and_unique(&["a", "a"]), "duplicate ids are detected");
     }
 
-    // Goal: every row is complete: a lowercase dashed id, a summary sentence and a reference.
+    // Goal: every row is complete: a lowercase dashed id, a summary sentence, a detail that is
+    // empty or sentences, and a reference.
     #[test]
     fn rule_rows_are_complete() {
         for rule in RULES {
             assert!(is_dashed(rule.id), "id `{}` must be lowercase-dashed", rule.id);
             assert!(rule.summary.ends_with('.'), "summary of `{}` must be a sentence", rule.id);
+            let detail_is_prose = rule.detail.is_empty() || rule.detail.ends_with('.');
+            assert!(detail_is_prose, "detail of `{}` must be empty or sentences", rule.id);
             let cites = ["ADR-", "TIGER_STYLE.md, ", "docs/"]
                 .iter()
                 .any(|prefix| rule.reference.starts_with(prefix));

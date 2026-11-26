@@ -33,7 +33,7 @@ pub fn render(root: &Path) -> io::Result<String> {
     lines.extend(header_section());
     lines.extend(rules_section());
     lines.extend(bans_section());
-    lines.extend(lints_section(&lints::declared(root)?));
+    lines.extend(lints_section(&lints::declared(root)?, &lints::documented(root)?));
     lines.extend(planned_section());
     lines.extend(review_section(review_count));
     lines.extend(foreign_gate_section());
@@ -115,18 +115,20 @@ fn rules_section() -> Vec<String> {
         String::new(),
         "`cargo xtask tidy`. A source rule is decided from one file, so the edit hook can run it \
          on the file that was just edited. A workspace rule needs the whole tree. Every source \
-         rule has a firing and a passing example in `xtask/fixtures/tidy/`."
+         rule has a firing and a passing example in `xtask/fixtures/tidy/`. What a rule sees and \
+         misses is here, not in `docs/TIGER_STYLE.md`, which states the rule and its reason \
+         (rule `doc-tool-name`)."
             .to_owned(),
         String::new(),
-        row(&["Rule", "Kind", "What it requires", "Reference"]),
-        row(&["---"; 4]),
+        row(&["Rule", "Kind", "What it requires", "What it sees and misses", "Reference"]),
+        row(&["---"; 5]),
     ];
     for rule in registry::RULES {
         let kind = match rule.kind {
             RuleKind::Source => "source",
             RuleKind::Workspace => "workspace",
         };
-        lines.push(row(&[&code(rule.id), kind, rule.summary, rule.reference]));
+        lines.push(row(&[&code(rule.id), kind, rule.summary, rule.detail, rule.reference]));
     }
     lines
 }
@@ -162,32 +164,36 @@ fn bans_section() -> Vec<String> {
     lines
 }
 
-fn lints_section(declared: &[lints::DylintLint]) -> Vec<String> {
+fn lints_section(declared: &[lints::DylintLint], documented: &[(String, String)]) -> Vec<String> {
     let mut lines = vec![
         String::new(),
         "## Dylint lints".to_owned(),
         String::new(),
         format!(
             "`just dylint`, part of `just check-full`. Declared in `{}/`, on a pinned nightly. \
-             A lint gates only at `Deny`, because the recipe does not deny warnings.",
+             A lint gates only at `Deny`, because the recipe does not deny warnings. What it sees \
+             and misses is the `### What it does` section of its doc comment.",
             lints::LINT_SOURCES
         ),
         String::new(),
-        row(&["Lint", "Level", "What it reports"]),
-        row(&["---"; 3]),
+        row(&["Lint", "Level", "What it reports", "What it sees and misses"]),
+        row(&["---"; 4]),
     ];
     for lint in declared {
-        lines.push(row(&[&code(&lint.name), &lint.level, &lint.description]));
+        let documentation = documented.iter().find(|(name, _)| *name == lint.name);
+        let detail = documentation.map_or("", |(_, text)| text.as_str());
+        lines.push(row(&[&code(&lint.name), &lint.level, &lint.description, detail]));
     }
     lines.extend([
         String::new(),
         "## Clippy and rustc lints".to_owned(),
         String::new(),
         "The lint tables are `[workspace.lints.rust]` and `[workspace.lints.clippy]` in the root \
-         `Cargo.toml`. The banned methods and types, each with a reason that names the \
-         replacement, are in `clippy.toml`. `just clippy` denies warnings. A lint that a tag in \
-         `docs/TIGER_STYLE.md` names cannot be removed or set to `allow` without `doc-tag` \
-         failing."
+         `Cargo.toml`. The workspace lints are pedantic plus selected restriction lints, and \
+         `-D warnings` applies in `just` and CI. The banned methods and types, each with a reason \
+         that names the replacement, are in `clippy.toml`. `just clippy` denies warnings. A lint \
+         that a tag in `docs/TIGER_STYLE.md` names cannot be removed or set to `allow` without \
+         `doc-tag` failing."
             .to_owned(),
     ]);
     lines
@@ -271,7 +277,9 @@ mod tests {
         let scratch = Scratch::new(name);
         let style_guide = "# Style\n\n## Rules\n\n- One. `[review]`\n- Two. `[review]` `[fmt]`\n";
         scratch.write("docs/TIGER_STYLE.md", style_guide);
-        scratch.write("lints/src/lib.rs", "declare_lint! { pub A_LINT, Deny, \"reports a | b\" }");
+        let lint = "declare_lint! {\n/// ### What it does\n/// Sees `x`.\n\
+                    pub A_LINT, Deny, \"reports a | b\" }";
+        scratch.write("lints/src/lib.rs", lint);
         scratch.write(RULES_DOC, &render(scratch.root()).unwrap());
         scratch
     }
@@ -280,8 +288,9 @@ mod tests {
         violations.iter().map(|violation| (violation.rule, violation.line)).collect()
     }
 
-    // Goal: the document lists every rule, ban and planned mechanism of the registry, the
-    // declared lints, the review count and the rules that a foreign gate skips.
+    // Goal: the document lists every rule with its detail, every ban and planned mechanism of
+    // the registry, the declared lints with what they do, the review count and the rules that a
+    // foreign gate skips.
     #[test]
     fn document_lists_the_registry() {
         let scratch = tree("rules-doc-render");
@@ -292,7 +301,11 @@ mod tests {
         for planned in registry::PLANNED {
             assert!(text.contains(&format!("| `{}` |", planned.id)), "`{}`", planned.id);
         }
-        assert!(text.contains("| `a_lint` | Deny | reports a \\| b |"), "lints are listed");
+        assert!(text.contains("| `a_lint` | Deny | reports a \\| b | Sees `x`. |"), "lints");
+        for rule in registry::RULES {
+            let cells = format!("| {} | {} |", rule.summary, rule.detail);
+            assert!(text.contains(&cells), "`{}` and its detail", rule.id);
+        }
         assert!(text.contains("carries 2 `[review]` tags"), "review tags are counted");
         assert!(text.contains("`doc-tag`, `planned-task`, `rules-doc`."), "skipped rules");
         assert!(text.contains("| `direct-libm` | paths that start with `libm::`"), "path bans");

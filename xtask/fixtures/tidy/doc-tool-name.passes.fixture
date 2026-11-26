@@ -1,0 +1,15 @@
+<!-- path: docs/TIGER_STYLE.md -->
+# A style guide whose rules state the rule, its reason and its tag
+
+The legend above the first section may name the tools: tidy checks every tag.
+
+## Rules
+
+- **Loops are bounded,** so that a violation fails fast instead of hanging. `[tidy:unbounded-loop]`
+- **Never silence a lint.** A suppression hides the finding from the reviewer.
+  `[clippy:allow_attributes]` `[dylint:nami_recursion]`
+- Untidy prose is a review matter. `[review]`
+
+```rust
+// Code blocks may name tidy and clippy.
+```
