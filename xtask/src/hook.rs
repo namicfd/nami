@@ -1195,6 +1195,9 @@ mod tests {
         };
         let worst = |budget| super::Budget::of_seconds(budget).polls_left;
         let seconds = |polls: u32| polls * super::POLL_INTERVAL_MILLISECONDS / 1000;
+        assert_eq!(super::polls_in(1), 50, "one second is 50 polls of 20 ms");
+        assert_eq!(seconds(worst(EDIT_BUDGET_SECONDS_MAX)), 80, "the edit budget is 80 s");
+        assert_eq!(seconds(worst(GATE_SECONDS_MAX)), 480, "the gate budget is 480 s");
         let edit = seconds(worst(EDIT_BUDGET_SECONDS_MAX)) + OWN_WORK_SECONDS_MIN;
         assert!(edit <= timeout("PostToolUse"), "{edit} s exceed the edit hook's timeout");
         for event in ["Stop", "SubagentStop"] {
