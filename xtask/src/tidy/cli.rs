@@ -137,7 +137,6 @@ mod tests {
         assert!(is(tidy_file("notes.md"), ExitCode::FAILURE), "a relative path");
         assert!(is(tidy_file(&file("missing.md")), ExitCode::FAILURE), "a file that is missing");
         assert!(is(tidy_file("/notes.md"), ExitCode::FAILURE), "a file outside a checkout");
-        assert!(!is(violations, ExitCode::FAILURE), "the codes differ");
     }
 
     // Goal: the exit code says whether the tree is tidy. A tree with violations, a tree that

@@ -28,12 +28,14 @@
 //!   that fails, cannot start or runs out of time is a failed gate, never a pass.
 //! - After an edit in another worktree of this repository, the file is formatted by the rustfmt
 //!   of the toolchain that worktree pins and checked by its `cargo xtask tidy --file`, so that
-//!   new rules on a branch apply to it. A worktree is one whose git toplevel is the checkout and
-//!   whose git common directory is this repository's. If its formatting or check cannot run, for
-//!   example because the toolchain it pins is missing or its xtask is too old to know `--file`,
-//!   this process formats or checks the file itself and says so. Any other checkout, and any
-//!   that git cannot name, is formatted and checked by this process: an edit builds no code
-//!   from outside this repository.
+//!   new rules on a branch apply to it. Such a worktree is one whose git toplevel is the
+//!   checkout, whose git common directory is this repository's, and whose `HEAD` is a local
+//!   branch: a detached `HEAD`, such as a fork's pull request checked out for review, is not.
+//!   If its formatting or check cannot run, for example because the toolchain it pins is
+//!   missing or its xtask is too old to know `--file`, this process formats or checks the file
+//!   itself and says so. Any other checkout, and any that git cannot name, is formatted and
+//!   checked by this process: an edit builds no code that is not on a local branch of this
+//!   repository.
 //!
 //! # The stop gate
 //!
@@ -196,10 +198,12 @@ pub fn hook_root(event: Event, payload: &str, project: Option<&Path>) -> Option<
     Some(root)
 }
 
-/// True if `root` is another worktree of the repository that this process runs in, so that its
-/// own checks may run: git names `root` as its own toplevel, and the same common directory for
-/// both. A checkout that git cannot name, a nami-looking directory inside another checkout, and
-/// this process's own checkout are not.
+/// True if `root` is another worktree of the repository that this process runs in, on a local
+/// branch, so that its own checks may run: git names `root` as its own toplevel, the same common
+/// directory for both, and a branch for its `HEAD`. A checkout that git cannot name, a
+/// nami-looking directory inside another checkout, a detached `HEAD` (such as a fork's pull
+/// request that `git worktree add --detach` checked out for review, which shares this common
+/// directory) and this process's own checkout are not.
 fn is_other_worktree(root: &Path) -> bool {
     let current = std::env::current_dir().ok().and_then(|directory| checkout_around(&directory));
     let Some(current) = current else {
@@ -211,6 +215,9 @@ fn is_other_worktree(root: &Path) -> bool {
     }
     let toplevel = git(root, None, &["rev-parse", "--show-toplevel"]);
     if toplevel.and_then(|toplevel| canonical(Path::new(&toplevel))) != canonical(root) {
+        return false;
+    }
+    if git(root, None, &["symbolic-ref", "--quiet", "HEAD"]).is_none() {
         return false;
     }
     let common = |checkout: &Path| {
@@ -253,6 +260,8 @@ fn run_bounded(
     log: &Path,
     budget: &mut Budget,
 ) -> Outcome {
+    assert!(log.is_absolute(), "the logs of a run are named by an absolute path");
+    assert!(input.is_none_or(Path::is_absolute), "the input of a run is an absolute path");
     if budget.deadline() == 0 {
         return Outcome::CouldNotRun("was not started: its time budget is spent".to_owned());
     }
@@ -297,7 +306,12 @@ fn polls_in(seconds: u32) -> u32 {
 
 /// Polls that a run, or a series of runs that share it, may still take, each run's reap after a
 /// kill included. A run's deadline is what is left minus one reap, so a series of runs can never
-/// take longer than its budget.
+/// take more polls than its budget.
+///
+/// A budget counts polls, not wall-clock time (ADR-0005). Each poll sleeps
+/// [`POLL_INTERVAL_MILLISECONDS`], and the sleeps' overrun, the time `try_wait` takes, the git
+/// calls around the runs and the fallback check all come out of the headroom that the hook keeps
+/// below Claude Code's timeout: 40 seconds after an edit, 120 at stop.
 #[derive(Debug)]
 struct Budget {
     polls_left: u32,
@@ -326,6 +340,20 @@ impl Budget {
 fn wait_until(child: &mut Child, budget: &mut Budget) -> Result<ExitStatus, String> {
     let interval = Duration::from_millis(u64::from(POLL_INTERVAL_MILLISECONDS));
     let deadline = budget.deadline();
+    assert!(deadline > 0, "a run is started only with a deadline left in its budget");
+    let polls_before = budget.polls_left;
+    let result = wait_within(child, budget, deadline, interval);
+    assert!(budget.polls_left < polls_before, "every wait takes at least one poll");
+    result
+}
+
+/// [`wait_until`] without its checks: polls `child` up to `deadline` times, then kills it.
+fn wait_within(
+    child: &mut Child,
+    budget: &mut Budget,
+    deadline: u32,
+    interval: Duration,
+) -> Result<ExitStatus, String> {
     for _ in 0..deadline {
         budget.spend();
         match child.try_wait() {
@@ -406,6 +434,27 @@ fn output_log(root: &Path, purpose: &str) -> PathBuf {
 }
 
 fn post_edit(root: &Path, payload: &str) -> ExitCode {
+    // One budget for all of the worktree's own work, so that the fallback in `check_edit`
+    // always has time before the hook's timeout.
+    let work = is_other_worktree(root).then(|| WorktreeWork {
+        budget: Budget::of_seconds(EDIT_BUDGET_SECONDS_MAX),
+        rustfmt: "rustfmt",
+        cargo: "cargo",
+    });
+    check_edit(root, payload, work)
+}
+
+/// The work that a worktree's own code does after an edit in it: the programs it runs, found on
+/// `PATH`, and the one budget that they share.
+struct WorktreeWork<'a> {
+    budget: Budget,
+    rustfmt: &'a str,
+    cargo: &'a str,
+}
+
+/// Formats and checks the file that a `PostToolUse` payload names, in the checkout at `root`:
+/// with `work`, by that worktree's own rustfmt and rules first, else by this process.
+fn check_edit(root: &Path, payload: &str, mut work: Option<WorktreeWork<'_>>) -> ExitCode {
     let Some(file) = json_string_field(payload, "file_path").map(PathBuf::from) else {
         return ExitCode::SUCCESS;
     };
@@ -420,20 +469,17 @@ fn post_edit(root: &Path, payload: &str) -> ExitCode {
         eprintln!("hook post-edit: {} is not in {}", file.display(), root.display());
         return ExitCode::FAILURE;
     };
-    // One budget for all of the worktree's own work, so that the fallback below always has
-    // time before the hook's timeout.
-    let mut budget = is_other_worktree(root).then(|| Budget::of_seconds(EDIT_BUDGET_SECONDS_MAX));
     let is_rust = file.extension().is_some_and(|extension| extension == "rs");
     let text = if is_rust {
-        match format_in_place(root, &file, &original, budget.as_mut()) {
+        match format_in_place(root, &file, &original, work.as_mut()) {
             Ok(formatted) => formatted,
             Err(exit) => return exit,
         }
     } else {
         original
     };
-    if let Some(budget) = budget.as_mut() {
-        match own_file_check(root, &file, budget) {
+    if let Some(work) = work.as_mut() {
+        match own_file_check(root, &file, work) {
             Ok(exit) => return exit,
             Err(reason) => eprintln!(
                 "hook post-edit: the check of {} could not run ({reason}); checked with the \
@@ -461,9 +507,13 @@ fn post_edit(root: &Path, payload: &str) -> ExitCode {
 /// Checks `file` with the rules of the worktree at `root`: `cargo xtask tidy --file` in it,
 /// with the toolchain it pins. Returns the exit code to stop with if the check ran: it passed,
 /// or it found violations, which go to the agent. Otherwise returns why it could not run.
-fn own_file_check(root: &Path, file: &Path, budget: &mut Budget) -> Result<ExitCode, String> {
+fn own_file_check(
+    root: &Path,
+    file: &Path,
+    work: &mut WorktreeWork<'_>,
+) -> Result<ExitCode, String> {
     assert!(file.is_absolute(), "the worktree's check is given an absolute path");
-    let mut command = Command::new("cargo");
+    let mut command = Command::new(work.cargo);
     let command = command
         .args(["xtask", "tidy", "--file"])
         .arg(file)
@@ -472,7 +522,7 @@ fn own_file_check(root: &Path, file: &Path, budget: &mut Budget) -> Result<ExitC
         .env_remove(TOOLCHAIN_VARIABLES[1]);
     let log = output_log(root, "edit-check");
     let violations = i32::from(crate::tidy::cli::EXIT_VIOLATIONS);
-    match run_bounded(command, None, &log, budget) {
+    match run_bounded(command, None, &log, &mut work.budget) {
         Outcome::Exited(0, _) => Ok(ExitCode::SUCCESS),
         Outcome::Exited(code, printed) if code == violations => {
             eprint!("{}", printed.both());
@@ -486,18 +536,18 @@ fn own_file_check(root: &Path, file: &Path, budget: &mut Budget) -> Result<ExitC
     }
 }
 
-/// Formats a Rust file and writes it back if the text changed. With `checkout_budget`, the
-/// rustfmt of the toolchain that `root` pins formats it within that budget, or, if that cannot
-/// run, this process's own. Returns the formatted text, or the exit code to stop with: feedback
-/// for a syntax error, failure if the file cannot be written.
+/// Formats a Rust file and writes it back if the text changed. With `checkout_work`, the
+/// rustfmt of the toolchain that `root` pins formats it within that work's budget, or, if that
+/// cannot run, this process's own. Returns the formatted text, or the exit code to stop with:
+/// feedback for a syntax error, failure if the file cannot be written.
 fn format_in_place(
     root: &Path,
     file: &Path,
     original: &str,
-    checkout_budget: Option<&mut Budget>,
+    checkout_work: Option<&mut WorktreeWork<'_>>,
 ) -> Result<String, ExitCode> {
-    let formatted = match checkout_budget {
-        Some(budget) => match format_with_checkout_toolchain(root, original, budget) {
+    let formatted = match checkout_work {
+        Some(work) => match format_with_checkout_toolchain(root, original, work) {
             Err(error) => format_source(root, original).inspect(|_| {
                 let first = error.lines().next().unwrap_or_default();
                 eprintln!("note: the rustfmt that {} pins did not run ({first})", root.display());
@@ -817,25 +867,25 @@ fn format_source(root: &Path, source: &str) -> Result<String, String> {
 }
 
 /// Formats one file's source like [`format_source`], but with the rustfmt of the toolchain that
-/// `root` pins, as a bounded check: within what is left of `budget`, its process group killed
-/// at the deadline. Returns what went wrong if it did not format the source, so that the caller
-/// can fall back to this process's rustfmt.
+/// `root` pins, as a bounded check: within what is left of the work's budget, its process group
+/// killed at the deadline. Returns what went wrong if it did not format the source, so that the
+/// caller can fall back to this process's rustfmt.
 fn format_with_checkout_toolchain(
     root: &Path,
     source: &str,
-    budget: &mut Budget,
+    work: &mut WorktreeWork<'_>,
 ) -> Result<String, String> {
     let input = output_log(root, "format-input");
     let written = fs::write(&input, source);
     written.map_err(|error| format!("cannot write {}: {error}", input.display()))?;
-    let mut command = Command::new("rustfmt");
+    let mut command = Command::new(work.rustfmt);
     let command = command
         .args(["--edition", "2024", "--emit", "stdout"])
         .current_dir(root)
         .env_remove(TOOLCHAIN_VARIABLES[0])
         .env_remove(TOOLCHAIN_VARIABLES[1]);
     let log = output_log(root, "format");
-    let outcome = run_bounded(command, Some(&input), &log, budget);
+    let outcome = run_bounded(command, Some(&input), &log, &mut work.budget);
     discard(Some(&input));
     match outcome {
         Outcome::Exited(0, printed) => Ok(printed.stdout),
@@ -938,9 +988,10 @@ mod tests {
     const UNFORMATTED: &str = "fn a( )->u32{1}\n";
     const FORMATTED: &str = "fn a() -> u32 {\n    1\n}\n";
 
-    /// The budget of the worktree's own work after an edit.
-    fn edit_budget() -> super::Budget {
-        super::Budget::of_seconds(super::EDIT_BUDGET_SECONDS_MAX)
+    /// The worktree's own work after an edit, as the hook does it.
+    fn edit_work() -> super::WorktreeWork<'static> {
+        let budget = super::Budget::of_seconds(super::EDIT_BUDGET_SECONDS_MAX);
+        super::WorktreeWork { budget, rustfmt: "rustfmt", cargo: "cargo" }
     }
 
     // Goal: an unformatted Rust file is rewritten in its formatted form, and the formatted text
@@ -966,7 +1017,7 @@ mod tests {
             &crate::workspace_root(),
             unwritable,
             FORMATTED,
-            Some(&mut edit_budget()),
+            Some(&mut edit_work()),
         );
         assert_eq!(text.ok().as_deref(), Some(FORMATTED), "nothing to write, nothing fails");
     }
@@ -982,14 +1033,13 @@ mod tests {
             &root,
             &scratch.root().join("broken.rs"),
             "fn a( {\n",
-            Some(&mut edit_budget()),
+            Some(&mut edit_work()),
         );
         let broken = broken.expect_err("a syntax error cannot be formatted");
         assert!(is(broken, ExitCode::from(EXIT_FEEDBACK)), "feedback, got {broken:?}");
         let unwritable = format_in_place(&root, scratch.root(), UNFORMATTED, None);
         let unwritable = unwritable.expect_err("a directory cannot be written as a file");
         assert!(is(unwritable, ExitCode::FAILURE), "a failure, got {unwritable:?}");
-        assert!(!is(ExitCode::FAILURE, ExitCode::from(EXIT_FEEDBACK)), "the codes differ");
     }
 
     // Goal: the file path is extracted from a PostToolUse payload, with escapes decoded.
@@ -1141,6 +1191,44 @@ mod tests {
         let blocked = shell("read x < f", None, &mut budget_with_deadline(5));
         let Outcome::CouldNotRun(killed) = blocked else { panic!("it ended: {blocked:?}") };
         assert!(killed.starts_with("did not finish within 0 seconds and was killed"), "{killed}");
+    }
+
+    // Goal: after an edit, the worktree's formatting and its check share one budget: a rustfmt
+    // that uses all of it up leaves none for the check, which is not started, and this process
+    // still formats and checks the file. Method: event-driven, no clock. The worktree's rustfmt
+    // blocks on a FIFO that nothing writes, so only its deadline ends it; its cargo would leave
+    // a marker if it ran.
+    #[test]
+    fn the_worktree_edit_work_shares_one_budget() {
+        use super::{WorktreeWork, check_edit};
+        let scratch = Scratch::new("hook-shared-budget");
+        let workspace = crate::workspace_root();
+        let toolchain = std::fs::read_to_string(workspace.join("rust-toolchain.toml")).unwrap();
+        scratch.write("rust-toolchain.toml", &toolchain);
+        scratch.write("xtask/README", "tooling\n");
+        scratch.write("src/lib.rs", "fn a() {}\n");
+        let root = scratch.root();
+        let mut fifo = std::process::Command::new("mkfifo");
+        assert!(fifo.arg(root.join("f")).status().unwrap().success(), "the FIFO is made");
+        let marker = root.join("cargo-ran");
+        scratch
+            .write("bin/rustfmt", &format!("#!/bin/sh\nread x < {}\n", root.join("f").display()));
+        scratch.write("bin/cargo", &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+        for tool in ["bin/rustfmt", "bin/cargo"] {
+            let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+            std::fs::set_permissions(root.join(tool), executable).unwrap();
+        }
+        let rustfmt = root.join("bin/rustfmt").display().to_string();
+        let cargo = root.join("bin/cargo").display().to_string();
+        let work =
+            WorktreeWork { budget: budget_with_deadline(5), rustfmt: &rustfmt, cargo: &cargo };
+        let file = root.join("src/lib.rs");
+        let payload = format!(r#"{{"tool_input":{{"file_path":"{}"}}}}"#, file.display());
+        let exit = check_edit(root, &payload, Some(work));
+        assert!(is(exit, ExitCode::SUCCESS), "this process checked the file: {exit:?}");
+        assert!(!marker.exists(), "the worktree's check was not started: the budget was spent");
+        let formatted = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(formatted, "fn a() {}\n", "and this process's rustfmt formatted it");
     }
 
     // Goal: runs that share a budget never take longer than it, reaps included: what one run

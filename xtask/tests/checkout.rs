@@ -134,6 +134,15 @@ impl Scratch {
         fs::canonicalize(path).expect("the worktree exists")
     }
 
+    /// A second worktree of the checkout with a detached `HEAD` at `HEAD`, as `review-pr` checks
+    /// out a fork's pull request.
+    fn detached_worktree(&self, name: &str) -> PathBuf {
+        let path = self.directory.join(name);
+        let path_text = path.to_str().expect("the path is UTF-8");
+        self.git(&["worktree", "add", "--quiet", "--detach", path_text, "HEAD"]);
+        fs::canonicalize(path).expect("the worktree exists")
+    }
+
     fn root(&self) -> PathBuf {
         self.directory.join("checkout")
     }
@@ -551,7 +560,10 @@ fn edits_in_a_worktree_use_its_own_check() {
     let draft = worktree.join("tests/snapshots/a.snap.new");
     fs::create_dir_all(draft.parent().expect("a file has a parent")).unwrap();
     fs::write(&draft, "draft\n").unwrap();
-    let toolchain = [("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain"))];
+    let toolchain = [
+        ("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain")),
+        ("RUSTUP_TOOLCHAIN_SOURCE", Path::new("env")),
+    ];
     let edited = scratch.hook("post-edit", &edit_payload(&project, &draft), &toolchain);
     let stderr = String::from_utf8_lossy(&edited.stderr);
     assert_eq!(edited.status.code(), Some(2), "the draft is a violation: {stderr}");
@@ -703,10 +715,66 @@ fn a_worktree_check_that_cannot_run_falls_back_to_the_project() {
     assert_eq!(cargo_calls(&worktree).len(), 6, "the worktree's check was tried every time");
 }
 
-// Goal: only a worktree of the project's own repository runs its own checks after an edit;
-// another clone, such as a fork's review checkout, is checked with the project's rules, as is
-// a worktree whose repository git cannot name. Neither is ever skipped. Method: a clone, and a
-// fake `git` that always fails, first on `PATH`.
+// Goal: a worktree of the project's own repository with a detached `HEAD`, as `review-pr`
+// checks out a fork's pull request, runs none of its own code after an edit: it shares the
+// repository, but its `HEAD` is not a local branch, so the project's rules check its files.
+#[test]
+fn a_detached_worktree_gets_the_project_rules() {
+    let scratch = Scratch::new("edit-detached");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let detached = scratch.detached_worktree("review");
+    let draft = detached.join("a.snap.new");
+    fs::write(&draft, "draft\n").unwrap();
+    let source = detached.join("src/lib.rs");
+    fs::create_dir_all(detached.join("src")).unwrap();
+    fs::write(&source, "fn a() {}\n").unwrap();
+    let toolchain = [("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain"))];
+    let edited = scratch.hook("post-edit", &edit_payload(&project, &draft), &toolchain);
+    let stderr = String::from_utf8_lossy(&edited.stderr);
+    assert_eq!(edited.status.code(), Some(2), "the draft is checked: {stderr}");
+    assert!(stderr.contains("a.snap.new:0: error[snapshot-draft]"), "by the project: {stderr}");
+    assert!(!stderr.contains("could not run"), "no worktree check was tried: {stderr}");
+    let formatted = scratch.hook("post-edit", &edit_payload(&project, &source), &toolchain);
+    assert_eq!(formatted.status.code(), Some(0), "the Rust file is formatted and clean");
+    let text = fs::read_to_string(&source).unwrap();
+    assert_eq!(text, "// formatted by the-project-toolchain\nfn a() {}\n", "by the project");
+    assert_eq!(cargo_calls(&detached), Vec::<String>::new(), "none of its code ran");
+}
+
+// Goal: an edit in the project checkout itself runs no worktree check: this process's rules
+// and toolchain are the project's own. Method: a Rust file and an unreviewed snapshot edited in
+// the project, with the fake `rustfmt` and `cargo` recording any call.
+#[test]
+fn an_edit_in_the_project_runs_no_worktree_check() {
+    let scratch = Scratch::new("edit-project");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    scratch.write("a.snap.new", "draft\n");
+    scratch.write("src/lib.rs", "fn a() {}\n");
+    let toolchain = [
+        ("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain")),
+        ("RUSTUP_TOOLCHAIN_SOURCE", Path::new("env")),
+    ];
+    let draft = project.join("a.snap.new");
+    let edited = scratch.hook("post-edit", &edit_payload(&project, &draft), &toolchain);
+    let stderr = String::from_utf8_lossy(&edited.stderr);
+    assert_eq!(edited.status.code(), Some(2), "the draft is checked: {stderr}");
+    assert!(stderr.contains("a.snap.new:0: error[snapshot-draft]"), "{stderr}");
+    let source = project.join("src/lib.rs");
+    let formatted = scratch.hook("post-edit", &edit_payload(&project, &source), &toolchain);
+    assert_eq!(formatted.status.code(), Some(0), "the Rust file is formatted and clean");
+    let calls = lines_of(&project, "target/rustfmt-calls");
+    let own =
+        format!("{}|the-project-toolchain|env|--edition 2024 --emit stdout", project.display());
+    assert_eq!(calls, [own], "by this process's rustfmt, with its toolchain kept");
+    assert_eq!(cargo_calls(&project), Vec::<String>::new(), "and no `cargo xtask tidy --file`");
+}
+
+// Goal: only a worktree of the project's own repository whose `HEAD` is a local branch runs
+// its own checks after an edit. Another clone is checked with the project's rules, as is a
+// worktree whose repository git cannot name; neither is ever skipped. (A fork's pull request
+// checked out for review shares this repository and is told apart by its detached `HEAD`: see
+// `a_detached_worktree_gets_the_project_rules`.) Method: a clone, and a fake `git` that always
+// fails, first on `PATH`.
 #[test]
 fn a_foreign_or_unnamed_checkout_gets_the_project_rules() {
     let scratch = Scratch::new("foreign");
