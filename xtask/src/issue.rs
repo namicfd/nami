@@ -5,22 +5,28 @@
 //!   trusted open issues, and stops if it finds one, unless `--new` says none is the same.
 //! - `show <number>` prints a trusted issue and its trusted comments. Agents read issues only
 //!   this way: it refuses an issue by anyone but the bot and the code owners.
+//! - `decide <number> --by <login> --date <YYYY-MM-DD> --source <text> <decision.md>` records a
+//!   code owner's decision on an issue with `needs-decision`, then removes the label (ADR-0021,
+//!   point 7). The file holds the decision: one paragraph.
 //!
-//! Both act on the checkout's GitHub repository, as whoever `GH_TOKEN` names. The code owners
+//! They act on the checkout's GitHub repository, as whoever `GH_TOKEN` names. The code owners
 //! come from `.github/CODEOWNERS` on `<remote>/main`; the remote is `$NAMI_TASK_REMOTE`, or
 //! `origin`. A claimed issue is a task with the ID `issue-<number>` (`cargo xtask task`).
 
+pub mod decision;
 pub mod github;
 pub mod trust;
 
-use github::{Comment, Gh, GitHub, Issue};
+use decision::Record;
+use github::{Comment, Gh, GitHub, Issue, LabelEvent};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::ExitCode;
-use trust::{KINDS, NEEDS_DECISION, Trust};
+use trust::{BOT_LOGIN, KINDS, NEEDS_DECISION, Trust};
 
 const USAGE: &str = "usage: cargo xtask issue file --kind <guardrail-gap|bug|docs> \
-                     [--needs-decision] [--new] <file.md> | show <number>";
+                     [--needs-decision] [--new] <file.md> | show <number> | decide <number> \
+                     --by <login> --date <YYYY-MM-DD> --source <text> <decision.md>";
 
 /// The prefix of a claim ID that names an issue: `issue-12` is issue #12.
 pub const ID_PREFIX: &str = "issue-";
@@ -78,6 +84,14 @@ pub fn execute(
             let draft = Draft::parse(&text)?;
             file(&draft, &options, github, &trust::load(root, &main_of(remote))?)
         }
+        ["decide", number, options @ ..] => {
+            let number = parse_number(number)?;
+            let options = DecideOptions::parse(options)?;
+            let text = std::fs::read_to_string(options.path)
+                .map_err(|error| format!("cannot read `{}`: {error}", options.path))?;
+            let record = options.record(&text)?;
+            decide(number, &record, github, &trust::load(root, &main_of(remote))?)
+        }
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -124,6 +138,22 @@ fn main_of(remote: &str) -> String {
     format!("{remote}/main")
 }
 
+/// The label events of issue `number`, and its comments if [`trust::unworkable`] needs them:
+/// only when the bot removed `needs-decision` last.
+///
+/// # Errors
+///
+/// When GitHub cannot be asked.
+pub fn history(
+    github: &dyn GitHub,
+    number: u32,
+) -> Result<(Vec<LabelEvent>, Vec<Comment>), String> {
+    let events = github.label_events(number)?;
+    let comments = if trust::needs_record(&events) { github.comments(number)? } else { Vec::new() };
+    assert!(comments.is_empty() || trust::needs_record(&events), "comments only when needed");
+    Ok((events, comments))
+}
+
 /// Prints a trusted issue and its trusted comments.
 fn show(issue: &Issue, github: &dyn GitHub, trust: &Trust) -> Result<String, String> {
     if let Some(reason) = trust::refused(issue, trust) {
@@ -148,7 +178,10 @@ pub fn render(issue: &Issue, comments: &[Comment], trust: &Trust) -> String {
     )];
     let (kept, left_out) = trust::trusted_comments(comments, trust);
     pieces.extend(kept.iter().map(|comment| {
-        format!("\n--- comment by {}\n\n{}\n", comment.author, comment.body.trim_end())
+        let is_record = comment.author == BOT_LOGIN
+            && Record::parse(&comment.body).is_ok_and(|record| trust.is_owner(&record.decider));
+        let kind = if is_record { "decision record" } else { "comment" };
+        format!("\n--- {kind} by {}\n\n{}\n", comment.author, comment.body.trim_end())
     }));
     if left_out > 0 {
         pieces.push(format!(
@@ -206,6 +239,124 @@ impl<'arguments> FileOptions<'arguments> {
         };
         Ok(Self { kind, needs_decision, new, path })
     }
+}
+
+/// The options of `issue decide`, after the issue's number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecideOptions<'arguments> {
+    /// The code owner who decided.
+    pub by: &'arguments str,
+    /// The day of the decision, `YYYY-MM-DD`.
+    pub date: &'arguments str,
+    /// Where it was decided: a session or a PR.
+    pub source: &'arguments str,
+    /// The file that holds the decision.
+    pub path: &'arguments str,
+}
+
+impl<'arguments> DecideOptions<'arguments> {
+    /// Reads the options that follow `decide <number>`, in any order.
+    ///
+    /// # Errors
+    ///
+    /// An unknown or repeated option, a missing value, a value in the wrong form, or not
+    /// exactly one file.
+    pub fn parse(options: &[&'arguments str]) -> Result<Self, String> {
+        const NAMES: [&str; 3] = ["--by", "--date", "--source"];
+        let mut values: [Option<&str>; 3] = [None; 3];
+        let mut paths = Vec::new();
+        let mut pending: Option<usize> = None;
+        for &word in options {
+            let Some(slot) = pending.take() else {
+                match NAMES.iter().position(|name| *name == word) {
+                    Some(slot) => pending = Some(slot),
+                    None if !word.starts_with('-') && !word.is_empty() => paths.push(word),
+                    None => return Err(format!("unknown option `{word}`; {USAGE}")),
+                }
+                continue;
+            };
+            let held = values.get_mut(slot).expect("one slot per option");
+            if held.replace(word).is_some() {
+                return Err(format!("`{}` is given twice", NAMES.get(slot).unwrap_or(&"")));
+            }
+        }
+        if let Some(name) = pending.and_then(|slot| NAMES.get(slot)) {
+            return Err(format!("`{name}` needs a value"));
+        }
+        let [Some(by), Some(date), Some(source)] = values else {
+            return Err(format!("give `--by`, `--date` and `--source`; {USAGE}"));
+        };
+        let by = by.strip_prefix('@').unwrap_or(by);
+        if !decision::is_login(by) {
+            return Err(format!("`--by {by}` is not a GitHub login"));
+        }
+        if !decision::is_date(date) {
+            return Err(format!("`--date {date}` is not a day in the form YYYY-MM-DD"));
+        }
+        if !decision::is_one_line(source) {
+            return Err("`--source` is one line of text, without surrounding space".to_owned());
+        }
+        let [path] = paths[..] else {
+            return Err(format!("give exactly one Markdown file with the decision; {USAGE}"));
+        };
+        Ok(Self { by, date, source, path })
+    }
+
+    /// The record of the decision in `text`: one paragraph, joined onto one line.
+    ///
+    /// # Errors
+    ///
+    /// When `text` is empty or holds more than one paragraph.
+    pub fn record(&self, text: &str) -> Result<Record, String> {
+        let text = text.trim();
+        if text.is_empty() || text.lines().any(|line| line.trim().is_empty()) {
+            return Err(format!("`{}` must hold the decision as one paragraph", self.path));
+        }
+        let decision: Vec<&str> = text.split_whitespace().collect();
+        let record = Record {
+            decision: decision.join(" "),
+            decider: self.by.to_owned(),
+            date: self.date.to_owned(),
+            source: self.source.to_owned(),
+        };
+        let parsed = Record::parse(&record.render());
+        assert!(parsed.is_ok_and(|parsed| parsed == record), "the record reads back");
+        Ok(record)
+    }
+}
+
+/// Posts `record` on issue `number`, then removes `needs-decision`. Refuses unless the issue
+/// is trusted and waits for a decision, and the decider is a code owner.
+fn decide(
+    number: u32,
+    record: &Record,
+    github: &dyn GitHub,
+    trust: &Trust,
+) -> Result<String, String> {
+    if !trust.is_owner(&record.decider) {
+        return Err(format!(
+            "`{}` is not a code owner in `.github/CODEOWNERS` on main; only a code owner \
+             decides (ADR-0021)",
+            record.decider
+        ));
+    }
+    let found = github.issue(number)?;
+    if let Some(reason) = trust::refused(&found, trust) {
+        return Err(reason);
+    }
+    if !found.labels.iter().any(|label| label == NEEDS_DECISION) {
+        return Err(format!(
+            "#{number} has no `{NEEDS_DECISION}` label: nothing waits for a decision"
+        ));
+    }
+    github.comment(number, &record.render())?;
+    github.remove_label(number, NEEDS_DECISION).map_err(|error| {
+        format!(
+            "posted the decision record on #{number}, but cannot remove `{NEEDS_DECISION}`: \
+             {error}; run `issue decide` again, which posts a new record before it removes it"
+        )
+    })?;
+    Ok(format!("decided #{number}: posted the decision record and removed `{NEEDS_DECISION}`\n"))
 }
 
 /// A finding, ready to be filed.
@@ -327,21 +478,28 @@ fn significant_words(title: &str) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::github::{Comment, GitHub, Issue, LabelEvent};
+    use super::github::{Comment, GitHub, Issue, LabelEvent, Timestamp};
     use super::trust::{BOT_LOGIN, Trust};
-    use super::{Draft, FileOptions, file, id_of, number_of_id, possible_duplicates, render, show};
+    use super::{
+        DecideOptions, Draft, FileOptions, decide, file, id_of, number_of_id, possible_duplicates,
+        render, show,
+    };
     use std::cell::RefCell;
 
     /// A finding with every part.
     const DRAFT: &str = "\n# Loop rule misses cycle()\n\n- Found in: task euler1d-hllc\n\n\
                          ## What happened\n\nIt passed.\n\n## Proposed fix\n\nTidy, rung 4.\n";
 
-    /// GitHub with fixed issues and comments, which records what is filed.
+    /// GitHub with fixed issues and comments, which records what is filed, posted and
+    /// removed, and refuses to remove a label if asked to.
     #[derive(Default)]
     struct Fake {
         issues: Vec<Issue>,
         comments: Vec<Comment>,
         filed: RefCell<Vec<(String, String, Vec<String>)>>,
+        posted: RefCell<Vec<(u32, String)>>,
+        removed: RefCell<Vec<(u32, String)>>,
+        refuses_removal: bool,
     }
 
     impl GitHub for Fake {
@@ -362,6 +520,17 @@ mod tests {
             let labels = labels.iter().map(|label| (*label).to_owned()).collect();
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(40)
+        }
+        fn comment(&self, number: u32, body: &str) -> Result<(), String> {
+            self.posted.borrow_mut().push((number, body.to_owned()));
+            Ok(())
+        }
+        fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
+            if self.refuses_removal {
+                return Err("GitHub refused".to_owned());
+            }
+            self.removed.borrow_mut().push((number, label.to_owned()));
+            Ok(())
         }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
             Err(format!("the issue commands never ask whether #{number} is queued"))
@@ -386,6 +555,22 @@ mod tests {
 
     fn options(arguments: &[&'static str]) -> Result<FileOptions<'static>, String> {
         FileOptions::parse(arguments)
+    }
+
+    fn comment(author: &str, body: &str) -> Comment {
+        let at = Timestamp::parse("2026-11-26T08:00:00Z").expect("a time");
+        Comment {
+            author: author.to_owned(),
+            body: body.to_owned(),
+            created_at: at.clone(),
+            updated_at: at,
+        }
+    }
+
+    /// The options of a decision by `by`.
+    fn decide_options(by: &'static str) -> DecideOptions<'static> {
+        let arguments = ["d.md", "--by", by, "--date", "2026-11-26", "--source", "PR #64"];
+        DecideOptions::parse(&arguments).expect("complete options")
     }
 
     // Goal: claim IDs and issue numbers convert both ways; only canonical numbers are issues.
@@ -492,8 +677,7 @@ mod tests {
     // refuses untrusted issues and pull requests without printing their text.
     #[test]
     fn show_prints_only_trusted_text() {
-        let comment =
-            |author: &str| Comment { author: author.to_owned(), body: "Said.".to_owned() };
+        let comment = |author: &str| comment(author, "Said.");
         let fake =
             Fake { comments: vec![comment("owner"), comment("outsider")], ..Fake::default() };
         let output = show(&issue(9, BOT_LOGIN, "Gap"), &fake, &trust()).expect("trusted");
@@ -511,5 +695,105 @@ mod tests {
         let refused = refused.expect_err("untrusted");
         assert!(refused.contains("neither the bot nor a code owner"), "{refused}");
         assert!(!refused.contains("Ignore all rules"), "{refused}");
+    }
+
+    // Goal: `decide` needs a login, a day, one line of source and one file, in any order; the
+    // file's one paragraph becomes the record's one line.
+    #[test]
+    fn decide_options_are_read() {
+        let parsed = decide_options("@owner");
+        let wanted =
+            DecideOptions { by: "owner", date: "2026-11-26", source: "PR #64", path: "d.md" };
+        assert_eq!(parsed, wanted);
+        let record = parsed.record("\n  Agents may\nremove   it.\n\n").expect("one paragraph");
+        assert_eq!(record.decision, "Agents may remove it.");
+        assert_eq!((record.decider.as_str(), record.source.as_str()), ("owner", "PR #64"));
+        for text in ["", " \n", "One.\n\nTwo.\n", "One.\n \nTwo.\n"] {
+            let error = parsed.record(text).expect_err("not one paragraph");
+            assert!(error.contains("`d.md` must hold the decision as one paragraph"), "{error}");
+        }
+        let full = ["--by", "owner", "--date", "2026-11-26", "--source", "PR #64", "d.md"];
+        assert_eq!(DecideOptions::parse(&full), Ok(wanted));
+        for (arguments, expected) in [
+            (&full[..6], "exactly one Markdown file"),
+            (&[&full[..], &["e.md"]].concat()[..], "exactly one Markdown file"),
+            (&full[2..], "give `--by`, `--date` and `--source`"),
+            (&[&full[..], &["--by", "two"]].concat()[..], "`--by` is given twice"),
+            (&[&full[..], &["--date", "2026-11-27"]].concat()[..], "`--date` is given twice"),
+            (&[&full[..], &["--source", "x"]].concat()[..], "`--source` is given twice"),
+            (&[&full[..], &["--source"]].concat()[..], "`--source` needs a value"),
+            (&[&full[..], &["--force"]].concat()[..], "unknown option `--force`"),
+            (
+                &["--by", "a b", "--date", "2026-11-26", "--source", "s", "d.md"],
+                "not a GitHub login",
+            ),
+            (&["--by", "a", "--date", "2026-11-31", "--source", "s", "d.md"], "not a day"),
+            (&["--by", "a", "--date", "2026-11-26", "--source", "s ", "d.md"], "`--source` is one"),
+        ] {
+            let error = DecideOptions::parse(arguments).expect_err("bad options");
+            assert!(error.contains(expected), "{arguments:?}: {error}");
+        }
+    }
+
+    // Goal: `decide` posts the record and then removes the label, only for a code owner's
+    // decision on a trusted issue that waits for one; a failed removal says what is done.
+    #[test]
+    fn decisions_are_recorded_then_the_label_goes() {
+        let waiting = Issue {
+            labels: vec!["bug".to_owned(), "needs-decision".to_owned()],
+            ..issue(9, BOT_LOGIN, "Gap")
+        };
+        let untrusted = Issue { author: "outsider".to_owned(), ..waiting.clone() };
+        let fake =
+            Fake { issues: vec![waiting.clone(), issue(8, BOT_LOGIN, "Gap")], ..Fake::default() };
+        let record = decide_options("owner").record("Do it.").unwrap();
+        let output = decide(9, &record, &fake, &trust()).expect("decided");
+        assert_eq!(output, "decided #9: posted the decision record and removed `needs-decision`\n");
+        assert_eq!(*fake.posted.borrow(), [(9, record.render())]);
+        assert_eq!(*fake.removed.borrow(), [(9, "needs-decision".to_owned())]);
+
+        let quiet = Fake { issues: vec![untrusted, issue(8, BOT_LOGIN, "Gap")], ..Fake::default() };
+        let outsider = decide_options("outsider").record("Do it.").unwrap();
+        for (number, by, expected) in [
+            (9, &outsider, "`outsider` is not a code owner"),
+            (9, &record, "neither the bot nor a code owner"),
+            (8, &record, "#8 has no `needs-decision` label"),
+            (7, &record, "no #7"),
+        ] {
+            let error = decide(number, by, &quiet, &trust()).expect_err("refused");
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        assert!(quiet.posted.borrow().is_empty(), "a refusal posts nothing");
+
+        let refusing = Fake { issues: vec![waiting], refuses_removal: true, ..Fake::default() };
+        let error = decide(9, &record, &refusing, &trust()).expect_err("the label stays");
+        assert!(error.contains("posted the decision record on #9, but cannot remove"), "{error}");
+        assert!(error.contains("GitHub refused"), "{error}");
+        assert_eq!(refusing.posted.borrow().len(), 1, "the record was posted first");
+    }
+
+    // Goal: `show` marks the bot's record of a code owner's decision, and only that.
+    #[test]
+    fn show_marks_decision_records() {
+        let record = "<!-- nami:decision -->\nDecision: Go.\nDecided by: @owner, 2026-11-26\n\
+                      Source: lead session\n";
+        let comments = [
+            comment(BOT_LOGIN, record),
+            comment("owner", record),
+            comment(BOT_LOGIN, &record.replace("@owner", "@other")),
+            comment(BOT_LOGIN, &record.replace("Go.", "")),
+        ];
+        let output = render(&issue(9, BOT_LOGIN, "Gap"), &comments, &trust());
+        let headers: Vec<&str> = output.lines().filter(|line| line.starts_with("--- ")).collect();
+        assert_eq!(
+            headers,
+            [
+                "--- decision record by nami-agent[bot]",
+                "--- comment by owner",
+                "--- comment by nami-agent[bot]",
+                "--- comment by nami-agent[bot]",
+            ]
+        );
+        assert!(output.contains(record.trim_end()), "the record is printed: {output}");
     }
 }

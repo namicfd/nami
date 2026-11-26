@@ -598,6 +598,12 @@ mod tests {
         fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
             Err("not used".to_owned())
         }
+        fn comment(&self, _number: u32, _body: &str) -> Result<(), String> {
+            Err("not used".to_owned())
+        }
+        fn remove_label(&self, _number: u32, _label: &str) -> Result<(), String> {
+            Err("not used".to_owned())
+        }
         fn is_queued(&self, _number: u32) -> Result<bool, String> {
             Err("not used".to_owned())
         }

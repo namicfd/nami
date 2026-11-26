@@ -234,8 +234,9 @@ fn ready_issues(
     let mut left_out = Vec::new();
     for found in candidates {
         let id = issue::id_of(found.number);
-        // The cheap checks first: label events cost one request per issue.
-        if held.contains(id.as_str()) || trust::unworkable(found, &[], &trust).is_some() {
+        // The cheap checks first: label events cost one request per issue, and comments one
+        // more when the bot removed `needs-decision` last.
+        if held.contains(id.as_str()) || trust::unworkable(found, &[], &[], &trust).is_some() {
             continue;
         }
         match is_workable(github, found, &trust, repository.as_deref()) {
@@ -259,8 +260,8 @@ fn is_workable(
     trust: &trust::Trust,
     repository: Option<&str>,
 ) -> Result<bool, String> {
-    let events = github.label_events(found.number)?;
-    if trust::unworkable(found, &events, trust).is_some() {
+    let (events, comments) = issue::history(github, found.number)?;
+    if trust::unworkable(found, &events, &comments, trust).is_some() {
         return Ok(false);
     }
     Ok(queue_failure_hold(github, found, repository)?.is_none())
@@ -304,8 +305,8 @@ fn claim_issue(
     }
     let found = github.issue(number)?;
     let trust = trust::load(root, &format!("{remote}/main"))?;
-    let events = github.label_events(number)?;
-    if let Some(reason) = trust::unworkable(&found, &events, &trust) {
+    let (events, comments) = issue::history(github, number)?;
+    if let Some(reason) = trust::unworkable(&found, &events, &comments, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
     let repository = issue::github::repository_of(root, remote);
