@@ -170,7 +170,7 @@ pub fn run(event: &str) -> ExitCode {
     if let Err(error) = io::stdin().read_to_string(&mut payload) {
         eprintln!("hook {}: cannot read stdin: {error}", event.name());
         if event == Event::SessionStart {
-            // Unchecked is not a pass: stop the session, and exit 0 so that the stop is read.
+            // Unchecked is not a pass: report an error, and exit 0 so that the report is read.
             print!("{}", session_start_failed("reading the hook's input", &error.to_string()));
             return ExitCode::SUCCESS;
         }
@@ -700,15 +700,16 @@ fn stop_failed(attempts: Option<&Path>, stop_hook_active: bool, output_tail: &st
 }
 
 /// Session start. It always exits 0 once it has a report: Claude Code reads a hook's JSON only
-/// after exit 0, and a stop it does not read is no stop. Every problem is therefore a finding in
-/// the report, and every failure of the hook itself a fixed stop ([`session_start_failed`]).
+/// after exit 0, and a finding it does not read reaches no one. Every problem is therefore a
+/// finding in the report, and every failure of the hook itself a fixed error report
+/// ([`session_start_failed`]).
 fn session_start(root: Option<&Path>) -> ExitCode {
     let mut findings: Vec<github_login::Finding> =
         export_cargo_bin().err().map(|error| env_file_finding(&error)).into_iter().collect();
     let report = match doctor_within(root, DOCTOR_SECONDS_MAX) {
         Err(reason) => session_start_failed("the doctor", &reason),
         Ok(doctor) => {
-            // The login check fails closed: a panic in it is a finding that stops the session.
+            // The login check fails closed: a panic in it is an error finding, never a pass.
             findings.extend(github_login::checked(|| login_findings(root)));
             let output = std::panic::catch_unwind(|| session_start_output(&doctor, &findings));
             output
@@ -733,7 +734,7 @@ fn env_file_finding(error: &io::Error) -> github_login::Finding {
          make that file writable, then start a new session"
     );
     assert!(!message.contains('\n'), "a finding is one line");
-    github_login::Finding { severity: github_login::Severity::Stop, message }
+    github_login::Finding { severity: github_login::Severity::Error, message }
 }
 
 /// The login check of this session, with the real gh and environment.
@@ -812,23 +813,32 @@ fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
     reason
 }
 
-/// What session start prints when `stage` of it failed for `reason`: a stop, for the human and
-/// the agent, since the login check is not known to have passed.
+/// What session start prints when `stage` of it failed for `reason`: an error for the human and
+/// the agent, since the login check is not known to have passed. It asks for a stop, which
+/// Claude Code ignores at `SessionStart` (see [`session_start_output`]).
 fn session_start_failed(stage: &str, reason: &str) -> String {
     let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    let stop = format!(
-        "Session stopped: {stage} of the session-start hook failed ({reason}), so it is not \
-         known whether gh can reach a person's GitHub login (docs/operations/github-setup.md, \
-         step 6). Report it as a bug."
+    let message = format!(
+        "error[session-start]: {stage} failed ({reason}), so it is not known whether gh can \
+         reach a person's GitHub login; report it as a bug (docs/operations/github-setup.md, \
+         step 6)"
     );
-    let message =
-        format!("error[session-start]: {stage} failed ({reason}); the session is stopped");
-    let (stop, message) = (crate::json::quote(&stop), crate::json::quote(&message));
-    let output =
-        format!("{{\"continue\":false,\"stopReason\":{stop},\"systemMessage\":{message}}}\n");
-    assert!(output.lines().count() == 1, "the stop is one line of JSON");
+    let context = format!("{message}\n{UNSTOPPED_NOTE}");
+    let output = format!(
+        "{{\"continue\":false,\"stopReason\":{},\"systemMessage\":{},\"hookSpecificOutput\":\
+         {{\"hookEventName\":\"SessionStart\",\"additionalContext\":{}}}}}\n",
+        crate::json::quote(STOP_REASON),
+        crate::json::quote(&message),
+        crate::json::quote(&context)
+    );
+    assert!(output.lines().count() == 1, "the report is one line of JSON");
     output
 }
+
+/// What the agent is told after an error, since Claude Code does not stop the session for it.
+const UNSTOPPED_NOTE: &str = "note[session-start]: the errors above should stop this session, \
+                              but Claude Code ignores a stop at SessionStart (issue #75): run \
+                              no gh command in this session, and tell the human.";
 
 /// Seconds that the doctor may take (hook timeout: 120). Its commands are not bounded one by
 /// one; past this, the hook goes on without it.
@@ -839,20 +849,23 @@ const DOCTOR_SECONDS_MAX: u32 = 30;
 /// a check that runs out of time cannot tell, and says so, unless the keyring is in reach.
 const LOGIN_CHECK_SECONDS_MAX: u32 = 30;
 
-/// Why a session is stopped at its start, for the human.
-const STOP_REASON: &str = "Session stopped: the session-start hook found a problem that must be \
-                           fixed before an agent works here, such as a person's GitHub login in \
-                           reach of gh. Fix what it reports, then start a new session \
+/// The `stopReason` of a report with an error. Claude Code ignores the stop at `SessionStart`, so
+/// this text is shown only if a later version honours it (issue #75).
+const STOP_REASON: &str = "The session-start hook found a problem that must be fixed before an \
+                           agent works here, such as a person's GitHub login in reach of gh. \
+                           Fix what it reports, then start a new session \
                            (docs/operations/github-setup.md, step 6).";
 
 /// What the session-start hook prints. Claude Code adds plain stdout to the agent's context, so
 /// without a finding that is the doctor's findings, one per line. With one, it is a JSON
-/// object: every finding goes to the agent (`additionalContext`), the findings also go to
-/// the human (`systemMessage`), and a stop finding stops the session (`continue: false`).
+/// object: every finding goes to the agent (`additionalContext`) and to the human
+/// (`systemMessage`).
 ///
-/// A session start cannot be blocked otherwise, and the stop is kept for a login that gh does
-/// reach: the environment is the guard, and this check only proves that it holds. A check that
-/// cannot tell is reported and the session goes on, so that a new gh cannot halt every session.
+/// With an error, the object also asks for a stop (`continue: false`), and the agent is told
+/// what to do instead ([`UNSTOPPED_NOTE`]). Claude Code ignores the stop at `SessionStart`: its
+/// hooks reference calls the event "Context only ... No blocking or decision control", and a
+/// live check in PR #72 confirmed it. The environment is what keeps a stored login out; this
+/// check reports what it misses. Enforcing the verdict is issue #75.
 fn session_start_output(doctor: &[String], findings: &[github_login::Finding]) -> String {
     let mut context: Vec<&str> = doctor.iter().map(String::as_str).collect();
     if findings.is_empty() {
@@ -864,7 +877,10 @@ fn session_start_output(doctor: &[String], findings: &[github_login::Finding]) -
     }
     let human: Vec<&str> = findings.iter().map(|finding| finding.message.as_str()).collect();
     context.extend(&human);
-    let stops = findings.iter().any(|finding| finding.severity == github_login::Severity::Stop);
+    let stops = findings.iter().any(|finding| finding.severity == github_login::Severity::Error);
+    if stops {
+        context.push(UNSTOPPED_NOTE);
+    }
     let mut fields = Vec::new();
     if stops {
         fields.push(r#""continue":false"#.to_owned());
@@ -876,11 +892,11 @@ fn session_start_output(doctor: &[String], findings: &[github_login::Finding]) -
         crate::json::quote(&context.join("\n"))
     ));
     let output = format!("{{{}}}\n", fields.join(","));
-    // Claude Code ignores stdout that is not JSON, and a stop it cannot read is no stop.
+    // Claude Code ignores stdout that is not JSON, and a finding it cannot read reaches no one.
     let parsed = crate::json::parse(&output);
     let proceeds = parsed.as_ref().ok().and_then(|value| value.get("continue")?.as_bool());
     assert!(parsed.is_ok(), "the session-start output is JSON: {output}");
-    assert_eq!(proceeds, stops.then_some(false), "the output stops exactly for a stop finding");
+    assert_eq!(proceeds, stops.then_some(false), "the output asks for a stop exactly for an error");
     output
 }
 
@@ -1669,19 +1685,19 @@ mod tests {
 
     // Goal: without a login finding, session start prints the doctor's findings as plain lines;
     // with one, a JSON object that tells the agent everything and the human the login findings,
-    // and that stops the session only for a login in reach.
+    // and that asks for a stop, and tells the agent what to do instead, only for an error.
     #[test]
-    fn session_start_stops_only_for_a_login_in_reach() {
+    fn session_start_asks_for_a_stop_only_for_an_error() {
         use super::github_login::{Finding, Severity};
         use super::session_start_output;
         let doctor = vec!["error[doctor]: a".to_owned(), "error[doctor]: b".to_owned()];
         assert_eq!(session_start_output(&doctor, &[]), "error[doctor]: a\nerror[doctor]: b\n");
         assert_eq!(session_start_output(&[], &[]), "");
         let finding = |severity, message: &str| Finding { severity, message: message.to_owned() };
-        let unsure = [finding(Severity::Warn, "warning[gh-login]: \"odd\"")];
+        let unsure = [finding(Severity::Warning, "warning[gh-login]: \"odd\"")];
         let printed = session_start_output(&doctor, &unsure);
         let output = crate::json::parse(&printed).expect("the output is one JSON object");
-        assert!(output.get("continue").is_none(), "an unverified login does not stop: {printed}");
+        assert!(output.get("continue").is_none(), "a warning asks for no stop: {printed}");
         let message = output.get("systemMessage").and_then(crate::json::Value::as_str);
         assert_eq!(message, Some("warning[gh-login]: \"odd\""), "the human sees the finding");
         let specific = output.get("hookSpecificOutput").expect("the agent's part");
@@ -1690,33 +1706,40 @@ mod tests {
         let context = specific.get("additionalContext").and_then(crate::json::Value::as_str);
         let expected = "error[doctor]: a\nerror[doctor]: b\nwarning[gh-login]: \"odd\"";
         assert_eq!(context, Some(expected), "the agent sees every finding");
-        let both = [unsure[0].clone(), finding(Severity::Stop, "error[gh-login]: x")];
-        let stopping = session_start_output(&[], &both);
-        let stopped = crate::json::parse(&stopping).expect("the output is one JSON object");
-        let stop = stopped.get("continue").and_then(crate::json::Value::as_bool);
-        assert_eq!(stop, Some(false), "a login in reach stops the session: {stopping}");
-        let reason = stopped.get("stopReason").and_then(crate::json::Value::as_str);
+        let both = [unsure[0].clone(), finding(Severity::Error, "error[gh-login]: x")];
+        let erring = session_start_output(&[], &both);
+        let errors = crate::json::parse(&erring).expect("the output is one JSON object");
+        let stop = errors.get("continue").and_then(crate::json::Value::as_bool);
+        assert_eq!(stop, Some(false), "an error asks for a stop: {erring}");
+        let reason = errors.get("stopReason").and_then(crate::json::Value::as_str);
         assert_eq!(reason, Some(super::STOP_REASON));
-        let told = stopped.get("systemMessage").and_then(crate::json::Value::as_str);
+        let told = errors.get("systemMessage").and_then(crate::json::Value::as_str);
         assert_eq!(told, Some("warning[gh-login]: \"odd\"\nerror[gh-login]: x"));
+        let agent = errors.get("hookSpecificOutput").and_then(|part| part.get("additionalContext"));
+        let agent = agent.and_then(crate::json::Value::as_str).unwrap_or_default();
+        assert!(agent.ends_with(super::UNSTOPPED_NOTE), "the agent is told to run no gh: {agent}");
+        assert!(!context.unwrap_or_default().contains("note["), "a warning has no note");
     }
 
-    // Goal: what session start prints when a stage of it failed is a stop that Claude Code can
-    // read: one line of JSON with `continue: false`, naming the stage and the reason, on one
-    // line even if the reason spans several, for the human and in the stop reason.
+    // Goal: what session start prints when a stage of it failed is an error report that Claude
+    // Code can read: one line of JSON that names the stage and the reason, on one line even if
+    // the reason spans several, for the human and for the agent, with the note that tells the
+    // agent to run no gh command, since the stop it asks for is ignored.
     #[test]
-    fn a_failed_session_start_stops_the_session() {
+    fn a_failed_session_start_is_an_error_for_both() {
         let failed = super::session_start_failed("the doctor", "broken \"quoted\"\n  doctor");
         assert!(failed.ends_with("}\n") && failed.lines().count() == 1, "one line: {failed}");
-        let output = crate::json::parse(&failed).expect("the stop is JSON");
+        let output = crate::json::parse(&failed).expect("the report is JSON");
         let stop = output.get("continue").and_then(crate::json::Value::as_bool);
-        assert_eq!(stop, Some(false), "it stops the session: {failed}");
-        let told = output.get("systemMessage").and_then(crate::json::Value::as_str);
-        let expected = "error[session-start]: the doctor failed (broken \"quoted\" doctor); the \
-                        session is stopped";
-        assert_eq!(told, Some(expected), "{failed}");
-        let reason = output.get("stopReason").and_then(crate::json::Value::as_str).unwrap();
-        assert!(reason.contains("the doctor of the session-start hook failed (broken"), "{reason}");
+        assert_eq!(stop, Some(false), "it asks for a stop: {failed}");
+        let told = output.get("systemMessage").and_then(crate::json::Value::as_str).unwrap();
+        let start = "error[session-start]: the doctor failed (broken \"quoted\" doctor), so it is";
+        assert!(told.starts_with(start), "{told}");
+        let agent = output.get("hookSpecificOutput").and_then(|part| part.get("additionalContext"));
+        let agent = agent.and_then(crate::json::Value::as_str).unwrap();
+        assert_eq!(agent, format!("{told}\n{}", super::UNSTOPPED_NOTE), "the agent is told too");
+        let reason = output.get("stopReason").and_then(crate::json::Value::as_str);
+        assert_eq!(reason, Some(super::STOP_REASON));
     }
 
     // Goal: work that ends in time is returned, work that panics is its panic's message on one
@@ -1734,13 +1757,13 @@ mod tests {
         assert_eq!(super::doctor_within(None, 1), Ok(Vec::new()), "no checkout, no doctor");
     }
 
-    // Goal: an env file that cannot be extended is a stop finding that names the file's
+    // Goal: an env file that cannot be extended is an error finding that names the file's
     // variable and the error, on one line.
     #[test]
-    fn an_env_file_that_cannot_be_extended_stops_the_session() {
+    fn an_env_file_that_cannot_be_extended_is_an_error() {
         let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied\n here");
         let finding = super::env_file_finding(&error);
-        assert_eq!(finding.severity, super::github_login::Severity::Stop);
+        assert_eq!(finding.severity, super::github_login::Severity::Error);
         assert!(finding.message.contains("CLAUDE_ENV_FILE names (denied here)"), "{finding:?}");
     }
 }

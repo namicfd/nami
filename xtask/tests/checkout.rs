@@ -478,11 +478,11 @@ fn session_start_extends_path_and_reports_findings() {
     assert_eq!(fs::read_to_string(&env_file).unwrap(), export, "but only once");
 }
 
-// Goal: a session whose gh can reach a person's login is stopped at its start, and both the
-// human and the agent are told why. Method: the fake gh on the hook's `PATH` answers like a gh
-// with a stored login while `gh-login` exists in the checkout.
+// Goal: a session whose gh can reach a person's login gets an error at its start, for both the
+// human and the agent, and a request to stop. Method: the fake gh on the hook's `PATH` answers
+// like a gh with a stored login while `gh-login` exists in the checkout.
 #[test]
-fn session_start_stops_a_session_with_a_person_s_gh_login() {
+fn session_start_reports_a_person_s_gh_login() {
     let scratch = Scratch::new("session-start-gh-login");
     scratch.write("gh-login", "");
     let payload = format!(r#"{{"session_id":"s1","cwd":"{}"}}"#, scratch.root().display());
@@ -494,19 +494,23 @@ fn session_start_stops_a_session_with_a_person_s_gh_login() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let printed = xtask::json::parse(&stdout).expect("the hook prints one JSON object");
     let stop = printed.get("continue").and_then(xtask::json::Value::as_bool);
-    assert_eq!(stop, Some(false), "the session is stopped: {stdout}");
+    assert_eq!(stop, Some(false), "a stop is asked for, though Claude Code ignores it: {stdout}");
     let told = printed.get("systemMessage").and_then(xtask::json::Value::as_str).unwrap();
     assert!(told.starts_with("error[gh-login]: `gh auth status` without GH_TOKEN"), "{told}");
     assert!(told.contains("account human"), "the human learns whose login it is: {told}");
     let specific = printed.get("hookSpecificOutput").expect("the agent's part");
     let context = specific.get("additionalContext").and_then(xtask::json::Value::as_str).unwrap();
     assert!(context.starts_with("error[doctor]: "), "the doctor's findings stay: {context}");
-    assert!(context.ends_with(told), "and the agent is told too: {context}");
+    assert!(context.contains(told), "and the agent is told too: {context}");
+    assert!(
+        context.ends_with("run no gh command in this session, and tell the human."),
+        "{context}"
+    );
 }
 
-/// The `continue` field and the `systemMessage` of what session start printed, and its exit
-/// code, which must be 0 for Claude Code to read the JSON at all.
-fn session_start_stop(output: Output) -> (Option<bool>, String) {
+/// The `continue` field and the `systemMessage` of what session start printed, after checking
+/// its exit code, which must be 0 for Claude Code to read the JSON at all.
+fn session_start_report(output: Output) -> (Option<bool>, String) {
     assert_eq!(output.status.code(), Some(0), "Claude Code reads JSON only after exit 0");
     let stdout = String::from_utf8(output.stdout).expect("the hook prints UTF-8");
     let printed = xtask::json::parse(&stdout).expect("the hook prints one JSON object");
@@ -516,11 +520,11 @@ fn session_start_stop(output: Output) -> (Option<bool>, String) {
 }
 
 // Goal: an env file that session start cannot extend does not turn the hook's exit code into a
-// failure that hides its JSON: the hook exits 0, and stops the session for both the env file
+// failure that hides its JSON: the hook exits 0, with an error for both the env file
 // and a personal token. Method: the reviewer's case, a read-only CLAUDE_ENV_FILE and a fake
 // `ghp_` token in GH_TOKEN.
 #[test]
-fn session_start_stops_with_exit_0_when_the_env_file_is_read_only() {
+fn session_start_reports_with_exit_0_when_the_env_file_is_read_only() {
     let scratch = Scratch::new("session-start-read-only");
     let env_file = scratch.directory.join("env");
     fs::write(&env_file, "").expect("the scratch directory is writable");
@@ -531,19 +535,20 @@ fn session_start_stops_with_exit_0_when_the_env_file_is_read_only() {
         ("NAMI_SESSION_PATH", Path::new("/usr/bin:/bin")),
         ("GH_TOKEN", Path::new("ghp_notarealtokenxyz")),
     ];
-    let (stop, told) = session_start_stop(scratch.hook("session-start", &payload, &environment));
-    assert_eq!(stop, Some(false), "the session is stopped: {told}");
+    let (stop, told) = session_start_report(scratch.hook("session-start", &payload, &environment));
+    assert_eq!(stop, Some(false), "a stop is asked for: {told}");
     assert!(told.contains("error[gh-login]: GH_TOKEN holds a classic personal"), "{told}");
     assert!(told.contains("error[session-start]: cannot add `$HOME/.cargo/bin`"), "{told}");
     assert!(!told.contains("notarealtoken"), "the token is never shown: {told}");
 }
 
-// Goal: a session-start payload that cannot be read stops the session with exit 0, and names
+// Goal: a session-start payload that cannot be read is an error, with exit 0, that names
 // the stage that failed. Method: bytes that are not UTF-8 on stdin.
 #[test]
-fn session_start_stops_when_its_input_cannot_be_read() {
+fn session_start_reports_an_input_it_cannot_read() {
     let scratch = Scratch::new("session-start-bad-input");
-    let (stop, told) = session_start_stop(scratch.hook_bytes("session-start", &[0xff, 0xfe], &[]));
+    let (stop, told) =
+        session_start_report(scratch.hook_bytes("session-start", &[0xff, 0xfe], &[]));
     assert_eq!(stop, Some(false), "unchecked is not a pass: {told}");
     assert!(told.starts_with("error[session-start]: reading the hook's input failed"), "{told}");
 }
