@@ -750,7 +750,7 @@ fn env_file_finding(error: &io::Error) -> github_login::Finding {
         ),
         remedy: "make that file writable, end this session, and start a new one".to_owned(),
     };
-    assert!(finding.is_well_formed(), "{finding:?}");
+    assert!(finding.is_well_formed(), "the env-file finding is well formed");
     finding
 }
 
@@ -760,12 +760,14 @@ fn doctor_panic_finding(reason: &str) -> github_login::Finding {
     let finding = github_login::Finding {
         severity: github_login::Severity::Warning,
         topic: github_login::Topic::Doctor,
-        message: format!(
-            "warning[doctor]: the doctor failed ({reason}), so the tools are unchecked"
+        // The panic's message goes to the human alone: an assertion message may hold anything.
+        message: "warning[doctor]: the doctor failed, so the tools are unchecked".to_owned(),
+        remedy: format!(
+            "it failed with \"{reason}\"; report it as a bug; `cargo xtask doctor` checks the \
+             tools by hand"
         ),
-        remedy: "report it as a bug; `cargo xtask doctor` checks the tools by hand".to_owned(),
     };
-    assert!(finding.is_well_formed(), "{finding:?}");
+    assert!(finding.is_well_formed(), "the doctor finding is well formed");
     finding
 }
 
@@ -840,7 +842,7 @@ fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
         .map(String::as_str)
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("a panic without a message");
-    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ").replace('"', "'");
     assert!(!reason.contains('\n'), "the reason is one line");
     reason
 }
@@ -849,16 +851,17 @@ fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
 /// the agent, since the login check is not known to have passed. It asks for a stop, which
 /// Claude Code ignores at `SessionStart` (see [`session_start_output`]).
 fn session_start_failed(stage: &str, reason: &str) -> String {
-    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ").replace('"', "'");
+    // The reason goes to the human alone: a panic's message may hold anything.
     let message = format!(
-        "error[session-start]: {stage} failed ({reason}), so it is not known whether gh can \
-         reach a person's GitHub login"
+        "error[session-start]: {stage} failed, so it is not known whether gh can reach a \
+         person's GitHub login"
     );
     let human = format!(
-        "{message}. For the human: report it as a bug, and end this session \
-         (docs/operations/github-setup.md, step 6).\n{HUMAN_UNSTOPPED_NOTE}"
+        "{message}. For the human: it failed with \"{reason}\"; report it as a bug, and end \
+         this session (docs/operations/github-setup.md, step 6).\n{HUMAN_UNSTOPPED_NOTE}"
     );
-    let context = format!("{message}\n{AGENT_GH_LOGIN_NOTE}");
+    let context = format!("{message}\n{AGENT_FAILED_NOTE}");
     let output = format!(
         "{{\"continue\":false,\"stopReason\":{},\"systemMessage\":{},\"hookSpecificOutput\":\
          {{\"hookEventName\":\"SessionStart\",\"additionalContext\":{}}}}}\n",
@@ -877,6 +880,14 @@ const AGENT_GH_LOGIN_NOTE: &str = "note[gh-login] for the agent: do not run gh w
                                    stop and ask if that script fails, and tell the human about \
                                    the gh-login findings above. Claude Code does not stop this \
                                    session for them (issue #75).";
+
+/// What the agent is told when the session-start hook itself failed ([`session_start_failed`]).
+const AGENT_FAILED_NOTE: &str = "note[session-start] for the agent: the session-start hook \
+                                 failed, so a person's GitHub login in reach of gh is not ruled \
+                                 out. Do not run gh without the bot-token prefix \
+                                 (`GH_TOKEN=$(xtask/agent-token.sh) gh ...`), stop and ask if \
+                                 that script fails, and tell the human that the hook failed. \
+                                 Claude Code does not stop this session for it (issue #75).";
 
 /// What the agent is told when `$HOME/.cargo/bin` could not be put on the session's `PATH`.
 const AGENT_CARGO_PATH_NOTE: &str = "note[session-start] for the agent: `$HOME/.cargo/bin` is \
@@ -909,8 +920,9 @@ const STOP_REASON: &str = "The session-start hook found a problem that must be f
 /// What the session-start hook prints. Claude Code adds plain stdout to the agent's context, so
 /// without a finding that is the doctor's findings, one per line. With one, it is a JSON
 /// object. The agent gets each finding's message, and one note per topic that says what it
-/// should do ([`AGENT_GH_LOGIN_NOTE`], [`AGENT_CARGO_PATH_NOTE`]); no other text tells it to do
-/// anything. The human gets each message with its remedy.
+/// should do ([`AGENT_GH_LOGIN_NOTE`], [`AGENT_CARGO_PATH_NOTE`]). No other text about gh or
+/// the session start tells it to do anything; the doctor's own findings do, about tools. The
+/// human gets each message with its remedy.
 ///
 /// With an error, the object also asks for a stop (`continue: false`), and the human is told
 /// that the session keeps running ([`HUMAN_UNSTOPPED_NOTE`]). Claude Code ignores the stop at
@@ -1816,7 +1828,7 @@ mod tests {
         let (human, agent) = human_and_agent(&report);
         for expected in [
             "error[session-start]: cannot add `$HOME/.cargo/bin`",
-            "warning[doctor]: the doctor failed (doctor broke)",
+            "warning[doctor]: the doctor failed, so the tools are unchecked",
             "error[gh-login]: GH_TOKEN holds a test token",
             super::AGENT_GH_LOGIN_NOTE,
             super::AGENT_CARGO_PATH_NOTE,
@@ -1824,6 +1836,8 @@ mod tests {
             assert!(agent.contains(expected), "the agent is told {expected:?}: {agent}");
         }
         assert!(human.contains("For the human: unset it."), "{human}");
+        assert!(human.contains("it failed with \"doctor broke\""), "the human gets why: {human}");
+        assert!(!agent.contains("doctor broke"), "the agent does not: {agent}");
         let clean = super::session_start_report(Ok(()), Ok(Vec::new()), Vec::new);
         assert_eq!(clean, "", "nothing to report");
     }
@@ -1842,11 +1856,12 @@ mod tests {
         let reason = output.get("stopReason").and_then(crate::json::Value::as_str);
         assert_eq!(reason, Some(super::STOP_REASON));
         let (human, agent) = human_and_agent(&failed);
-        let message = "error[session-start]: the report failed (broken \"quoted\" report), so it \
-                       is not known whether gh can reach a person's GitHub login";
-        assert!(human.starts_with(&format!("{message}. For the human: ")), "{human}");
+        let message = "error[session-start]: the report failed, so it is not known whether gh \
+                       can reach a person's GitHub login";
+        let why = "For the human: it failed with \"broken 'quoted' report\"";
+        assert!(human.starts_with(&format!("{message}. {why}")), "{human}");
         assert!(human.ends_with(super::HUMAN_UNSTOPPED_NOTE), "{human}");
-        assert_eq!(agent, format!("{message}\n{}", super::AGENT_GH_LOGIN_NOTE));
+        assert_eq!(agent, format!("{message}\n{}", super::AGENT_FAILED_NOTE));
     }
 
     // Goal: work that ends in time is returned, work that panics is its panic's message on one
