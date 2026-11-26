@@ -626,8 +626,12 @@ fn fold_add_assign_into_the_item(values: &[f64]) -> f64 {
     })
 }
 
-// Reported: a difference fold that returns a parameter changed through a `&mut` borrow, an
-// autoref or a call that takes `&mut`. Only `parameter = parameter` may change a selection.
+// Reported: a difference fold that changes a parameter through a `&mut` borrow, an autoref or
+// a call that takes `&mut`. Three of these fire even without the mutation guard, because the
+// update is itself a difference with the accumulator that is not only compared: the `mut`
+// parameter, the item field and the `SubAssign::sub_assign` path call. The reborrow, the
+// `mem::replace`, the `&mut self` method and the `reduce` cases fire only because of the
+// guard (checked by deleting it).
 struct Point {
     x: f64,
 }
@@ -697,6 +701,41 @@ fn reduce_sub_assign_through_a_reborrow(values: &[f64]) -> Option<f64> {
         let place = &mut total;
         place.sub_assign(value);
         total
+    })
+}
+
+// Reported only because of one branch of the mutation guard each (checked by deleting the
+// branch): the closure is a compared difference that returns a parameter, and nothing else
+// rules the exemption out.
+//
+// `shrink` takes `self` by value, so its signature has no `&mut`. Method lookup finds the
+// implementation for `&mut f64` and borrows `total` mutably by autoref, an adjustment that
+// only `is_mutably_adjusted` sees.
+trait Shrink {
+    fn shrink(self, by: f64);
+}
+
+impl Shrink for &mut f64 {
+    fn shrink(self, by: f64) {
+        *self -= by;
+    }
+}
+
+fn fold_sub_through_an_autoref_by_value(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |mut total, &value| {
+        if total - value > 1.0e300 {}
+        total.shrink(value);
+        total
+    })
+}
+
+// A call through a `fn` pointer does not resolve to a known function, so it may change
+// anything.
+fn fold_sub_with_a_fn_pointer_call(values: &[f64], step: fn(f64) -> f64) -> f64 {
+    values.iter().fold(f64::INFINITY, |best, &value| {
+        if value - best < 0.0 {}
+        let _stepped = step(value);
+        best
     })
 }
 
@@ -783,6 +822,31 @@ fn rfold_min_shifted(values: &[f64], shift: f64) -> f64 {
 
 fn try_rfold_max(values: &[f64]) -> Option<f64> {
     values.iter().try_rfold(f64::NEG_INFINITY, |greatest, &value| Some(greatest.max(value)))
+}
+
+// Not reported: an argmin returned inside an enum variant, a tuple or a struct, which the
+// selection exemption looks through.
+struct Pair {
+    first: f64,
+    second: f64,
+}
+
+fn try_fold_argmin_in_some(values: &[f64]) -> Option<f64> {
+    values
+        .iter()
+        .try_fold(f64::INFINITY, |best, &value| Some(if value - best < 0.0 { value } else { best }))
+}
+
+fn fold_argmin_through_a_tuple_field(values: &[f64]) -> f64 {
+    values.iter().fold(f64::INFINITY, |best, &value| {
+        if value - best < 0.0 { (value, best).0 } else { (best, value).0 }
+    })
+}
+
+fn fold_argmin_through_a_struct_field(values: &[f64]) -> f64 {
+    values.iter().fold(f64::INFINITY, |best, &value| {
+        Pair { first: if value - best < 0.0 { value } else { best }, second: value }.first
+    })
 }
 
 // Not reported: an argmin or argmax, where the accumulator is subtracted only in the condition,

@@ -65,6 +65,9 @@
 //! - The selection exemption, by design: a closure that only compares differences with the
 //!   accumulator and returns only its parameters, without changing them, passes. It takes the
 //!   difference only to choose a parameter, so it carries no sum into the accumulator.
+//! - An accumulator bound by `ref` and read through a dereference (`|ref total, &value|
+//!   *total + value`) is not seen: the operand is `*total`, not a path to the accumulator.
+//!   The base lint misses it too.
 //! - `Sum::sum` and `Product::product` called directly, and a `sum` whose result type is a
 //!   generic parameter, are not seen.
 //! - An integration test is recognised by its path, `tests/` below the package root. A test
@@ -268,6 +271,16 @@ struct Found<'tcx> {
     combination: Combination,
 }
 
+/// Upper bound on the ancestors that `lies_within` walks: deeper than any nesting the
+/// compiler accepts.
+const ANCESTORS_MAX: usize = 100_000;
+
+/// True if the node `id` is `ancestor` or lies below it in the HIR.
+fn lies_within(tcx: TyCtxt<'_>, id: HirId, ancestor: HirId) -> bool {
+    id == ancestor
+        || tcx.hir_parent_iter(id).take(ANCESTORS_MAX).any(|(parent, _)| parent == ancestor)
+}
+
 /// The operand rule: every sum or difference in `body`, closures nested in it included, that
 /// has the accumulator (a binding of the first parameter) as an operand.
 fn sums_with_accumulator<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) -> Vec<Found<'tcx>> {
@@ -276,13 +289,13 @@ fn sums_with_accumulator<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) -
     };
     let accumulators = bindings(accumulator.pat);
     assert!(
-        accumulators.iter().all(|binding| binding.owner == body.value.hir_id.owner),
-        "the accumulator is a binding of the fold's closure"
+        accumulators.iter().all(|&binding| lies_within(cx.tcx, binding, accumulator.hir_id)),
+        "every accumulator binding lies in the first parameter of the fold's closure"
     );
     let mut finder = AdditionFinder { cx, accumulators, sums: Vec::new() };
     finder.visit_expr(body.value);
     assert!(
-        finder.sums.iter().all(|sum| sum.expression.hir_id.owner == body.value.hir_id.owner),
+        finder.sums.iter().all(|sum| lies_within(cx.tcx, sum.expression.hir_id, body.value.hir_id)),
         "every sum found lies in the body of the fold's closure"
     );
     finder.sums
@@ -577,7 +590,7 @@ fn is_compared(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> bool {
 /// once and only as a direct operand of a comparison (`let gain = value - best; if gain > ..`).
 fn is_compared_sum<'tcx>(tcx: TyCtxt<'tcx>, body: &'tcx Body<'tcx>, sum: &Expr<'_>) -> bool {
     assert!(
-        sum.hir_id.owner == body.value.hir_id.owner,
+        lies_within(tcx, sum.hir_id, body.value.hir_id),
         "the sum lies in the body of the fold's closure"
     );
     if is_compared(tcx, sum) {

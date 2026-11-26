@@ -755,7 +755,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:646:19
+  --> $DIR/float_reduction.rs:650:19
    |
 LL |       values.iter().fold(0.0, |mut total, &value| {
    |  ___________________^
@@ -767,7 +767,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:655:28
+  --> $DIR/float_reduction.rs:659:28
    |
 LL |       values.iter().copied().fold(0.0, |total, mut value| {
    |  ____________________________^
@@ -778,7 +778,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:663:23
+  --> $DIR/float_reduction.rs:667:23
    |
 LL |       points.iter_mut().fold(0.0, |total, item: &mut Point| {
    |  _______________________^
@@ -789,7 +789,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:671:28
+  --> $DIR/float_reduction.rs:675:28
    |
 LL |       values.iter().copied().fold(0.0, |mut total, value| {
    |  ____________________________^
@@ -800,7 +800,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:679:28
+  --> $DIR/float_reduction.rs:683:28
    |
 LL |       values.iter().copied().fold(0.0, |total, mut value| {
    |  ____________________________^
@@ -811,7 +811,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:687:19
+  --> $DIR/float_reduction.rs:691:19
    |
 LL |       values.iter().fold(0.0, |mut total, &value| {
    |  ___________________^
@@ -822,7 +822,7 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:695:28
+  --> $DIR/float_reduction.rs:699:28
    |
 LL |       values.iter().copied().reduce(|mut total, value| {
    |  ____________________________^
@@ -834,7 +834,29 @@ LL | |     })
    | |______^
 
 error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
-  --> $DIR/float_reduction.rs:716:19
+  --> $DIR/float_reduction.rs:725:19
+   |
+LL |       values.iter().fold(0.0, |mut total, &value| {
+   |  ___________________^
+LL | |         if total - value > 1.0e300 {}
+LL | |         total.shrink(value);
+LL | |         total
+LL | |     })
+   | |______^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:735:19
+   |
+LL |       values.iter().fold(f64::INFINITY, |best, &value| {
+   |  ___________________^
+LL | |         if value - best < 0.0 {}
+LL | |         let _stepped = step(value);
+LL | |         best
+LL | |     })
+   | |______^
+
+error: naive float sum; use `kernels::reduce::sum_fixed`, or `sum_compensated` for conservation totals (ADR-0005)
+  --> $DIR/float_reduction.rs:755:19
    |
 LL |       values.iter().fold(0.0, |best, &value| {
    |  ___________________^
@@ -845,5 +867,5 @@ LL | |         } else {
 LL | |     })
    | |______^
 
-error: aborting due to 93 previous errors
+error: aborting due to 95 previous errors
 
