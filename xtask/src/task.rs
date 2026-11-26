@@ -333,11 +333,12 @@ fn claim_issue(
     Ok(format!("claimed {id}\nread it with `cargo xtask issue show {number}`, {work}\n"))
 }
 
-/// The PR that `found` reports as failed in the merge queue, if the bot filed it with the
-/// title that `cargo xtask queue failed` gives (ADR-0021, point 6).
+/// The PR that `found` reports as failed in the merge queue, if the bot or the CI app filed it
+/// with the title that `cargo xtask queue failed` gives (ADR-0021, point 6; ADR-0023).
 fn queue_failure_pull(found: &Issue) -> Option<u32> {
     let entry = queue::failure::entry_of_title(&found.title);
-    entry.map(|(pull, _)| pull).filter(|_| found.author == trust::BOT_LOGIN)
+    let by_filer = [trust::BOT_LOGIN, trust::CI_LOGIN].contains(&found.author.as_str());
+    entry.map(|(pull, _)| pull).filter(|_| by_filer)
 }
 
 /// Why agents may not work on the queue-failure issue `found` now, or `None` if they may or it

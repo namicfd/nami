@@ -464,6 +464,30 @@ fn a_humans_failed_pull_request_is_held_without_the_label() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+// Goal: a queue-failure issue that the CI app filed waits for its fix like the bot's, and is
+// claimed for the PR's own branch; any other issue by the CI app is neither listed nor
+// claimable (ADR-0023).
+#[test]
+fn the_ci_apps_queue_failures_wait_like_the_bots() {
+    let (root, clone) = setup("queue-failures-ci");
+    push_code_owners(&clone);
+    let failure = Issue { author: "nami-ci[bot]".to_owned(), ..queue_failure(3, 900) };
+    let listed = format!("a\tTask a\nissue-3\t{}\n", failure.title);
+    let other = issue(5, "nami-ci[bot]", &["bug"]);
+    let mut github = Fake { issues: vec![failure, other, pull_45("Fixes #3")], ..Fake::default() };
+    let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
+    assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "#3 waits, #5 is out");
+    let refused = task(&github, &["claim", "issue-3"]).expect_err("it waits");
+    assert!(refused.contains("#45 says `Fixes #3`: the fix is in flight"), "{refused}");
+    let untrusted = task(&github, &["claim", "issue-5"]).expect_err("not a queue failure");
+    assert!(untrusted.contains("`nami-ci[bot]`, whom agents trust only"), "{untrusted}");
+    github.issues[2].body = "Summary.".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok(listed), "no fix in flight: work for an agent");
+    let claimed = task(&github, &["claim", "issue-3"]).expect("work for an agent");
+    assert!(claimed.contains("fix it on #45's own branch"), "{claimed}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
 // Goal: a second failed run of the same PR is new work. Its issue is ready while the PR says
 // `Fixes` only for the first one, and waits too once the PR closes both (ADR-0021, point 6).
 #[test]
