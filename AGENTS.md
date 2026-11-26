@@ -152,8 +152,10 @@ The authoritative list is `.github/CODEOWNERS`.
   `main`.
 - **You act as `nami-agent[bot]`.** In Claude Code, `.claude/settings.json` already makes git
   commit and push as the bot, so use plain commands: `git push origin <branch>`. Prefix gh with
-  `GH_TOKEN=$(xtask/agent-token.sh)`. Without it, gh fails with "To get started with GitHub
-  CLI, please run: gh auth login", because sessions see no human login. If a push or token is
+  `GH_TOKEN=$(xtask/agent-token.sh)`. Without it, gh usually fails with "To get started with
+  GitHub CLI, please run: gh auth login", because sessions see no stored human login. On a Mac
+  whose gh login is in the keychain, which no setting hides, gh without the prefix still acts
+  as that human; the session-start report then shows an `error[gh-login]`. If a push or token is
   refused, stop and ask. Never use a human's credentials (`docs/operations/github-setup.md`,
   step 6).
 - **Write files with the Write tool, never with a shell heredoc.** A heredoc that ends early
