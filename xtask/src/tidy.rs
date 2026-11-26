@@ -18,7 +18,7 @@ pub mod cli;
 pub(crate) mod docs;
 #[cfg(test)]
 mod fixtures;
-mod lints;
+pub(crate) mod lints;
 mod manifest;
 pub mod registry;
 mod rules_doc;

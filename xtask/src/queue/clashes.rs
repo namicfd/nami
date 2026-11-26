@@ -55,21 +55,28 @@ fn adr_name(path: &str) -> Option<&str> {
     adr_number(name).map(|_| name)
 }
 
+/// True if the file's paths, before and after, are relative to the repository root.
+fn is_relative(file: &PullFile) -> bool {
+    !file.path.starts_with('/')
+        && file.previous.as_deref().is_none_or(|path| !path.starts_with('/'))
+}
+
 /// The ADR file names that a pull request's `files` bring in: added, copied, or renamed to.
 #[must_use]
 pub fn added_adrs(files: &[PullFile]) -> BTreeSet<String> {
+    assert!(files.iter().all(is_relative), "GitHub gives a PR's paths from the repository root");
     let added: BTreeSet<String> = files
         .iter()
         .filter(|file| matches!(file.status.as_str(), "added" | "copied" | "renamed"))
         .filter_map(|file| adr_name(&file.path).map(str::to_owned))
         .collect();
-    assert!(added.len() <= files.len(), "each added ADR is one file");
     added
 }
 
 /// The ADR file names that a pull request's `files` take away: removed, or renamed from.
 #[must_use]
 pub fn removed_adrs(files: &[PullFile]) -> BTreeSet<String> {
+    assert!(files.iter().all(is_relative), "GitHub gives a PR's paths from the repository root");
     let removed: BTreeSet<String> = files
         .iter()
         .filter_map(|file| match file.status.as_str() {
@@ -79,7 +86,6 @@ pub fn removed_adrs(files: &[PullFile]) -> BTreeSet<String> {
         })
         .filter_map(|path| adr_name(path).map(str::to_owned))
         .collect();
-    assert!(removed.len() <= files.len(), "each removed ADR is one file");
     removed
 }
 
@@ -117,9 +123,7 @@ pub fn clashes(
 #[must_use]
 pub fn next_free<'names>(names: impl IntoIterator<Item = &'names String>) -> u32 {
     let highest = names.into_iter().filter_map(|name| adr_number(name)).max();
-    let next = highest.map_or(0, |highest| highest + 1);
-    assert!(next <= 10_000, "ADR numbers have four digits");
-    next
+    highest.map_or(0, |highest| highest + 1)
 }
 
 /// The comment for a pull request with `clashes`, which names the next free number.
@@ -207,6 +211,19 @@ mod tests {
             names(&["0022-a.md", "0023-b.md", "0024-c.md", "0032-h.md"])
         );
         assert_eq!(removed_adrs(&files), names(&["0006-e.md", "0021-b.md"]));
+    }
+
+    // Goal: a path from the filesystem's root, before or after a rename, is not GitHub's and
+    // stops the check.
+    #[test]
+    fn absolute_paths_are_refused() {
+        let absolute = [file("/docs/design/0001-a.md", "added", None)];
+        let renamed = [file("docs/design/0002-b.md", "renamed", Some("/docs/design/0001-b.md"))];
+        for files in [&absolute[..], &renamed[..]] {
+            let added = std::panic::catch_unwind(|| added_adrs(files));
+            let removed = std::panic::catch_unwind(|| removed_adrs(files));
+            assert!(added.is_err() && removed.is_err(), "{files:?}");
+        }
     }
 
     // Goal: a number that main keeps or another PR adds under another file name is a clash; the
