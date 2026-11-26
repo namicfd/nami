@@ -28,6 +28,10 @@ const HEADING_PROTECTED: &str = "## Protected files";
 /// The section of a PR description that lists the issues the work filed (ADR-0021).
 const HEADING_FOLLOW_UPS: &str = "## Follow-up issues";
 
+/// How the attribution line starts that Claude Code appends to every PR description it writes.
+/// The line is not part of the section it lands in, which is the template's last (issue #18).
+const ATTRIBUTION_PREFIX: &str = "🤖 Generated with";
+
 /// The prefix of a branch that works on a task or a claimed issue (ADR-0011).
 const TASK_BRANCH_PREFIX: &str = "task/";
 
@@ -137,15 +141,37 @@ pub fn protected_paths(patterns: &[Pattern], changed: &[String]) -> Vec<String> 
 
 /// The lines of the section of `body` under `heading`, or `None` if there is no such heading.
 ///
-/// HTML comments and blank lines are left out. The section ends at the next `#` or `##` heading.
+/// HTML comments, blank lines and thematic breaks (`---`) are left out, so they neither count
+/// as content nor end the section: what follows them is still checked. So are the attribution
+/// lines at the end of the section, after its last other line; an attribution line in the
+/// middle is content. The section ends at the next `#` or `##` heading.
 #[must_use]
 pub fn section(body: &str, heading: &str) -> Option<Vec<String>> {
     let visible = without_comments(body);
     let mut lines = visible.lines().map(str::trim).skip_while(|line| *line != heading);
     let _heading = lines.next()?;
     let is_next_section = |line: &&str| line.starts_with("# ") || line.starts_with("## ");
-    let content = lines.take_while(|line| !is_next_section(line)).filter(|line| !line.is_empty());
-    Some(content.map(str::to_owned).collect())
+    let is_filler = |line: &&str| line.is_empty() || is_thematic_break(line);
+    let mut content: Vec<String> = lines
+        .take_while(|line| !is_next_section(line))
+        .filter(|line| !is_filler(line))
+        .map(str::to_owned)
+        .collect();
+    let footer_start = content
+        .iter()
+        .rposition(|line| !line.starts_with(ATTRIBUTION_PREFIX))
+        .map_or(0, |last| last + 1);
+    content.truncate(footer_start);
+    assert!(
+        content.last().is_none_or(|line| !line.starts_with(ATTRIBUTION_PREFIX)),
+        "the trailing attribution lines are cut off"
+    );
+    Some(content)
+}
+
+/// True for a line of three or more `-` and nothing else.
+fn is_thematic_break(line: &str) -> bool {
+    line.len() >= 3 && line.chars().all(|character| character == '-')
 }
 
 /// Removes HTML comments. A comment that is never closed runs to the end of the text.
@@ -193,6 +219,15 @@ fn follow_up_problems(
         && is_none(line)
     {
         return Vec::new();
+    }
+    if let [first, second, ..] = lines
+        && is_none(first)
+    {
+        return vec![format!(
+            "the section `{HEADING_FOLLOW_UPS}` says `None` and then `{second}`; write only \
+             `None` there and move the rest to another section, or list each issue that this \
+             work filed with `cargo xtask issue file`, as `#<number>`, without `None`"
+        )];
     }
     let numbers = issue_numbers(&lines.join("\n"));
     if numbers.is_empty() {
@@ -597,7 +632,8 @@ mod tests {
     }
 
     // Goal: a section is the text between its heading and the next `#` or `##` heading, without
-    // blank lines and comments; a heading inside a comment does not count.
+    // blank lines, comments, `---` lines and the attribution line; a heading inside a comment
+    // does not count, and a `---` line does not end the section.
     #[test]
     fn sections_are_cut_out_of_the_body() {
         let body = "# Title\n## A\n\none\n<!-- hidden\n## B\n-->\n### Detail\n two \n## B\nthree\n";
@@ -609,6 +645,11 @@ mod tests {
         assert_eq!(section("## A\n<!-- only a comment -->\n", "## A"), Some(Vec::new()));
         assert_eq!(section("## A\none <!-- open\ntwo\n", "## A"), Some(paths(&["one"])));
         assert_eq!(section("## A and more\none\n", "## A"), None);
+        assert_eq!(section("## A\none\n---\ntwo\n", "## A"), Some(paths(&["one", "two"])));
+        assert_eq!(section("## A\n-----\n", "## A"), Some(Vec::new()));
+        assert_eq!(section("## A\none\n--\n", "## A"), Some(paths(&["one", "--"])));
+        let attribution = "## A\n🤖 Generated with [Claude Code](x)\n";
+        assert_eq!(section(attribution, "## A"), Some(Vec::new()));
     }
 
     // Goal: a complete description has no problems, and each problem is one line in the
@@ -636,16 +677,83 @@ mod tests {
         }
     }
 
+    // Goal: the attribution line that Claude Code appends to a PR description, and a `---` line
+    // before it, are not part of the last section (issue #18): they neither count as content
+    // nor make an empty section pass.
+    #[test]
+    fn attribution_is_not_part_of_the_section() {
+        let footer = "🤖 Generated with [Claude Code](https://claude.com/claude-code)";
+        let passing = [
+            format!("\nNone.\n\n{footer}"),
+            format!("\nNone.\n\n---\n\n{footer}"),
+            format!("\n- #12\n\n{footer}"),
+            format!("- #12\n---\n{footer}"),
+            "---\n- #12".to_owned(),
+        ];
+        for follow_ups in passing {
+            let body = body_with_follow_ups(&follow_ups);
+            assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+        }
+        let more_footers = format!("None.\n{footer}\n\n---\n<!-- end -->\n{footer}\n");
+        let body = body_with_follow_ups(&more_footers);
+        assert_eq!(check_body(&body, &[], "work", exists), Vec::<String>::new(), "{body}");
+        let failing = [format!("\n{footer}"), format!("\n---\n\n{footer}"), "---".to_owned()];
+        for follow_ups in failing {
+            let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
+            assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
+            assert!(problems[0].contains("names no issue; write `None`, or"), "{problems:?}");
+        }
+    }
+
+    // Goal: only the attribution lines at the end of a section are left out; one in the middle
+    // is content and is checked like any other line.
+    #[test]
+    fn attribution_in_the_middle_is_content() {
+        let middle = "🤖 Generated with #3";
+        assert_eq!(
+            section(&format!("## A\n- #12\n{middle}\n- #13\n"), "## A"),
+            Some(paths(&["- #12", middle, "- #13"]))
+        );
+        let follow_ups = format!("- #12\n{middle}\n- #13");
+        let problems = check_body(&body_with_follow_ups(&follow_ups), &[], "work", exists);
+        assert_eq!(problems.len(), 2, "#3 and #13 are checked: {problems:?}");
+        assert!(problems[0].contains("#3, listed under"), "{problems:?}");
+        assert!(problems[1].contains("#13, listed under"), "{problems:?}");
+        let after_none = format!("None.\n{middle}\n---\nA footer.");
+        let none_problems = check_body(&body_with_follow_ups(&after_none), &[], "work", exists);
+        assert_eq!(none_problems.len(), 1, "{none_problems:?}");
+        let expected = format!("says `None` and then `{middle}`;");
+        assert!(none_problems[0].contains(&expected), "{none_problems:?}");
+    }
+
+    // Goal: `None` followed by more text is reported as such, not as a section that names no
+    // issue, and the message names the extra line. A `---` line between them hides nothing,
+    // and an issue after `None` does not make the section pass, not even a follow-up issue.
+    #[test]
+    fn none_with_more_text_names_the_extra_line() {
+        let cases = [
+            ("None\nNone", "None"),
+            ("None.\n\nA footer.", "A footer."),
+            ("None.\n---\nSee #99", "See #99"),
+            ("None.\n\n---\n\n- #12", "- #12"),
+        ];
+        for (follow_ups, extra) in cases {
+            let problems = check_body(&body_with_follow_ups(follow_ups), &[], "work", exists);
+            assert_eq!(problems.len(), 1, "`{follow_ups}`: {problems:?}");
+            let expected = format!("says `None` and then `{extra}`;");
+            assert!(problems[0].contains(&expected), "{problems:?}");
+        }
+    }
+
     // Goal: anything else must name follow-up issues as `#<number>`. Method: text without a
-    // number, a number only inside a comment or with a leading zero, `None` with more text, and
-    // numbers that are not follow-up issues, each reported once.
+    // number, a number only inside a comment or with a leading zero, and numbers that are not
+    // follow-up issues, each reported once.
     #[test]
     fn follow_ups_must_name_follow_up_issues() {
         let no_issue = [
             "",
             "N/A",
             "None so far, but see below.",
-            "None\nNone",
             "<!-- #12 -->",
             "#",
             "#012",
