@@ -196,8 +196,21 @@ pub struct Failure {
 /// The title of the issue for PR `pull`. Re-runs find an open issue by this exact title.
 #[must_use]
 pub fn title(pull: u32) -> String {
-    format!("PR #{pull} failed in the merge queue")
+    format!("{TITLE_PREFIX}{pull}{TITLE_SUFFIX}")
 }
+
+/// The PR that a queue-failure issue's title names, or `None` for any other title.
+#[must_use]
+pub fn pull_of_title(title: &str) -> Option<u32> {
+    let number = title.strip_prefix(TITLE_PREFIX)?.strip_suffix(TITLE_SUFFIX)?;
+    canonical_number(number)
+}
+
+/// What a queue-failure issue's title says before the PR's number.
+const TITLE_PREFIX: &str = "PR #";
+
+/// What a queue-failure issue's title says after the PR's number.
+const TITLE_SUFFIX: &str = " failed in the merge queue";
 
 /// The finding for `failure`, in the format of `cargo xtask issue file`. Its text is fixed,
 /// apart from numbers, the repository name and names from `vocabulary`.
@@ -293,11 +306,13 @@ fn proposed_fix(pull: u32, by_bot: bool) -> String {
          shows up there. Two ADRs with one number are the usual case; renumber #{pull}'s ADR: \
          its file name, its `# ADR-NNNN:` title, its row in `docs/design/README.md` and every \
          reference (ADR-0000). Push to #{pull}'s branch, add `Fixes #<this issue>` to #{pull}'s \
-         description, and add #{pull} to the merge queue again; its merge closes this issue. If \
-         #{pull} passes as it is, re-queue it the same way. A push dismisses an approval, so if \
-         #{pull} changes protected paths, it needs the code owner again. If #{pull} is already \
-         back in the queue and says `Fixes #<this issue>`, someone else is on it: release the \
-         claim.\n"
+         description, and add #{pull} to the merge queue again. If #{pull} passes as it is, \
+         re-queue it the same way. A push dismisses an approval, so if #{pull} changes protected \
+         paths, it needs the code owner again. Keep the claim: this issue closes when #{pull} \
+         merges, or when a human closes it. While #{pull} is open and says `Fixes #<this \
+         issue>`, queued or not, its fix is in flight: take no new work from this issue and \
+         push nothing to #{pull}. A claim on this issue is stale only if #{pull} has had no \
+         push since the claim and does not say `Fixes #<this issue>`.\n"
     )
 }
 
@@ -373,6 +388,21 @@ mod tests {
             "gh-readonly-queue/main/pr-51".to_owned(),
         ] {
             assert_eq!(queue_entry(&bad), None, "{bad}");
+        }
+    }
+
+    // Goal: a queue-failure title names its PR and round-trips; any other title names none.
+    #[test]
+    fn titles_name_their_pull_request() {
+        assert_eq!(super::pull_of_title(&title(51)), Some(51));
+        for other in [
+            "PR #51 failed in the merge queue!",
+            "PR #051 failed in the merge queue",
+            "PR # failed in the merge queue",
+            "Re: PR #51 failed in the merge queue",
+            "PR #51 failed",
+        ] {
+            assert_eq!(super::pull_of_title(other), None, "{other}");
         }
     }
 
@@ -465,6 +495,10 @@ mod tests {
             "- Job `gate` failed at another step ([log]",
             "Its log could not be read.",
             "Rebase or renumber, then re-queue, on #51's own branch (ADR-0021, point 6).",
+            "Keep the claim: this issue closes when #51 merges, or when a human closes it.",
+            "While #51 is open and says `Fixes #<this issue>`, queued or not, its fix is in \
+             flight",
+            "stale only if #51 has had no push since the claim",
             "add `Fixes #<this issue>` to #51's description",
         ] {
             assert!(text.contains(part), "{part}\n---\n{text}");

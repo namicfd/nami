@@ -55,29 +55,41 @@ fn adr_name(path: &str) -> Option<&str> {
     adr_number(name).map(|_| name)
 }
 
-/// True if the file's paths, before and after, are relative to the repository root.
-fn is_relative(file: &PullFile) -> bool {
-    !file.path.starts_with('/')
-        && file.previous.as_deref().is_none_or(|path| !path.starts_with('/'))
+/// GitHub gives a PR's paths from the repository root. A path from the filesystem's root,
+/// before or after a rename, means the data is not what this check understands.
+fn check_relative(files: &[PullFile]) -> Result<(), String> {
+    let absolute = files.iter().find(|file| {
+        file.path.starts_with('/')
+            || file.previous.as_deref().is_some_and(|path| path.starts_with('/'))
+    });
+    match absolute {
+        Some(file) => Err(format!("GitHub sent the absolute path `{}` for a PR's file", file.path)),
+        None => Ok(()),
+    }
 }
 
 /// The ADR file names that a pull request's `files` bring in: added, copied, or renamed to.
-#[must_use]
-pub fn added_adrs(files: &[PullFile]) -> BTreeSet<String> {
-    assert!(files.iter().all(is_relative), "GitHub gives a PR's paths from the repository root");
-    let added: BTreeSet<String> = files
+///
+/// # Errors
+///
+/// When a path is absolute.
+pub fn added_adrs(files: &[PullFile]) -> Result<BTreeSet<String>, String> {
+    check_relative(files)?;
+    Ok(files
         .iter()
         .filter(|file| matches!(file.status.as_str(), "added" | "copied" | "renamed"))
         .filter_map(|file| adr_name(&file.path).map(str::to_owned))
-        .collect();
-    added
+        .collect())
 }
 
 /// The ADR file names that a pull request's `files` take away: removed, or renamed from.
-#[must_use]
-pub fn removed_adrs(files: &[PullFile]) -> BTreeSet<String> {
-    assert!(files.iter().all(is_relative), "GitHub gives a PR's paths from the repository root");
-    let removed: BTreeSet<String> = files
+///
+/// # Errors
+///
+/// When a path is absolute.
+pub fn removed_adrs(files: &[PullFile]) -> Result<BTreeSet<String>, String> {
+    check_relative(files)?;
+    Ok(files
         .iter()
         .filter_map(|file| match file.status.as_str() {
             "removed" => Some(file.path.as_str()),
@@ -85,8 +97,7 @@ pub fn removed_adrs(files: &[PullFile]) -> BTreeSet<String> {
             _ => None,
         })
         .filter_map(|path| adr_name(path).map(str::to_owned))
-        .collect();
-    removed
+        .collect())
 }
 
 /// The clashes of the ADRs that a pull request adds (`own`) with the ADRs on main that it keeps
@@ -208,21 +219,21 @@ mod tests {
         ];
         assert_eq!(
             added_adrs(&files),
-            names(&["0022-a.md", "0023-b.md", "0024-c.md", "0032-h.md"])
+            Ok(names(&["0022-a.md", "0023-b.md", "0024-c.md", "0032-h.md"]))
         );
-        assert_eq!(removed_adrs(&files), names(&["0006-e.md", "0021-b.md"]));
+        assert_eq!(removed_adrs(&files), Ok(names(&["0006-e.md", "0021-b.md"])));
     }
 
     // Goal: a path from the filesystem's root, before or after a rename, is not GitHub's and
-    // stops the check.
+    // is an error that names it.
     #[test]
     fn absolute_paths_are_refused() {
         let absolute = [file("/docs/design/0001-a.md", "added", None)];
         let renamed = [file("docs/design/0002-b.md", "renamed", Some("/docs/design/0001-b.md"))];
         for files in [&absolute[..], &renamed[..]] {
-            let added = std::panic::catch_unwind(|| added_adrs(files));
-            let removed = std::panic::catch_unwind(|| removed_adrs(files));
-            assert!(added.is_err() && removed.is_err(), "{files:?}");
+            let added = added_adrs(files).expect_err("an absolute path");
+            assert!(added.starts_with("GitHub sent the absolute path `"), "{added}");
+            assert_eq!(removed_adrs(files), Err(added), "{files:?}");
         }
     }
 

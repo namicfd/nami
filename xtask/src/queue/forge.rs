@@ -54,6 +54,8 @@ pub struct Run {
     pub head_branch: String,
     /// The commit it tested.
     pub head_sha: String,
+    /// The workflow file it ran, such as `.github/workflows/ci.yml`.
+    pub path: String,
     /// When it was created, as GitHub writes it: `2026-11-26T08:24:28Z`, which sorts by time.
     pub created_at: String,
 }
@@ -238,6 +240,7 @@ pub fn run_from_json(value: &Value) -> Result<Run, String> {
         conclusion: (!conclusion.is_empty()).then_some(conclusion),
         head_branch: string_at(value, &["head_branch"])?,
         head_sha: string_at(value, &["head_sha"])?,
+        path: string_at(value, &["path"])?,
         created_at,
     })
 }
@@ -513,9 +516,11 @@ mod tests {
         let text = r#"{"id": 45782890699, "workflow_id": 429670223, "event": "merge_group",
             "conclusion": "failure", "head_branch": "gh-readonly-queue/main/pr-51-abc",
             "head_sha": "abc", "created_at": "2026-11-26T08:24:28Z",
+            "path": ".github/workflows/ci.yml",
             "html_url": "https://github.com/o/r/actions/runs/7"}"#;
         let run = run_from_json(&parse(text).unwrap()).expect("a run");
         assert_eq!((run.id, run.workflow_id), (45_782_890_699, 429_670_223));
+        assert_eq!(run.path, ".github/workflows/ci.yml");
         assert_eq!(run.event, "merge_group");
         assert_eq!(run.conclusion.as_deref(), Some("failure"));
         assert_eq!(

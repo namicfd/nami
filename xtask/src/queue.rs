@@ -101,18 +101,17 @@ fn check_clashes(
     comment: bool,
 ) -> Result<String, String> {
     let files = forge.pull_files(pull)?;
-    let own = clashes::added_adrs(&files);
+    let own = clashes::added_adrs(&files)?;
     let main = forge.adr_names_on(MAIN)?;
     let mut others = Vec::new();
     if !own.is_empty() {
         for other in forge.open_pulls()? {
             if other.number != pull && trust.is_trusted(&other.author) {
-                others.push((other.number, clashes::added_adrs(&forge.pull_files(other.number)?)));
+                others.push((other.number, clashes::added_adrs(&forge.pull_files(other.number)?)?));
             }
         }
     }
-    assert!(others.iter().all(|(other, _)| *other != pull), "a PR does not clash with itself");
-    let found = clashes::clashes(&own, &main, &clashes::removed_adrs(&files), &others);
+    let found = clashes::clashes(&own, &main, &clashes::removed_adrs(&files)?, &others);
     let next = clashes::next_free(
         main.iter().chain(own.iter()).chain(others.iter().flat_map(|(_, names)| names.iter())),
     );
@@ -178,7 +177,16 @@ fn file_failure(
     run: u64,
 ) -> Result<String, String> {
     let details = forge.run(run)?;
-    assert_eq!(details.id, run, "GitHub answers for the run that was asked for");
+    if details.id != run {
+        return Err(format!("GitHub answered with run {} when asked for run {run}", details.id));
+    }
+    if details.path != failure::CI_WORKFLOW {
+        return Ok(format!(
+            "run {run} is a run of `{}`, not of {}; nothing to file\n",
+            details.path,
+            failure::CI_WORKFLOW
+        ));
+    }
     if details.event != "merge_group" || details.conclusion.as_deref() != Some("failure") {
         return Ok(format!("run {run} is not a failed merge-queue run; nothing to file\n"));
     }
@@ -214,7 +222,8 @@ fn file_failure(
     assert_eq!(draft.title, title, "the issue carries the title that re-runs look for");
     let by_bot = report.author == BOT_LOGIN;
     let options = FileOptions { kind: "bug", needs_decision: !by_bot, new: true, path: "-" };
-    issue::file(&draft, &options, github, trust)
+    let number = issue::file_number(&draft, &options, github, trust)?;
+    Ok(format!("filed #{number}: {title}\n"))
 }
 
 /// Why PR `entry.pull` has not left the queue for good after run `details`, or `None` if it
@@ -267,8 +276,14 @@ fn failed_jobs(
     let mut jobs = Vec::new();
     for job in forge.jobs(run)? {
         if matches!(job.conclusion.as_deref(), Some("failure" | "timed_out")) {
-            let codes =
-                forge.job_log(job.id).ok().map(|log| failure::codes_in_log(&log, vocabulary));
+            let codes = match forge.job_log(job.id) {
+                Ok(log) => Some(failure::codes_in_log(&log, vocabulary)),
+                Err(error) => {
+                    // For the CI log only: the issue says that the log could not be read.
+                    eprintln!("queue: cannot read the log of job {}: {error}", job.id);
+                    None
+                }
+            };
             jobs.push(FailedJob { job, codes });
         }
     }
@@ -318,7 +333,7 @@ mod tests {
         "conclusion": "failure",
         "head_branch": "gh-readonly-queue/main/pr-51-4810c28ee35a856141e571ce289397ef5975eef0",
         "head_sha": "0123456789abcdef0123456789abcdef01234567",
-        "created_at": "2026-11-26T08:24:28Z",
+        "created_at": "2026-11-26T08:24:28Z", "path": ".github/workflows/ci.yml",
         "html_url": "https://github.com/o/r/actions/runs/900"}"#;
 
     /// `gh api repos/o/r/actions/runs/<id>/jobs`: two failed jobs, one with names that `main`
@@ -373,7 +388,8 @@ mod tests {
         format!(
             "{{\"id\": {id}, \"workflow_id\": {workflow}, \"event\": \"merge_group\", \
              \"conclusion\": null, \"head_branch\": \"gh-readonly-queue/main/pr-{pull}-{SHA}\", \
-             \"head_sha\": \"{SHA}\", \"created_at\": \"{created_at}\"}}\n"
+             \"head_sha\": \"{SHA}\", \"created_at\": \"{created_at}\", \
+             \"path\": \".github/workflows/ci.yml\"}}\n"
         )
     }
 
@@ -604,7 +620,7 @@ mod tests {
     fn a_pull_request_that_dropped_out_gets_an_issue() {
         let fake = dropped();
         let output = run(&fake, &["failed", "--run", "900"]).expect("filed");
-        assert!(output.starts_with("filed #70: PR #51 failed in the merge queue\n"), "{output}");
+        assert_eq!(output, "filed #70: PR #51 failed in the merge queue\n", "no PR to list it in");
         let filed = fake.filed.borrow();
         assert_eq!(filed.len(), 1);
         let (title, body, labels) = &filed[0];
@@ -671,6 +687,24 @@ mod tests {
             + &queue_run(904, 42, "2026-11-26T08:20:00Z", 51);
         let fake = Fake { queue_runs: unrelated, ..dropped() };
         assert!(run(&fake, &["failed", "--run", "900"]).unwrap().starts_with("filed #70"));
+    }
+
+    // Goal: only a run of `ci.yml` counts, so a workflow that a PR adds under the name `ci`
+    // files nothing; an answer about another run than the one asked for is an error.
+    #[test]
+    fn only_runs_of_ci_count() {
+        let renamed = RUN.replace(".github/workflows/ci.yml", ".github/workflows/mine.yml");
+        let fake = Fake { run: renamed, ..dropped() };
+        let output = run(&fake, &["failed", "--run", "900"]).unwrap();
+        assert_eq!(
+            output,
+            "run 900 is a run of `.github/workflows/mine.yml`, not of .github/workflows/ci.yml; \
+             nothing to file\n"
+        );
+        assert!(fake.filed.borrow().is_empty());
+        let other = Fake { run: RUN.replace("\"id\": 900", "\"id\": 901"), ..dropped() };
+        let error = run(&other, &["failed", "--run", "900"]).expect_err("another run");
+        assert_eq!(error, "GitHub answered with run 901 when asked for run 900");
     }
 
     // Goal: a re-run finds the bot's open issue by its title and files nothing; runs that are

@@ -253,12 +253,28 @@ impl Draft {
 }
 
 /// Files `draft`, unless a trusted open issue may already record it.
-pub(crate) fn file(
+fn file(
     draft: &Draft,
     options: &FileOptions<'_>,
     github: &dyn GitHub,
     trust: &Trust,
 ) -> Result<String, String> {
+    let number = file_number(draft, options, github, trust)?;
+    Ok(format!(
+        "filed #{number}: {}\nlist it as #{number} under `## Follow-up issues` in the PR \
+         description\n",
+        draft.title
+    ))
+}
+
+/// Files `draft` like [`file`], and returns the new issue's number. CI files this way: it has
+/// no PR description to list the issue in.
+pub(crate) fn file_number(
+    draft: &Draft,
+    options: &FileOptions<'_>,
+    github: &dyn GitHub,
+    trust: &Trust,
+) -> Result<u32, String> {
     let open = github.open_issues()?;
     let duplicates = possible_duplicates(&draft.title, &open, trust);
     if !duplicates.is_empty() && !options.new {
@@ -275,12 +291,7 @@ pub(crate) fn file(
     if options.needs_decision {
         labels.push(NEEDS_DECISION);
     }
-    let number = github.create(&draft.title, &draft.body, &labels)?;
-    Ok(format!(
-        "filed #{number}: {}\nlist it as #{number} under `## Follow-up issues` in the PR \
-         description\n",
-        draft.title
-    ))
+    github.create(&draft.title, &draft.body, &labels)
 }
 
 /// The trusted open issues whose titles share at least half of the significant words of
