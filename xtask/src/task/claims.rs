@@ -2,12 +2,21 @@
 //!
 //! A claim is the file `claims/<task-id>` on the remote branch `claims`. Claiming builds a commit
 //! on top of the branch's current tip with git plumbing (a private index, no working-tree
-//! changes) and pushes it. Git rejects a push that is not a fast-forward, so when two agents
-//! claim at once exactly one push wins; the other refetches and finds the task taken.
+//! changes) and pushes it with a lease on the tip it was built on. Git rejects that push if the
+//! branch moved, so when two agents claim at once exactly one push wins; the other refetches and
+//! finds the task taken.
+//!
+//! What git push prints or returns never decides a claim: after every push the branch is
+//! refetched, and the claim is ours if and only if the remote's tip is our commit or descends
+//! from it. Two sessions of the bot share one identity, and git times are whole seconds, so two
+//! claims built on one tip in the same second would be the same commit (#32). So every claim
+//! commit carries a nonce, which makes "the remote holds our commit" mean "our push landed".
 
 use std::fmt;
+use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The branch that holds the claims.
 pub const BRANCH: &str = "claims";
@@ -15,8 +24,16 @@ pub const BRANCH: &str = "claims";
 /// The local ref the claims branch is fetched into.
 const LOCAL_REF: &str = "refs/nami/claims";
 
-/// Attempts before giving up when other claims keep landing first.
-const PUSH_ATTEMPTS_MAX: u32 = 8;
+/// Attempts before giving up when other claims keep landing first, or the remote keeps
+/// rejecting the push.
+pub const PUSH_ATTEMPTS_MAX: u32 = 8;
+
+/// The pause before each attempt, in milliseconds: none before the first, then doubling, so
+/// that a claim outlasts another push holding the remote's ref lock (about 2.4 s in all).
+const PAUSES_MILLISECONDS: [u64; 8] = [0, 25, 50, 100, 200, 400, 800, 800];
+
+/// Unique tokens this process has made (for commit nonces and index names): part of each.
+static TOKENS_MADE: AtomicU32 = AtomicU32::new(0);
 
 /// One claimed task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,29 +121,53 @@ pub fn list(root: &Path, tip: Option<&str>) -> Result<Vec<Claim>, ClaimError> {
 
 /// Claims `task` for `holder`, retrying while other claims land first.
 ///
+/// `commit_environment` is set only for the `git commit-tree` that builds the claim commit:
+/// its author, committer and dates (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`). The CLI passes none, so
+/// the commit takes them from the process; tests pin them to make two claims look alike.
+///
 /// # Errors
 ///
 /// Fails if the task is already claimed, or if git fails.
-pub fn claim(root: &Path, remote: &str, task: &str, holder: &str) -> Result<(), ClaimError> {
+pub fn claim(
+    root: &Path,
+    remote: &str,
+    commit_environment: &[(&str, &str)],
+    task: &str,
+    holder: &str,
+) -> Result<(), ClaimError> {
     assert!(!task.is_empty() && !task.contains('/'), "task ids are single path components");
     assert!(!holder.trim().is_empty(), "a claim names its holder");
-    update(root, remote, task, Some(holder))
+    update(root, remote, commit_environment, task, Some(holder))
 }
 
-/// Releases the claim on `task`.
+/// Releases the claim on `task`. `commit_environment` is as for [`claim`].
 ///
 /// # Errors
 ///
 /// Fails if the task is not claimed, or if git fails.
-pub fn release(root: &Path, remote: &str, task: &str) -> Result<(), ClaimError> {
+pub fn release(
+    root: &Path,
+    remote: &str,
+    commit_environment: &[(&str, &str)],
+    task: &str,
+) -> Result<(), ClaimError> {
     assert!(!task.is_empty() && !task.contains('/'), "task ids are single path components");
-    update(root, remote, task, None)
+    update(root, remote, commit_environment, task, None)
 }
 
 /// Adds (`Some(holder)`) or removes (`None`) the claim file and pushes the result.
-fn update(root: &Path, remote: &str, task: &str, holder: Option<&str>) -> Result<(), ClaimError> {
+fn update(
+    root: &Path,
+    remote: &str,
+    commit_environment: &[(&str, &str)],
+    task: &str,
+    holder: Option<&str>,
+) -> Result<(), ClaimError> {
     let mut last_error = String::new();
-    for _ in 0..PUSH_ATTEMPTS_MAX {
+    let mut attempts = 0_u32;
+    for pause in PAUSES_MILLISECONDS {
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+        attempts += 1;
         let tip = fetch(root, remote)?;
         let current = list(root, tip.as_deref())?;
         let existing = current.iter().find(|claim| claim.task == task);
@@ -135,24 +176,117 @@ fn update(root: &Path, remote: &str, task: &str, holder: Option<&str>) -> Result
             (None, None) => return Err(ClaimError::NotClaimed),
             (Some(_), None) | (None, Some(_)) => {}
         }
-        let commit = commit_change(root, tip.as_deref(), task, holder)?;
-        let refspec = format!("{commit}:refs/heads/{BRANCH}");
-        match git(root, &["push", "--quiet", remote, &refspec], &[], None) {
-            Ok(_) => return Ok(()),
-            // Another claim landed first: refetch and try again. Any other failure (no
-            // network, no permission) will not go away by retrying.
-            Err(ClaimError::Git(message)) if message.contains("rejected") => last_error = message,
-            Err(other) => return Err(other),
+        let commit = commit_change(root, commit_environment, tip.as_deref(), task, holder)?;
+        match push(root, remote, &commit, tip.as_deref())? {
+            Pushed::Landed => return Ok(()),
+            // Another claim landed first, or the remote rejected the push: try again.
+            Pushed::Lost(reason) => last_error = reason,
         }
     }
+    assert_eq!(attempts, PUSH_ATTEMPTS_MAX, "one attempt per pause");
     Err(ClaimError::Git(format!(
-        "the claims branch kept moving; gave up after {PUSH_ATTEMPTS_MAX} attempts: {last_error}"
+        "gave up after {PUSH_ATTEMPTS_MAX} attempts. The remote may be refusing the claim push \
+         (check its hooks, branch protection and permissions), other claims kept landing \
+         first, or another push still holds the remote's ref lock; then retrying later may \
+         work. The last attempt: {last_error}"
     )))
+}
+
+/// What a push of a claim commit did.
+#[derive(Debug, PartialEq, Eq)]
+enum Pushed {
+    /// The remote's branch holds our commit: we won.
+    Landed,
+    /// The branch does not hold our commit, and git said why: the summary and git's stderr.
+    Lost(String),
+}
+
+/// Pushes `commit` to the claims branch if the branch is still at `tip` (`None`: if it does not
+/// exist yet). Whether it landed is decided by what the remote holds afterwards, not by git's
+/// output or exit code: a push can land and still fail, when the remote dies after updating the
+/// branch. If the branch cannot be read back (no network, a dead remote), that is an error that
+/// says the claim may be held. If it can, but git reported nothing on our refspec, that is an
+/// error too.
+fn push(root: &Path, remote: &str, commit: &str, tip: Option<&str>) -> Result<Pushed, ClaimError> {
+    // With a lease that matches, `--force-with-lease` is a forced push: the lease is the only
+    // check, and git does not require a fast-forward. It is safe only because the commit's
+    // parent is the lease's tip, so the forced update is a fast-forward all the same; the
+    // assertion keeps it so. The lease names that tip (empty: the branch must not exist yet).
+    let parents = git(root, &["log", "-1", "--format=%P", commit], &[], None)?;
+    assert_eq!(
+        parents.trim(),
+        tip.unwrap_or_default(),
+        "a claim commit's only parent is the tip its lease names (none on an empty branch), so \
+         the forced push cannot drop another claim"
+    );
+    let lease = format!("--force-with-lease=refs/heads/{BRANCH}:{}", tip.unwrap_or_default());
+    let refspec = format!("{commit}:refs/heads/{BRANCH}");
+    let mut command = Command::new("git");
+    let _ = command.args(["push", "--porcelain", &lease, remote, &refspec]);
+    let _ = command.current_dir(root).stdin(Stdio::null());
+    let output = run(command, None)
+        .map_err(|error| ClaimError::Git(format!("cannot run git push {remote}: {error}")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let held = fetch(root, remote).and_then(|now| match now {
+        Some(now) => is_ancestor(root, commit, &now),
+        None => Ok(false),
+    });
+    let held = held.map_err(|error| {
+        ClaimError::Git(format!(
+            "the claim push may have landed, so the claim may be held, but the claims branch \
+             cannot be read back: {error}. Check with `cargo xtask task status`. git push said: \
+             {stderr}"
+        ))
+    })?;
+    if held {
+        return Ok(Pushed::Landed);
+    }
+    match retry_reason(&String::from_utf8_lossy(&output.stdout), &refspec) {
+        Some(summary) => Ok(Pushed::Lost(format!("{summary}: {stderr}"))),
+        None => Err(ClaimError::Git(format!("git push {remote} {refspec} did not land: {stderr}"))),
+    }
+}
+
+/// Whether the remote's claims branch, fetched at `tip`, is `commit` or has it as an ancestor.
+/// The nonce makes `commit` unique, so if the branch holds it, it was our push.
+fn is_ancestor(root: &Path, commit: &str, tip: &str) -> Result<bool, ClaimError> {
+    assert!(!commit.is_empty() && !tip.is_empty(), "both commits are named");
+    let mut command = Command::new("git");
+    let _ = command.args(["merge-base", "--is-ancestor", commit, tip]);
+    let _ = command.current_dir(root).stdin(Stdio::null());
+    let output = run(command, None)
+        .map_err(|error| ClaimError::Git(format!("cannot run git merge-base: {error}")))?;
+    // Exit 0: an ancestor; exit 1: not one; anything else: git failed.
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(ClaimError::Git(format!(
+            "git merge-base --is-ancestor {commit} {tip}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// Reads what `git push --porcelain` said about `refspec`, when the remote does not hold our
+/// commit: the line is `<flag> TAB <refspec> TAB <summary>`. Returns the summary if retrying
+/// can help: `!`, any rejection (git's reasons vary across versions, and a racing update that
+/// holds the remote's ref lock reads like a refusal), or `=`, up to date, which the nonce makes
+/// impossible unless the remote misreports. `None` if git did not report on `refspec`.
+fn retry_reason(porcelain: &str, refspec: &str) -> Option<String> {
+    assert!(refspec.contains(':'), "a refspec names its source and destination");
+    let (flag, summary) = porcelain.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        let (flag, reference, summary) = (fields.next()?, fields.next()?, fields.next()?);
+        (reference == refspec).then_some((flag, summary))
+    })?;
+    matches!(flag, "!" | "=").then(|| summary.to_owned())
 }
 
 /// Builds a commit on `tip` with the claim file added or removed, using a private index.
 fn commit_change(
     root: &Path,
+    commit_environment: &[(&str, &str)],
     tip: Option<&str>,
     task: &str,
     holder: Option<&str>,
@@ -160,7 +294,7 @@ fn commit_change(
     let index = private_index(root, task)?;
     let index_text = index.to_string_lossy().into_owned();
     let environment = [("GIT_INDEX_FILE", index_text.as_str())];
-    let result = build_commit(root, &environment, tip, task, holder);
+    let result = build_commit(root, &environment, commit_environment, tip, task, holder);
     let removed = std::fs::remove_file(&index);
     // A failed build reports its own error; it may have failed before the index existed.
     let commit = result?;
@@ -172,6 +306,7 @@ fn commit_change(
 fn build_commit(
     root: &Path,
     environment: &[(&str, &str)],
+    commit_environment: &[(&str, &str)],
     tip: Option<&str>,
     task: &str,
     holder: Option<&str>,
@@ -185,25 +320,49 @@ fn build_commit(
         let blob = git(root, &["hash-object", "-w", "--stdin"], &[], Some(&content))?;
         let entry = format!("100644,{},{path}", blob.trim());
         let _ = git(root, &["update-index", "--add", "--cacheinfo", &entry], environment, None)?;
-        format!("Claim {task}\n\n{holder}\n")
+        format!("Claim {task}\n\n{holder}\n\n{}\n", nonce())
     } else {
         let _ = git(root, &["update-index", "--force-remove", &path], environment, None)?;
-        format!("Release {task}\n")
+        format!("Release {task}\n\n{}\n", nonce())
     };
     let tree = git(root, &["write-tree"], environment, None)?;
     let mut arguments = vec!["commit-tree", tree.trim(), "-m", &message];
     if let Some(tip) = tip {
         arguments.extend(["-p", tip]);
     }
-    let commit = git(root, &arguments, &[], None)?;
+    let commit = git(root, &arguments, commit_environment, None)?;
     assert!(!commit.trim().is_empty(), "commit-tree prints the new commit");
     Ok(commit.trim().to_owned())
 }
 
-/// A path for a throwaway index inside the repository's git directory.
+/// A line that sets this commit apart from every other claim or release, even one built on the
+/// same tip by the same identity in the same second (#32).
+fn nonce() -> String {
+    let nonce = format!("Nonce: {}", unique_token());
+    assert!(!nonce.contains('\n'), "the nonce is one line");
+    nonce
+}
+
+/// A token no other call returns, in this process or another: the process, a per-process count
+/// and a random value. Not the clock: whole seconds are what made commits collide (#32), and
+/// clippy bans reading it (ADR-0005); the random value already covers what a finer clock would.
+fn unique_token() -> String {
+    let count = TOKENS_MADE.fetch_add(1, Ordering::Relaxed);
+    assert!(count < u32::MAX, "a process makes fewer than 2^32 tokens");
+    // A fresh `RandomState` has keys from the operating system's random source.
+    let random = RandomState::new().hash_one(count);
+    let token = format!("{}-{count}-{random:016x}", std::process::id());
+    let is_plain =
+        token.chars().all(|character| character.is_ascii_alphanumeric() || character == '-');
+    assert!(is_plain, "a token is safe in a file name and a commit message: {token}");
+    token
+}
+
+/// A path for a throwaway index inside the repository's git directory, unique to this call, so
+/// that two claims never share an index, even from two threads of one process.
 fn private_index(root: &Path, task: &str) -> Result<PathBuf, ClaimError> {
     let git_directory = git(root, &["rev-parse", "--absolute-git-dir"], &[], None)?;
-    let name = format!("nami-claim-{task}-{}.index", std::process::id());
+    let name = format!("nami-claim-{task}-{}.index", unique_token());
     Ok(Path::new(git_directory.trim()).join(name))
 }
 
@@ -237,7 +396,70 @@ fn run(mut command: Command, stdin: Option<&str>) -> std::io::Result<Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::ClaimError;
+    use super::{ClaimError, commit_change, git, private_index, retry_reason};
+
+    /// The bot's identity and a fixed clock: what makes two claims look the same (#32).
+    const BOT: &[(&str, &str)] = &[
+        ("GIT_AUTHOR_NAME", "nami-agent[bot]"),
+        ("GIT_AUTHOR_EMAIL", "bot@example.invalid"),
+        ("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z"),
+        ("GIT_COMMITTER_NAME", "nami-agent[bot]"),
+        ("GIT_COMMITTER_EMAIL", "bot@example.invalid"),
+        ("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z"),
+    ];
+
+    // Goal: two claims (or releases) of one task built on one tip by one identity in one second
+    // are different commits, so neither push can read as the other's (#32). Method: build each
+    // twice in a fresh repository, on the empty branch and on a tip.
+    #[test]
+    fn claim_commits_are_unique() {
+        let root = std::env::temp_dir().join(format!("nami-claim-unique-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).expect("a stale temporary directory is removable");
+        }
+        std::fs::create_dir_all(&root).expect("temporary directory is writable");
+        let _ = git(&root, &["init", "--quiet"], &[], None).expect("git init works");
+        let build = |tip: Option<&str>, holder: Option<&str>| {
+            commit_change(&root, BOT, tip, "t", holder).expect("the commit builds")
+        };
+        let (first, second) = (build(None, Some("agent: bot")), build(None, Some("agent: bot")));
+        assert_ne!(first, second, "claims on the empty branch differ");
+        let tree =
+            |commit: &str| git(&root, &["rev-parse", &format!("{commit}^{{tree}}")], &[], None);
+        assert_eq!(tree(&first), tree(&second), "only the message differs");
+        let index = |_| private_index(&root, "t").expect("the git directory is found");
+        assert_ne!(index(1), index(2), "two claims in one process never share an index");
+        let (released, again) = (build(Some(&first), None), build(Some(&first), None));
+        assert_ne!(released, again, "releases on one tip differ");
+        let message = git(&root, &["log", "-1", "--format=%B", &first], &[], None);
+        let message = message.expect("the commit is readable");
+        assert!(message.starts_with("Claim t\n\nagent: bot\n\nNonce: "), "{message}");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    // Goal: when the remote does not hold our commit, every rejection and "up to date" is
+    // retried, and a push git did not report on is not. Method: porcelain output as git 2.53
+    // prints it.
+    #[test]
+    fn retry_reasons() {
+        let refspec = "abc:refs/heads/claims";
+        let line =
+            |flag: &str, summary: &str| format!("To r.git\n{flag}\t{refspec}\t{summary}\nDone\n");
+        for summary in [
+            "[rejected] (stale info)",
+            "[rejected] (fetch first)",
+            "[remote rejected] (reference already exists)",
+            "[remote rejected] (pre-receive hook declined)",
+        ] {
+            assert_eq!(retry_reason(&line("!", summary), refspec).as_deref(), Some(summary));
+        }
+        let same = retry_reason(&line("=", "[up to date]"), refspec);
+        assert_eq!(same.as_deref(), Some("[up to date]"));
+        assert_eq!(retry_reason(&line("*", "[new branch]"), refspec), None);
+        assert_eq!(retry_reason(&line("+", "1...2 (forced update)"), refspec), None);
+        assert_eq!(retry_reason(&line("!", "[rejected]"), "def:refs/heads/claims"), None);
+        assert_eq!(retry_reason("", refspec), None, "a push that died prints nothing");
+    }
 
     // Goal: claim errors read as the CLI prints them.
     #[test]

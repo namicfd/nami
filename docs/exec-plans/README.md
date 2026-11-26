@@ -74,7 +74,7 @@ cargo xtask task validate        # the plan checks on their own
 `just task <command>` is the same.
 
 Claims are files `claims/<task-id>` on the `claims` branch.
-- **Claiming:** a claim pushes a commit to that branch. Git accepts only fast-forward pushes, so when two agents claim the same task at once, exactly one push wins.
+- **Claiming:** a claim pushes a commit to that branch, leased on the tip it was built on. Every claim commit carries a nonce, and a claim counts only if, after the push, the remote's branch holds that commit, whatever git push printed or returned. So when two agents claim the same task at once, exactly one push wins, even with the same identity in the same second.
 - **Holder:** the claim file records `$NAMI_AGENT_ID` (default: git's `user.name`) and `$NAMI_SESSION_ID`.
 - **Age:** `status` shows how old each claim is.
 - **After the PR merges, the claim stays.** It keeps the task from being picked up again until `passes` is set. Then `status` shows the task as done, whatever the claim says.
