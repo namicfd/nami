@@ -54,12 +54,15 @@ The tasks form one chain: each depends on the one before it.
 | 4 | `usize-alias` | dylint lint | the `strict-rust` chain (order only) |
 | 5 | `recursion-cross-crate` | dylint lint | nothing |
 | 6 | `glossary` | document and tidy rule | nothing |
-| 7 | `thresholds-file` | code-owned file | the reference crate |
-| 8 | `reference-suite` | tests | `thresholds-file`, a solver |
-| 9 | `tier-tag` | tidy rule | reference tests to tag |
-| 10 | `floor-activation-count` | test | `reference-suite`, a scheme with a floor |
-| 11 | `alloc-after-init` | test | the solver's time loop |
-| 12 | `determinism-hash` | CI job | a canonical problem set |
+| 7 | `tier-tag` | tidy rule | M0's reference tasks |
+| 8 | `alloc-after-init` | test | M0's time loop |
+| 9 | `determinism-hash` | CI job | M0's commands |
+| 10 | `floor-activation-count` | test | a scheme with a floor or positivity limiter (M2) |
+
+`thresholds-file` and `reference-suite` moved to the plan `m0-advection`, narrowed to code in
+`crates/reference/`, so that M0's references do not wait for this chain. The tags they promise are
+retagged by `tier-tag`. `m0-style-guide` (in `m0-advection`) joins the chain after
+`determinism-hash`, because it edits the style guide.
 
 Every task under `crates/reference/`, `xtask/`, `lints/`, `.github/` or `docs/TIGER_STYLE.md`
 touches protected paths, so its PR waits for the code owner (ADR-0008, ADR-0015). A reference is
@@ -122,27 +125,20 @@ its form: one entry per term, sorted, no term defined twice.
 
 Out of scope: checking that the code uses each word in its one meaning. That stays with review.
 
-### thresholds-file
-
-ADR-0007 puts every reference tolerance in one human-owned place. Create it under
-`crates/reference/`, with the derivation of each value next to it, and make the reference
-checks read their tolerances from there by name.
-
-### reference-suite
-
-Fill `crates/reference` with the tiers of ADR-0007 for the first equation system: invariants
-(conservation to round-off, the wave-speed bound, ghost cells written before they are read),
-symmetry, convergence order, exact solutions, and one reference per boundary-condition type.
-A no-op scheme must fail it. The style guide's `[planned:reference-suite]` tags name the rules
-that these tests carry.
-
 ### tier-tag
+
+Also retag the style guide's `[planned:thresholds-file]` and `[planned:reference-suite]` tags to
+the mechanisms that `m0-advection` built, and change the rule on magic tolerances from
+`reference/thresholds.toml` to `crates/reference/src/thresholds.rs` (ADR-0030).
 
 Every reference test names its tier (ADR-0007). Add a tidy rule that requires the tier in the
 goal comment of each test under a `tests/` directory of `crates/reference`, and fix the tests
 that exist by then.
 
 ### floor-activation-count
+
+Not before the first scheme with a floor or a positivity limiter: the first-order flux correction
+of M2 (ADR-0024). M0 and M0b have none. It waits at the end of the chain until then.
 
 A floor or limiter that is part of a scheme counts each activation and reports the count per
 step (`TIGER_STYLE.md`, Physical admissibility). Add the counter to the first scheme that has

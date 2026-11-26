@@ -1,0 +1,370 @@
+{
+  "tasks": [
+    {
+      "id": "m0-scaffold",
+      "title": "Crate structure for M0: the mesh crate, empty modules, dependencies, and a test over the crate graph (ADR-0026)",
+      "depends_on": [],
+      "owner_paths": [
+        "Cargo.lock",
+        "crates/mesh",
+        "crates/base/Cargo.toml",
+        "crates/base/src/lib.rs",
+        "crates/base/src/rows.rs",
+        "crates/kernels/Cargo.toml",
+        "crates/kernels/src/lib.rs",
+        "crates/kernels/src/system.rs",
+        "crates/kernels/src/advection.rs",
+        "crates/kernels/src/riemann.rs",
+        "crates/kernels/src/reconstruct.rs",
+        "crates/kernels/src/coordinates.rs",
+        "crates/kernels/src/integrator.rs",
+        "crates/solver/Cargo.toml",
+        "crates/solver/src/lib.rs",
+        "crates/solver/src/config.rs",
+        "crates/solver/src/output.rs",
+        "crates/solver/src/build_info.rs",
+        "crates/solver/src/diagnostics.rs",
+        "crates/solver/src/problem.rs",
+        "crates/solver/src/time_loop.rs",
+        "crates/solver/src/cli.rs",
+        "crates/solver/src/restart.rs",
+        "crates/reference/Cargo.toml",
+        "crates/reference/src/lib.rs",
+        "crates/reference/src/thresholds.rs",
+        "crates/reference/src/contract.rs",
+        "crates/reference/src/checks/mod.rs",
+        "crates/reference/src/advection.rs",
+        "xtask/tests/crate_graph.rs"
+      ],
+      "acceptance": [
+        "xtask::crate_graph::kernels_depends_only_on_base_and_libm",
+        "xtask::crate_graph::reference_shares_no_crate_with_the_solver"
+      ],
+      "passes": false
+    },
+    {
+      "id": "thresholds-file",
+      "title": "crates/reference/src/thresholds.rs: every test tolerance as a documented Rust constant (ADR-0007, ADR-0030)",
+      "depends_on": [
+        "m0-scaffold"
+      ],
+      "owner_paths": [
+        "crates/reference/src/thresholds.rs"
+      ],
+      "acceptance": [
+        "reference::thresholds::tests::every_threshold_is_finite_and_positive"
+      ],
+      "passes": false
+    },
+    {
+      "id": "reference-suite",
+      "title": "The scheme contract, declared properties and the generic checks they select, proven on bad schemes (ADR-0007, ADR-0030)",
+      "depends_on": [
+        "thresholds-file"
+      ],
+      "owner_paths": [
+        "crates/reference/src/contract.rs",
+        "crates/reference/src/checks"
+      ],
+      "acceptance": [
+        "reference::checks::tests::the_exact_scheme_passes",
+        "reference::checks::tests::a_no_op_scheme_fails",
+        "reference::checks::tests::a_scheme_that_produces_nan_fails",
+        "reference::checks::tests::a_non_conservative_scheme_fails",
+        "reference::checks::tests::a_mirror_asymmetric_scheme_fails",
+        "reference::checks::tests::an_axis_dependent_scheme_fails",
+        "reference::checks::tests::a_nondeterministic_scheme_fails",
+        "reference::checks::tests::properties_choose_the_checks",
+        "reference::checks::tests::each_declared_boundary_has_a_check"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-reference-advection",
+      "title": "Exact cell averages for linear advection and the advection checks: moved correctly, observed order, error ceiling (ADR-0007)",
+      "depends_on": [
+        "reference-suite"
+      ],
+      "owner_paths": [
+        "crates/reference/src/advection.rs"
+      ],
+      "acceptance": [
+        "reference::advection::tests::sine_cell_averages_match_the_integral",
+        "reference::advection::tests::pulse_cell_averages_conserve_mass",
+        "reference::advection::tests::the_exact_scheme_passes_every_advection_check",
+        "reference::advection::tests::a_half_speed_scheme_fails",
+        "reference::advection::tests::a_reversed_scheme_fails",
+        "reference::advection::tests::double_diffusion_fails_the_error_ceiling"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-rows",
+      "title": "base::rows: typed row access into a structure-of-arrays block (ADR-0031)",
+      "depends_on": [
+        "m0-scaffold"
+      ],
+      "owner_paths": [
+        "crates/base/src/rows.rs"
+      ],
+      "acceptance": [
+        "base::rows::tests::a_row_is_contiguous_in_i",
+        "base::rows::tests::stencil_rows_are_neighbours_in_j_and_k",
+        "base::rows::tests::a_shape_mismatch_is_rejected"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-system",
+      "title": "kernels::system (EquationSystem, WaveSpeedBounds, face-frame permutation) and linear advection (ADR-0025)",
+      "depends_on": [
+        "m0-scaffold"
+      ],
+      "owner_paths": [
+        "crates/kernels/src/system.rs",
+        "crates/kernels/src/advection.rs"
+      ],
+      "acceptance": [
+        "kernels::system::tests::permutation_puts_the_normal_component_first",
+        "kernels::system::tests::permutation_round_trips_exactly",
+        "kernels::advection::tests::flux_is_normal_speed_times_state",
+        "kernels::advection::tests::wave_speed_bound_is_the_normal_speed_magnitude"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-riemann",
+      "title": "kernels::riemann: the RiemannSolver trait and LLF for every system with wave-speed bounds (ADR-0025)",
+      "depends_on": [
+        "m0-system"
+      ],
+      "owner_paths": [
+        "crates/kernels/src/riemann.rs"
+      ],
+      "acceptance": [
+        "kernels::riemann::tests::llf_is_consistent_with_the_physical_flux",
+        "kernels::riemann::tests::llf_for_advection_is_upwind_to_round_off",
+        "kernels::riemann::tests::llf_is_antisymmetric_under_mirroring",
+        "kernels::riemann::tests::a_speed_below_the_bound_is_rejected"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-reconstruct",
+      "title": "kernels::reconstruct: the Reconstruction trait and donor cell as a row kernel (ADR-0025, ADR-0031)",
+      "depends_on": [
+        "m0-rows"
+      ],
+      "owner_paths": [
+        "crates/kernels/src/reconstruct.rs"
+      ],
+      "acceptance": [
+        "kernels::reconstruct::tests::donor_cell_copies_cell_values_to_faces",
+        "kernels::reconstruct::tests::donor_cell_ghost_width_is_one",
+        "kernels::reconstruct::tests::row_lengths_are_asserted"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-update",
+      "title": "kernels::coordinates (Cartesian) and the row update in area/volume form (ADR-0023, ADR-0031)",
+      "depends_on": [
+        "m0-rows"
+      ],
+      "owner_paths": [
+        "crates/kernels/src/coordinates.rs",
+        "crates/kernels/src/update.rs"
+      ],
+      "acceptance": [
+        "kernels::update::tests::row_update_matches_hand_computed_values",
+        "kernels::update::tests::row_total_changes_only_by_the_boundary_fluxes",
+        "kernels::update::tests::uniform_flux_leaves_the_row_unchanged",
+        "kernels::coordinates::tests::cartesian_areas_and_volumes_are_constant"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-integrator",
+      "title": "kernels::integrator: 3S* stage tables, forward Euler, and the register-combination row kernel (ADR-0025)",
+      "depends_on": [
+        "m0-rows"
+      ],
+      "owner_paths": [
+        "crates/kernels/src/integrator.rs"
+      ],
+      "acceptance": [
+        "kernels::integrator::tests::forward_euler_is_one_stage",
+        "kernels::integrator::tests::stage_combination_matches_hand_computed_values",
+        "kernels::integrator::tests::every_table_integrates_a_constant_rate_exactly"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-block",
+      "title": "mesh: block shape and geometry, the fixed-capacity pool, periodic ghost fill (ADR-0026)",
+      "depends_on": [
+        "m0-rows"
+      ],
+      "owner_paths": [
+        "crates/mesh/src/block.rs",
+        "crates/mesh/src/pool.rs",
+        "crates/mesh/src/ghost.rs"
+      ],
+      "acceptance": [
+        "mesh::block::tests::layout_is_var_k_j_i",
+        "mesh::block::tests::inactive_axes_have_no_ghost_cells",
+        "mesh::pool::tests::capacity_comes_from_the_memory_budget",
+        "mesh::pool::tests::exhausting_the_pool_is_an_error",
+        "mesh::pool::tests::new_storage_is_nan_in_checked_builds",
+        "mesh::ghost::tests::periodic_fill_wraps_both_ends",
+        "mesh::ghost::tests::every_ghost_cell_is_written"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-config",
+      "title": "solver::config: the strict TOML subset with no defaults and errors that name the fix (ADR-0029)",
+      "depends_on": [
+        "m0-scaffold"
+      ],
+      "owner_paths": [
+        "crates/solver/src/config.rs"
+      ],
+      "acceptance": [
+        "solver::config::tests::parses_the_toml_subset",
+        "solver::config::tests::a_missing_key_names_the_key_and_the_fix",
+        "solver::config::tests::an_unknown_key_is_rejected",
+        "solver::config::tests::a_wrong_type_names_the_line",
+        "solver::config::tests::set_overrides_a_value",
+        "solver::config::tests::resolved_config_round_trips"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-output",
+      "title": "solver::output: nami's binary format with version metadata, and the build fields (ADR-0029)",
+      "depends_on": [
+        "m0-config"
+      ],
+      "owner_paths": [
+        "crates/solver/src/output.rs",
+        "crates/solver/src/build_info.rs",
+        "crates/solver/build.rs"
+      ],
+      "acceptance": [
+        "solver::output::tests::write_then_read_round_trips_bits",
+        "solver::output::tests::header_records_every_version_field",
+        "solver::output::tests::blocks_land_at_their_offsets"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-diagnostics",
+      "title": "solver::diagnostics: per-step JSON Lines and one-line ERROR messages, without allocating after init (ADR-0029)",
+      "depends_on": [
+        "m0-scaffold"
+      ],
+      "owner_paths": [
+        "crates/solver/src/diagnostics.rs"
+      ],
+      "acceptance": [
+        "solver::diagnostics::tests::one_json_line_per_step",
+        "solver::diagnostics::tests::writing_a_step_does_not_allocate",
+        "solver::diagnostics::tests::an_error_is_one_line_starting_with_error"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-time-loop",
+      "title": "solver: the Problem trait, the combination type, Solver::init and the step phases with the CFL time step (ADR-0025, ADR-0026)",
+      "depends_on": [
+        "m0-system",
+        "m0-riemann",
+        "m0-reconstruct",
+        "m0-update",
+        "m0-integrator",
+        "m0-block",
+        "m0-config"
+      ],
+      "owner_paths": [
+        "crates/solver/src/problem.rs",
+        "crates/solver/src/time_loop.rs"
+      ],
+      "acceptance": [
+        "solver::time_loop::tests::a_constant_state_is_preserved_bitwise",
+        "solver::time_loop::tests::the_time_step_is_the_cfl_limit",
+        "solver::time_loop::tests::the_last_step_ends_exactly_at_the_end_time",
+        "solver::time_loop::tests::one_step_matches_a_hand_computed_upwind_step"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-cli",
+      "title": "solver::cli: run and check, an example advection problem, and in-process command tests (ADR-0029)",
+      "depends_on": [
+        "m0-time-loop",
+        "m0-output",
+        "m0-diagnostics"
+      ],
+      "owner_paths": [
+        "crates/solver/src/cli.rs",
+        "crates/solver/examples/advection.rs",
+        "crates/solver/tests/commands.rs"
+      ],
+      "acceptance": [
+        "solver::commands::run_writes_outputs_and_diagnostics",
+        "solver::commands::check_reports_a_bad_config_without_running"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-restart",
+      "title": "solver: checkpoints, restart, and the refusal of a different build (ADR-0029)",
+      "depends_on": [
+        "m0-cli"
+      ],
+      "owner_paths": [
+        "crates/solver/src/restart.rs",
+        "crates/solver/src/cli.rs",
+        "crates/solver/tests/restart.rs"
+      ],
+      "acceptance": [
+        "solver::restart::an_interrupted_run_matches_an_uninterrupted_one_bitwise",
+        "solver::restart::a_different_build_is_refused",
+        "solver::restart::allow_different_build_is_recorded"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-wire-references",
+      "title": "Wire the M0 combination into the advection reference suite (ADR-0030)",
+      "depends_on": [
+        "m0-reference-advection",
+        "m0-time-loop"
+      ],
+      "owner_paths": [
+        "crates/solver/tests/advection_reference.rs"
+      ],
+      "acceptance": [
+        "solver::advection_reference::donor_cell_llf_forward_euler_passes_its_checks"
+      ],
+      "passes": false
+    },
+    {
+      "id": "m0-style-guide",
+      "title": "Point the style guide's kernel template at the row kernel and remove update_pencil (ADR-0031)",
+      "depends_on": [
+        "determinism-hash",
+        "m0-update"
+      ],
+      "owner_paths": [
+        "docs/TIGER_STYLE.md",
+        "crates/kernels/src/update.rs"
+      ],
+      "acceptance": [
+        "xtask::style_guide_examples::every_code_block_passes_the_gate"
+      ],
+      "passes": false
+    }
+  ]
+}
