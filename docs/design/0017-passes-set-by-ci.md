@@ -63,7 +63,12 @@ Known gaps, with no mechanism yet:
 - The bot's PR is rebuilt whenever `main` moves, which takes it out of the merge queue until its checks pass again. On a quiet `main` it keeps its place. At phase 1's merge rate this is cheap. If the queue drops it for another reason, the next run turns auto-merge back on.
 - A merge-queue entry, and a PR that sets `passes`, need GitHub's API in the `gate`. When GitHub cannot answer, the check fails. Other PRs need no network for it.
 - Anyone who can push to `bot/passes`, agents included, can change the open PR. `check-pr` judges the PR's content, not who pushed it, so such a push can only flip a task that is done, and the next run rebuilds the branch. A ruleset that lets only the `nami-ci` app update `bot/passes` would close this; the runbook asks the maintainer for it.
-- Nothing is left for the maintainer to set up: the `nami-ci` app, its key in the `nami-ci` environment and the variable `NAMI_CI_CLIENT_ID` exist.
+- The `nami-ci` app, its key in the `nami-ci` environment and the variable `NAMI_CI_CLIENT_ID` exist. One optional maintainer step remains: the `bot/passes` ruleset in step 8 of `docs/operations/github-setup.md`, so that only the `nami-ci` app can update the branch. Without it, safety still holds, because `check-pr` judges the PR's content. But liveness depends on no one rewriting the branch: each foreign push is undone only by the next run, and a push that lands between runs keeps the PR out of the queue until then.
+
+Risks, not yet seen:
+
+- **Steady traffic on `main`.** Each merge moves `main`, so the next run rebuilds `bot/passes` on the new parent and force-pushes it. That takes the PR out of the merge queue, and it re-enters only after its checks pass again. Under steady traffic, the PR could be rebuilt and requeued on every merge and land late, or not for a long time.
+- **GitHub's `workflows` permission on the push.** The app's token has no `workflows` permission. GitHub refuses a push that creates or changes files under `.github/workflows/` without it. The rebuilt commit's only new content is the flip of `tasks.json` lines; its parent, `main`, is already on GitHub. So the check should not apply. This is unverified: if GitHub ever applies it to the whole branch, for example when the branch is first created on a `main` whose workflows changed, the push is refused and the job fails loudly.
 
 ## Alternatives considered
 
