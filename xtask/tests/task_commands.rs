@@ -42,9 +42,11 @@ impl GitHub for Fake {
     fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
         Err("the task commands never file issues".to_owned())
     }
-    fn comment(&self, number: u32, body: &str) -> Result<Timestamp, String> {
+    fn comment(&self, number: u32, body: &str) -> Result<Comment, String> {
         self.posted.borrow_mut().push((number, body.to_owned()));
-        Timestamp::parse("2026-11-26T09:00:00Z")
+        let at = Timestamp::parse("2026-11-26T09:00:00Z")?;
+        let author = "nami-agent[bot]".to_owned();
+        Ok(Comment { author, body: body.to_owned(), created_at: at.clone(), updated_at: at })
     }
     fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
         self.removed.borrow_mut().push((number, label.to_owned()));
@@ -197,11 +199,33 @@ fn issue_commands_trust_the_code_owners_on_main() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+/// The label history of issue `number` in which an owner removes the bot's `needs-decision`
+/// and asks again, and the bot then removes the label, adds it and removes it at 08:10.
+fn reask(number: u32) -> Vec<(u32, LabelEvent)> {
+    let steps = [
+        ("nami-agent[bot]", "2026-11-26T07:00:00Z"),
+        ("owner", "2026-11-26T07:10:00Z"),
+        ("owner", "2026-11-26T07:20:00Z"),
+        ("nami-agent[bot]", "2026-11-26T07:30:00Z"),
+        ("nami-agent[bot]", "2026-11-26T07:40:00Z"),
+        ("nami-agent[bot]", "2026-11-26T08:10:00Z"),
+    ];
+    let event = |step: usize, (actor, time): (&str, &str)| LabelEvent {
+        label: "needs-decision".to_owned(),
+        actor: actor.to_owned(),
+        added: step.is_multiple_of(2),
+        created_at: Timestamp::parse(time).expect("a time"),
+    };
+    steps.into_iter().enumerate().map(|(step, entry)| (number, event(step, entry))).collect()
+}
+
 /// Issues for `issues_are_claimed_like_tasks`. #3 is workable; #4 is an outsider's; #5 waits for
 /// a decision; #6 is a pull request; #8 and #10 are decided, by an owner and by the bot with a
 /// record; the bot removed the label of #7 before its record, of #11 with a non-owner's, and
 /// with a valid one that of #12, which an owner opened, and of #13, which an owner labelled.
-/// Each label was added at 08:00 and removed at 08:10.
+/// #14's record is from the second of the addition. Each label was added at 08:00 and removed
+/// at 08:10. #15 has the reviewer's history: an owner removed the bot's label and asked again,
+/// and the bot then removed it, added it, recorded a decision and removed it.
 fn claimable_issues() -> Fake {
     let pull = Issue { is_pull_request: true, ..issue(6, "nami-agent[bot]", &["bug"]) };
     let at = |time: &str| Timestamp::parse(time).expect("a time");
@@ -218,18 +242,6 @@ fn claimable_issues() -> Fake {
         ]
     };
     let bot = "nami-agent[bot]";
-    let record = |decider: &str, time: &str| Comment {
-        author: "nami-agent[bot]".to_owned(),
-        body: format!(
-            "<!-- nami:decision -->\nDecision: Go.\nDecided by: @{decider}, 2026-11-26\n\
-             Source: lead session\n"
-        ),
-        created_at: at(time),
-        updated_at: at(time),
-    };
-    // #7's record does not count: it was posted after the removal.
-    let late = "2026-11-26T08:11:00Z";
-    let time = "2026-11-26T08:10:00Z";
     Fake {
         issues: vec![
             issue(3, "nami-agent[bot]", &["bug"]),
@@ -242,25 +254,49 @@ fn claimable_issues() -> Fake {
             issue(11, "nami-agent[bot]", &["bug"]),
             issue(12, "owner", &["bug"]),
             issue(13, bot, &["bug"]),
+            issue(14, bot, &["bug"]),
+            issue(15, bot, &["bug"]),
         ],
         events: [
-            round(7, bot, bot),
-            round(8, "owner", "owner"),
-            round(10, bot, bot),
-            round(11, bot, bot),
-            round(12, bot, bot),
-            round(13, "owner", bot),
+            &round(7, bot, bot)[..],
+            &round(8, "owner", "owner"),
+            &round(10, bot, bot),
+            &round(11, bot, bot),
+            &round(12, bot, bot),
+            &round(13, "owner", bot),
+            &round(14, bot, bot),
+            &reask(15),
         ]
         .concat(),
-        comments: vec![
-            (7, record("owner", late)),
-            (10, record("owner", time)),
-            (11, record("outsider", time)),
-            (12, record("owner", time)),
-            (13, record("owner", time)),
-        ],
+        comments: claimable_records(),
         ..Fake::default()
     }
+}
+
+/// The bot's decision records on the issues of [`claimable_issues`].
+fn claimable_records() -> Vec<(u32, Comment)> {
+    let at = |time: &str| Timestamp::parse(time).expect("a time");
+    let record = |decider: &str, time: &str| Comment {
+        author: "nami-agent[bot]".to_owned(),
+        body: format!(
+            "<!-- nami:decision -->\nDecision: Go.\nDecided by: @{decider}, 2026-11-26\n\
+             Source: lead session\n"
+        ),
+        created_at: at(time),
+        updated_at: at(time),
+    };
+    // #7's record does not count: it was posted after the removal.
+    let late = "2026-11-26T08:11:00Z";
+    let time = "2026-11-26T08:10:00Z";
+    vec![
+        (7, record("owner", late)),
+        (10, record("owner", time)),
+        (11, record("outsider", time)),
+        (12, record("owner", time)),
+        (13, record("owner", time)),
+        (14, record("owner", "2026-11-26T08:00:00Z")),
+        (15, record("owner", time)),
+    ]
 }
 
 // Goal: an issue is listed, claimed, shown and released like a task, but only if agents may
@@ -274,8 +310,8 @@ fn issues_are_claimed_like_tasks() {
     let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
     let both = "a\tTask a\nissue-3\tIssue 3\nissue-8\tIssue 8\nissue-10\tIssue 10\n";
     assert_eq!(task(&github, &["ready"]), Ok(both.to_owned()), "plan tasks, then issues");
-    let asked = [7, 10, 11];
-    assert_eq!(*github.asked.borrow(), asked, "comments matter only on the bot's own issues");
+    let asked = [7, 10, 11, 14];
+    assert_eq!(*github.asked.borrow(), asked, "comments matter only for the bot's own labels");
 
     for (id, reason) in [
         ("issue-4", "neither the bot nor a code owner"),
@@ -283,8 +319,10 @@ fn issues_are_claimed_like_tasks() {
         ("issue-6", "is a pull request"),
         ("issue-7", "removed by `nami-agent[bot]` without a decision record"),
         ("issue-11", "`@outsider`, who is not a code owner"),
-        ("issue-12", "on an issue that `owner` opened, where only a code owner lifts it"),
-        ("issue-13", "but `owner` added it, and only a code owner lifts"),
+        ("issue-12", "`owner` opened the issue, so only a code owner lifts `needs-decision`"),
+        ("issue-13", "`owner` added `needs-decision` once, so only a code owner lifts it"),
+        ("issue-14", "the bot's latest comment before it is not newer than the label"),
+        ("issue-15", "`owner` removed `needs-decision` once, so only a code owner lifts it"),
         ("issue-9", "no issue #9"),
         ("issue-x", "is not an issue's ID"),
     ] {

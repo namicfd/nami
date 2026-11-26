@@ -137,94 +137,131 @@ pub fn unworkable(
 }
 
 /// True when the comments decide whether the last removal of `needs-decision` counts: the bot
-/// removed the label last, on an issue that the bot opened, and the bot added it last.
+/// removed the label last, and [`bot_owns_label`] holds.
 #[must_use]
-pub fn needs_record(issue: &Issue, events: &[LabelEvent], trust: &Trust) -> bool {
-    matches!(removal(issue, events, trust), Removal::Asks(_))
+pub fn needs_record(issue: &Issue, events: &[LabelEvent]) -> bool {
+    last_bot_removal(events).is_some() && bot_owns_label(issue, events).is_ok()
 }
 
 fn last_decision_event(events: &[LabelEvent]) -> Option<&LabelEvent> {
     events.iter().rev().find(|event| event.label == NEEDS_DECISION)
 }
 
+/// The last event of `needs-decision`, if it is a removal by the bot.
+fn last_bot_removal(events: &[LabelEvent]) -> Option<&LabelEvent> {
+    last_decision_event(events).filter(|last| !last.added && last.actor == BOT_LOGIN)
+}
+
 /// The latest addition of `needs-decision`, if it was ever added.
-#[must_use]
-pub fn latest_addition(events: &[LabelEvent]) -> Option<&LabelEvent> {
+fn latest_addition(events: &[LabelEvent]) -> Option<&LabelEvent> {
     events.iter().rev().find(|event| event.label == NEEDS_DECISION && event.added)
 }
 
-/// How the last removal of `needs-decision` stands before any comment is read.
-enum Removal<'events> {
-    /// Nothing waits: the label was never removed, was added again, or a code owner removed it.
-    Settled,
-    /// The removal does not count, for this reason.
-    Refused(String),
-    /// The removal counts if a decision record answers this round.
-    Asks(Round<'events>),
-}
-
-/// Sorts the last removal of `needs-decision`. Only a removal by the bot, on an issue that the
-/// bot opened, of a label that the bot added, may be answered by a record. A label that a human
-/// added stays until a code owner removes it, and so does one on a human's issue.
-fn removal<'events>(
+/// Whether the bot alone may answer `needs-decision` on `issue` with a decision record, and if
+/// so the label's latest addition. It may only if the bot opened the issue and made every
+/// addition and removal of the label in the issue's whole history. Once anyone else touched the
+/// label, only a code owner lifts it. The rule looks at no order of events, so no order of
+/// events gets around it.
+///
+/// # Errors
+///
+/// Who else opened the issue or touched the label, or that the label was never added.
+pub fn bot_owns_label<'events>(
     issue: &Issue,
     events: &'events [LabelEvent],
-    trust: &Trust,
-) -> Removal<'events> {
-    let Some(last) = last_decision_event(events) else {
-        return Removal::Settled;
-    };
-    if last.added || trust.is_owner(&last.actor) {
-        return Removal::Settled;
-    }
-    if last.actor != BOT_LOGIN {
-        return Removal::Refused(format!("by `{}`, who is not a code owner", last.actor));
-    }
+) -> Result<&'events LabelEvent, String> {
     if issue.author != BOT_LOGIN {
-        return Removal::Refused(format!(
-            "by `{BOT_LOGIN}` on an issue that `{}` opened, where only a code owner lifts it",
+        return Err(format!(
+            "`{}` opened the issue, so only a code owner lifts `{NEEDS_DECISION}`",
             issue.author
         ));
     }
-    // The last removal comes after an addition, so the latest addition is the one before it.
-    let Some(added) = latest_addition(events) else {
-        return Removal::Refused(format!(
-            "by `{BOT_LOGIN}`, but no addition of the label is on record"
-        ));
-    };
-    if added.actor != BOT_LOGIN {
-        return Removal::Refused(format!(
-            "by `{BOT_LOGIN}`, but `{}` added it, and only a code owner lifts a label that \
-             someone else than the bot added",
-            added.actor
+    let other =
+        events.iter().find(|event| event.label == NEEDS_DECISION && event.actor != BOT_LOGIN);
+    if let Some(other) = other {
+        let verb = if other.added { "added" } else { "removed" };
+        return Err(format!(
+            "`{}` {verb} `{NEEDS_DECISION}` once, so only a code owner lifts it",
+            other.actor
         ));
     }
-    Removal::Asks(Round { added: &added.created_at, removed: &last.created_at })
+    latest_addition(events).ok_or_else(|| format!("no addition of `{NEEDS_DECISION}` is on record"))
 }
 
 /// Why the last removal of `needs-decision` is no decision, or `None` when the label was never
-/// removed, was added again, or its last removal counts: by a code owner, or by the bot with a
-/// code owner's decision record (see [`removal`] for when a record may answer).
+/// removed, was added again, or its last removal counts: by a code owner, or by the bot with the
+/// [`answering_record`].
 fn open_decision(
     issue: &Issue,
     events: &[LabelEvent],
     comments: &[Comment],
     trust: &Trust,
 ) -> Option<String> {
-    match removal(issue, events, trust) {
-        Removal::Settled => None,
-        Removal::Refused(why) => Some(why),
-        Removal::Asks(round) => decision_record(comments, &round, trust)
-            .err()
-            .map(|why| format!("by `{BOT_LOGIN}` without a decision record: {why}")),
+    let last = last_decision_event(events)?;
+    if last.added || trust.is_owner(&last.actor) {
+        return None;
     }
+    if last.actor != BOT_LOGIN {
+        return Some(format!("by `{}`, who is not a code owner", last.actor));
+    }
+    let answer = answering_record(issue, events, comments, trust);
+    answer.err().map(|why| format!("by `{BOT_LOGIN}` without a decision record that counts: {why}"))
 }
 
-/// Why a record dated `date`, posted at `posted`, cannot answer a round whose label was added
-/// at `added`, or `None` if it can: its date lies between the UTC day of the addition and the
-/// UTC day it was posted, both included.
+/// The decision record that makes the bot's last removal of `needs-decision` count: the one
+/// predicate that `ready`, `claim`, `issue decide` and `issue show` share (ADR-0021, point 7).
+///
+/// - The bot removed the label last, and [`bot_owns_label`] holds.
+/// - The record is the bot's latest comment posted no later than the removal. It was posted
+///   strictly after the label's latest addition, and not edited after the removal.
+/// - It is in the record's form, its decider is a code owner, and its date is not
+///   [`misdated`].
+///
+/// GitHub's times have whole seconds. A record from the same second as the removal counts,
+/// because `issue decide` posts and then removes; one from the same second as the addition
+/// does not, because it may predate the question.
+///
+/// # Errors
+///
+/// The first condition that fails.
+pub fn answering_record<'comments>(
+    issue: &Issue,
+    events: &[LabelEvent],
+    comments: &'comments [Comment],
+    trust: &Trust,
+) -> Result<&'comments Comment, String> {
+    let removed = &last_bot_removal(events)
+        .ok_or_else(|| format!("the bot did not remove `{NEEDS_DECISION}` last"))?
+        .created_at;
+    let added = &bot_owns_label(issue, events)?.created_at;
+    let latest = comments
+        .iter()
+        .filter(|comment| comment.author == BOT_LOGIN && comment.created_at <= *removed)
+        .max_by(|one, other| one.created_at.cmp(&other.created_at))
+        .ok_or("the bot posted no comment before the removal")?;
+    if latest.created_at <= *added {
+        return Err("the bot's latest comment before it is not newer than the label".to_owned());
+    }
+    if latest.updated_at > *removed {
+        return Err("the bot's latest comment before it was edited after it".to_owned());
+    }
+    let record = Record::parse(&latest.body)
+        .map_err(|why| format!("the bot's latest comment before it is no record: {why}"))?;
+    if !trust.is_owner(&record.decider) {
+        return Err(format!("its record names `@{}`, who is not a code owner", record.decider));
+    }
+    if let Some(why) = misdated(&record.date, added, &latest.created_at) {
+        return Err(format!("its record is {why}"));
+    }
+    Ok(latest)
+}
+
+/// Why a record dated `date`, posted at `posted`, cannot answer a label added at `added`, or
+/// `None` if it can: its date lies between the UTC day of the addition and the UTC day it was
+/// posted, both included.
 #[must_use]
 pub fn misdated(date: &str, added: &Timestamp, posted: &Timestamp) -> Option<String> {
+    assert!(super::decision::is_date(date), "a record's date is a calendar day");
     if date > posted.day() {
         return Some(format!("dated {date}, after {}, the UTC day it was posted", posted.day()));
     }
@@ -235,53 +272,6 @@ pub fn misdated(date: &str, added: &Timestamp, posted: &Timestamp) -> Option<Str
         ));
     }
     None
-}
-
-/// One round of `needs-decision`: when the label was last added, and when the bot removed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Round<'times> {
-    /// The latest addition of the label before the removal.
-    pub added: &'times Timestamp,
-    /// The removal.
-    pub removed: &'times Timestamp,
-}
-
-/// The decision record that lets the bot's removal of `needs-decision` count. It is the bot's
-/// latest comment posted by the removal; it was posted after the label was last added, and
-/// not edited after the removal; it is in the record's form; its decider is a code owner; and
-/// its date is not [`misdated`].
-///
-/// # Errors
-///
-/// Says which of these fails. GitHub's times have whole seconds, so ties are broken by what
-/// `issue decide` does: a record from the same second as the removal counts, because it posts
-/// and then removes; a record from the same second as the addition does not, so that a
-/// question asked again is never answered by a record that may predate it.
-pub fn decision_record(
-    comments: &[Comment],
-    round: &Round<'_>,
-    trust: &Trust,
-) -> Result<Record, String> {
-    let latest = comments
-        .iter()
-        .filter(|comment| comment.author == BOT_LOGIN && comment.created_at <= *round.removed)
-        .max_by(|one, other| one.created_at.cmp(&other.created_at))
-        .ok_or("the bot posted no comment before the removal")?;
-    if latest.created_at <= *round.added {
-        return Err("the bot's latest comment before it is not newer than the label".to_owned());
-    }
-    if latest.updated_at > *round.removed {
-        return Err("the bot's latest comment before it was edited after it".to_owned());
-    }
-    let record = Record::parse(&latest.body)
-        .map_err(|why| format!("the bot's latest comment before it is no record: {why}"))?;
-    if !trust.is_owner(&record.decider) {
-        return Err(format!("its record names `@{}`, who is not a code owner", record.decider));
-    }
-    if let Some(why) = misdated(&record.date, round.added, &latest.created_at) {
-        return Err(format!("its record is {why}"));
-    }
-    Ok(record)
 }
 
 /// The comments by trusted authors, and how many others were left out.
@@ -299,7 +289,7 @@ pub fn trusted_comments<'comments>(
 
 #[cfg(test)]
 mod tests {
-    use super::{BOT_LOGIN, Trust, decision_record, needs_record, trusted_comments, unworkable};
+    use super::{BOT_LOGIN, Trust, answering_record, needs_record, trusted_comments, unworkable};
     use crate::issue::github::{Comment, Issue, LabelEvent, Timestamp};
 
     /// A decision record by `@owner`.
@@ -400,54 +390,87 @@ mod tests {
         }
     }
 
+    /// A `needs-decision` history as GitHub records it: additions and removals alternate,
+    /// starting with an addition. Each step is who acted and at which minute.
+    fn history(steps: &[(&str, u32)]) -> Vec<LabelEvent> {
+        let events: Vec<LabelEvent> = steps
+            .iter()
+            .enumerate()
+            .map(|(step, (actor, minute))| event(actor, step.is_multiple_of(2), *minute))
+            .collect();
+        events
+    }
+
     // Goal: a decision counts as made when a code owner removed `needs-decision` last, and a
-    // removal by anyone else does not, unless it is the bot's with a record (next test).
+    // removal by anyone else does not, unless it is the bot's with a record (next tests).
     #[test]
     fn only_a_code_owner_clears_a_decision() {
         let trust = trust();
         let bug = issue(BOT_LOGIN, &["bug"]);
-        let decided = [event(BOT_LOGIN, true, 2), event("owner", false, 10)];
+        let decided = history(&[(BOT_LOGIN, 2), ("owner", 10)]);
         assert_eq!(unworkable(&bug, &decided, &[], &trust), None);
         let reason = unworkable(&bug, &round(), &[], &trust).expect("the bot cannot decide");
         assert!(reason.contains("removed by `nami-agent[bot]` without a decision record"));
         assert!(reason.contains("posted no comment"), "{reason}");
-        let ghost = [event("owner", true, 2), event("ghost", false, 10)];
+        let ghost = history(&[("owner", 2), ("ghost", 10)]);
         let nobody = unworkable(&bug, &ghost, &[], &trust).expect("a deleted account");
         assert!(nobody.contains("by `ghost`, who is not a code owner"), "{nobody}");
         let records = [comment(BOT_LOGIN, RECORD, 5, 5)];
         assert!(unworkable(&bug, &ghost, &records, &trust).is_some(), "the record is the bot's");
-        let again =
-            [event("owner", false, 1), event(BOT_LOGIN, true, 2), event(BOT_LOGIN, false, 10)];
-        assert!(unworkable(&bug, &again, &[], &trust).is_some(), "the last removal counts");
+        let owner_last = history(&[(BOT_LOGIN, 1), (BOT_LOGIN, 2), ("owner", 3), ("owner", 10)]);
+        assert_eq!(unworkable(&bug, &owner_last, &[], &trust), None, "an owner lifts it");
         let other = LabelEvent { label: "bug".to_owned(), ..event(BOT_LOGIN, false, 10) };
         assert_eq!(unworkable(&bug, &[other], &[], &trust), None, "other labels do not matter");
     }
 
-    // Goal: only a code owner lifts `needs-decision` from an issue that a code owner opened, or
-    // that a code owner labelled, whatever the bot recorded; there the record is never read.
+    // Goal: once anyone but the bot has added or removed `needs-decision`, in any order, or a
+    // human opened the issue, only a code owner lifts the label: a valid record posted after
+    // the bot's last addition never counts, and the comments are not even fetched.
     #[test]
-    fn a_record_counts_only_for_the_bots_own_label() {
+    fn any_other_hand_on_the_label_leaves_it_to_a_code_owner() {
         let trust = trust();
+        let bug = issue(BOT_LOGIN, &["bug"]);
+        let records = [comment(BOT_LOGIN, RECORD, 6, 6)];
+        let bot = BOT_LOGIN;
+        let touched = [
+            (history(&[("owner", 1), (bot, 4), (bot, 5), (bot, 10)]), "`owner` added"),
+            (
+                history(&[(bot, 1), ("owner", 2), ("owner", 3), (bot, 4), (bot, 5), (bot, 10)]),
+                "`owner` removed",
+            ),
+            (history(&[(bot, 1), ("owner", 2), (bot, 5), (bot, 10)]), "`owner` removed"),
+            (
+                history(&[(bot, 1), (bot, 2), ("owner", 3), (bot, 4), (bot, 5), (bot, 10)]),
+                "`owner` added",
+            ),
+            (history(&[(bot, 1), ("ghost", 2), (bot, 5), (bot, 10)]), "`ghost` removed"),
+            (history(&[("outsider", 1), (bot, 4), (bot, 5), (bot, 10)]), "`outsider` added"),
+        ];
+        for (events, expected) in touched {
+            let reason = unworkable(&bug, &events, &records, &trust).expect("a code owner's call");
+            assert!(reason.contains(expected), "{expected}: {reason}");
+            assert!(reason.contains("once, so only a code owner lifts it"), "{reason}");
+            assert!(!super::needs_record(&bug, &events), "its comments are not fetched");
+        }
+        for events in
+            [history(&[(bot, 5), (bot, 10)]), history(&[(bot, 1), (bot, 2), (bot, 5), (bot, 10)])]
+        {
+            assert_eq!(unworkable(&bug, &events, &records, &trust), None, "the bot's own label");
+        }
         let owners = issue("owner", &["bug"]);
-        let records = [comment(BOT_LOGIN, RECORD, 5, 5)];
         let reason = unworkable(&owners, &round(), &records, &trust).expect("the owner's issue");
-        assert!(reason.contains("on an issue that `owner` opened, where only a code owner"));
-        assert!(!needs_record(&owners, &round(), &trust), "its comments are not fetched");
-        let lifted = [event("owner", true, 2), event("owner", false, 10)];
+        assert!(
+            reason.contains("`owner` opened the issue, so only a code owner lifts"),
+            "{reason}"
+        );
+        assert!(!super::needs_record(&owners, &round()), "its comments are not fetched");
+        let lifted = history(&[("owner", 2), ("owner", 10)]);
         assert_eq!(unworkable(&owners, &lifted, &[], &trust), None, "the owner lifts it");
-
-        let bots = issue(BOT_LOGIN, &["bug"]);
-        let labelled = [event("owner", true, 2), event(BOT_LOGIN, false, 10)];
-        let held = unworkable(&bots, &labelled, &records, &trust).expect("the owner's label");
-        assert!(held.contains("but `owner` added it, and only a code owner lifts"), "{held}");
-        assert!(!needs_record(&bots, &labelled, &trust), "its comments are not fetched");
-        let relabelled = [event("owner", true, 1), event(BOT_LOGIN, true, 2), labelled[1].clone()];
-        assert_eq!(unworkable(&bots, &relabelled, &records, &trust), None, "the bot's is last");
     }
 
     // Goal: the bot's removal counts when its latest comment by then is a record of a code
     // owner's decision, posted after the label was added and no later than the removal, not
-    // edited after it, and dated no later than its day. Each near miss is refused.
+    // edited after it, and dated within its round. Each near miss is refused.
     #[test]
     fn a_decision_record_lets_the_bot_clear_a_decision() {
         let trust = trust();
@@ -461,9 +484,8 @@ mod tests {
         assert_eq!(decided(&[comment(BOT_LOGIN, RECORD, 5, 5), later]), None, "after it");
         let reversed = [comment(BOT_LOGIN, RECORD, 5, 5), note];
         assert_eq!(decided(&reversed), None, "the latest by time, in any order");
-        let window = super::Round { added: &at(2), removed: &at(10) };
-        let record = decision_record(&[comment(BOT_LOGIN, RECORD, 5, 5)], &window, &trust);
-        assert_eq!(record.map(|record| record.decider), Ok("owner".to_owned()));
+        let answer = answering_record(&bug, &removed, &reversed, &trust);
+        assert_eq!(answer, Ok(&reversed[0]), "the record");
 
         let not_owner = RECORD.replace("@owner", "@outsider");
         let working = comment(BOT_LOGIN, "Working on it.", 7, 7);
@@ -500,6 +522,8 @@ mod tests {
         let open = issue(BOT_LOGIN, &["bug", "needs-decision"]);
         let asked = unworkable(&open, &events, std::slice::from_ref(&first), &trust);
         assert!(asked.expect("asked again").contains("waits for the maintainer"));
+        let pending = answering_record(&open, &events, std::slice::from_ref(&first), &trust);
+        assert!(pending.expect_err("on").contains("the bot did not remove `needs-decision` last"));
 
         events.push(event(BOT_LOGIN, false, 30));
         let bug = issue(BOT_LOGIN, &["bug"]);
@@ -513,7 +537,7 @@ mod tests {
         let unlabelled = [event(BOT_LOGIN, false, 10)];
         let records = [comment(BOT_LOGIN, RECORD, 5, 5)];
         let reason = unworkable(&bug, &unlabelled, &records, &trust).expect("no addition");
-        assert!(reason.contains("no addition of the label is on record"), "{reason}");
+        assert!(reason.contains("no addition of `needs-decision` is on record"), "{reason}");
     }
 
     // Goal: a record's date lies between the UTC day the label was last added and the UTC day
@@ -535,22 +559,21 @@ mod tests {
     }
 
     // Goal: the comments are needed only when the bot removed `needs-decision` last from an
-    // issue that the bot opened, and the bot added it last.
+    // issue that the bot opened, and nobody else ever touched the label.
     #[test]
     fn only_a_bot_removal_needs_the_comments() {
-        let trust = trust();
         let bots = issue(BOT_LOGIN, &["bug"]);
-        assert!(needs_record(&bots, &round(), &trust));
-        assert!(!needs_record(&issue("owner", &["bug"]), &round(), &trust), "an owner's issue");
-        assert!(!needs_record(&bots, &[], &trust), "never labelled");
-        let added = [event(BOT_LOGIN, false, 1), event(BOT_LOGIN, true, 2)];
-        assert!(!needs_record(&bots, &added, &trust), "added again");
-        let by_owner = [event(BOT_LOGIN, true, 1), event("owner", false, 2)];
-        assert!(!needs_record(&bots, &by_owner, &trust), "an owner");
-        let unlabelled = [event(BOT_LOGIN, false, 2)];
-        assert!(!needs_record(&bots, &unlabelled, &trust), "no addition");
+        assert!(needs_record(&bots, &round()));
+        assert!(!needs_record(&issue("owner", &["bug"]), &round()), "an owner's issue");
+        assert!(!needs_record(&bots, &[]), "never labelled");
+        assert!(
+            !needs_record(&bots, &history(&[(BOT_LOGIN, 1), (BOT_LOGIN, 2), (BOT_LOGIN, 3)])),
+            "on"
+        );
+        assert!(!needs_record(&bots, &history(&[(BOT_LOGIN, 1), ("owner", 2)])), "an owner");
+        assert!(!needs_record(&bots, &[event(BOT_LOGIN, false, 2)]), "no addition");
         let other = LabelEvent { label: "bug".to_owned(), ..event(BOT_LOGIN, false, 10) };
-        assert!(!needs_record(&bots, &[other], &trust), "another label");
+        assert!(!needs_record(&bots, &[other]), "another label");
     }
 
     // Goal: comments by anyone but the bot and the code owners are left out and counted.

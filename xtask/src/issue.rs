@@ -147,10 +147,9 @@ fn main_of(remote: &str) -> String {
 pub fn history(
     github: &dyn GitHub,
     found: &Issue,
-    trust: &Trust,
 ) -> Result<(Vec<LabelEvent>, Vec<Comment>), String> {
     let events = github.label_events(found.number)?;
-    if !trust::needs_record(found, &events, trust) {
+    if !trust::needs_record(found, &events) {
         return Ok((events, Vec::new()));
     }
     Ok((events, github.comments(found.number)?))
@@ -162,12 +161,30 @@ fn show(issue: &Issue, github: &dyn GitHub, trust: &Trust) -> Result<String, Str
         return Err(reason);
     }
     let comments = github.comments(issue.number)?;
-    Ok(render(issue, &comments, trust))
+    let events = github.label_events(issue.number)?;
+    Ok(render(issue, &comments, &events, trust))
+}
+
+/// The heading of a trusted comment in `show`. A record by the bot is a "decision record" only
+/// if it makes the last removal of `needs-decision` count now; any other says why it does not.
+fn heading(comment: &Comment, answer: &Result<&Comment, String>) -> String {
+    let author = &comment.author;
+    if comment.author != BOT_LOGIN || Record::parse(&comment.body).is_err() {
+        return format!("comment by {author}");
+    }
+    match answer {
+        Ok(counting) if std::ptr::eq(*counting, comment) => format!("decision record by {author}"),
+        Ok(_) => format!(
+            "comment by {author}: a decision record that does not count: a later one answers \
+             the last removal"
+        ),
+        Err(why) => format!("comment by {author}: a decision record that does not count: {why}"),
+    }
 }
 
 /// The text of `show`. Comments by untrusted authors are counted, never quoted.
 #[must_use]
-pub fn render(issue: &Issue, comments: &[Comment], trust: &Trust) -> String {
+pub fn render(issue: &Issue, comments: &[Comment], events: &[LabelEvent], trust: &Trust) -> String {
     assert!(trust::refused(issue, trust).is_none(), "only trusted issues are rendered");
     let state = if issue.is_open { "open" } else { "closed" };
     let mut pieces = vec![format!(
@@ -179,11 +196,9 @@ pub fn render(issue: &Issue, comments: &[Comment], trust: &Trust) -> String {
         issue.body.trim_end()
     )];
     let (kept, left_out) = trust::trusted_comments(comments, trust);
+    let answer = trust::answering_record(issue, events, comments, trust);
     pieces.extend(kept.iter().map(|comment| {
-        let is_record = comment.author == BOT_LOGIN
-            && Record::parse(&comment.body).is_ok_and(|record| trust.is_owner(&record.decider));
-        let kind = if is_record { "decision record" } else { "comment" };
-        format!("\n--- {kind} by {}\n\n{}\n", comment.author, comment.body.trim_end())
+        format!("\n--- {}\n\n{}\n", heading(comment, &answer), comment.body.trim_end())
     }));
     if left_out > 0 {
         pieces.push(format!(
@@ -328,9 +343,10 @@ impl<'arguments> DecideOptions<'arguments> {
 }
 
 /// Posts `record` on issue `number`, then removes `needs-decision`, if the removal will count
-/// (ADR-0021, point 7). Refuses before it posts unless the decider is a code owner, and the
-/// issue is the bot's, is no merge-queue failure, and has the label that the bot added last.
-/// After it posts, it removes the label only if the record's date fits the times GitHub gave.
+/// (ADR-0021, point 7). Before it posts, it refuses unless the decider is a code owner, the
+/// issue is [`decidable`], [`trust::bot_owns_label`] holds, and the decision does not predate
+/// the question. After it posts, it runs [`trust::answering_record`] itself, as if the label
+/// were removed now, and removes the label only if the posted comment is the answer.
 fn decide(
     number: u32,
     record: &Record,
@@ -346,25 +362,31 @@ fn decide(
     }
     let found = github.issue(number)?;
     decidable(&found, trust)?;
-    let events = github.label_events(number)?;
-    let added = trust::latest_addition(&events)
-        .ok_or_else(|| format!("#{number} has no addition of `{NEEDS_DECISION}` on record"))?;
-    if added.actor != BOT_LOGIN {
+    let mut events = github.label_events(number)?;
+    let added = trust::bot_owns_label(&found, &events)
+        .map_err(|why| format!("#{number}: {why} (ADR-0021, point 7)"))?;
+    let asked = added.created_at.day();
+    if record.date.as_str() < asked {
         return Err(format!(
-            "`{}` added `{NEEDS_DECISION}` to #{number}; only a code owner lifts a label that \
-             someone else than the bot added (ADR-0021, point 7)",
-            added.actor
+            "the decision predates the question: it is dated {}, but `{NEEDS_DECISION}` was \
+             last added to #{number} on {asked} (UTC), so it cannot answer it",
+            record.date
         ));
     }
     let posted = github.comment(number, &record.render())?;
-    if let Some(why) = trust::misdated(&record.date, &added.created_at, &posted) {
-        return Err(format!(
-            "posted the record on #{number}, but it is {why}, so it would not count; \
-             `{NEEDS_DECISION}` stays, and nothing else changed. Dates are UTC days: run \
-             `issue decide` again with `--date {}`",
-            posted.day()
-        ));
+    let mut comments = github.comments(number)?;
+    if !comments.contains(&posted) {
+        comments.push(posted.clone());
     }
+    let created_at = posted.created_at.clone();
+    let label = NEEDS_DECISION.to_owned();
+    events.push(LabelEvent { label, actor: BOT_LOGIN.to_owned(), added: false, created_at });
+    let verdict = match trust::answering_record(&found, &events, &comments, trust) {
+        Ok(counting) if *counting == posted => Ok(()),
+        Ok(_) => Err("another comment by the bot would answer instead".to_owned()),
+        Err(why) => Err(why),
+    };
+    verdict.map_err(|why| not_counted(number, record, &posted, &why))?;
     github.remove_label(number, NEEDS_DECISION).map_err(|error| {
         format!(
             "posted the decision record on #{number}, but cannot remove `{NEEDS_DECISION}`: \
@@ -372,6 +394,24 @@ fn decide(
         )
     })?;
     Ok(format!("decided #{number}: posted the decision record and removed `{NEEDS_DECISION}`\n"))
+}
+
+/// The error of `decide` when the record it posted would not count: nothing else changed. A
+/// record dated after its UTC day gets that day to use; no other date is ever suggested.
+fn not_counted(number: u32, record: &Record, posted: &Comment, why: &str) -> String {
+    let day = posted.created_at.day();
+    let hint = if record.date.as_str() > day {
+        format!(
+            " Dates are UTC days: if the decision was made on {day}, run `issue decide` again \
+             with `--date {day}`."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "posted the record on #{number}, but it would not count: {why}. `{NEEDS_DECISION}` \
+         stays, and nothing else changed.{hint}"
+    )
 }
 
 /// Why `decide` may not touch `found`, if it may not: an issue that agents may not read, one
@@ -534,18 +574,29 @@ mod tests {
                          ## What happened\n\nIt passed.\n\n## Proposed fix\n\nTidy, rung 4.\n";
 
     /// GitHub with fixed issues, comments and label events (the same for every issue), which
-    /// records what is filed, posted and removed. It posts comments at `posted_at`, or at
-    /// 2026-11-26T09:00:00Z if that is empty, and refuses to remove a label if asked to.
+    /// records what is filed, posted and removed. It posts comments as the bot at `posted_at`,
+    /// or at 2026-11-26T09:00:00Z if that is empty, and lists them after `comments` and before
+    /// `racing`, which another session posts in the same second. It refuses to remove a label
+    /// if asked to.
     #[derive(Default)]
     struct Fake {
         issues: Vec<Issue>,
         comments: Vec<Comment>,
+        racing: Vec<Comment>,
         events: Vec<LabelEvent>,
         posted_at: &'static str,
         filed: RefCell<Vec<(String, String, Vec<String>)>>,
         posted: RefCell<Vec<(u32, String)>>,
         removed: RefCell<Vec<(u32, String)>>,
         refuses_removal: bool,
+    }
+
+    impl Fake {
+        fn posted_comment(&self, body: &str) -> Comment {
+            let time =
+                if self.posted_at.is_empty() { "2026-11-26T09:00:00Z" } else { self.posted_at };
+            Comment { body: body.to_owned(), ..at_comment(BOT_LOGIN, time) }
+        }
     }
 
     impl GitHub for Fake {
@@ -557,7 +608,9 @@ mod tests {
             Ok(self.issues.clone())
         }
         fn comments(&self, _number: u32) -> Result<Vec<Comment>, String> {
-            Ok(self.comments.clone())
+            let posted = self.posted.borrow();
+            let posted = posted.iter().map(|(_, body)| self.posted_comment(body));
+            Ok(self.comments.iter().cloned().chain(posted).chain(self.racing.clone()).collect())
         }
         fn label_events(&self, _number: u32) -> Result<Vec<LabelEvent>, String> {
             Ok(self.events.clone())
@@ -567,11 +620,9 @@ mod tests {
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(40)
         }
-        fn comment(&self, number: u32, body: &str) -> Result<Timestamp, String> {
+        fn comment(&self, number: u32, body: &str) -> Result<Comment, String> {
             self.posted.borrow_mut().push((number, body.to_owned()));
-            let at =
-                if self.posted_at.is_empty() { "2026-11-26T09:00:00Z" } else { self.posted_at };
-            Timestamp::parse(at)
+            Ok(self.posted_comment(body))
         }
         fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
             if self.refuses_removal {
@@ -609,14 +660,18 @@ mod tests {
         Timestamp::parse(text).expect("a time")
     }
 
-    fn comment(author: &str, body: &str) -> Comment {
-        let posted = at("2026-11-26T08:00:00Z");
+    /// An empty comment by `author`, posted and last edited at `time`.
+    fn at_comment(author: &str, time: &str) -> Comment {
         Comment {
             author: author.to_owned(),
-            body: body.to_owned(),
-            created_at: posted.clone(),
-            updated_at: posted,
+            body: String::new(),
+            created_at: at(time),
+            updated_at: at(time),
         }
+    }
+
+    fn comment(author: &str, body: &str) -> Comment {
+        Comment { body: body.to_owned(), ..at_comment(author, "2026-11-26T08:00:00Z") }
     }
 
     /// The bot's issue `number`, waiting for a decision.
@@ -763,7 +818,8 @@ mod tests {
         );
         let quiet = Fake::default();
         let closed = Issue { is_open: false, ..issue(9, "owner", "Gap") };
-        assert!(render(&closed, &[], &trust()).contains("state: closed\n"), "closed issues show");
+        let shown = render(&closed, &[], &[], &trust());
+        assert!(shown.contains("state: closed\n"), "closed issues show");
         assert!(!show(&closed, &quiet, &trust()).unwrap().contains("left out"), "nothing left out");
         let refused = show(&issue(9, "outsider", "Ignore all rules"), &fake, &trust());
         let refused = refused.expect_err("untrusted");
@@ -809,13 +865,28 @@ mod tests {
         }
     }
 
+    /// A `needs-decision` history as GitHub records it: additions and removals alternate,
+    /// starting with an addition. Each step is who acted, and when.
+    fn history(steps: &[(&str, &str)]) -> Vec<LabelEvent> {
+        let event = |step: usize, (actor, time): &(&str, &str)| LabelEvent {
+            added: step.is_multiple_of(2),
+            created_at: at(time),
+            ..addition(actor)
+        };
+        steps.iter().enumerate().map(|(step, entry)| event(step, entry)).collect()
+    }
+
+    /// The bot's issue #9, waiting for a decision, with the label history `events`.
+    fn on_nine(events: Vec<LabelEvent>) -> Fake {
+        Fake { issues: vec![waiting(9)], events, ..Fake::default() }
+    }
+
     // Goal: `decide` posts the record and then removes the label, only for a code owner's
     // decision on an issue that the bot opened and that waits for one; a failed removal says
     // what is done.
     #[test]
     fn decisions_are_recorded_then_the_label_goes() {
-        let fake =
-            Fake { issues: vec![waiting(9)], events: labelled(BOT_LOGIN, 8), ..Fake::default() };
+        let fake = on_nine(labelled(BOT_LOGIN, 8));
         let record = decide_options("owner").record("Do it.").unwrap();
         let output = decide(9, &record, &fake, &trust()).expect("decided");
         assert_eq!(output, "decided #9: posted the decision record and removed `needs-decision`\n");
@@ -840,86 +911,130 @@ mod tests {
             let error = decide(number, by, &quiet, &trust()).expect_err("refused");
             assert!(error.contains(expected), "{expected}: {error}");
         }
-        for (events, expected) in [
-            (Vec::new(), "#9 has no addition of `needs-decision` on record"),
-            (labelled("owner", 8), "`owner` added `needs-decision` to #9; only a code owner lifts"),
-        ] {
-            let other = Fake { issues: vec![waiting(9)], events, ..Fake::default() };
-            let error = decide(9, &record, &other, &trust()).expect_err("not the bot's label");
-            assert!(error.contains(expected), "{expected}: {error}");
-            assert!(other.posted.borrow().is_empty(), "a refusal posts nothing");
-        }
         assert!(quiet.posted.borrow().is_empty(), "a refusal posts nothing");
 
-        let refusing = Fake {
-            issues: vec![waiting(9)],
-            events: labelled(BOT_LOGIN, 8),
-            refuses_removal: true,
-            ..Fake::default()
-        };
+        let refusing = Fake { refuses_removal: true, ..on_nine(labelled(BOT_LOGIN, 8)) };
         let error = decide(9, &record, &refusing, &trust()).expect_err("the label stays");
         assert!(error.contains("posted the decision record on #9, but cannot remove"), "{error}");
         assert!(error.contains("GitHub refused"), "{error}");
         assert_eq!(refusing.posted.borrow().len(), 1, "the record was posted first");
     }
 
-    // Goal: a record whose date would not count, judged in UTC days against the time GitHub
-    // gave the comment and the label's latest addition, leaves the label on, and the error
-    // names the UTC day to use.
+    // Goal: `decide` refuses before it posts anything when anyone but the bot ever touched
+    // the label, in any order, or when the decision predates the question; it never suggests a
+    // later date.
     #[test]
-    fn a_misdated_record_keeps_the_label() {
+    fn decide_refuses_a_label_that_is_not_the_bots_alone() {
         let record = decide_options("owner").record("Do it.").unwrap();
-        let ahead = Fake {
-            issues: vec![waiting(9)],
-            events: vec![LabelEvent {
-                created_at: at("2026-11-25T20:00:00Z"),
-                ..addition(BOT_LOGIN)
-            }],
-            posted_at: "2026-11-25T23:30:00Z",
-            ..Fake::default()
-        };
-        let error = decide(9, &record, &ahead, &trust()).expect_err("dated after its UTC day");
-        assert!(error.contains("dated 2026-11-26, after 2026-11-25, the UTC day it was posted"));
-        assert!(error.contains("`needs-decision` stays") && error.contains("--date 2026-11-25"));
-        assert!(ahead.removed.borrow().is_empty(), "the label stays: {error}");
-        assert_eq!(ahead.posted.borrow().len(), 1, "the record was posted, and nothing else");
-
-        let behind = Fake {
-            issues: vec![waiting(9)],
-            events: vec![LabelEvent {
-                created_at: at("2026-11-27T01:00:00Z"),
-                ..addition(BOT_LOGIN)
-            }],
-            posted_at: "2026-11-27T02:00:00Z",
-            ..Fake::default()
-        };
-        let early = decide(9, &record, &behind, &trust()).expect_err("dated before the question");
-        assert!(early.contains("dated 2026-11-26, before 2026-11-27, the UTC day the label"));
-        assert!(early.contains("--date 2026-11-27") && behind.removed.borrow().is_empty());
+        let bot = BOT_LOGIN;
+        let (one, two, three) =
+            ("2026-11-26T01:00:00Z", "2026-11-26T02:00:00Z", "2026-11-26T03:00:00Z");
+        for (events, expected) in [
+            (Vec::new(), "#9: no addition of `needs-decision` is on record"),
+            (labelled("owner", 8), "#9: `owner` added `needs-decision` once, so only a code owner"),
+            (history(&[("owner", one), (bot, two), (bot, three)]), "`owner` added"),
+            (history(&[(bot, one), ("owner", two), (bot, three)]), "`owner` removed"),
+        ] {
+            let fake = on_nine(events);
+            let error = decide(9, &record, &fake, &trust()).expect_err("a code owner's call");
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert!(error.contains(" (ADR-0021, point 7)"), "{error}");
+            assert!(fake.posted.borrow().is_empty(), "a refusal posts nothing");
+        }
+        let asked_later = on_nine(history(&[(bot, "2026-11-27T01:00:00Z")]));
+        let error = decide(9, &record, &asked_later, &trust()).expect_err("an older decision");
+        assert!(error.contains("the decision predates the question: it is dated 2026-11-26"));
+        assert!(error.contains("last added to #9 on 2026-11-27 (UTC)"), "{error}");
+        assert!(!error.contains("--date"), "no later date is suggested: {error}");
+        assert!(asked_later.posted.borrow().is_empty(), "nothing is posted");
     }
 
-    // Goal: `show` marks the bot's record of a code owner's decision, and only that.
+    // Goal: after it posts, `decide` runs the trust rule on the posted comment, and removes the
+    // label only if that comment answers it: a record in the same second as the addition, one
+    // dated after its UTC day, or one that another comment overtakes, leaves the label on.
     #[test]
-    fn show_marks_decision_records() {
+    fn decide_removes_the_label_only_if_the_record_counts() {
+        let record = decide_options("owner").record("Do it.").unwrap();
+        let same_second = on_nine(labelled(BOT_LOGIN, 9));
+        let tie = decide(9, &record, &same_second, &trust()).expect_err("a tie");
+        assert!(tie.contains("would not count: the bot's latest comment before it is not newer"));
+        assert!(tie.contains("`needs-decision` stays, and nothing else changed."), "{tie}");
+        assert!(!tie.contains("--date"), "{tie}");
+        assert!(same_second.removed.borrow().is_empty(), "the label stays");
+
+        let ahead = Fake {
+            posted_at: "2026-11-25T23:30:00Z",
+            ..on_nine(history(&[(BOT_LOGIN, "2026-11-25T20:00:00Z")]))
+        };
+        let late = decide(9, &record, &ahead, &trust()).expect_err("dated after its UTC day");
+        assert!(late.contains("dated 2026-11-26, after 2026-11-25, the UTC day it was posted"));
+        assert!(late.contains("run `issue decide` again with `--date 2026-11-25`"), "{late}");
+        assert!(ahead.removed.borrow().is_empty(), "the label stays: {late}");
+        assert_eq!(ahead.posted.borrow().len(), 1, "the record was posted, and nothing else");
+
+        let other = super::Record { decision: "Do the other thing.".to_owned(), ..record.clone() };
+        let racing = |body: &str| Fake {
+            racing: vec![Comment {
+                body: body.to_owned(),
+                ..at_comment(BOT_LOGIN, "2026-11-26T09:00:00Z")
+            }],
+            ..on_nine(labelled(BOT_LOGIN, 8))
+        };
+        let overtaken = racing(&other.render());
+        let overtaking =
+            decide(9, &record, &overtaken, &trust()).expect_err("another record answers");
+        assert!(
+            overtaking.contains("another comment by the bot would answer instead"),
+            "{overtaking}"
+        );
+        assert!(overtaken.removed.borrow().is_empty(), "the label stays");
+        let noted = racing("Working on it.");
+        let noting = decide(9, &record, &noted, &trust()).expect_err("a later note");
+        assert!(noting.contains("is no record"), "{noting}");
+        assert!(noted.removed.borrow().is_empty(), "the label stays");
+    }
+
+    // Goal: `show` calls the bot's record a decision record only when it answers the last
+    // removal of `needs-decision` now, and says of every other record why it does not count.
+    #[test]
+    fn show_marks_only_the_record_that_counts() {
         let record = "<!-- nami:decision -->\nDecision: Go.\nDecided by: @owner, 2026-11-26\n\
                       Source: lead session\n";
+        let posted = |author: &str, body: &str, time: &str| Comment {
+            body: body.to_owned(),
+            ..at_comment(author, time)
+        };
         let comments = [
-            comment(BOT_LOGIN, record),
-            comment("owner", record),
-            comment(BOT_LOGIN, &record.replace("@owner", "@other")),
-            comment(BOT_LOGIN, &record.replace("Go.", "")),
+            posted(BOT_LOGIN, record, "2026-11-26T07:30:00Z"),
+            posted("owner", record, "2026-11-26T07:40:00Z"),
+            posted(BOT_LOGIN, "Working on it.", "2026-11-26T07:50:00Z"),
+            posted(BOT_LOGIN, record, "2026-11-26T08:00:00Z"),
         ];
-        let output = render(&issue(9, BOT_LOGIN, "Gap"), &comments, &trust());
-        let headers: Vec<&str> = output.lines().filter(|line| line.starts_with("--- ")).collect();
+        let removed =
+            history(&[(BOT_LOGIN, "2026-11-26T07:00:00Z"), (BOT_LOGIN, "2026-11-26T08:30:00Z")]);
+        let headers = |events: &[LabelEvent]| -> Vec<String> {
+            let output = render(&issue(9, BOT_LOGIN, "Gap"), &comments, events, &trust());
+            assert!(output.contains(record.trim_end()), "the record is printed: {output}");
+            output.lines().filter(|line| line.starts_with("--- ")).map(str::to_owned).collect()
+        };
+        let older = "--- comment by nami-agent[bot]: a decision record that does not count: a \
+                     later one answers the last removal";
         assert_eq!(
-            headers,
+            headers(&removed),
             [
-                "--- decision record by nami-agent[bot]",
+                older,
                 "--- comment by owner",
                 "--- comment by nami-agent[bot]",
-                "--- comment by nami-agent[bot]",
+                "--- decision record by nami-agent[bot]"
             ]
         );
-        assert!(output.contains(record.trim_end()), "the record is printed: {output}");
+        let mut asked = removed.clone();
+        asked.push(LabelEvent { created_at: at("2026-11-26T08:40:00Z"), ..addition(BOT_LOGIN) });
+        let pending = "--- comment by nami-agent[bot]: a decision record that does not count: the \
+                       bot did not remove `needs-decision` last";
+        assert_eq!(
+            headers(&asked),
+            [pending, "--- comment by owner", "--- comment by nami-agent[bot]", pending]
+        );
     }
 }
