@@ -6,11 +6,12 @@ use std::process::Command;
 use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent};
 use xtask::task::execute;
 
-/// GitHub with fixed issues and label events, or unreachable.
+/// GitHub with fixed issues, label events and merge-queue entries, or unreachable.
 #[derive(Default)]
 struct Fake {
     issues: Vec<Issue>,
     events: Vec<(u32, LabelEvent)>,
+    queued: Vec<u32>,
     is_down: bool,
 }
 
@@ -32,6 +33,13 @@ impl GitHub for Fake {
     }
     fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
         Err("the task commands never file issues".to_owned())
+    }
+    fn is_queued(&self, number: u32) -> Result<bool, String> {
+        if self.is_down {
+            Err("GitHub is down".to_owned())
+        } else {
+            Ok(self.queued.contains(&number))
+        }
     }
 }
 
@@ -165,6 +173,7 @@ fn issues_are_claimed_like_tasks() {
             issue(8, "owner", &["guardrail-gap"]),
         ],
         events: vec![(7, removal("nami-agent[bot]")), (8, removal("owner"))],
+        queued: Vec::new(),
         is_down: false,
     };
     let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
@@ -240,6 +249,11 @@ fn queue_failures_wait_for_their_fix() {
 
     github.issues[1].body = "Summary.\n<!-- Fixes #3 -->\n".to_owned();
     assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "a comment closes nothing");
+    github.queued = vec![45];
+    assert_eq!(task(&github, &["ready"]), Ok(left_out.clone()), "never push to a queued PR");
+    let queued = task(&github, &["claim", "issue-3"]).expect_err("#45 is queued");
+    assert!(queued.contains("#45 is in the merge queue, and agents never push"), "{queued}");
+    github.queued.clear();
     let claimed = task(&github, &["claim", "issue-3"]).expect("work for an agent");
     assert!(claimed.contains("fix it on #45's own branch") && claimed.contains("keep the claim"));
     github.issues[1].body = "**Fixes #3**".to_owned();

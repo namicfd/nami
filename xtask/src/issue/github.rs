@@ -87,6 +87,13 @@ pub trait GitHub {
     ///
     /// When GitHub refuses it or cannot be asked.
     fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String>;
+
+    /// True while pull request `number` has an entry in the merge queue.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or does not have it.
+    fn is_queued(&self, number: u32) -> Result<bool, String>;
 }
 
 /// Reads an issue or pull request in the shape of GitHub's issues API.
@@ -202,6 +209,13 @@ fn as_number(value: &Value) -> Option<u32> {
 
 /// The GitHub repository, `owner/name`, that `remote` of the checkout at `root` points to, or
 /// `None` if git cannot tell or the remote is not on GitHub.
+///
+/// It is used to recognise `Fixes <owner>/<name>#<n>` as a reference to this repository. If
+/// `origin` points to a fork, the fork's name comes back, and a reference qualified with the
+/// base repository's name is not recognised: `pr-body` then asks for `Fixes #<n>`, and `task
+/// ready` lists a queue-failure issue whose PR closes it only in that form. In CI,
+/// `actions/checkout` sets `origin` to the repository that the workflow runs in, the base
+/// repository also for a PR from a fork, so CI reads the right name.
 #[must_use]
 pub fn repository_of(root: &Path, remote: &str) -> Option<String> {
     let url = crate::task::claims::git(root, &["remote", "get-url", remote], &[], None).ok()?;
@@ -310,6 +324,39 @@ impl GitHub for Gh {
         let arguments = ["--method", "POST", "repos/{owner}/{repo}/issues", "--input", "-"];
         Ok(issue_from_json(&self.one(&arguments, Some(&request))?)?.number)
     }
+
+    fn is_queued(&self, number: u32) -> Result<bool, String> {
+        is_queued_from_json(&self.queue_entry(number)?)
+    }
+}
+
+impl Gh {
+    /// GitHub's GraphQL answer to `pullRequest(number:) { mergeQueueEntry { state } }`.
+    pub(crate) fn queue_entry(&self, number: u32) -> Result<Value, String> {
+        let query = "query($owner: String!, $name: String!, $number: Int!) { \
+                     repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+                     mergeQueueEntry { state } } } }";
+        let number = format!("number={number}");
+        let query = format!("query={query}");
+        let arguments =
+            ["graphql", "-f", &query, "-F", "owner={owner}", "-F", "name={repo}", "-F", &number];
+        self.one(&arguments, None)
+    }
+}
+
+/// Reads whether a pull request has a merge-queue entry from the GraphQL answer to
+/// `pullRequest(number:) { mergeQueueEntry { state } }`.
+///
+/// # Errors
+///
+/// When the answer has no `mergeQueueEntry` field: a missing field is never "not queued".
+pub fn is_queued_from_json(graphql: &Value) -> Result<bool, String> {
+    let path = ["data", "repository", "pullRequest"];
+    let pull = path.iter().try_fold(graphql, |inner, key| inner.get(key));
+    let entry = pull
+        .and_then(|pull| pull.get("mergeQueueEntry"))
+        .ok_or_else(|| format!("GitHub sent no `{}.mergeQueueEntry`", path.join(".")))?;
+    Ok(*entry != Value::Null)
 }
 
 #[cfg(test)]

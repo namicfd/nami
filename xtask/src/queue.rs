@@ -497,6 +497,9 @@ mod tests {
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(70)
         }
+        fn is_queued(&self, number: u32) -> Result<bool, String> {
+            Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
+        }
     }
 
     fn trust() -> Trust {

@@ -284,23 +284,88 @@ fn closing_problem(body: &str, branch: &str, repository: Option<&str>) -> Option
 /// Markdown emphasis that may wrap a closing word or the issue reference: `**Fixes #3**`.
 const EMPHASIS: [char; 2] = ['*', '_'];
 
+/// Punctuation that may follow the issue reference.
+const TRAILING: [char; 4] = ['.', ',', ';', ')'];
+
 /// True if the PR description `body` closes issue `number` on merge: a closing word such as
-/// `Fixes`, then `#<number>`, or `<owner>/<name>#<number>` when `repository` is this
-/// repository's `owner/name`, outside HTML comments. Emphasis around either word counts, as on
-/// GitHub. A reference to another repository's issue closes nothing here.
+/// `Fixes`, then a reference to the issue, outside HTML comments and fenced code blocks.
+///
+/// The reference is `#<number>`, possibly in parentheses, or, when `repository` is this
+/// repository's `owner/name`, `<owner>/<name>#<number>` or the issue's URL. A pair of emphasis
+/// markers around a word or around both words counts, as on GitHub; an unpaired marker does
+/// not. A reference to another repository's issue closes nothing here.
 #[must_use]
 pub fn closes(body: &str, number: u32, repository: Option<&str>) -> bool {
-    let local = format!("#{number}");
-    let qualified = repository.map(|slug| format!("{}#{number}", slug.to_ascii_lowercase()));
-    let visible = without_comments(body);
+    let slug = repository.map(str::to_ascii_lowercase);
+    let references: Vec<String> = [
+        Some(format!("#{number}")),
+        slug.as_ref().map(|slug| format!("{slug}#{number}")),
+        slug.as_ref().map(|slug| format!("https://github.com/{slug}/issues/{number}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let visible = without_fences(&without_comments(body));
     let words: Vec<&str> = visible.split_whitespace().collect();
-    words.array_windows().any(|[word, next]| {
-        let word = word.trim_matches(EMPHASIS).trim_end_matches(':').trim_matches(EMPHASIS);
-        let next = next.trim_matches(EMPHASIS).trim_end_matches(['.', ',', ';', ')']);
-        let next = next.trim_matches(EMPHASIS).to_ascii_lowercase();
-        CLOSING_WORDS.contains(&word.to_ascii_lowercase().as_str())
-            && (next == local || qualified.as_ref() == Some(&next))
+    words.array_windows().any(|&[word, next]| {
+        let across = paired_across(word, next.trim_end_matches(TRAILING));
+        [Some((word, next)), across].into_iter().flatten().any(|(word, next)| {
+            let keyword = unwrapped(word.trim_end_matches(':')).trim_end_matches(':');
+            let reference = unwrapped(next.trim_end_matches(['.', ',', ';']));
+            let parenthesised =
+                reference.strip_prefix('(').and_then(|inner| inner.strip_suffix(')'));
+            let reference = parenthesised.unwrap_or(reference);
+            let reference = reference.trim_end_matches(TRAILING).to_ascii_lowercase();
+            CLOSING_WORDS.contains(&keyword.to_ascii_lowercase().as_str())
+                && references.contains(&reference)
+        })
     })
+}
+
+/// The emphasis markers that `word` starts with, such as `**`; empty if none.
+fn leading_marker(word: &str) -> &str {
+    let rest = word.trim_start_matches(EMPHASIS);
+    word.strip_suffix(rest).unwrap_or_default()
+}
+
+/// `word` without one pair of emphasis markers around it, such as `**Fixes**`, or `word` as it
+/// is when its markers do not pair up.
+fn unwrapped(word: &str) -> &str {
+    let marker = leading_marker(word);
+    if marker.is_empty() {
+        return word;
+    }
+    let inner = word.strip_prefix(marker).and_then(|rest| rest.strip_suffix(marker));
+    let inner = inner.filter(|inner| !inner.is_empty() && !inner.ends_with(EMPHASIS));
+    inner.unwrap_or(word)
+}
+
+/// The two words without the pair of emphasis markers that opens before `word` and closes
+/// after `next`, such as `**Fixes #3**`, or `None` if there is no such pair.
+fn paired_across<'text>(word: &'text str, next: &'text str) -> Option<(&'text str, &'text str)> {
+    let marker = leading_marker(word);
+    if marker.is_empty() {
+        return None;
+    }
+    let inner_next = next.strip_suffix(marker).filter(|inner| !inner.ends_with(EMPHASIS))?;
+    Some((word.strip_prefix(marker)?, inner_next))
+}
+
+/// Removes fenced code blocks, opened and closed by a line that starts with three backticks or
+/// three tildes. A block that is never closed runs to the end of the text.
+fn without_fences(text: &str) -> String {
+    let mut open: Option<&str> = None;
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        let fence = ["```", "~~~"].into_iter().find(|fence| line.trim_start().starts_with(fence));
+        match (open, fence) {
+            (None, Some(fence)) => open = Some(fence),
+            (Some(opened), Some(fence)) if opened == fence => open = None,
+            (None, None) => kept.push(line),
+            _ => {}
+        }
+    }
+    kept.join("\n")
 }
 
 /// Why issue `number` is not a follow-up issue, or `None` if it is one: GitHub has it, it is
@@ -531,6 +596,9 @@ mod tests {
             Err("not used".to_owned())
         }
         fn create(&self, _title: &str, _body: &str, _labels: &[&str]) -> Result<u32, String> {
+            Err("not used".to_owned())
+        }
+        fn is_queued(&self, _number: u32) -> Result<bool, String> {
             Err("not used".to_owned())
         }
     }
@@ -804,34 +872,58 @@ mod tests {
         assert!(problems[1].contains("is not a follow-up issue: it is not #12;"), "{problems:?}");
     }
 
-    // Goal: the closing forms that GitHub honours count: emphasis around the keyword or the
-    // reference, and `owner/name#n` for this repository only, in any case. A comment, another
+    // Goal: the closing forms that GitHub honours count: a pair of emphasis markers around the
+    // keyword, the reference or both, `(#n)`, and `owner/name#n` or the issue's URL for this
+    // repository only, in any case. A comment, a fenced code block, an unpaired marker, another
     // repository's issue, and a qualified reference when the repository is unknown do not.
     #[test]
     fn closing_forms_that_github_honours() {
         let here = Some("namicfd/nami");
         for text in [
             "**Fixes #3**",
+            "**Fixes #3.**",
             "**Fixes** #3",
             "_Fixes_ #3.",
             "**Fixes:** **#3**",
+            "**Fixes** **#3**.",
+            "Fixes (#3)",
+            "Fixes (#3).",
             "Closes namicfd/nami#3",
             "Fixes NamiCFD/Nami#3.",
             "*Resolves namicfd/nami#3*",
+            "Fixes https://github.com/namicfd/nami/issues/3",
+            "Fixes https://github.com/NamiCFD/Nami/issues/3.",
+            "```\ncode\n```\nFixes #3",
+            "~~~\nFixes #2\n~~~\n\nFixes #3",
         ] {
             assert!(super::closes(text, 3, here), "`{text}` closes #3");
         }
         for text in [
             "<!-- **Fixes #3** -->",
+            "```\nFixes #3\n```",
+            "  ```rust\nFixes #3\n  ```",
+            "~~~\nFixes #3\n```\nstill code\n",
+            "**Fixes #3",
+            "Fixes #3**",
+            "*Fixes** #3",
+            "**Fixes*** #3",
+            "Fixes (#3",
+            "Fixes #3(",
             "Fixes other/repo#3",
             "Fixes namicfd/nami#30",
             "Fixes namicfd/nami3",
+            "Fixes https://github.com/other/repo/issues/3",
+            "Fixes https://github.com/namicfd/nami/pull/3",
+            "Fixes https://github.com/namicfd/nami/issues/30",
             "**Fixes #30**",
             "Fixes **#",
+            "Fixes ****",
         ] {
             assert!(!super::closes(text, 3, here), "`{text}` does not close #3");
         }
         assert!(!super::closes("Fixes namicfd/nami#3", 3, None), "unknown repository");
+        let url = "Fixes https://github.com/namicfd/nami/issues/3";
+        assert!(!super::closes(url, 3, None), "unknown repository");
         assert!(super::closes("**Fixes #3**", 3, None), "a local reference needs no repository");
     }
 

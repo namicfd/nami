@@ -342,7 +342,9 @@ fn queue_failure_pull(found: &Issue) -> Option<u32> {
 /// - the PR it names is open and its description closes the issue: the fix is in flight, and
 ///   the PR's merge closes the issue;
 /// - the PR is closed or merged while the issue is open, or the number is no PR: nobody can
-///   push a fix there, and a human closes the issue.
+///   push a fix there, and a human closes the issue;
+/// - the PR is in the merge queue: a push would take it out again. If it fails there, the
+///   new run gets its own issue.
 ///
 /// `repository` is this repository's `owner/name`, for `Fixes <owner>/<name>#<n>`. Only whether
 /// the description closes the issue is read, never its text.
@@ -364,6 +366,11 @@ fn queue_failure_hold(
         format!(
             "#{pull} says `Fixes #{number}`: the fix is in flight and #{pull}'s merge closes the \
              issue, so take other work"
+        )
+    } else if github.is_queued(pull)? {
+        format!(
+            "#{pull} is in the merge queue, and agents never push to a queued PR; take other \
+             work, and if #{pull} fails again, CI files a new issue"
         )
     } else {
         return Ok(None);

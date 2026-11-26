@@ -5,7 +5,7 @@
 //! `GH_TOKEN` names. Parsing is kept apart from the process calls, so that it is tested on JSON
 //! in the shape that GitHub returns.
 
-use crate::issue::github::{Gh, optional_string, parse_lines, string_at};
+use crate::issue::github::{Gh, is_queued_from_json, optional_string, parse_lines, string_at};
 use crate::json::{self, Value};
 
 /// An open pull request: only its number and author are read, never its text.
@@ -290,16 +290,11 @@ pub fn pull_state_from_json(rest: &Value, graphql: &Value) -> Result<PullState, 
         other => return Err(format!("a pull request has the unknown state `{other}`")),
     };
     let is_merged = rest.get("merged").and_then(Value::as_bool).ok_or("no boolean `merged`")?;
-    let path = ["data", "repository", "pullRequest"];
-    let pull = path.iter().try_fold(graphql, |inner, key| inner.get(key));
-    let entry = pull
-        .and_then(|pull| pull.get("mergeQueueEntry"))
-        .ok_or_else(|| format!("GitHub sent no `{}.mergeQueueEntry`", path.join(".")))?;
     Ok(PullState {
         author: string_at(rest, &["user", "login"])?,
         is_open,
         is_merged,
-        is_queued: *entry != Value::Null,
+        is_queued: is_queued_from_json(graphql)?,
     })
 }
 
@@ -412,24 +407,7 @@ impl Forge for Gh {
 
     fn pull_state(&self, number: u32) -> Result<PullState, String> {
         let rest = self.one(&[&format!("repos/{{owner}}/{{repo}}/pulls/{number}")], None)?;
-        let query = "query($owner: String!, $name: String!, $number: Int!) { \
-                     repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
-                     mergeQueueEntry { state } } } }";
-        let graphql = self.one(
-            &[
-                "graphql",
-                "-f",
-                &format!("query={query}"),
-                "-F",
-                "owner={owner}",
-                "-F",
-                "name={repo}",
-                "-F",
-                &format!("number={number}"),
-            ],
-            None,
-        )?;
-        pull_state_from_json(&rest, &graphql)
+        pull_state_from_json(&rest, &self.queue_entry(number)?)
     }
 
     fn queue_runs_since(&self, created_at: &str) -> Result<Vec<Run>, String> {
