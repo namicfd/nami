@@ -1,0 +1,78 @@
+### config A
+<aos::Aos as Block>::advance                                 call=11 total=460 vaddpd(ymm)=2 vaddsd=8 vdivsd=1 vmulpd(ymm)=10 vmulsd=24 ymm=29
+<aos::Aos as Block>::prepare                                 call=9 sqrtsd=1 total=279 vaddsd=4 vblendvpd=3 vdivsd=2 vmulsd=10
+<hybrid::Hybrid<4> as Block>::advance                        call=23 total=726 vaddpd(ymm)=2 vaddsd=12 vdivsd=4 vmulpd(ymm)=8 vmulsd=53 ymm=23
+<hybrid::Hybrid<4> as Block>::prepare                        call=21 sqrtsd=4 total=673 vaddsd=16 vblendvpd=12 vdivsd=8 vmulsd=40
+<hybrid::Hybrid<8> as Block>::advance                        call=23 total=924 vaddpd(ymm)=2 vaddsd=20 vdivsd=8 vmulpd(ymm)=8 vmulsd=89 ymm=23
+<hybrid::Hybrid<8> as Block>::prepare                        call=21 sqrtsd=1 total=430 vaddsd=4 vblendvpd=4 vdivsd=2 vmulsd=10
+<soa::Soa as Block>::advance                                 call=18 total=1649 vaddpd(ymm)=13 vaddsd=28 vdivpd(ymm)=1 vdivsd=1 vmulpd(ymm)=49 vmulsd=110 ymm=231
+<soa::Soa as Block>::prepare                                 call=16 sqrtsd=1 total=332 vaddsd=4 vblendvpd=4 vdivsd=2 vmulsd=10 ymm=9
+aos::sweep_transverse                                        call=15 sqrtsd=4 total=923 vaddpd(ymm)=18 vaddsd=36 vblendvpd=4 vdivpd=2 vdivpd(ymm)=6 vdivsd=9 vmulpd(ymm)=12 vmulsd=66 ymm=139
+aos::sweep_transverse::{closure#0}                           call=6 total=106
+aos::sweep_x                                                 call=12 sqrtsd=4 total=822 vaddpd=1 vaddpd(ymm)=18 vaddsd=29 vblendvpd=4 vdivpd=2 vdivpd(ymm)=6 vdivsd=9 vmulpd=2 vmulpd(ymm)=15 vmulsd=61 ymm=168
+hybrid::sweep_transverse::<4>                                call=21 sqrtsd=4 total=783 vaddsd=60 vblendvpd=4 vdivpd=2 vdivsd=11 vmulsd=87
+hybrid::sweep_transverse::<4>::{closure#0}                   call=6 total=106
+hybrid::sweep_transverse::<8>                                call=21 sqrtsd=4 total=951 vaddsd=92 vblendvpd=4 vdivpd=2 vdivsd=15 vmulsd=115
+hybrid::sweep_transverse::<8>::{closure#0}                   call=6 total=106
+hybrid::sweep_x::<4>                                         call=34 sqrtsd=4 total=2515 vaddpd(ymm)=15 vaddsd=73 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=22 vmulpd(ymm)=35 vmulsd=114 ymm=294
+hybrid::sweep_x::<8>                                         call=34 sqrtsd=4 total=2615 vaddpd(ymm)=15 vaddsd=73 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=22 vmulpd(ymm)=35 vmulsd=114 ymm=394
+soa::sweep_transverse                                        call=27 sqrtsd=4 total=2007 vaddpd(ymm)=25 vaddsd=98 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=23 vmulpd(ymm)=20 vmulsd=114 ymm=162
+soa::sweep_x                                                 call=22 sqrtsd=4 total=1710 vaddpd(ymm)=15 vaddsd=73 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=23 vmulpd(ymm)=35 vmulsd=114 ymm=199
+### config B
+<aos::Aos as Block>::advance                                 call=11 total=460 vaddpd(ymm)=2 vaddsd=8 vdivsd=1 vmulpd(ymm)=10 vmulsd=24 ymm=29
+<aos::Aos as Block>::prepare                                 call=8 total=276 vaddsd=4 vblendvpd=3 vdivsd=2 vmulsd=10 vsqrtsd=1
+<hybrid::Hybrid<4> as Block>::advance                        call=23 total=726 vaddpd(ymm)=2 vaddsd=12 vdivsd=4 vmulpd(ymm)=8 vmulsd=53 ymm=23
+<hybrid::Hybrid<4> as Block>::prepare                        call=20 total=664 vaddsd=16 vblendvpd=12 vdivsd=8 vmulsd=40 vsqrtsd=4
+<hybrid::Hybrid<8> as Block>::advance                        call=23 total=924 vaddpd(ymm)=2 vaddsd=20 vdivsd=8 vmulpd(ymm)=8 vmulsd=89 ymm=23
+<hybrid::Hybrid<8> as Block>::prepare                        call=20 total=421 vaddsd=4 vblendvpd=4 vdivsd=2 vmulsd=10 vsqrtsd=1
+<soa::Soa as Block>::advance                                 call=18 total=1649 vaddpd(ymm)=13 vaddsd=28 vdivpd(ymm)=1 vdivsd=1 vmulpd(ymm)=49 vmulsd=110 ymm=231
+<soa::Soa as Block>::prepare                                 call=15 total=329 vaddsd=4 vblendvpd=4 vdivsd=2 vmulsd=10 vsqrtsd=1 ymm=9
+aos::sweep_transverse                                        call=14 total=921 vaddpd(ymm)=18 vaddsd=36 vblendvpd=4 vdivpd=2 vdivpd(ymm)=6 vdivsd=9 vmulpd(ymm)=12 vmulsd=66 vsqrtsd=4 ymm=139
+aos::sweep_transverse::{closure#0}                           call=6 total=106
+aos::sweep_x                                                 call=11 total=819 vaddpd=1 vaddpd(ymm)=18 vaddsd=29 vblendvpd=4 vdivpd=2 vdivpd(ymm)=6 vdivsd=9 vmulpd=2 vmulpd(ymm)=15 vmulsd=61 vsqrtsd=4 ymm=170
+hybrid::sweep_transverse::<4>                                call=20 total=767 vaddsd=60 vblendvpd=4 vdivpd=2 vdivsd=11 vmulsd=87 vsqrtsd=4
+hybrid::sweep_transverse::<4>::{closure#0}                   call=6 total=106
+hybrid::sweep_transverse::<8>                                call=20 total=935 vaddsd=92 vblendvpd=4 vdivpd=2 vdivsd=15 vmulsd=115 vsqrtsd=4
+hybrid::sweep_transverse::<8>::{closure#0}                   call=6 total=106
+hybrid::sweep_x::<4>                                         call=33 total=2502 vaddpd(ymm)=15 vaddsd=73 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=22 vmulpd(ymm)=35 vmulsd=114 vsqrtsd=4 ymm=294
+hybrid::sweep_x::<8>                                         call=33 total=2602 vaddpd(ymm)=15 vaddsd=73 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=22 vmulpd(ymm)=35 vmulsd=114 vsqrtsd=4 ymm=394
+soa::sweep_transverse                                        call=26 total=1982 vaddpd(ymm)=25 vaddsd=98 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=23 vmulpd(ymm)=20 vmulsd=114 vsqrtsd=4 ymm=162
+soa::sweep_x                                                 call=21 total=1705 vaddpd(ymm)=15 vaddsd=73 vblendvpd=4 vdivpd=2 vdivpd(ymm)=5 vdivsd=23 vmulpd(ymm)=35 vmulsd=114 vsqrtsd=4 ymm=199
+### config C
+<aos::Aos as Block>::advance                                 call=11 total=460 vaddpd(ymm)=2 vaddsd=8 vdivsd=1 vmulpd(ymm)=10 vmulsd=24 ymm=29
+<aos::Aos as Block>::prepare                                 call=6 total=244 vaddsd=4 vblendvpd=3 vdivsd=2 vmulsd=10 vsqrtsd=1
+<hybrid::Hybrid<4> as Block>::advance                        call=23 total=726 vaddpd(ymm)=2 vaddsd=12 vdivsd=4 vmulpd(ymm)=8 vmulsd=53 ymm=23
+<hybrid::Hybrid<4> as Block>::prepare                        call=18 total=629 vaddsd=12 vblendvpd=8 vdivpd(ymm)=1 vdivsd=4 vmulpd(ymm)=1 vmulsd=36 vsqrtpd(ymm)=1 ymm=7
+<hybrid::Hybrid<8> as Block>::advance                        call=23 total=924 vaddpd(ymm)=2 vaddsd=20 vdivsd=8 vmulpd(ymm)=8 vmulsd=89 ymm=23
+<hybrid::Hybrid<8> as Block>::prepare                        call=18 total=406 vaddsd=4 vblendvpd=4 vdivsd=2 vmulsd=10 vsqrtsd=1
+<soa::Soa as Block>::advance                                 call=18 total=1649 vaddpd(ymm)=13 vaddsd=28 vdivpd(ymm)=1 vdivsd=1 vmulpd(ymm)=49 vmulsd=110 ymm=231
+<soa::Soa as Block>::prepare                                 call=13 total=801 vaddpd(ymm)=4 vaddsd=4 vblendvpd=7 vblendvpd(ymm)=3 vdivpd(ymm)=2 vdivsd=2 vmulpd(ymm)=10 vmulsd=10 vsqrtpd(ymm)=1 vsqrtsd=1 ymm=131
+aos::sweep_transverse                                        call=12 total=826 vaddpd(ymm)=18 vaddsd=36 vblendvpd=2 vdivpd=3 vdivpd(ymm)=6 vdivsd=7 vmulpd=1 vmulpd(ymm)=12 vmulsd=64 vsqrtpd=1 vsqrtsd=2 ymm=139
+aos::sweep_x                                                 call=9 total=1012 vaddpd=1 vaddpd(ymm)=46 vaddsd=29 vblendvpd=2 vblendvpd(ymm)=5 vdivpd=3 vdivpd(ymm)=16 vdivsd=7 vmulpd=3 vmulpd(ymm)=74 vmulsd=59 vsqrtpd=1 vsqrtpd(ymm)=4 vsqrtsd=2 ymm=349
+hybrid::sweep_transverse::<4>                                call=18 total=734 vaddsd=60 vblendvpd=2 vdivpd=3 vdivsd=9 vmulpd=1 vmulsd=85 vsqrtpd=1 vsqrtsd=2
+hybrid::sweep_transverse::<4>::{closure#0}                   call=6 total=106
+hybrid::sweep_transverse::<8>                                call=18 total=889 vaddsd=92 vblendvpd=2 vdivpd=3 vdivsd=13 vmulpd=1 vmulsd=113 vsqrtpd=1 vsqrtsd=2
+hybrid::sweep_transverse::<8>::{closure#0}                   call=6 total=106
+hybrid::sweep_x::<4>                                         call=31 total=2830 vaddpd(ymm)=43 vaddsd=73 vblendvpd=2 vblendvpd(ymm)=5 vdivpd=3 vdivpd(ymm)=15 vdivsd=20 vmulpd=1 vmulpd(ymm)=94 vmulsd=112 vsqrtpd=1 vsqrtpd(ymm)=4 vsqrtsd=2 ymm=563
+hybrid::sweep_x::<8>                                         call=31 total=2907 vaddpd(ymm)=43 vaddsd=73 vblendvpd=2 vblendvpd(ymm)=5 vdivpd=3 vdivpd(ymm)=15 vdivsd=20 vmulpd=1 vmulpd(ymm)=94 vmulsd=112 vsqrtpd=1 vsqrtpd(ymm)=4 vsqrtsd=2 ymm=664
+soa::sweep_transverse                                        call=24 total=2321 vaddpd(ymm)=53 vaddsd=98 vblendvpd=2 vblendvpd(ymm)=5 vdivpd=3 vdivpd(ymm)=15 vdivsd=21 vmulpd=1 vmulpd(ymm)=79 vmulsd=112 vsqrtpd=1 vsqrtpd(ymm)=4 vsqrtsd=2 ymm=432
+soa::sweep_x                                                 call=19 total=2070 vaddpd(ymm)=43 vaddsd=73 vblendvpd=2 vblendvpd(ymm)=5 vdivpd=3 vdivpd(ymm)=15 vdivsd=21 vmulpd=1 vmulpd(ymm)=94 vmulsd=112 vsqrtpd=1 vsqrtpd(ymm)=4 vsqrtsd=2 ymm=469
+### config CA
+<aos::Aos as Block>::advance                                 call=11 total=460 vaddpd(ymm)=2 vaddsd=8 vdivsd=1 vmulpd(ymm)=10 vmulsd=24 ymm=29
+<aos::Aos as Block>::prepare                                 call=6 total=244 vaddsd=4 vblendvpd=3 vdivsd=2 vmulsd=10 vsqrtsd=1
+<hybrid::Hybrid<4> as Block>::advance                        call=23 total=726 vaddpd(ymm)=2 vaddsd=12 vdivsd=4 vmulpd(ymm)=8 vmulsd=53 ymm=23
+<hybrid::Hybrid<4> as Block>::prepare                        call=18 total=629 vaddsd=12 vblendvpd=8 vdivpd(ymm)=1 vdivsd=4 vmulpd(ymm)=1 vmulsd=36 vsqrtpd(ymm)=1 ymm=7
+<hybrid::Hybrid<8> as Block>::advance                        call=23 total=924 vaddpd(ymm)=2 vaddsd=20 vdivsd=8 vmulpd(ymm)=8 vmulsd=89 ymm=23
+<hybrid::Hybrid<8> as Block>::prepare                        call=18 total=406 vaddsd=4 vblendvpd=4 vdivsd=2 vmulsd=10 vsqrtsd=1
+<soa::Soa as Block>::advance                                 call=18 total=1649 vaddpd(ymm)=13 vaddsd=28 vdivpd(ymm)=1 vdivsd=1 vmulpd(ymm)=49 vmulsd=110 ymm=231
+<soa::Soa as Block>::prepare                                 call=13 total=801 vaddpd(ymm)=4 vaddsd=4 vblendvpd=7 vblendvpd(ymm)=3 vdivpd(ymm)=2 vdivsd=2 vmulpd(ymm)=10 vmulsd=10 vsqrtpd(ymm)=1 vsqrtsd=1 ymm=131
+aos::sweep_transverse                                        call=12 total=797 vaddpd=1 vaddpd(ymm)=6 vaddsd=10 vblendvpd=3 vdivpd=2 vdivpd(ymm)=6 vdivsd=6 vmulpd=5 vmulpd(ymm)=6 vmulsd=38 vsqrtpd=2 ymm=131
+aos::sweep_x                                                 call=9 total=971 vaddpd=2 vaddpd(ymm)=12 vaddsd=5 vblendvpd=3 vblendvpd(ymm)=5 vdivpd=2 vdivpd(ymm)=13 vdivsd=6 vmulpd=6 vmulpd(ymm)=51 vmulsd=36 vsqrtpd=2 vsqrtpd(ymm)=4 ymm=323
+hybrid::sweep_transverse::<4>                                call=18 total=1719 vaddpd=1 vaddpd(ymm)=20 vaddsd=44 vblendvpd=4 vdivpd=2 vdivpd(ymm)=20 vdivsd=24 vmulpd=5 vmulpd(ymm)=20 vmulsd=72 vsqrtpd=2 ymm=280
+hybrid::sweep_transverse::<4>::{closure#0}                   call=6 total=106
+hybrid::sweep_transverse::<8>                                call=18 total=868 vaddpd=1 vaddsd=52 vblendvpd=4 vdivpd=2 vdivsd=12 vmulpd=5 vmulsd=80 vsqrtpd=2
+hybrid::sweep_transverse::<8>::{closure#0}                   call=6 total=106
+hybrid::sweep_x::<4>                                         call=31 total=2792 vaddpd=1 vaddpd(ymm)=11 vaddsd=19 vblendvpd=4 vblendvpd(ymm)=5 vdivpd=2 vdivpd(ymm)=12 vdivsd=19 vmulpd=5 vmulpd(ymm)=72 vmulsd=72 vsqrtpd=2 vsqrtpd(ymm)=4 ymm=536
+hybrid::sweep_x::<8>                                         call=31 total=2892 vaddpd=1 vaddpd(ymm)=11 vaddsd=19 vblendvpd=4 vblendvpd(ymm)=5 vdivpd=2 vdivpd(ymm)=12 vdivsd=19 vmulpd=5 vmulpd(ymm)=72 vmulsd=72 vsqrtpd=2 vsqrtpd(ymm)=4 ymm=636
+soa::sweep_transverse                                        call=24 total=2278 vaddpd=1 vaddpd(ymm)=21 vaddsd=44 vblendvpd=4 vblendvpd(ymm)=5 vdivpd=2 vdivpd(ymm)=12 vdivsd=20 vmulpd=5 vmulpd(ymm)=57 vmulsd=72 vsqrtpd=2 vsqrtpd(ymm)=4 ymm=403
+soa::sweep_x                                                 call=19 total=2053 vaddpd=1 vaddpd(ymm)=11 vaddsd=19 vblendvpd=4 vblendvpd(ymm)=5 vdivpd=2 vdivpd(ymm)=12 vdivsd=20 vmulpd=5 vmulpd(ymm)=72 vmulsd=72 vsqrtpd=2 vsqrtpd(ymm)=4 ymm=441

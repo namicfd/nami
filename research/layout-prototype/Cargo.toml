@@ -1,0 +1,65 @@
+# Throwaway layout prototype (docs/ARCHITECTURE.md § 4(a)). Its own workspace, never a member of
+# the nami workspace, so it touches no protected manifest or lockfile.
+[workspace]
+
+[package]
+name = "layout-prototype"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[dependencies]
+# Same pin as the nami workspace.
+libm = { version = "=0.2.16", default-features = false, features = ["arch"] }
+
+[features]
+# Per-phase wall-clock timers (adds an Instant::now pair per row and phase).
+phase-timers = []
+# Data point: the domain asserts in math::sqrt become debug_assert!.
+sqrt-debug-asserts = []
+# Data point: math::sqrt calls f64::sqrt (LLVM intrinsic, correctly rounded) instead of libm.
+intrinsic-sqrt = []
+# Data point only (ADR-0005 forbids it): algebraic_* arithmetic in the per-face physics.
+algebraic = []
+# Hybrid only: per-group lane loops behind a call boundary, so the loop vectoriser sees them.
+outlined-lanes = []
+
+[profile.release]
+overflow-checks = true
+debug-assertions = false
+
+[profile.release-checked]
+inherits = "release"
+debug-assertions = true
+
+# The nami lint table, minus the documentation lints.
+[lints.rust]
+unsafe_code = "deny"
+unused_results = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+let_underscore_must_use = "deny"
+dbg_macro = "deny"
+missing_assert_message = "warn"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+indexing_slicing = "deny"
+missing_asserts_for_indexing = "warn"
+float_cmp = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+iter_over_hash_type = "deny"
+too_many_lines = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+similar_names = "allow"
+many_single_char_names = "allow"

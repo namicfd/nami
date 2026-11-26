@@ -1,0 +1,46 @@
+<comment>
+problem   = 3D linear sound wave along the grid diagonal (nami layout prototype)
+
+<job>
+problem_id = LinWave
+
+<time>
+cfl_number  = 0.3
+nlim        = -1
+tlim        = 0.5773502691896258
+integrator  = rk2
+xorder      = 2
+ncycle_out  = 0
+
+<mesh>
+nx1 = 128
+x1min = 0.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 128
+x2min = 0.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 128
+x3min = 0.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+num_threads = 1
+refinement = none
+
+<meshblock>
+nx1 = 128
+nx2 = 128
+nx3 = 128
+
+<hydro>
+gamma = 1.666666666666667
+
+<problem>
+compute_error = true
+wave_flag = 0
+amp = 1.0e-6
+vflow = 0.0

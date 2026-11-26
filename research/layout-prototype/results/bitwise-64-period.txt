@@ -1,0 +1,18 @@
+## config C
+variant=soa n=64 cycles=124 seconds=2.5962 zone_cycles_per_second=1.2521e7 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=aos n=64 cycles=124 seconds=4.1420 zone_cycles_per_second=7.8479e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=hybrid4 n=64 cycles=124 seconds=4.4303 zone_cycles_per_second=7.3372e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=hybrid8 n=64 cycles=124 seconds=4.4570 zone_cycles_per_second=7.2932e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+all layouts bitwise identical: hash=cd8c234f981d50dc
+## config D
+variant=soa n=64 cycles=124 seconds=37.6981 zone_cycles_per_second=8.6227e5 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=aos n=64 cycles=124 seconds=51.9562 zone_cycles_per_second=6.2564e5 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=hybrid4 n=64 cycles=124 seconds=5.2868 zone_cycles_per_second=6.1484e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=hybrid8 n=64 cycles=124 seconds=5.1873 zone_cycles_per_second=6.2664e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+all layouts bitwise identical: hash=cd8c234f981d50dc
+## config A
+variant=soa n=64 cycles=124 seconds=45.5193 zone_cycles_per_second=7.1411e5 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=aos n=64 cycles=124 seconds=68.3942 zone_cycles_per_second=4.7527e5 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=hybrid4 n=64 cycles=124 seconds=6.2016 zone_cycles_per_second=5.2415e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+variant=hybrid8 n=64 cycles=124 seconds=6.3299 zone_cycles_per_second=5.1353e6 hash=cd8c234f981d50dc rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]
+all layouts bitwise identical: hash=cd8c234f981d50dc

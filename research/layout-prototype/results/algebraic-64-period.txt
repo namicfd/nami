@@ -1,0 +1,1 @@
+variant=soa n=64 cycles=124 seconds=3.4900 zone_cycles_per_second=9.3139e6 hash=b3d1240b56d648aa rms_l1=2.297543e-8 l1=[1.112785e-8 6.465961e-9 6.465961e-9 6.465961e-9 1.669178e-8]

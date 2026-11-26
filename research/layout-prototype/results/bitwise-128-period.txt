@@ -1,0 +1,5 @@
+variant=soa n=128 cycles=247 seconds=52.9681 zone_cycles_per_second=9.7794e6 hash=b4ff5fa133dad012 rms_l1=6.057865e-9 l1=[2.936264e-9 1.700723e-9 1.700723e-9 1.700723e-9 4.404396e-9]
+variant=aos n=128 cycles=247 seconds=72.3746 zone_cycles_per_second=7.1572e6 hash=b4ff5fa133dad012 rms_l1=6.057865e-9 l1=[2.936264e-9 1.700723e-9 1.700723e-9 1.700723e-9 4.404396e-9]
+variant=hybrid4 n=128 cycles=247 seconds=83.0868 zone_cycles_per_second=6.2344e6 hash=b4ff5fa133dad012 rms_l1=6.057865e-9 l1=[2.936264e-9 1.700723e-9 1.700723e-9 1.700723e-9 4.404396e-9]
+variant=hybrid8 n=128 cycles=247 seconds=69.2908 zone_cycles_per_second=7.4757e6 hash=b4ff5fa133dad012 rms_l1=6.057865e-9 l1=[2.936264e-9 1.700723e-9 1.700723e-9 1.700723e-9 4.404396e-9]
+all layouts bitwise identical: hash=b4ff5fa133dad012

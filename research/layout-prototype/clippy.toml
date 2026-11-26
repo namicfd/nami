@@ -1,0 +1,60 @@
+# Clippy configuration (ADR-0006, amended by ADR-0013). Code-owned (ADR-0008).
+# Every ban carries a reason that names the replacement, because the reason is the error message.
+
+# Backstop for tidy's 70 physical lines; clippy counts code lines only.
+too-many-lines-threshold = 60
+excessive-nesting-threshold = 4
+
+# Acronyms are written as words (HllcSolver), also on public items (TIGER_STYLE.md, Naming).
+upper-case-acronyms-aggressive = true
+avoid-breaking-exported-api = false
+
+# Tests may unwrap and index directly.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+doc-valid-idents = ["TigerStyle", "TigerBeetle", "SymPy", "PyClaw", "Clawpack", ".."]
+
+disallowed-methods = [
+  # Transcendental functions: std calls the platform libm, which differs between platforms (ADR-0005).
+  { path = "f64::sqrt", reason = "use kernels::math::sqrt (libm, deterministic; ADR-0005)" },
+  { path = "f64::cbrt", reason = "use libm::cbrt via kernels::math (ADR-0005)" },
+  { path = "f64::exp", reason = "use libm::exp via kernels::math (ADR-0005)" },
+  { path = "f64::exp2", reason = "use libm::exp2 via kernels::math (ADR-0005)" },
+  { path = "f64::exp_m1", reason = "use libm::expm1 via kernels::math (ADR-0005)" },
+  { path = "f64::ln", reason = "use libm::log via kernels::math (ADR-0005)" },
+  { path = "f64::log", reason = "use libm::log via kernels::math (ADR-0005)" },
+  { path = "f64::log2", reason = "use libm::log2 via kernels::math (ADR-0005)" },
+  { path = "f64::log10", reason = "use libm::log10 via kernels::math (ADR-0005)" },
+  { path = "f64::ln_1p", reason = "use libm::log1p via kernels::math (ADR-0005)" },
+  { path = "f64::powf", reason = "use libm::pow via kernels::math (ADR-0005)" },
+  { path = "f64::powi", reason = "use explicit multiplication or libm::pow via kernels::math (ADR-0005)" },
+  { path = "f64::hypot", reason = "use libm::hypot via kernels::math (ADR-0005)" },
+  { path = "f64::sin", reason = "use libm::sin via kernels::math (ADR-0005)" },
+  { path = "f64::cos", reason = "use libm::cos via kernels::math (ADR-0005)" },
+  { path = "f64::tan", reason = "use libm::tan via kernels::math (ADR-0005)" },
+  { path = "f64::sin_cos", reason = "use libm::sincos via kernels::math (ADR-0005)" },
+  { path = "f64::asin", reason = "use libm::asin via kernels::math (ADR-0005)" },
+  { path = "f64::acos", reason = "use libm::acos via kernels::math (ADR-0005)" },
+  { path = "f64::atan", reason = "use libm::atan via kernels::math (ADR-0005)" },
+  { path = "f64::atan2", reason = "use libm::atan2 via kernels::math (ADR-0005)" },
+  { path = "f64::sinh", reason = "use libm::sinh via kernels::math (ADR-0005)" },
+  { path = "f64::cosh", reason = "use libm::cosh via kernels::math (ADR-0005)" },
+  { path = "f64::tanh", reason = "use libm::tanh via kernels::math (ADR-0005)" },
+  # Reordering arithmetic is not deterministic (ADR-0005).
+  { path = "f64::algebraic_add", reason = "not deterministic; use plain + (ADR-0005)" },
+  { path = "f64::algebraic_sub", reason = "not deterministic; use plain - (ADR-0005)" },
+  { path = "f64::algebraic_mul", reason = "not deterministic; use plain * (ADR-0005)" },
+  { path = "f64::algebraic_div", reason = "not deterministic; use plain / (ADR-0005)" },
+  { path = "f64::algebraic_rem", reason = "not deterministic; use plain % (ADR-0005)" },
+  # Wall-clock time is not deterministic (ADR-0005).
+  { path = "std::time::SystemTime::now", reason = "not deterministic; pass time in explicitly (ADR-0005)" },
+]
+
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "iteration order is not deterministic; use a sorted array or BTreeMap (ADR-0005)" },
+  { path = "std::collections::HashSet", reason = "iteration order is not deterministic; use a sorted array or BTreeSet (ADR-0005)" },
+]
+# Prototype: the Instant::now ban is removed, because the benchmark driver and the phase timers
+# need wall-clock time. The f64::sqrt ban stays; the intrinsic-sqrt data point carries an #[expect].
