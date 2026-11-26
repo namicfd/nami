@@ -271,19 +271,25 @@ fn issue_numbers(text: &str) -> Vec<u32> {
 fn closing_problem(body: &str, branch: &str) -> Option<String> {
     let id = branch.strip_prefix(TASK_BRANCH_PREFIX)?;
     let number = crate::issue::number_of_id(id).ok().flatten()?;
-    let reference = format!("#{number}");
-    let visible = without_comments(body);
-    let words: Vec<&str> = visible.split_whitespace().collect();
-    let closes = words.array_windows().any(|[word, next]| {
-        let word = word.trim_end_matches(':').to_ascii_lowercase();
-        let next = next.trim_end_matches(['.', ',', ';', ')']);
-        CLOSING_WORDS.contains(&word.as_str()) && next == reference
-    });
-    (!closes).then(|| {
+    (!closes(body, number)).then(|| {
         format!(
             "the branch `{branch}` works on issue #{number}, but the description does not close \
              it; add the line `Fixes #{number}` (ADR-0021)"
         )
+    })
+}
+
+/// True if the PR description `body` closes issue `number` on merge: a closing word such as
+/// `Fixes`, then `#<number>`, outside HTML comments.
+#[must_use]
+pub fn closes(body: &str, number: u32) -> bool {
+    let reference = format!("#{number}");
+    let visible = without_comments(body);
+    let words: Vec<&str> = visible.split_whitespace().collect();
+    words.array_windows().any(|[word, next]| {
+        let word = word.trim_end_matches(':').to_ascii_lowercase();
+        let next = next.trim_end_matches(['.', ',', ';', ')']);
+        CLOSING_WORDS.contains(&word.as_str()) && next == reference
     })
 }
 

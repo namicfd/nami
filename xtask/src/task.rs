@@ -17,8 +17,9 @@
 pub mod claims;
 pub mod plan;
 
-use crate::issue::github::{Gh, GitHub};
+use crate::issue::github::{Gh, GitHub, Issue};
 use crate::issue::{self, trust};
+use crate::queue;
 use claims::Claim;
 use plan::Task;
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,7 +173,13 @@ fn status(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Stri
         // Titles are not printed: whether an issue is trusted is `issue show`'s business.
         let description = match github.issue(number) {
             Ok(found) if !found.is_open => "done: the issue is closed".to_owned(),
-            Ok(_) => claimed(claim),
+            Ok(found) => match waiting_for(github, &found) {
+                Ok(Some(pull)) => {
+                    format!("{}; #{pull} says `Fixes #{number}` and waits to merge", claimed(claim))
+                }
+                Ok(None) => claimed(claim),
+                Err(error) => format!("{}; its fix's state is unknown: {error}", claimed(claim)),
+            },
             Err(error) => format!("{}; its state is unknown: {error}", claimed(claim)),
         };
         lines.push(format!("{:<32} {description}\n", claim.task));
@@ -224,7 +231,9 @@ fn ready_issues(
             continue;
         }
         let events = github.label_events(found.number)?;
-        if trust::unworkable(found, &events, &trust).is_none() {
+        if trust::unworkable(found, &events, &trust).is_none()
+            && waiting_for(github, found)?.is_none()
+        {
             lines.push(format!("{id}\t{}\n", found.title));
         }
     }
@@ -274,13 +283,46 @@ fn claim_issue(
     if let Some(reason) = trust::unworkable(&found, &events, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
+    if let Some(pull) = waiting_for(github, &found)? {
+        return Err(format!(
+            "`{id}` waits for #{pull}, whose description says `Fixes #{number}`: its merge \
+             closes the issue, so take other work (ADR-0021, point 6)"
+        ));
+    }
     let holder = holder(root);
     claims::claim(root, remote, &[], id, &holder)
         .map_err(|error| format!("cannot claim `{id}`: {error}"))?;
-    Ok(format!(
-        "claimed {id}\nread it with `cargo xtask issue show {number}`, work on the branch \
-         `task/{id}`, and write `Fixes #{number}` in the PR description\n"
-    ))
+    let work = match queue_failure_pull(&found) {
+        Some(pull) => format!(
+            "fix it on #{pull}'s own branch, add `Fixes #{number}` to #{pull}'s description, \
+             re-queue #{pull}, and keep the claim: #{pull}'s merge closes the issue (ADR-0021, \
+             point 6)"
+        ),
+        None => format!(
+            "work on the branch `task/{id}`, and write `Fixes #{number}` in the PR \
+                         description"
+        ),
+    };
+    Ok(format!("claimed {id}\nread it with `cargo xtask issue show {number}`, {work}\n"))
+}
+
+/// The PR that `found` reports as failed in the merge queue, if the bot filed it with the
+/// title that `cargo xtask queue failed` gives (ADR-0021, point 6).
+fn queue_failure_pull(found: &Issue) -> Option<u32> {
+    queue::failure::pull_of_title(&found.title).filter(|_| found.author == trust::BOT_LOGIN)
+}
+
+/// The PR that the queue-failure issue `found` waits for, or `None`: its fix is in flight
+/// while that PR is open and its description closes the issue. Sessions then back off, and
+/// the PR's merge closes the issue (ADR-0021, point 6). Only whether the description closes
+/// the issue is read, never its text.
+fn waiting_for(github: &dyn GitHub, found: &Issue) -> Result<Option<u32>, String> {
+    let Some(pull) = queue_failure_pull(found) else {
+        return Ok(None);
+    };
+    let fix = github.issue(pull)?;
+    let waits = fix.is_pull_request && fix.is_open && crate::pr::closes(&fix.body, found.number);
+    Ok(waits.then_some(pull))
 }
 
 /// The text of a claim file: who holds the task and from which session.

@@ -206,6 +206,57 @@ fn issues_are_claimed_like_tasks() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+// Goal: the bot's queue-failure issue waits while the PR it names is open and its description
+// closes the issue: `ready` leaves it out, `claim` refuses and says why, and `status` shows a
+// held claim as waiting (ADR-0021, point 6). A closing word in a comment, a closed PR, an
+// issue that is not a PR, or a title by someone else than the bot does not make it wait.
+#[test]
+fn queue_failures_wait_for_their_fix() {
+    let (root, clone) = setup("queue-failures");
+    push_code_owners(&clone);
+    let title = "PR #45 failed in the merge queue";
+    let failure = Issue { title: title.to_owned(), ..issue(3, "nami-agent[bot]", &["bug"]) };
+    let fix = Issue {
+        is_pull_request: true,
+        body: "Summary.\n\nFixes #3\n".to_owned(),
+        ..issue(45, "nami-agent[bot]", &[])
+    };
+    let mut github = Fake { issues: vec![failure, fix], ..Fake::default() };
+    let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
+    let waiting = "a\tTask a\n".to_owned();
+    let listed = format!("a\tTask a\nissue-3\t{title}\n");
+    assert_eq!(task(&github, &["ready"]), Ok(waiting.clone()), "the fix is in flight");
+    let refused = task(&github, &["claim", "issue-3"]).expect_err("it waits");
+    assert!(refused.contains("`issue-3` waits for #45, whose description says `Fixes #3`"));
+
+    github.issues[1].body = "Summary.\n<!-- Fixes #3 -->\n".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "a comment closes nothing");
+    let claimed = task(&github, &["claim", "issue-3"]).expect("work for an agent");
+    assert!(claimed.contains("fix it on #45's own branch") && claimed.contains("keep the claim"));
+    github.issues[1].body = "Fixes #3".to_owned();
+    let status = task(&github, &["status"]).expect("status works");
+    assert!(status.contains("#45 says `Fixes #3` and waits to merge"), "{status}");
+    let popped = github.issues.pop().expect("the fix");
+    let unknown = task(&github, &["status"]).expect("status works");
+    assert!(unknown.contains("its fix's state is unknown: no issue #45"), "{unknown}");
+    assert_eq!(task(&github, &["release", "issue-3"]), Ok("released issue-3\n".to_owned()));
+    assert!(task(&github, &["ready"]).expect_err("incomplete").contains("no issue #45"));
+    github.issues.push(popped);
+    assert_eq!(task(&github, &["ready"]), Ok(waiting), "released, and still waiting");
+
+    github.issues[1].is_open = false;
+    assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "a closed PR waits for nothing");
+    github.issues[1] = Issue { is_pull_request: false, ..github.issues[1].clone() };
+    github.issues[1].is_open = true;
+    assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "#45 is an issue, not a PR");
+    github.issues[1].is_pull_request = true;
+    github.issues[0].author = "owner".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok(listed), "only the bot files queue failures");
+    let plain = task(&github, &["claim", "issue-3"]).expect("an ordinary issue");
+    assert!(plain.contains("work on the branch `task/issue-3`"), "{plain}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
 // Goal: validate, ready, status, claim and release agree with each other and with the
 // dependency graph. Method: walk one task through its life in a fixture checkout.
 #[test]
