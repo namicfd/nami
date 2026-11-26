@@ -261,7 +261,7 @@ In the app's settings, **Install App** shows one installation, on this repositor
 ### Rotate or revoke the key
 
 - **To rotate:** generate a new key in the `nami-ci` app's settings and replace the secret with it (`gh secret set NAMI_CI_PRIVATE_KEY --repo "$REPO" --env nami-ci < <the new key's file>`). Delete the downloaded file, then delete the old key in the app's settings. No agent's machine is touched.
-- **If the key leaks:** delete it in the app's settings first, then set a new one as above. Tokens already issued expire within an hour. Close any issue by `nami-ci[bot]` that the queue did not file.
+- **If the key leaks:** delete it in the app's settings first, then set a new one as above. Tokens already issued expire within an hour. Close any issue by `nami-ci[bot]` that the queue did not file. The key's `issues: write` also lets it edit any issue or comment without changing its author, and agents trust that text by its author (ADR-0023, issue #76). So check the edit history of the open issues and comments by `nami-agent[bot]` and the code owners, and the pushes and PRs by `nami-ci[bot]`.
 
 ## 9. Check that it works
 
