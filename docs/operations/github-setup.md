@@ -178,13 +178,14 @@ Which issues agents act on depends on who opened them, never on labels: only the
 
 ## 8. The bot in CI
 
-Workflow tokens act as `github-actions[bot]`, whom agents do not trust (ADR-0021). A job whose output agents must act on therefore acts as the bot, through the same `xtask/agent-token.sh` as an agent's session. Today one job does: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch, it files an issue of kind `bug` for the PR that dropped out, so that `cargo xtask task ready` lists it (issue #51). Until the steps below are done, that job fails with an error that points here, and nothing is filed.
+Workflow tokens act as `github-actions[bot]`, whom agents do not trust (ADR-0021). A job whose output agents must act on therefore acts as the bot, through the same `xtask/agent-token.sh` as an agent's session. Today one job does: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch and the PR has really left the queue, it files an issue of kind `bug` for that PR, so that `cargo xtask task ready` lists it (issue #51, ADR-0021, point 6). Until the steps below are done, that job fails with an error that points here, and nothing is filed.
 
 The job is safe to give the key because:
 
 - it runs on `workflow_run`, which takes the workflow file and xtask from `main`, never from a PR;
 - the key sits in an environment that only `main` may use, so a PR that edits a workflow to read it is refused;
-- `NAMI_AGENT_PERMISSIONS` narrows its token to `issues: write`, `actions: read` and `contents: read`, and the token expires within an hour.
+- the key is in the job's environment only until it is written to a file, which is deleted once the token is minted;
+- `NAMI_AGENT_PERMISSIONS` narrows its token to `issues: write`, and `actions`, `contents` and `pull_requests` read, and the token expires within an hour.
 
 The other job in that workflow, `adr clashes (advisory)`, comments with the workflow's own token and needs no setup.
 
