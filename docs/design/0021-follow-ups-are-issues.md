@@ -1,6 +1,6 @@
 # ADR-0021: Follow-ups are GitHub issues, claimed like tasks
 
-- Status: Proposed
+- Status: Proposed (point 6 Accepted, 2026-11-27, by the maintainer)
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0011, ADR-0020
@@ -73,7 +73,7 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 - This ADR replaces point 2 of ADR-0020. Its other points stand; where they say "learning", read "issue".
 - ADR-0011, point 5, changes. GitHub Issues carry human input and findings from agents. Plans stay the source of planned work. A trusted issue that one small PR closes is work without a plan.
 
-### 6. Amendment (Proposed, 2026-11-26): a merge-queue failure is fixed on the failing PR's own branch
+### 6. Amendment (Accepted, 2026-11-27, deciders: maintainer; proposed 2026-11-26): a merge-queue failure is fixed on the failing PR's own branch
 
 The workflow `queue` files an issue `PR #<n> failed in the merge queue (run <id>)`, of kind `bug`, when the required checks fail on PR #n's merge-queue branch and #n has left the queue: it is open, not merged, not queued, and no newer queue run tested it (issue #51). There is one issue per failed run. A re-run of the same run files nothing, but a later failed run of #n is a new failure and gets a new issue #m2, even while #n says `Fixes #<m>` for the first one. #m2 names #m and asks for `Fixes #<m2>` beside it. Most such failures are clashes that git merged without a conflict, such as two ADRs with one number. Only #n's own branch can take the fix: a rebase or a renumber of #n itself. A new PR would repeat the change and its review.
 
