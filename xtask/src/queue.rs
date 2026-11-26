@@ -26,6 +26,7 @@
 pub mod clashes;
 pub mod failure;
 pub mod forge;
+pub mod shape;
 
 use crate::issue::github::{Gh, GitHub};
 use crate::issue::trust::{self, BOT_LOGIN, Trust};
@@ -55,10 +56,11 @@ pub fn run(arguments: &[&str]) -> ExitCode {
     let root = crate::workspace_root();
     let remote = std::env::var("NAMI_TASK_REMOTE").unwrap_or_else(|_| "origin".to_owned());
     let main = format!("{remote}/{MAIN}");
-    let (reads, filer) = clients(&root, std::env::var_os(FILING_TOKEN).is_some());
     let vocabulary = || Vocabulary::load(&root, &main);
-    let result = trust::load(&root, &main)
-        .and_then(|trust| execute(&reads, &reads, &filer, &trust, &vocabulary, arguments));
+    let result = trust::load(&root, &main).and_then(|trust| {
+        let clients = clients(&root, std::env::var_os(FILING_TOKEN).is_some());
+        execute_wired(&clients, &trust, &vocabulary, arguments)
+    });
     match result {
         Ok(output) => {
             print!("{output}");
@@ -79,6 +81,18 @@ fn clients(root: &std::path::Path, separate_filing: bool) -> (Gh, Gh) {
         return (Gh::new(root), Gh::new(root));
     }
     (Gh::new(root).hiding(FILING_TOKEN), Gh::with_token_from(root, FILING_TOKEN))
+}
+
+/// Runs one command with `clients` as [`clients`] returns them, wired as in production: the
+/// first does every read and the clash comment, the second only creates issues (ADR-0023,
+/// rule 2).
+fn execute_wired<Client: Forge + GitHub>(
+    (workflow, filer): &(Client, Client),
+    trust: &Trust,
+    vocabulary: &dyn Fn() -> Result<Vocabulary, String>,
+    arguments: &[&str],
+) -> Result<String, String> {
+    execute(workflow, workflow, filer, trust, vocabulary, arguments)
 }
 
 /// Runs one command against `forge`, reading issues from `issues` and creating them through
@@ -389,11 +403,29 @@ mod tests {
 
     /// One line of `gh api --jq '.[]' repos/o/r/issues?state=open`.
     fn issue_line(number: u32, title: &str, author: &str, state: &str) -> String {
+        issue_line_with_body(number, title, author, state, "")
+    }
+
+    /// Like [`issue_line`], with the body `body`.
+    fn issue_line_with_body(
+        number: u32,
+        title: &str,
+        author: &str,
+        state: &str,
+        body: &str,
+    ) -> String {
         format!(
             "{{\"number\": {number}, \"title\": \"{title}\", \"user\": {{\"login\": \
              \"{author}\"}}, \"state\": \"{state}\", \"labels\": [{{\"name\": \"bug\"}}], \
-             \"body\": \"\"}}\n"
+             \"body\": {}}}\n",
+            crate::json::quote(body)
         )
+    }
+
+    /// The CI app's open issue #`number` for run `run` of #51, as `queue failed` writes it.
+    fn ci_issue_line(number: u32, run: u64) -> String {
+        let (title, body) = super::shape::tests::queue_failure(51, run, &[]);
+        issue_line_with_body(number, &title, CI_LOGIN, "open", &body)
     }
 
     /// The open issues: an outsider's issue with the title of #51's failure, and the bot's
@@ -439,8 +471,10 @@ mod tests {
         /// Both, as when `GH_TOKEN` is the only token.
         #[default]
         Both,
-        /// Every read, of issues too: the workflow's own token in CI.
-        Reads,
+        /// The client that acts as `GH_TOKEN`, the workflow's own token in CI: every read, of
+        /// issues too, and the clash comment's writes (`post_comment`, `edit_comment`), which
+        /// the `adr clashes` job makes with that token.
+        WorkflowToken,
         /// Creating issues, and nothing else: the CI app's token in CI.
         Filing,
     }
@@ -486,81 +520,81 @@ mod tests {
 
     impl Forge for Fake {
         fn adr_names_on(&self, branch: &str) -> Result<Vec<String>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             assert_eq!(branch, "main");
             Ok(lines(self.main, name_of))
         }
         fn open_pulls(&self) -> Result<Vec<Pull>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Ok(lines(self.pulls, pull_from_json))
         }
         fn pull_files(&self, number: u32) -> Result<Vec<PullFile>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Ok(lines(self.files.get(&number).map_or("", String::as_str), pull_file_from_json))
         }
         fn pull_comments(&self, _number: u32) -> Result<Vec<PullComment>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Ok(lines(&self.comments, pull_comment_from_json))
         }
         fn post_comment(&self, number: u32, body: &str) -> Result<(), String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             self.posted.borrow_mut().push((number, body.to_owned()));
             Ok(())
         }
         fn edit_comment(&self, id: u64, body: &str) -> Result<(), String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             self.edited.borrow_mut().push((id, body.to_owned()));
             Ok(())
         }
         fn run(&self, _id: u64) -> Result<Run, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             run_from_json(&parse(&self.run).unwrap())
         }
         fn jobs(&self, _id: u64) -> Result<Vec<Job>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             jobs_from_json(&parse(JOBS).unwrap())
         }
         fn job_log(&self, id: u64) -> Result<String, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             if id == 11 { Ok(LOG.to_owned()) } else { Err(format!("no log for {id}")) }
         }
         fn commit_messages(&self, base: &str, head: &str) -> Result<Vec<String>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             assert_eq!((base, head), (BASE_SHA, SHA), "the group is read from its base");
             strings_from_json(&parse(self.messages).unwrap())
         }
         fn pull_state(&self, number: u32) -> Result<PullState, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             assert_eq!(number, 51);
             pull_state_from_json(&parse(&self.state.0).unwrap(), &parse(&self.state.1).unwrap())
         }
         fn queue_runs_since(&self, created_at: &str) -> Result<Vec<Run>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             assert_eq!(created_at, "2026-11-26T08:24:28Z");
             Ok(lines(&self.queue_runs, run_from_json))
         }
         fn repository(&self) -> Result<String, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             repository_from_text("namicfd/nami\n")
         }
     }
 
     impl GitHub for Fake {
         fn issue(&self, number: u32) -> Result<Issue, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}"))
         }
         fn open_issues(&self) -> Result<Vec<Issue>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             self.issue_reads.set(self.issue_reads.get() + 1);
             Ok(lines(&self.issues, issue_from_json))
         }
         fn comments(&self, number: u32) -> Result<Vec<Comment>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}"))
         }
         fn label_events(&self, number: u32) -> Result<Vec<LabelEvent>, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}"))
         }
         fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String> {
@@ -579,13 +613,13 @@ mod tests {
             Err("the queue commands never list the labels".to_owned())
         }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
-            self.serve(Serves::Reads);
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
         }
     }
 
     fn trust() -> Trust {
-        Trust::from_codeowners("/docs/design/ @owner\n")
+        Trust::from_codeowners("/docs/design/ @owner\n").with_vocabulary(vocabulary())
     }
 
     fn vocabulary() -> Vocabulary {
@@ -867,37 +901,61 @@ mod tests {
         assert_eq!(rerun.filed.borrow().len(), 1, "only the filing before the re-run");
     }
 
-    // Goal: with two clients, every read, of the open issues too, goes to the read client, and
-    // the filing client only creates the issue: the CI app's token reads nothing, and the
-    // workflow's token never writes (ADR-0023, rule 2). Method: each fake fails on the other's
-    // calls. The filing fake also holds a trusted issue for this run, which would stop the
-    // filing if it were asked for issues. The open issues are read once, by the read client,
-    // for both the earlier failures and the duplicate search. An issue that the CI app filed
-    // for an earlier run of #51 is trusted and named.
+    // Goal: wired as in production, every read, of the open issues too, goes to the first
+    // client, the workflow's token, and the second client only creates the issue: the CI
+    // app's token reads nothing, and the workflow's token files nothing (ADR-0023, rule 2).
+    // Method: `execute_wired`, which `run` calls with the clients in the order that `clients`
+    // returns them; each fake fails on the other's calls. The filing fake also holds a trusted
+    // issue for this run, which would stop the filing if it were asked for issues. The open
+    // issues are read once, for both the earlier failures and the duplicate search. An issue
+    // that the CI app filed for an earlier run of #51 is trusted and named.
     #[test]
     fn reads_and_writes_go_to_their_own_clients() {
-        let earlier = issue_line(6, "PR #51 failed in the merge queue (run 800)", CI_LOGIN, "open");
-        let reads = Fake { serves: Serves::Reads, issues: issues() + &earlier, ..dropped() };
+        let earlier = ci_issue_line(6, 800);
+        let workflow =
+            Fake { serves: Serves::WorkflowToken, issues: issues() + &earlier, ..dropped() };
         let recorded =
             issue_line(5, "PR #51 failed in the merge queue (run 900)", BOT_LOGIN, "open");
         let filer = Fake { serves: Serves::Filing, issues: recorded, ..Fake::default() };
+        let clients = (workflow, filer);
         let arguments = ["failed", "--run", "900"];
-        let output = execute(&reads, &reads, &filer, &trust(), &|| Ok(vocabulary()), &arguments);
+        let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
+        let (workflow_client, filing_client) = &clients;
         assert_eq!(
             output.as_deref(),
             Ok("filed #70: PR #51 failed in the merge queue (run 900)\n")
         );
-        assert_eq!(reads.issue_reads.get(), 1, "the read client reads the open issues once");
-        assert_eq!(filer.issue_reads.get(), 0, "the filing client reads no issue");
-        assert!(reads.filed.borrow().is_empty(), "the read client files nothing");
-        assert!(reads.posted.borrow().is_empty() && reads.edited.borrow().is_empty());
-        let filed = filer.filed.borrow();
+        assert_eq!(
+            workflow_client.issue_reads.get(),
+            1,
+            "the workflow's token reads the issues once"
+        );
+        assert_eq!(filing_client.issue_reads.get(), 0, "the filing client reads no issue");
+        assert!(workflow_client.filed.borrow().is_empty(), "the workflow's token files nothing");
+        assert!(
+            workflow_client.posted.borrow().is_empty()
+                && workflow_client.edited.borrow().is_empty()
+        );
+        let filed = filing_client.filed.borrow();
         assert_eq!(filed.len(), 1, "the filing client creates the issue");
         assert!(
             filed[0].1.contains("still open: #6."),
             "the CI app's earlier issue: {}",
             filed[0].1
         );
+    }
+
+    // Goal: wired as in production, the clash comment is read and posted with the workflow's
+    // token, and the filing client is never asked.
+    #[test]
+    fn the_clash_comment_uses_the_workflow_token() {
+        let workflow = Fake { serves: Serves::WorkflowToken, ..clash_fake() };
+        let clients = (workflow, Fake { serves: Serves::Filing, ..Fake::default() });
+        let arguments = ["clashes", "--pr", "51", "--comment"];
+        let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
+        assert!(output.is_ok_and(|text| text.ends_with("commented on #51\n")), "posted");
+        assert_eq!(clients.0.posted.borrow().len(), 1, "the workflow's token posts");
+        assert!(clients.1.posted.borrow().is_empty() && clients.1.filed.borrow().is_empty());
     }
 
     // Goal: with `NAMI_FILING_TOKEN` set, the read client never sees it and the filing client

@@ -465,22 +465,45 @@ fn a_humans_failed_pull_request_is_held_without_the_label() {
 }
 
 // Goal: a queue-failure issue that the CI app filed waits for its fix like the bot's, and is
-// claimed for the PR's own branch; any other issue by the CI app is neither listed nor
-// claimable (ADR-0023).
+// claimed for the PR's own branch; any other issue by the CI app, also one with the right
+// title and a body that `queue failed` did not write, is neither listed nor claimable
+// (ADR-0023). Its body is checked against the vocabulary of `main`'s `ci.yml`.
 #[test]
 fn the_ci_apps_queue_failures_wait_like_the_bots() {
     let (root, clone) = setup("queue-failures-ci");
+    std::fs::create_dir_all(clone.join(".github/workflows")).expect("directory is writable");
+    let workflow = "name: ci\njobs:\n  gate:\n    name: gate\n";
+    std::fs::write(clone.join(".github/workflows/ci.yml"), workflow).expect("file is written");
     push_code_owners(&clone);
-    let failure = Issue { author: "nami-ci[bot]".to_owned(), ..queue_failure(3, 900) };
+    let vocabulary = xtask::queue::failure::Vocabulary::load(&clone, "origin/main")
+        .expect("main's ci.yml is readable");
+    let report = xtask::queue::failure::Failure {
+        pull: 45,
+        author: "nami-agent[bot]".to_owned(),
+        group: std::collections::BTreeSet::new(),
+        repository: "namicfd/nami".to_owned(),
+        run: 900,
+        jobs: Vec::new(),
+        earlier: std::collections::BTreeSet::new(),
+    };
+    let finding = xtask::queue::failure::finding(&report, &vocabulary);
+    let draft = xtask::issue::Draft::parse(&finding).expect("the finding parses");
+    let failure =
+        Issue { author: "nami-ci[bot]".to_owned(), body: draft.body, ..queue_failure(3, 900) };
     let listed = format!("a\tTask a\nissue-3\t{}\n", failure.title);
     let other = issue(5, "nami-ci[bot]", &["bug"]);
-    let mut github = Fake { issues: vec![failure, other, pull_45("Fixes #3")], ..Fake::default() };
+    let tampered = Issue { number: 6, body: failure.body.clone() + "More.\n", ..failure.clone() };
+    let pulls = pull_45("Fixes #3");
+    let mut github = Fake { issues: vec![failure, other, pulls, tampered], ..Fake::default() };
     let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
     assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "#3 waits, #5 is out");
     let refused = task(&github, &["claim", "issue-3"]).expect_err("it waits");
     assert!(refused.contains("#45 says `Fixes #3`: the fix is in flight"), "{refused}");
-    let untrusted = task(&github, &["claim", "issue-5"]).expect_err("not a queue failure");
-    assert!(untrusted.contains("`nami-ci[bot]`, whom agents trust only"), "{untrusted}");
+    for number in ["5", "6"] {
+        let untrusted = task(&github, &["claim", &format!("issue-{number}")])
+            .expect_err("not what queue failed writes");
+        assert!(untrusted.contains("`nami-ci[bot]`, whom agents trust only"), "{untrusted}");
+    }
     github.issues[2].body = "Summary.".to_owned();
     assert_eq!(task(&github, &["ready"]), Ok(listed), "no fix in flight: work for an agent");
     let claimed = task(&github, &["claim", "issue-3"]).expect("work for an agent");
