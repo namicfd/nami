@@ -16,6 +16,7 @@ Every command below was run against `namicfd/nami` on 2026-11-25.
 | `.github/CODEOWNERS` | The ruleset (step 3) |
 | `xtask/agent-token.sh` | The GitHub App and its installation (step 5) |
 | `.claude/settings.json` (`env`): the bot's git identity (step 6) | The app's private key on each machine, at `$NAMI_AGENT_KEY` or `~/.config/nami/nami-agent.pem` |
+| `.github/workflows/queue.yml`: the jobs that act as the bot in CI | The `nami-agent` environment and its secret `NAMI_AGENT_PRIVATE_KEY` (step 8) |
 
 When you change a setting on GitHub, update this file.
 
@@ -175,7 +176,48 @@ gh label create needs-decision --repo "$REPO" --force --color fbca04 --descripti
 
 Which issues agents act on depends on who opened them, never on labels: only the bot and the users in `.github/CODEOWNERS`. To hand an outsider's report to the agents, file it again in your own words, with one kind label.
 
-## 8. Check that it works
+## 8. The bot in CI
+
+Workflow tokens act as `github-actions[bot]`, whom agents do not trust (ADR-0021). A job whose output agents must act on therefore acts as the bot, through the same `xtask/agent-token.sh` as an agent's session. Today one job does: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch, it files an issue of kind `bug` for the PR that dropped out, so that `cargo xtask task ready` lists it (issue #51). Until the steps below are done, that job fails with an error that points here, and nothing is filed.
+
+The job is safe to give the key because:
+
+- it runs on `workflow_run`, which takes the workflow file and xtask from `main`, never from a PR;
+- the key sits in an environment that only `main` may use, so a PR that edits a workflow to read it is refused;
+- `NAMI_AGENT_PERMISSIONS` narrows its token to `issues: write`, `actions: read` and `contents: read`, and the token expires within an hour.
+
+The other job in that workflow, `adr clashes (advisory)`, comments with the workflow's own token and needs no setup.
+
+### Set it up
+
+Unlike the steps above, these have not been run against `namicfd/nami` yet. When you run them, remove this sentence.
+
+1. Go to Settings → Environments → **New environment**, and name it `nami-agent`.
+2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the rule `main`. Add no required reviewers: the job runs unattended.
+3. Under **Environment secrets**, add `NAMI_AGENT_PRIVATE_KEY` with the full contents of a private key of the app (step 5), from `-----BEGIN` to the last line. Generate a separate key for CI, so that it can be revoked without touching the agents' machines.
+
+With `gh`, from a machine that holds the CI key:
+
+```sh
+gh api -X PUT "repos/$REPO/environments/nami-agent" --input - <<'EOF'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+gh api -X POST "repos/$REPO/environments/nami-agent/deployment-branch-policies" \
+  -f name=main -f type=branch
+gh secret set NAMI_AGENT_PRIVATE_KEY --repo "$REPO" --env nami-agent < nami-agent-ci.pem
+```
+
+### Check it
+
+```sh
+gh api "repos/$REPO/environments/nami-agent" --jq '.deployment_branch_policy'
+gh api "repos/$REPO/environments/nami-agent/deployment-branch-policies" --jq '.branch_policies[].name'
+gh secret list --repo "$REPO" --env nami-agent
+```
+
+The first failed merge-queue run after that should leave an issue `PR #<n> failed in the merge queue` by `nami-agent[bot]`, labelled `bug`. To rotate the CI key, generate a new one in the app's settings, replace the secret, then delete the old key there.
+
+## 9. Check that it works
 
 ```sh
 GH_TOKEN=$(xtask/agent-token.sh) gh api installation/repositories --jq '[.repositories[].full_name]'
