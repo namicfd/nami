@@ -74,14 +74,14 @@ The checks run when the head changes anything under `xtask/` or `lints/`, or a r
 
 | Check | Fails when |
 |---|---|
-| **Rule set** (read from the head's source with `syn`; no head code runs) | Any of these:<ul><li>a base rule id is missing from the head's `RULES`, or changes kind;</li><li>a base ban row is missing, bans less, applies in a narrower scope (`Everywhere` may not become `NamiCrates`), or has an allowed entry that no base entry covers (allowed lists only shrink);</li><li>a base `(function, check_* callee)` call site in a rule module is gone;</li><li>a base lint at `Deny` or `Forbid` is not declared exactly once at such a level, or is not registered in `register_lints`;</li><li>a rule with code in a rule path has no base case.</li></ul>A table that is not written as plain literals gives no verdict. |
+| **Rule set** (read from the head's source with `syn`; no head code runs) | Any of these:<ul><li>a base rule id is missing from the head's `RULES`, or changes kind;</li><li>a base ban row is missing, moves to the other ban table (a path ban and a macro ban ban different things), bans less, changes its scope to anything but `Everywhere`, or has an allowed entry that no base entry covers (allowed lists only shrink);</li><li>a base `(function, check_* callee)` call site in a rule module is gone;</li><li>a base lint at `Deny` or `Forbid` is not declared exactly once at such a level, or is not registered in `register_lints`;</li><li>a rule with code in a rule path has no base case.</li></ul>A table that is not written as plain literals gives no verdict, and so does a form that could hide code from this reading: a `#[cfg]` or `#[cfg_attr]` other than `#[cfg(test)]`, an item macro, an expression macro outside a short list (`assert!`, `format!`, `vec!` and the like), a binding or import that could shadow a table, in the registry, the rule modules or the lint library (where only `declare_lint!`-style item macros are allowed). Calls in test code do not count as call sites. A ban row must name its scope, and a scope the ratchet does not know gives no verdict. |
 | **Tidy corpus** | For each base fixture, at each placement, the head's `tidy --file` misses a `(rule, line)` that the base's tidy reports there (firing fixture), or reports one that the base does not (passing fixture). |
-| **Lint corpus** | The base's UI cases are compiled with the base's library, in the judging job, and with the head's library, in the observing job under a random package name. A `(lint, line, column, level)` of the base is missing in the head's output. The base's run must first reproduce the base's `.stderr` locations. |
+| **Lint corpus** | The base's UI cases are compiled with the base's library, in the judging job, and with the head's library, in the observing job under a random package name. A `(lint, line, column, level)` of the base is missing in the head's output. The base's run must first reproduce the base's `.stderr` locations. A run whose exit code disagrees with its error diagnostics (0 beside an error, or an error code without one) gives no verdict, here and end to end. |
 | **End to end** | The head's `cargo xtask tidy` misses a firing case planted in a scratch copy of the head tree (regular files only), or the head's `cargo xtask dylint` misses a UI case planted as an example with a random name in a crate drawn from the head tree. This catches changes to the walk and to the wrapper. It does not prove which files a rule applies to; point 3 hardens that. |
-| **Mutants** | `cargo mutants --in-diff` over the rule-path diff, per workspace, misses a mutant. The judge reads the listing, `outcomes.json`, `missed.txt` and the exit code. All four must agree, or there is no verdict. The summary prints the mutant count. A changed rule-path source that yields no mutant is unproven: a changed constant or a deleted line makes none. |
+| **Mutants** | `cargo mutants --in-diff` over the rule-path diff, per workspace, misses a mutant. The judge reads the listing, `outcomes.json`, `missed.txt` and the exit code. All four must agree, or there is no verdict. A mutant that times out is neither caught nor missed, so any timeout is no verdict, naming the mutants. The summary prints the mutant count. A changed rule-path source that yields no mutant is unproven: a changed constant or a deleted line makes none. |
 | **Review** | See point 5. |
 
-**Placements.** Each case is planted at its virtual path and at up to two paths drawn per run, with a seed from the operating system:
+**Placements.** Each case is planted at its virtual path and at up to two paths drawn from a seed of the head's content (the fingerprint of the head tree with a fixed, public salt). The same head always gets the same placements, so re-running the check cannot draw new ones until they miss; only a change to the head's content draws again, and that change is in the diff:
 
 - one existing file of the head tree, overwritten;
 - one new file with a random name in an existing directory.
@@ -94,7 +94,9 @@ A drawn path counts only if:
 
 The judge recomputes the base's reports at each placement itself.
 
-**Output and exit code.** Each finding is one stderr line, `place: error[ratchet-<check>]: what; fix`. A Markdown summary goes to stdout. It names the corpus fingerprint, the seed and the mutant counts, and its last line is the verdict.
+**One head tree.** The observer and the judge read the same files. Both give no verdict for a head with a symbolic link anywhere, so the observer's scratch copy, made of regular files only, holds every file of the head, and the judge, which reads every path component without following links, reads what the compiler compiles. The observer records the head tree's fingerprint, and the judge gives no verdict when its own checkout differs.
+
+**Output and exit code.** Each finding is one stderr line, `place: error[ratchet-<check>]: what; fix`. A Markdown summary goes to stdout. It names the commits judged, the corpus fingerprint, the seed and the mutant counts, and its last line is the verdict. In shadow mode it also shows the verdict that the PR would get with the rule paths unowned, so that the evidence for the flip is the verdict the flip would apply.
 
 - `0`, `ratchet: pass`: every check holds. Also `pass, outside the rule paths`, the neutral outcome: CODEOWNERS decides on the other paths. The ratchet still checked the rule paths.
 - `1`, `ratchet: fail`: at least one finding.
@@ -103,7 +105,9 @@ The judge recomputes the base's reports at each placement itself.
   - a head xtask that does not build;
   - a tool that cannot be started;
   - a record that is missing, killed, inconsistent or unreadable;
-  - a base corpus that is empty or differs from the one observed;
+  - a base corpus that is empty or differs from the one observed, or a head tree that differs from the one observed;
+  - a head with a symbolic link, or a source form the `syn` reading cannot vouch for;
+  - a pull request whose head moved on from the commit judged;
   - something unproven (no mutant, no reviewer app, a skipped check) when no code owner reviews the PR.
 
   When the base's CODEOWNERS owns a changed path, the owner reviews anyway, and the unproven items become notes. So do they when a user whom the base's CODEOWNERS names has approved the PR's head commit: a rule-only PR that the ratchet cannot vouch for then needs the owner's approval, never the admin bypass.
@@ -112,7 +116,7 @@ The judge recomputes the base's reports at each placement itself.
 
 - **Sound against honest mistakes by agents**, which is what #31 showed: a rule that goes silent on cases written down, a deleted check, a narrowed table, a walk that skips a directory, tests that do not pin the change.
 - **Sound against any loosening that can be seen without running head code**: rule ids, ban rows, scopes, allowed lists, `check_*` call sites, lint declarations and registrations. The base reads these from the head's source, so no output of the head's code is involved.
-- **The review gate's separate identity** holds against an honest authoring session acting as the reviewer and against a review counted from the wrong identity. It is hardening only against PR code run during a review and against an authoring account that can become the reviewer account (point 5).
+- **The review gate** counts only the bot that `NAMI_REVIEWER_LOGIN` names, matched by account type and exact login, never the authoring app and never a user account with a look-alike name. The review runs in CI (pending #59), where no authoring session holds the reviewer app's key (point 5).
 - **Defence in depth only** against head code written to deceive. Such code can recognise inputs, behave differently when observed, or lie in the records it prints, which the judge reads as data. The placements (point 2) are hardening against code that special-cases the planted cases, not proof. The reviewer app (point 5), sampled audits after merge (ADR-0008) and the trusted core, which deceptive code would have to get past, back the ratchet here.
 
 ### 4. Isolation in CI
@@ -124,46 +128,30 @@ The judge recomputes the base's reports at each placement itself.
   - It checks out the base and the PR as data.
   - It installs the toolchains and the pinned `cargo-dylint` itself, not from a cache that the head job could write.
   - It builds the base's binary under `${RUNNER_TEMP}`.
-  - It runs `cargo xtask ratchet judge` with the PR number and the reviewer app's login.
+  - It runs `cargo xtask ratchet judge` with the PR number, the PR's head commit, the commits judged and the reviewer app's login.
   - It reads the base's corpus from its own checkout, so the head job cannot change it. The judge compares the corpus fingerprint with the one in the record. A mismatch or an empty corpus is no verdict.
 
-Both jobs run on `pull_request`, `pull_request_review` (the review arrives after the push) and `merge_group`. `ratchet` runs `if: always()` and is never skipped by a condition, because a skipped job counts as passed. A base without a ratchet skips with a note, as `base gate` does.
+Both jobs run on `pull_request` and `merge_group`. A review arrives after the push, so `pull_request_review` runs only the judge, as a job also named `ratchet`, in `.github/workflows/ratchet-review.yml`: it reuses the record of the latest run for the same head commit, waiting for it if needed, and cancels only other review runs. No review can start or cancel `ratchet (head)`. `ratchet` runs `if: always()` and is never skipped by a condition, because a skipped job counts as passed. A base without a ratchet skips with a note, as `base gate` does.
+
+In a merge group, the judge diffs the group's head against the group's parent commit (`merge_group.base_sha`), and the summary names that range, so that what was judged can be checked. The reviews and approvals are those of the PR named in the queue's ref, and its head must be the commit in that ref.
 
 ### 5. The review gate
 
 The check passes when all of these hold:
 
-- the reviewer app (`nami-reviewer[bot]`, a GitHub App separate from the agents' `nami-agent[bot]`) has a review on the PR's head commit that is not dismissed;
+- the reviewer app, the bot that the repository variable `NAMI_REVIEWER_LOGIN` names (`nami-reviewer[bot]`, a GitHub App separate from the agents' `nami-agent[bot]`), has reviewed the PR's head commit, and its latest review there is neither dismissed nor a request for changes;
 - the PR was not opened by that app;
-- every review thread that the app opened is resolved, and resolved by that app; a thread of someone else's that the app resolved is a finding, and everyone else's threads are left to the ruleset, which requires every conversation resolved before merge.
+- every review thread that the app opened is resolved, and resolved by that app.
 
-A review of an earlier commit does not count, not even for fixes, because `review-pr` re-reviews the new head and resolves the fixed threads then.
+Everyone else's threads are left to the ruleset, which requires every conversation resolved before merge; they are never a ratchet finding, whoever resolved them. A review of an earlier commit does not count, not even for fixes: the reviewer re-reviews the new head and resolves the fixed threads then. The judge passes the head commit it judged, and gives no verdict when the PR's head has moved on by the time the reviews are read.
 
-The authoring sessions never hold the reviewer's key. It belongs to another OS account or machine (`docs/operations/github-setup.md`, step 5b). `xtask/agent-token.sh` selects the app with `NAMI_AGENT_APP=reviewer`, and refuses to let the reviewer app commit or push. CI learns the login from the repository variable `NAMI_REVIEWER_LOGIN`.
+**Identity.** An app is matched by its account type and exact login with `[bot]`, never by a login alone, so a user account named `nami-reviewer` is not the reviewer. GitHub logins cannot contain `[`, so only an app has such a login. A code owner's approval counts by that owner's latest review that decided something: a later request for changes, or the dismissal of the approval, cancels it, and any owner's standing request for changes blocks.
 
-**What the separate identity protects against:**
-
-- an honest authoring session posting or resolving as the reviewer by accident: the key is not in its environment, and its account cannot read it;
-- a review counted from the wrong identity: only `nami-reviewer[bot]` counts, never the `nami-agent[bot]` that every authoring session holds.
-
-**What it does not protect against:**
-
-- PR code run by the reviewer's subagents. That code runs as the reviewer account.
-- An authoring account that can become the reviewer account: passwordless `sudo` or `su`, `lxd`, `docker`, `pkexec`, or a launcher that switches user without a human.
-
-Against these it is hardening only, as point 3 says for all deceptive code. The mitigation:
-
-- The review-pr skill and both reviewer agents run PR code only in a bubblewrap sandbox. The sandbox hides the key directory, drops the reviewer's variables and the token, and runs in its own PID namespace.
-- The key is read only before the reviewers start and in the final posting steps.
-- The runbook requires that the authoring account cannot become the reviewer account.
-
-What holds and what does not is written in step 5b. A reviewer hosted in CI, with the key as a secret of a workflow that runs no PR code, is possible future work.
-
-Until the maintainer has created the app and set the variable, the review gate gives no verdict, so a rule-path PR needs a code owner's approval of its head commit, as today: the safe default.
+**Where the review runs.** The gate counts the reviews that the bot posts, whatever posts them. The reviewer is to run in CI (pending #59), from a workflow that holds the app's key as a secret and runs no PR code, so that no authoring session can post as it. The gate does not depend on that: until the app exists and the variable is set, the review gate gives no verdict, so a rule-path PR needs a code owner's approval of its head commit, as today: the safe default.
 
 ### 6. Staging
 
-The ratchet lands in shadow mode first: the core moves, then `ratchet observe` and `ratchet judge` with both CI jobs, not required, with every guardrail path still owned. The reviewer app's tooling lands separately. The policy flip comes last and alone: this ADR, the owner-less CODEOWNERS lines with their last-match rule, and making `ratchet` a required check. It merges only after the ratchet has given correct verdicts on real PRs in shadow mode.
+The ratchet lands in shadow mode first: the core moves, then `ratchet observe` and `ratchet judge` with both CI jobs, not required, with every guardrail path still owned. The CI-hosted reviewer lands separately (#59). The policy flip comes last and alone: this ADR, the owner-less CODEOWNERS lines with their last-match rule, and making `ratchet` a required check. It merges only after the ratchet has given correct verdicts on real PRs in shadow mode.
 
 ### 7. A PR that touches both, deliberate loosenings, and the residual risks
 
@@ -179,17 +167,17 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
   - a loosened rule, at drawn placements too;
   - a rule that fires on correct code;
   - a walk that skips `crates/`;
-  - a narrowed ban scope, a wider allowed list and a removed rule;
+  - a narrowed ban scope, a wider allowed list, a removed rule, a ban moved to the other table, and tables or calls hidden behind `#[cfg]` or a macro;
   - a deleted `check_*` call;
-  - a dropped, lowered and twice-declared lint;
+  - a dropped, lowered and twice-declared lint, and a dylint run whose exit code disagrees with its output;
   - changes outside the rule paths;
-  - mutation results that are missing or empty;
-  - reviews by the wrong app and threads resolved by the wrong app;
-  - a code owner's approval of the head commit standing in for what is unproven;
-  - a corpus changed in the head job;
+  - mutation results that are missing, empty or timed out;
+  - reviews by the wrong app or by a user named like it, threads resolved by the wrong account, a head that moved, and other people's threads left to the ruleset;
+  - a code owner's approval of the head commit standing in for what is unproven, and cancelled by a later request for changes;
+  - a corpus changed in the head job, a head changed between the jobs, and a head with a symbolic link;
   - the head build;
   - the command line, including `observe` then `judge`.
-- The required `ratchet` check (`.github/workflows/guardrails.yml`; ruleset and reviewer app per `docs/operations/github-setup.md`, steps 5b and 9).
+- The required `ratchet` check (`.github/workflows/guardrails.yml`, and `.github/workflows/ratchet-review.yml` for reviews; ruleset per `docs/operations/github-setup.md`, step 9; the reviewer in CI, #59).
 - `.github/CODEOWNERS`. `xtask/src/pr.rs` refuses owner-less lines outside `RULE_PATHS`, and its tests hold the two equal.
 - The test `every_rule_in_a_rule_path_has_a_case` keeps `main` free of rule-path rules without a case.
 - **No mechanism:** whether the corpus is rich enough. The reviewer app and the sampled audits judge that.
