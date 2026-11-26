@@ -144,7 +144,10 @@ The protected paths are:
   fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths merges without the
   code owner once the required `ratchet` check proves that every case `main` writes down still
   holds, the rule tables only narrow, mutation testing misses nothing, and the reviewer app
-  (`NAMI_REVIEWER_LOGIN`, not the agents' bot) reviewed its head and resolved its threads.
+  (`NAMI_REVIEWER_LOGIN`, not the agents' bot) reviewed its head and resolved its threads. That
+  holds for an **additive** change: new rules, new fixtures and UI cases, new rows. An **edit** to
+  existing rule code (a changed function, constant, test, fixture or UI case) also waits for the
+  reviewer app's approval of its head commit (#59), and until that app exists for a code owner's.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
 - **Policy:** `docs/design/`, `docs/TIGER_STYLE.md` and `docs/operations/`.
 - **References:** `crates/reference/` and `tools/`.

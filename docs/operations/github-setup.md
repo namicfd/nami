@@ -300,7 +300,7 @@ Then try the flow end to end:
 1. **Protected path.** As the bot, push a branch that touches a protected path (any path listed in `.github/CODEOWNERS`) and open a PR. It must show "Review required" from the code owner, and must not enter the queue until that review is given.
 2. **Unowned path.** A PR touching only unowned paths, for example `crates/kernels/src/`, must enter the queue once `gate` and `lints (UI tests)` pass, with no review.
 3. **Direct push.** A direct `git push origin main` by the bot must be rejected.
-4. **Rule path.** A PR that changes only rule paths, for example a new case in `xtask/fixtures/tidy/`, must show no "Review required", must show `ratchet` as required, and must enter the queue only once `ratchet` passes. `ratchet` stays red until the reviewer app that `NAMI_REVIEWER_LOGIN` names has reviewed the PR's head commit and resolved every thread.
+4. **Rule path.** A PR that changes only rule paths, for example a new case in `xtask/fixtures/tidy/`, must show no "Review required", must show `ratchet` as required, and must enter the queue only once `ratchet` passes. `ratchet` stays red until the reviewer app that `NAMI_REVIEWER_LOGIN` names has reviewed the PR's head commit and resolved every thread. For a PR that edits existing rule code, for example a changed fixture, the summary says `(edit)`, and `ratchet` stays red until the app approves the head commit, or you do.
 
 ## 9. Turning on the ratchet (ADR-0022)
 
@@ -309,7 +309,7 @@ The ratchet first runs in shadow mode: both jobs run and show their verdict in t
 1. **Before merging the ratchet PR**, add the check. Settings → Rules → Rulesets → `main` → Require status checks to pass → Add checks → type `ratchet` → choose the GitHub Actions source → Save changes. Only `ratchet` is required; `ratchet (head)` is the job that runs the PR's code, and `ratchet` judges its output. A review runs `ratchet` again from `.github/workflows/ratchet-review.yml`, under the same name. The bot cannot do this: it has no administration permission, and must not have one.
 2. **Merge the ratchet PR.** On that PR, `ratchet` passes with "The base branch has no ratchet yet; skipped." in its summary, because the base cannot judge yet. The PR touches the trusted core, so it waits for your review in any case.
 3. **Rebase or close stale PRs.** A PR whose branch predates the ratchet has no `ratchet` job, so the required check never reports; it waits until it is rebased onto `main`.
-4. **Set up the reviewer app**, which reviews in CI (#59), and set the repository variable `NAMI_REVIEWER_LOGIN` to its login with `[bot]`. Until you do, `ratchet` gives no verdict on PRs that only change rule paths unless you approve the head commit, so you review those as today. No admin bypass is needed.
+4. **Set up the reviewer app**, which reviews in CI (#59), and set the repository variable `NAMI_REVIEWER_LOGIN` to its login with `[bot]`. Until you do, `ratchet` gives no verdict on PRs that only change rule paths unless you approve the head commit, so you review those as today. No admin bypass is needed. The app must be able to submit `APPROVE`: an edit to existing rule code merges only on its approval of the head commit, or yours (ADR-0022, point 2).
 5. **Check it** with step 8, point 4.
 
 To print what the ruleset requires:

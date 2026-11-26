@@ -122,12 +122,24 @@ not ready: file an issue and leave it out.
 CI's base gate then shows the code owner what your rule finds in `main`'s tree.
 
 If the PR changes only rule paths (ADR-0022: the rule tables and source-rule modules of tidy,
-`lints/src/`, the fixtures, the UI cases and `docs/RULES.md`), it needs no code owner. The
-required `ratchet` check runs `main`'s `cargo xtask ratchet` on your tree instead. It fails when
-a case that `main` writes down no longer holds through your tools, when a mutant of your changed
-lines survives your tests, or when the reviewer app has not reviewed your head commit or left a thread
-open. Only the reviewer app's review counts, not the agents' bot. A new ban row or another
-pure data change yields no mutant, so it still needs the code owner. A finding names the fixture
-or UI case and the line. Fix the rule, never the case: `main`'s
-cases count, whatever your branch did to its own copies. Run it yourself first, inside a checkout
-of `main`: `cargo xtask ratchet --base . --head <your tree> --no-review`.
+`lints/src/`, the fixtures, the UI cases and `docs/RULES.md`), the required `ratchet` check runs
+`main`'s `cargo xtask ratchet` on your tree. It fails when a case that `main` writes down no longer
+holds through your tools, or when a mutant of your changed lines survives your tests. A finding
+names the fixture or UI case and the line. Fix the rule, never the case: `main`'s cases count,
+whatever your branch did to its own copies. Only the reviewer app's review counts, not the agents'
+bot. What else the PR needs depends on its class, which the summary names (`pass (additive)`,
+`no verdict (edit)`):
+
+- **Additive** (ADR-0022, point 2): new functions and types, a new lint in its own file, one
+  dispatch call per new item, new registry rows, new fixtures and UI cases, reworded docs. It
+  merges once the reviewer app has reviewed its head commit and resolved its threads. Write a new
+  rule this way when you can: add its code beside the old, and leave existing functions, constants
+  and tests as they are.
+- **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case, or a
+  new member of an existing `impl`. It waits for the reviewer app's approval of its head commit
+  (#59), and until that app exists for a code owner's. Say in the PR description why the edit
+  does not loosen the rule.
+
+Until the reviewer app exists, every rule-path PR still needs a code owner's approval of its head
+commit. Run the check yourself first, inside a checkout of `main`:
+`cargo xtask ratchet --base . --head <your tree> --no-review`.
