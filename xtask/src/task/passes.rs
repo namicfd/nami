@@ -8,16 +8,19 @@
 //!   holds no secret.
 //! - `passes --open-pr <file>`, the `open passes PR` job: reads that file as data and keeps
 //!   the tasks that may be set: active, not passing, every dependency passing, and a merged PR
-//!   from `task/<id>`. It sets `passes` on exactly those, commits the change on top of `HEAD`,
-//!   force-pushes the commit as [`BOT_BRANCH`], opens or updates that branch's PR and turns on
-//!   auto-merge. When `bot/passes` already sets `passes` on exactly those tasks, it pushes
-//!   nothing, so the PR stays in the merge queue. When no task is left, it closes the open PR,
-//!   if there is one. An open PR from [`BOT_BRANCH`] that [`CI_LOGIN`] did not open is never
-//!   adopted: the job fails and changes nothing. It runs no tests, so the bot's token never
-//!   meets a test binary. Only the push and the PR writes act as the app's token,
-//!   [`WRITE_TOKEN`]; every read acts as `GH_TOKEN` (`super::pulls`).
+//!   from `task/<id>`. It builds the commit that [`BOT_BRANCH`] should hold, those flips on
+//!   top of `HEAD`, and force-pushes it only when the branch differs from it in tree or
+//!   parent. Then it opens the PR if there is none, and reconciles it every run: the title and
+//!   description match the flips, and auto-merge is on. When no task is left, it closes the
+//!   open PR, if there is one. An open PR from [`BOT_BRANCH`] that [`CI_LOGIN`] did not open
+//!   is never adopted: the job fails and changes nothing. It runs no tests, so the bot's token
+//!   never meets a test binary. Only the push and the PR writes act as the app's token,
+//!   [`WRITE_TOKEN`]; every read acts as `GH_TOKEN` (`super::pulls`), and no other git command
+//!   sees the token.
 //! - `check-pr` lets a change set `passes` only when [`flip_problems`] finds nothing, and
 //!   rejects a PR from [`BOT_BRANCH`] or by [`CI_LOGIN`] that sets none ([`no_flip_problems`]).
+//!   On `pull_request` events CI passes the PR's head from the event, so a change that sets no
+//!   `passes` is checked without GitHub.
 //!
 //! The merged PR is a weak condition: any agent can merge a trivial PR from `task/<id>`. The
 //! acceptance tests carry the weight; the merged PR only keeps a task from passing on a test
@@ -44,7 +47,7 @@ pub const BOT_BRANCH: &str = "bot/passes";
 
 /// The bot of the `nami-ci` GitHub App: the one author whose PR may set `passes`. Agents act
 /// as `nami-agent[bot]`, so no agent can open that PR.
-pub const CI_LOGIN: &str = "nami-ci[bot]";
+pub use crate::issue::trust::CI_LOGIN;
 
 /// The branch that tasks merge into.
 const BASE_BRANCH: &str = "main";
@@ -58,7 +61,7 @@ const PASSING: &str = "\"passes\": true";
 /// The one key of the file that the `acceptance` job writes.
 const PASSING_KEY: &str = "passing";
 
-/// A pull request's head branch and author, as GitHub has them.
+/// A pull request's head branch and author, as GitHub or the event that started CI has them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullHead {
     /// The head branch; `<owner>:<branch>` when it lives in another repository.
@@ -67,14 +70,44 @@ pub struct PullHead {
     pub author: String,
 }
 
+impl PullHead {
+    /// The head of a PR from `branch` in the repository `head_repository`, opened by `author`,
+    /// against `repository`. A head elsewhere, or in a deleted repository (empty), is written
+    /// `<owner>:<branch>`, so it is never this repository's branch.
+    #[must_use]
+    pub fn from_event(branch: &str, head_repository: &str, repository: &str, author: &str) -> Self {
+        assert!(!repository.is_empty(), "the event names this repository");
+        let branch = if head_repository == repository {
+            branch.to_owned()
+        } else {
+            let owner = head_repository.split('/').next().filter(|owner| !owner.is_empty());
+            format!("{}:{branch}", owner.unwrap_or("(unknown)"))
+        };
+        Self { branch, author: author.to_owned() }
+    }
+}
+
+/// What the open-PR job reconciles on the bot's PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullState {
+    /// Its head.
+    pub head: PullHead,
+    /// Its title, which becomes the squash commit's subject.
+    pub title: String,
+    /// Its description.
+    pub body: String,
+    /// True if auto-merge is on, so that it enters the merge queue once its checks pass.
+    pub auto_merge: bool,
+}
+
 /// What setting `passes` needs from GitHub's pull requests. Every error says what failed.
 pub trait Pulls {
-    /// The head branch and author of pull request `number`.
+    /// Pull request `number`: its head, title, description and auto-merge.
     ///
     /// # Errors
     ///
     /// When GitHub cannot be asked, or does not have it.
-    fn head(&self, number: u32) -> Result<PullHead, String>;
+    fn pull(&self, number: u32) -> Result<PullState, String>;
 
     /// True if a pull request from this repository's `branch` has merged into `main`.
     ///
@@ -138,10 +171,14 @@ pub struct Change<'change> {
     pub branch: &'change str,
     /// Its pull request, if CI knows it; in the merge queue, the branch names it.
     pub pull: Option<u32>,
+    /// The PR's head as the `pull_request` event has it, so that a change that sets no
+    /// `passes` is checked without asking GitHub.
+    pub head: Option<&'change PullHead>,
 }
 
 const USAGE: &str = "usage: cargo xtask task passes [--output <file> | --open-pr <file>] | \
-                     check-pr <base> [<branch> [<pull request>]]";
+                     check-pr <base> [<branch> [<pull request> [--author <login> --head-repo \
+                     <owner/name> --repo <owner/name>]]]";
 
 /// Runs `passes` or `check-pr` against the checkout at `root`, pushing to `remote`.
 ///
@@ -154,7 +191,7 @@ pub fn execute(
     services: Services<'_>,
     arguments: &[&str],
 ) -> Result<String, String> {
-    let change = |base, branch, pull| Change { base, branch, pull };
+    let change = |base, branch, pull| Change { base, branch, pull, head: None };
     match arguments {
         ["passes"] => found(root, services.tests, None),
         ["passes", "--output", file] => found(root, services.tests, Some(Path::new(file))),
@@ -165,20 +202,39 @@ pub fn execute(
             let pull = pull_number(pull)?;
             super::check_pr(root, &change(base, branch, pull), services)
         }
+        [
+            "check-pr",
+            base,
+            branch,
+            pull,
+            "--author",
+            author,
+            "--head-repo",
+            head_repository,
+            "--repo",
+            repository,
+        ] => {
+            let pull = pull_number(pull)?.ok_or("the event's PR needs its number")?;
+            if repository.is_empty() || author.is_empty() || branch.is_empty() {
+                return Err("the event names no repository, author or branch".to_owned());
+            }
+            let head = PullHead::from_event(branch, head_repository, repository, author);
+            let known = Change { head: Some(&head), ..change(base, branch, Some(pull)) };
+            super::check_pr(root, &known, services)
+        }
         _ => Err(USAGE.to_owned()),
     }
 }
 
-/// A pull request number from the command line; empty means none, as CI passes it in the
-/// merge queue.
+/// A pull request number from the command line, written as GitHub writes it; empty means
+/// none, as CI passes it in the merge queue.
 fn pull_number(text: &str) -> Result<Option<u32>, String> {
     if text.is_empty() {
         return Ok(None);
     }
-    let number = text.parse::<u32>().ok().filter(|number| *number > 0);
-    let number = number.ok_or_else(|| format!("`{text}` is not a pull request number"))?;
-    assert!(number > 0, "pull requests are numbered from 1");
-    Ok(Some(number))
+    let number = text.parse::<u32>().ok().filter(|number| number.to_string() == text);
+    let number = number.filter(|number| *number > 0);
+    number.map(Some).ok_or_else(|| format!("`{text}` is not a pull request number"))
 }
 
 /// The branch of task `id`.
@@ -192,13 +248,13 @@ fn task_branch(id: &str) -> String {
 pub fn unblocked(tasks: &[Task]) -> Vec<&Task> {
     let passing: BTreeSet<&str> =
         tasks.iter().filter(|task| task.passes).map(|task| task.id.as_str()).collect();
-    let found: Vec<&Task> = tasks
+    let passing_count = tasks.iter().filter(|task| task.passes).count();
+    assert_eq!(passing.len(), passing_count, "task IDs are unique: the plans were validated");
+    tasks
         .iter()
         .filter(|task| task.active && !task.passes)
         .filter(|task| task.depends_on.iter().all(|id| passing.contains(id.as_str())))
-        .collect();
-    assert!(found.iter().all(|task| !task.passes), "only unfinished tasks are unblocked");
-    found
+        .collect()
 }
 
 /// The tasks that may be set now, before their tests run: [`unblocked`], and a merged PR from
@@ -213,11 +269,12 @@ pub fn candidates<'tasks>(
 ) -> Result<Vec<&'tasks Task>, String> {
     let mut found = Vec::new();
     for task in unblocked(tasks) {
-        if pulls.has_merged(&task_branch(&task.id))? {
+        let branch = task_branch(&task.id);
+        assert!(plan::is_valid_id(&task.id), "a task ID cannot change the query: {branch}");
+        if pulls.has_merged(&branch)? {
             found.push(task);
         }
     }
-    assert!(found.iter().all(|task| task.active), "only active tasks are candidates");
     Ok(found)
 }
 
@@ -376,6 +433,7 @@ pub fn is_active_tasks_file(path: &str) -> bool {
 /// Why the change from `base` to the working tree's tracked files is more than `passes`
 /// values set to true in active plans.
 fn shape_problems(root: &Path, base: &str) -> Result<Vec<String>, String> {
+    assert!(!base.is_empty() && !base.starts_with('-'), "a base is a revision: {base}");
     let arguments = ["diff", "--no-renames", "--name-status", base];
     let diff = git(root, &arguments, &[], None).map_err(|error| error.to_string())?;
     let mut problems = Vec::new();
@@ -396,7 +454,6 @@ fn shape_problems(root: &Path, base: &str) -> Result<Vec<String>, String> {
             problems.push(problem);
         }
     }
-    assert!(problems.len() <= diff.lines().count(), "at most one problem per changed file");
     Ok(problems)
 }
 
@@ -486,8 +543,8 @@ fn pull_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
             change.branch
         )];
     };
-    let head = match pulls.head(number) {
-        Ok(head) => head,
+    let head = match pulls.pull(number) {
+        Ok(state) => state.head,
         Err(error) => return vec![format!("cannot read pull request #{number}: {error}")],
     };
     let mut problems = Vec::new();
@@ -509,23 +566,35 @@ fn pull_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
 
 /// Why `change`, which sets no `passes`, is still refused: [`BOT_BRANCH`] and [`CI_LOGIN`]'s
 /// PRs exist only to set it, so anything else they carry is someone else's change. Empty
-/// when it is neither. A PR that cannot be looked up is a problem, so the check never passes
-/// unseen.
+/// when it is neither. The head comes from the event when CI passes it, and from GitHub only
+/// for a merge-queue entry or a PR given without it. A PR that cannot be looked up is a
+/// problem, so the check never passes unseen.
 #[must_use]
 pub fn no_flip_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
-    let refusal = |what: String| {
-        format!("{what}, and it sets no `passes`; that branch and that bot only ever set it")
+    let refusal = |head: &PullHead, what: &str| {
+        format!(
+            "{what} comes from `{}` by `{}`, and it sets no `passes`; that branch and that bot \
+             only ever set it",
+            head.branch, head.author
+        )
     };
+    if let Some(head) = change.head {
+        let is_bot = head.branch == BOT_BRANCH || head.author == CI_LOGIN;
+        return if is_bot { vec![refusal(head, "the PR")] } else { Vec::new() };
+    }
     if change.branch == BOT_BRANCH {
-        return vec![refusal(format!("the change comes from `{BOT_BRANCH}`"))];
+        return vec![format!(
+            "the change comes from `{BOT_BRANCH}`, and it sets no `passes`; that branch only \
+             ever sets it"
+        )];
     }
     let queued = queue_entry(change.branch).map(|entry| entry.pull);
     let Some(number) = change.pull.or(queued) else {
         return Vec::new();
     };
-    match pulls.head(number) {
-        Ok(head) if head.branch == BOT_BRANCH || head.author == CI_LOGIN => {
-            vec![refusal(format!("#{number} comes from `{}` by `{}`", head.branch, head.author))]
+    match pulls.pull(number) {
+        Ok(state) if state.head.branch == BOT_BRANCH || state.head.author == CI_LOGIN => {
+            vec![refusal(&state.head, &format!("#{number}"))]
         }
         Ok(_) => Vec::new(),
         Err(error) => vec![format!("cannot read pull request #{number}: {error}")],
@@ -542,7 +611,7 @@ fn adoptable(pulls: &dyn Pulls) -> Result<Option<u32>, String> {
     let Some(number) = pulls.open_from(BOT_BRANCH)? else {
         return Ok(None);
     };
-    let head = pulls.head(number)?;
+    let head = pulls.pull(number)?.head;
     if head.author != CI_LOGIN || head.branch != BOT_BRANCH {
         return Err(format!(
             "#{number}, the open PR from `{BOT_BRANCH}`, comes from `{}` by `{}`, not from \
@@ -551,43 +620,7 @@ fn adoptable(pulls: &dyn Pulls) -> Result<Option<u32>, String> {
             head.branch, head.author
         ));
     }
-    assert!(number > 0, "pull requests are numbered from 1");
     Ok(Some(number))
-}
-
-/// The tasks on which `remote`'s [`BOT_BRANCH`] sets `passes`: those that pass at its tip and
-/// not at the tip's parent. `None` when the branch does not exist.
-///
-/// # Errors
-///
-/// When git cannot reach the remote or read the plans there.
-fn held_flips(root: &Path, remote: &str) -> Result<Option<BTreeSet<String>>, String> {
-    let run = |arguments: &[&str]| {
-        git(root, arguments, &[], None)
-            .map_err(|error| format!("cannot read `{BOT_BRANCH}`: {error}"))
-    };
-    let reference = format!("refs/heads/{BOT_BRANCH}");
-    if run(&["ls-remote", remote, &reference])?.trim().is_empty() {
-        return Ok(None);
-    }
-    let local = "refs/nami/bot-passes";
-    let _ = run(&[
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        "--depth=2",
-        remote,
-        &format!("+{reference}:{local}"),
-    ])?;
-    let parent_passing: BTreeSet<String> = super::tasks_at(root, &format!("{local}^1"))?
-        .into_iter()
-        .filter(|task| task.passes)
-        .map(|task| task.id)
-        .collect();
-    let held: BTreeSet<String> =
-        super::passes_flips(&super::tasks_at(root, local)?, &parent_passing).into_iter().collect();
-    assert!(held.is_disjoint(&parent_passing), "a flip did not pass before");
-    Ok(Some(held))
 }
 
 /// `passes --open-pr <file>`.
@@ -620,19 +653,6 @@ fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<
         });
         return Ok(lines.concat());
     }
-    let held = match open {
-        Some(_) => held_flips(root, remote)?,
-        None => None,
-    };
-    if let Some(number) = open.filter(|_| held.as_ref() == Some(&wanted)) {
-        let ids: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        lines.push(format!(
-            "#{number} already sets `passes` on {}; nothing pushed, so it keeps its place in \
-             the merge queue\n",
-            ids.join(", ")
-        ));
-        return Ok(lines.concat());
-    }
     write_passes(root, &tasks, &wanted)?;
     let problems = shape_problems(root, "HEAD")?;
     if !problems.is_empty() {
@@ -642,15 +662,22 @@ fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<
         ));
     }
     let after = super::valid_tasks(root)?;
+    let passing = |all: &[Task]| -> BTreeSet<String> {
+        all.iter().filter(|task| task.passes).map(|task| task.id.clone()).collect()
+    };
+    let newly: BTreeSet<String> = passing(&after).difference(&passing(&tasks)).cloned().collect();
+    assert_eq!(newly, wanted, "the working tree sets `passes` on exactly the wanted tasks");
     let flipped: Vec<String> =
         after.iter().filter(|task| wanted.contains(&task.id)).map(|task| task.id.clone()).collect();
-    assert_eq!(flipped.len(), wanted.len(), "every task to set is still in the plans");
     lines.push(publish(root, remote, pulls, (&after, &flipped), open)?);
     Ok(lines.concat())
 }
 
-/// Commits the working tree's change to `passes` as [`BOT_BRANCH`], pushes it, and opens or
-/// updates the PR, `open` if there is one, that sets `passes` on `flipped`.
+/// Builds the commit that [`BOT_BRANCH`] should hold, the flips in the working tree on top of
+/// `HEAD`, and force-pushes it only when `remote`'s branch differs from it in tree or parent:
+/// an unchanged `main` and an unchanged set of flips leave the PR's place in the merge queue
+/// alone, and any drift rebuilds the branch. Then it opens the PR if `open` is none, and
+/// reconciles it ([`reconcile`]).
 fn publish(
     root: &Path,
     remote: &str,
@@ -662,27 +689,96 @@ fn publish(
     let head = git(root, &["rev-parse", "HEAD"], &[], None).map_err(|error| error.to_string())?;
     let (title, body) = pull_text(tasks, flipped, head.trim());
     let commit = commit_working_tree(root, &title)?;
-    let target = format!("{commit}:refs/heads/{BOT_BRANCH}");
-    assert!(PUSH_CREDENTIALS.contains(WRITE_TOKEN), "the push acts as the token for writes");
+    let mut done = Vec::new();
+    if !branch_holds(root, remote, &commit)? {
+        push(root, remote, &commit)?;
+        done.push("pushed");
+    }
+    let number = if let Some(number) = open {
+        number
+    } else {
+        done.push("opened");
+        pulls.open(BOT_BRANCH, &title, &body)?
+    };
+    done.extend(reconcile(pulls, number, &title, &body)?);
+    let changes = if done.is_empty() { "nothing to change".to_owned() } else { done.join(", ") };
+    Ok(format!("#{number} sets `passes` on {}: {changes}\n", flipped.join(", ")))
+}
+
+/// Force-pushes `commit` as `remote`'s [`BOT_BRANCH`]. This is the one git command that gets
+/// [`WRITE_TOKEN`], through a credential helper that only it is configured with.
+fn push(root: &Path, remote: &str, commit: &str) -> Result<(), String> {
+    let token = std::env::var(WRITE_TOKEN).unwrap_or_default();
+    assert!(PUSH_CREDENTIALS.contains(WRITE_TOKEN), "the helper answers with the write token");
     let credentials = [
+        (WRITE_TOKEN, token.as_str()),
         ("GIT_CONFIG_COUNT", "2"),
         ("GIT_CONFIG_KEY_0", "credential.helper"),
         ("GIT_CONFIG_VALUE_0", ""),
         ("GIT_CONFIG_KEY_1", "credential.helper"),
         ("GIT_CONFIG_VALUE_1", PUSH_CREDENTIALS),
     ];
+    let target = format!("{commit}:refs/heads/{BOT_BRANCH}");
     let _ = git(root, &["push", "--quiet", "--force", remote, &target], &credentials, None)
         .map_err(|error| error.to_string())?;
-    let number = match open {
-        Some(number) => {
-            pulls.edit(number, &title, &body)?;
-            number
-        }
-        None => pulls.open(BOT_BRANCH, &title, &body)?,
+    Ok(())
+}
+
+/// True if `remote`'s [`BOT_BRANCH`] exists and its tip has the tree and the parents of
+/// `commit`.
+fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String> {
+    let run = |arguments: &[&str]| {
+        git(root, arguments, &[], None)
+            .map_err(|error| format!("cannot read `{BOT_BRANCH}`: {error}"))
     };
-    pulls.auto_merge(number)?;
-    assert!(number > 0, "pull requests are numbered from 1");
-    Ok(format!("#{number} sets `passes` on {}\n", flipped.join(", ")))
+    let reference = format!("refs/heads/{BOT_BRANCH}");
+    let listed = run(&["ls-remote", remote, &reference])?;
+    let Some(tip) = listed.split_whitespace().next() else {
+        return Ok(false);
+    };
+    let local = format!("+{reference}:refs/nami/bot-passes");
+    let _ = run(&["fetch", "--quiet", "--no-tags", "--depth=1", remote, &local])?;
+    let theirs = run(&["cat-file", "commit", tip])?;
+    let ours = run(&["cat-file", "commit", commit])?;
+    let ours_shape = tree_and_parents(&ours);
+    assert!(ours_shape.len() == 2, "the bot's commit has a tree and one parent: {ours_shape:?}");
+    Ok(tree_and_parents(&theirs) == ours_shape)
+}
+
+/// The `tree` and `parent` lines of a raw commit object, as `git cat-file commit` prints it:
+/// what the commit holds and where it sits, without its author, time or message.
+#[must_use]
+pub fn tree_and_parents(commit: &str) -> Vec<&str> {
+    let header = commit.lines().take_while(|line| !line.is_empty());
+    header.filter(|line| line.starts_with("tree ") || line.starts_with("parent ")).collect()
+}
+
+/// Brings the bot's PR `number` to `title` and `body`, with auto-merge on, as GitHub shows it
+/// now. Returns what it changed. Neither write takes the PR out of the merge queue.
+fn reconcile(
+    pulls: &dyn Pulls,
+    number: u32,
+    title: &str,
+    body: &str,
+) -> Result<Vec<&'static str>, String> {
+    let state = pulls.pull(number)?;
+    if state.head.branch != BOT_BRANCH || state.head.author != CI_LOGIN {
+        return Err(format!(
+            "#{number} comes from `{}` by `{}`, not from {CI_LOGIN}'s `{BOT_BRANCH}`; a human \
+             looks at it",
+            state.head.branch, state.head.author
+        ));
+    }
+    let mut done = Vec::new();
+    if state.title != title || state.body != body {
+        pulls.edit(number, title, body)?;
+        done.push("edited");
+    }
+    if !state.auto_merge {
+        pulls.auto_merge(number)?;
+        done.push("auto-merge on");
+    }
+    Ok(done)
 }
 
 /// Commits the working tree's changes to the plans on top of `HEAD`, through a private index,

@@ -9,8 +9,8 @@
 //! What GitHub's answers mean is decided by plain functions of its JSON, tested without gh.
 //! [`GhProcess`] only runs the program.
 
-use super::passes::{PullHead, Pulls};
-use crate::issue::github::{parse_lines, string_at};
+use super::passes::{PullHead, PullState, Pulls};
+use crate::issue::github::{optional_string, parse_lines, string_at};
 use crate::json::{self, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -101,16 +101,27 @@ impl Api for GhProcess {
                 .map_err(|error| format!("cannot write to gh: {error}"))?;
         }
         let output = child.wait_with_output().map_err(|error| format!("gh failed: {error}"))?;
-        if output.status.success() {
-            return String::from_utf8(output.stdout)
-                .map_err(|_| "gh printed invalid UTF-8".to_owned());
-        }
-        Err(format!(
-            "`gh {}` failed: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        printed(arguments, output.status.success(), output.stdout, &output.stderr)
     }
+}
+
+/// What gh printed when it succeeded, or why `gh <arguments>` failed, with what it printed
+/// on stderr.
+///
+/// # Errors
+///
+/// When gh failed, or printed something that is not UTF-8.
+pub fn printed(
+    arguments: &[&str],
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: &[u8],
+) -> Result<String, String> {
+    if !success {
+        let reason = String::from_utf8_lossy(stderr);
+        return Err(format!("`gh {}` failed: {}", arguments.join(" "), reason.trim()));
+    }
+    String::from_utf8(stdout).map_err(|_| "gh printed invalid UTF-8".to_owned())
 }
 
 /// [`Pulls`] through an [`Api`]: reads as [`Token::Read`], writes as [`Token::Write`].
@@ -146,8 +157,8 @@ impl<'api> GitHubPulls<'api> {
 }
 
 impl Pulls for GitHubPulls<'_> {
-    fn head(&self, number: u32) -> Result<PullHead, String> {
-        head_from_json(&self.read_one(&format!("repos/{{owner}}/{{repo}}/pulls/{number}"))?)
+    fn pull(&self, number: u32) -> Result<PullState, String> {
+        pull_from_json(&self.read_one(&format!("repos/{{owner}}/{{repo}}/pulls/{number}"))?)
     }
 
     fn has_merged(&self, branch: &str) -> Result<bool, String> {
@@ -207,11 +218,7 @@ impl Pulls for GitHubPulls<'_> {
 /// time. A PR that was closed without merging has `merged_at: null`.
 #[must_use]
 pub fn merged_from_json(pulls: &[Value]) -> bool {
-    let merged =
-        pulls.iter().filter(|pull| pull.get("merged_at").and_then(Value::as_str).is_some());
-    let count = merged.count();
-    assert!(count <= pulls.len(), "at most every PR merged");
-    count > 0
+    pulls.iter().any(|pull| pull.get("merged_at").and_then(Value::as_str).is_some())
 }
 
 /// The one open PR among `pulls`, GitHub's open PRs from `branch`, or `None`.
@@ -221,7 +228,6 @@ pub fn merged_from_json(pulls: &[Value]) -> bool {
 /// When a PR has no valid number, or there is more than one: a branch heads one PR at a time.
 pub fn one_open(pulls: &[Value], branch: &str) -> Result<Option<u32>, String> {
     let numbers: Vec<u32> = pulls.iter().map(number_of).collect::<Result<_, String>>()?;
-    assert_eq!(numbers.len(), pulls.len(), "one number per PR");
     match numbers.as_slice() {
         [] => Ok(None),
         [number] => Ok(Some(*number)),
@@ -238,15 +244,30 @@ pub fn one_open(pulls: &[Value], branch: &str) -> Result<Option<u32>, String> {
 pub fn head_from_json(pull: &Value) -> Result<PullHead, String> {
     let branch = string_at(pull, &["head", "ref"])?;
     let base = string_at(pull, &["base", "repo", "full_name"])?;
-    let head = string_at(pull, &["head", "repo", "full_name"]).ok();
-    let branch = if head.as_deref() == Some(base.as_str()) {
-        branch
-    } else {
-        string_at(pull, &["head", "label"]).unwrap_or_else(|_| format!("(unknown):{branch}"))
-    };
+    let head = string_at(pull, &["head", "repo", "full_name"]).unwrap_or_default();
     let author = string_at(pull, &["user", "login"])?;
-    assert!(!branch.is_empty(), "a head names its branch");
-    Ok(PullHead { branch, author })
+    Ok(PullHead::from_event(&branch, &head, &base, &author))
+}
+
+/// Reads a pull request's head, title, description and auto-merge from GitHub's pulls API.
+/// Auto-merge is on when `auto_merge` is an object; GitHub sends `null` when it is off.
+///
+/// # Errors
+///
+/// Names the field that is missing or has the wrong type.
+pub fn pull_from_json(pull: &Value) -> Result<PullState, String> {
+    let auto_merge = match pull.get("auto_merge") {
+        Some(Value::Object(_)) => true,
+        None | Some(Value::Null) => false,
+        Some(other) => return Err(format!("GitHub sent {} as `auto_merge`", other.kind())),
+    };
+    let state = PullState {
+        head: head_from_json(pull)?,
+        title: string_at(pull, &["title"])?,
+        body: optional_string(pull, "body")?,
+        auto_merge,
+    };
+    Ok(state)
 }
 
 /// The `number` of a pull request in GitHub's pulls API.
@@ -266,7 +287,7 @@ pub fn number_of(pull: &Value) -> Result<u32, String> {
 mod tests {
     use super::{
         Api, GhProcess, GitHubPulls, Token, WRITE_TOKEN, head_from_json, merged_from_json,
-        number_of, one_open,
+        number_of, one_open, printed, pull_from_json,
     };
     use crate::json::{self, Value};
     use crate::task::passes::{PullHead, Pulls};
@@ -299,7 +320,8 @@ mod tests {
         value.as_array().expect("an array").to_vec()
     }
 
-    const PULL: &str = r#"{"number": 9, "user": {"login": "nami-ci[bot]"}, "base": {"repo":
+    const PULL: &str = r#"{"number": 9, "title": "Set passes: a", "body": null,
+        "auto_merge": null, "user": {"login": "nami-ci[bot]"}, "base": {"repo":
         {"full_name": "o/n"}}, "head": {"ref": "bot/passes", "repo": {"full_name": "o/n"}}}"#;
 
     // Goal: every read acts as the read token and every write as the write token, so the
@@ -308,8 +330,8 @@ mod tests {
     fn each_call_takes_only_its_own_token() {
         let gh = fake(PULL);
         let pulls = GitHubPulls::new(&gh);
-        let head = pulls.head(9).expect("a head");
-        assert_eq!(head.author, "nami-ci[bot]");
+        let state = pulls.pull(9).expect("a pull request");
+        assert_eq!(state.head.author, "nami-ci[bot]");
         let lines = fake(&format!("{}\n", PULL.replace('\n', " ")));
         let listing = GitHubPulls::new(&lines);
         assert_eq!(listing.has_merged("task/a"), Ok(false), "no merged_at");
@@ -407,8 +429,44 @@ mod tests {
         assert_eq!(own, expected);
         let fork = head_from_json(&pull(r#"{"full_name": "x/n"}"#)).expect("valid");
         assert_eq!(fork.branch, "x:bot/passes");
-        assert_eq!(head_from_json(&pull("null")).expect("valid").branch, "x:bot/passes");
+        let deleted = head_from_json(&pull("null")).expect("valid");
+        assert_eq!(deleted.branch, "(unknown):bot/passes", "a deleted fork is not this repository");
         let gone = json::parse(r#"{"head": {"ref": "b"}}"#).expect("JSON");
         assert!(head_from_json(&gone).is_err(), "no base");
+    }
+
+    // Goal: a PR's title, description and auto-merge are read as GitHub sends them: a null
+    // description is empty, and auto-merge is on only when GitHub sends an object.
+    #[test]
+    fn pull_states_come_from_github() {
+        let state = |text: &str| pull_from_json(&json::parse(text).expect("the fixture is JSON"));
+        let off = state(PULL).expect("valid");
+        assert_eq!(off.title, "Set passes: a");
+        assert_eq!((off.body.as_str(), off.auto_merge), ("", false), "null body, auto-merge off");
+        let on = PULL.replace(r#""body": null"#, r#""body": "b""#);
+        let on = on.replace(r#""auto_merge": null"#, r#""auto_merge": {}"#);
+        let on = state(&on).expect("valid");
+        assert_eq!((on.body.as_str(), on.auto_merge), ("b", true));
+        let odd = PULL.replace(r#""auto_merge": null"#, r#""auto_merge": true"#);
+        let error = state(&odd).expect_err("not an object");
+        assert!(error.contains("`auto_merge`"), "{error}");
+        let untitled = PULL.replace(r#""title": "Set passes: a","#, "");
+        assert!(state(&untitled).is_err(), "no title");
+    }
+
+    // Goal: gh's output is returned only when it succeeded; a failure names the command and
+    // what gh said, and output that is not UTF-8 is an error.
+    #[test]
+    fn gh_output_counts_only_on_success() {
+        assert_eq!(printed(&["api", "x"], true, b"ok".to_vec(), b""), Ok("ok".to_owned()));
+        let failed = printed(
+            &["api", "x"],
+            false,
+            b"ok".to_vec(),
+            b" HTTP 404 
+",
+        );
+        assert_eq!(failed, Err("`gh api x` failed: HTTP 404".to_owned()));
+        assert!(printed(&["x"], true, vec![0xff], b"").is_err(), "not UTF-8");
     }
 }

@@ -6,15 +6,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::task::acceptance::{Acceptance, Nextest};
-use xtask::task::passes::{self, PullHead, Pulls, Services};
+use xtask::task::passes::{self, PullHead, PullState, Pulls, Services};
 use xtask::task::plan::Task;
 
-/// GitHub's pull requests: fixed heads and merged branches, and a log of what was asked.
+/// GitHub's pull requests: fixed heads and merged branches; each PR's title, description and
+/// auto-merge, which the writes change; and a log of the writes.
 #[derive(Default)]
 struct FakePulls {
     heads: BTreeMap<u32, PullHead>,
     merged: Vec<String>,
     open: Option<u32>,
+    states: RefCell<BTreeMap<u32, (String, String, bool)>>,
     log: RefCell<Vec<String>>,
 }
 
@@ -25,8 +27,12 @@ impl FakePulls {
 }
 
 impl Pulls for FakePulls {
-    fn head(&self, number: u32) -> Result<PullHead, String> {
-        self.heads.get(&number).cloned().ok_or_else(|| format!("no pull request #{number}"))
+    fn pull(&self, number: u32) -> Result<PullState, String> {
+        let head = self.heads.get(&number).cloned();
+        let head = head.ok_or_else(|| format!("no pull request #{number}"))?;
+        let states = self.states.borrow();
+        let (title, body, auto_merge) = states.get(&number).cloned().unwrap_or_default();
+        Ok(PullState { head, title, body, auto_merge })
     }
     fn has_merged(&self, branch: &str) -> Result<bool, String> {
         Ok(self.merged.iter().any(|merged| merged == branch))
@@ -36,10 +42,14 @@ impl Pulls for FakePulls {
     }
     fn open(&self, branch: &str, title: &str, body: &str) -> Result<u32, String> {
         self.record(format!("open {branch} {title}\n{body}"));
+        let _ = self.states.borrow_mut().insert(70, (title.to_owned(), body.to_owned(), false));
         Ok(70)
     }
-    fn edit(&self, number: u32, title: &str, _body: &str) -> Result<(), String> {
+    fn edit(&self, number: u32, title: &str, body: &str) -> Result<(), String> {
         self.record(format!("edit #{number} {title}"));
+        let mut states = self.states.borrow_mut();
+        let state = states.entry(number).or_default();
+        (state.0, state.1) = (title.to_owned(), body.to_owned());
         Ok(())
     }
     fn close(&self, number: u32) -> Result<(), String> {
@@ -48,6 +58,7 @@ impl Pulls for FakePulls {
     }
     fn auto_merge(&self, number: u32) -> Result<(), String> {
         self.record(format!("auto-merge #{number}"));
+        self.states.borrow_mut().entry(number).or_default().2 = true;
         Ok(())
     }
 }
@@ -254,6 +265,57 @@ fn check_pr_rejects_the_bots_pr_without_a_flip() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+// Goal: on `pull_request` events, the head comes from the event, so the check of a change
+// that sets no `passes` asks GitHub nothing: the bot's branch or author is rejected, an
+// agent's PR and a fork's `bot/passes` pass, and an event without its fields is refused.
+#[test]
+fn check_pr_takes_the_head_from_the_event() {
+    let (root, clone) = setup("event");
+    let base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join("other.txt"), "x").expect("written");
+    let _ = commit(&clone, "Something else");
+    let offline = FakePulls::default();
+    let tests = FakeTests::default();
+    let event = |branch: &str, author: &str, head_repository: &str| {
+        let arguments = [
+            "check-pr",
+            &base,
+            branch,
+            "12",
+            "--author",
+            author,
+            "--head-repo",
+            head_repository,
+            "--repo",
+            "o/n",
+        ];
+        check(&clone, &offline, &tests, &arguments)
+    };
+    let bots = event("bot/passes", "nami-ci[bot]", "o/n");
+    assert!(bots.contains("error: the PR comes from `bot/passes` by `nami-ci[bot]`"), "{bots}");
+    let by_bot = event("task/a", "nami-ci[bot]", "o/n");
+    assert!(by_bot.contains("comes from `task/a` by `nami-ci[bot]`"), "{by_bot}");
+    assert_eq!(event("feature/x", "nami-agent[bot]", "o/n"), "ok: ", "an agent's PR");
+    assert_eq!(event("bot/passes", "someone", "x/n"), "ok: ", "a fork's branch is not ours");
+    assert_eq!(event("bot/passes", "someone", ""), "ok: ", "a deleted fork is not ours");
+    assert!(event("feature/x", "", "o/n").contains("names no repository, author or branch"));
+    let unnumbered = [
+        "check-pr",
+        &base,
+        "feature/x",
+        "",
+        "--author",
+        "a",
+        "--head-repo",
+        "o/n",
+        "--repo",
+        "o/n",
+    ];
+    let error = check(&clone, &offline, &tests, &unnumbered);
+    assert!(error.contains("the event's PR needs its number"), "{error}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
 // Goal: the `acceptance` job runs only unfinished, unblocked tasks, and its file lists exactly
 // those that passed; a failing task is reported with its reason and left out.
 #[test]
@@ -279,10 +341,10 @@ fn passes_reports_the_unblocked_tasks_that_pass() {
 }
 
 // Goal: the `open passes PR` job sets `passes` only on reported tasks that may be set, pushes
-// exactly that change as `bot/passes`, opens one PR or updates the open one, and closes it
-// when nothing is left; and the pushed commit passes `check-pr`.
+// exactly that change as `bot/passes` on top of main, opens one PR with auto-merge on, and
+// closes it when nothing is left; the pushed commit passes `check-pr`.
 #[test]
-fn open_pr_sets_only_candidates_and_keeps_one_pr() {
+fn open_pr_sets_only_candidates_and_opens_one_pr() {
     let (root, clone) = setup("open-pr");
     let main = git(&clone, &["rev-parse", "HEAD"]);
     let file = root.join("passing.json");
@@ -292,13 +354,15 @@ fn open_pr_sets_only_candidates_and_keeps_one_pr() {
     let tests = FakeTests::default();
     let output = check(&clone, &pulls, &tests, &["passes", "--open-pr", &file_text]);
     assert!(output.contains("skipped\tb\t") && output.contains("skipped\tzz\t"), "{output}");
-    assert!(output.ends_with("#70 sets `passes` on a\n"), "{output}");
+    assert!(
+        output.ends_with("#70 sets `passes` on a: pushed, opened, auto-merge on\n"),
+        "{output}"
+    );
     let log = pulls.log.borrow().clone();
     assert!(log[0].starts_with("open bot/passes Set passes: a\n## Summary"), "{log:?}");
-    assert_eq!(log[1], "auto-merge #70");
+    assert_eq!(log[1..], ["auto-merge #70"]);
     assert!(tests.ran.borrow().is_empty(), "the job with the token runs no tests");
-    let pushed = git(&clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
-    let pushed = pushed.split('\t').next().expect("a commit").to_owned();
+    let pushed = tip(&clone);
     assert_eq!(git(&clone, &["rev-parse", &format!("{pushed}^")]), main, "on top of main");
     let diff = git(&clone, &["diff", "--numstat", &main, &pushed]);
     assert_eq!(diff, format!("1\t1\t{TASKS}"), "one line of one file");
@@ -309,33 +373,6 @@ fn open_pr_sets_only_candidates_and_keeps_one_pr() {
     assert!(checked.starts_with("ok: "), "the bot's commit passes check-pr: {checked}");
     let _ = git(&clone, &["checkout", "--quiet", "--force", &main]);
 
-    let holding = FakePulls { open: Some(70), ..bots_pull() };
-    let held = check(&clone, &holding, &tests, &["passes", "--open-pr", &file_text]);
-    let kept = "#70 already sets `passes` on a; nothing pushed, so it keeps its place in the \
-                merge queue\n";
-    assert!(held.ends_with(kept), "{held}");
-    assert!(holding.log.borrow().is_empty(), "the same flips: no push, no edit");
-    let tip = git(&clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
-    assert!(tip.starts_with(&pushed), "bot/passes is unchanged");
-    let empty = git(&clone, &["commit-tree", &format!("{main}^{{tree}}"), "-p", &main, "-m", "x"]);
-    let stale = format!("{empty}:refs/heads/bot/passes");
-    let _ = git(&clone, &["push", "--quiet", "--force", "origin", &stale]);
-    let updating = FakePulls { open: Some(70), ..bots_pull() };
-    let updated = check(&clone, &updating, &tests, &["passes", "--open-pr", &file_text]);
-    assert!(updated.ends_with("#70 sets `passes` on a\n"), "other flips: {updated}");
-    assert_eq!(*updating.log.borrow(), ["edit #70 Set passes: a", "auto-merge #70"]);
-    let _ = git(&clone, &["checkout", "--quiet", "--force", &main]);
-
-    let before = git(&clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
-    let mut squatted = FakePulls { open: Some(70), ..bots_pull() };
-    let _ = squatted.heads.insert(70, bot_head(passes::BOT_BRANCH, "nami-agent[bot]"));
-    let squat = check(&clone, &squatted, &tests, &["passes", "--open-pr", &file_text]);
-    let named = "error: #70, the open PR from `bot/passes`, comes from `bot/passes` by \
-                 `nami-agent[bot]`, not from nami-ci[bot]; nothing was changed. A human closes #70";
-    assert!(squat.starts_with(named), "{squat}");
-    assert!(squatted.log.borrow().is_empty(), "a squatted PR is neither edited nor closed");
-    let after = git(&clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
-    assert_eq!(after, before, "nothing is pushed");
     std::fs::write(&file, "{\"passing\": [\"b\"]}").expect("written");
     let closing = FakePulls { open: Some(70), ..bots_pull() };
     let closed = check(&clone, &closing, &tests, &["passes", "--open-pr", &file_text]);
@@ -344,6 +381,72 @@ fn open_pr_sets_only_candidates_and_keeps_one_pr() {
     std::fs::write(&file, "{\"passing\": [\"a\"], \"x\": 1}").expect("written");
     let refused = check(&clone, &closing, &tests, &["passes", "--open-pr", &file_text]);
     assert!(refused.starts_with("error: the file must be {\"passing\""), "{refused}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// The commit at the tip of the remote's `bot/passes`.
+fn tip(clone: &Path) -> String {
+    let listed = git(clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
+    listed.split('\t').next().expect("a commit").to_owned()
+}
+
+// Goal: each run builds the commit that `bot/passes` should hold and pushes only when the
+// branch differs from it in tree or parent: an unchanged main and flip set push nothing, while
+// a foreign file on the tip or a change to the plan on main rebuilds the branch. Every run
+// reconciles the PR: a stale title is edited and auto-merge is turned back on, without a push.
+// A PR from `bot/passes` that the bot did not open is never touched.
+#[test]
+fn open_pr_pushes_only_on_drift_and_always_reconciles() {
+    let (root, clone) = setup("drift");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let mut github = bots_pull();
+    let tests = FakeTests::default();
+    let run = |pulls: &FakePulls| {
+        let output = check(&clone, pulls, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let first = run(&github);
+    assert!(first.ends_with("pushed, opened, auto-merge on\n"), "{first}");
+    github.open = Some(70);
+    let pushed = tip(&clone);
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: nothing to change\n");
+    assert_eq!(tip(&clone), pushed, "nothing pushed");
+    github.states.borrow_mut().get_mut(&70).expect("opened").2 = false;
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: auto-merge on\n", "dropped");
+    github.states.borrow_mut().get_mut(&70).expect("opened").0 = "Set passes: old".to_owned();
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: edited\n", "a stale title");
+    assert_eq!(tip(&clone), pushed, "reconciling pushes nothing");
+
+    let _ = git(&clone, &["checkout", "--quiet", &pushed]);
+    std::fs::write(clone.join("extra.txt"), "x").expect("written");
+    let foreign = commit(&clone, "a foreign push");
+    let _ = git(
+        &clone,
+        &["push", "--quiet", "--force", "origin", &format!("{foreign}:refs/heads/bot/passes")],
+    );
+    let _ = git(&clone, &["checkout", "--quiet", "-"]);
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed\n", "a foreign file");
+    let rebuilt = tip(&clone);
+    assert_eq!(git(&clone, &["diff", "--name-only", &pushed, &rebuilt]), "", "the same tree");
+
+    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nMore.\n")
+        .expect("written");
+    let moved = commit(&clone, "main changes the plan");
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed, edited\n", "main moved");
+    assert_eq!(git(&clone, &["rev-parse", &format!("{}^", tip(&clone))]), moved, "on new main");
+
+    let before = tip(&clone);
+    let mut squatted = FakePulls { open: Some(70), ..bots_pull() };
+    let _ = squatted.heads.insert(70, bot_head(passes::BOT_BRANCH, "nami-agent[bot]"));
+    let squat = run(&squatted);
+    let named = "error: #70, the open PR from `bot/passes`, comes from `bot/passes` by \
+                 `nami-agent[bot]`, not from nami-ci[bot]; nothing was changed. A human closes #70";
+    assert!(squat.starts_with(named), "{squat}");
+    assert!(squatted.log.borrow().is_empty(), "a squatted PR is neither edited nor closed");
+    assert_eq!(tip(&clone), before, "nothing is pushed");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

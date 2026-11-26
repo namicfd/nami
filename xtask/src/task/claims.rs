@@ -12,6 +12,7 @@
 //! claims built on one tip in the same second would be the same commit (#32). So every claim
 //! commit carries a nonce, which makes "the remote holds our commit" mean "our push landed".
 
+use super::pulls::WRITE_TOKEN;
 use std::fmt;
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
@@ -366,6 +367,23 @@ fn private_index(root: &Path, task: &str) -> Result<PathBuf, ClaimError> {
     Ok(Path::new(git_directory.trim()).join(name))
 }
 
+/// The git command `git <arguments>` in `root`, with `environment` added. The app's token for
+/// writes ([`WRITE_TOKEN`]) is removed from its environment unless `environment` names it:
+/// only the push of `bot/passes` does (ADR-0023, rule 2).
+pub(crate) fn git_command(
+    root: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Command {
+    let mut command = Command::new("git");
+    let _ = command.args(arguments).current_dir(root).env_remove(WRITE_TOKEN);
+    let _ = command.envs(environment.iter().copied());
+    let given = environment.iter().any(|(name, _)| *name == WRITE_TOKEN);
+    let sees = command.get_envs().any(|(name, value)| name == WRITE_TOKEN && value.is_some());
+    assert_eq!(sees, given, "git sees the token for writes only when it is given");
+    command
+}
+
 /// Runs git in `root` and returns its stdout, or its stderr as the error.
 pub(crate) fn git(
     root: &Path,
@@ -373,8 +391,7 @@ pub(crate) fn git(
     environment: &[(&str, &str)],
     stdin: Option<&str>,
 ) -> Result<String, ClaimError> {
-    let mut command = Command::new("git");
-    let _ = command.args(arguments).current_dir(root).envs(environment.iter().copied());
+    let mut command = git_command(root, arguments, environment);
     let _ = command.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let output = run(command, stdin).map_err(|error| ClaimError::Git(error.to_string()))?;
     if output.status.success() {
@@ -396,7 +413,9 @@ fn run(mut command: Command, stdin: Option<&str>) -> std::io::Result<Output> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimError, commit_change, git, private_index, retry_reason};
+    use super::{
+        ClaimError, WRITE_TOKEN, commit_change, git, git_command, private_index, retry_reason,
+    };
 
     /// The bot's identity and a fixed clock: what makes two claims look the same (#32).
     const BOT: &[(&str, &str)] = &[
@@ -470,5 +489,20 @@ mod tests {
         );
         assert_eq!(ClaimError::NotClaimed.to_string(), "not claimed");
         assert_eq!(ClaimError::Git("boom".to_owned()).to_string(), "git failed: boom");
+    }
+
+    // Goal: no git command sees the app's token for writes, unless it is handed to that one
+    // command, as the push of bot/passes does (ADR-0023, rule 2).
+    #[test]
+    fn git_sees_the_write_token_only_when_given() {
+        let root = std::path::Path::new(".");
+        let token_of = |environment: &[(&str, &str)]| {
+            let command = git_command(root, &["status"], environment);
+            let found = command.get_envs().find(|(name, _)| *name == WRITE_TOKEN);
+            found.map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+        assert_eq!(token_of(&[]), Some(None), "removed");
+        assert_eq!(token_of(&[("GIT_INDEX_FILE", "x")]), Some(None), "removed");
+        assert_eq!(token_of(&[(WRITE_TOKEN, "t")]), Some(Some("t".to_owned())), "given");
     }
 }

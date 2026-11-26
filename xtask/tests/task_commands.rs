@@ -7,7 +7,7 @@ use std::process::Command;
 use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent, Timestamp};
 use xtask::task::acceptance::Acceptance;
 use xtask::task::execute;
-use xtask::task::passes::{self, PullHead, Pulls, Services};
+use xtask::task::passes::{self, PullState, Pulls, Services};
 use xtask::task::plan::Task;
 
 /// GitHub with fixed issues, label events, comments and merge-queue entries, or unreachable.
@@ -87,7 +87,7 @@ impl GitHub for Fake {
 struct Unasked;
 
 impl Pulls for Unasked {
-    fn head(&self, number: u32) -> Result<PullHead, String> {
+    fn pull(&self, number: u32) -> Result<PullState, String> {
         Err(format!("no pull request #{number}"))
     }
     fn has_merged(&self, _branch: &str) -> Result<bool, String> {
