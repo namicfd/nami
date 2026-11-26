@@ -46,7 +46,9 @@ ADR-0025 fixes the extension points, and this ADR fixes the structure they run o
 
 - `alloc-guard`: the planned `alloc-after-init` test covers refinement and coarsening steps once
   AMR exists.
-- The compiler and `no_std`: `kernels` cannot depend on `mesh`, because `mesh` allocates at init.
+- A test over the crate graph (`xtask/tests/crate_graph.rs`, added by the M0 scaffold) checks that
+  `kernels` depends only on `base` and `libm`. The compiler does not: a `no_std` crate can depend
+  on a `std` crate.
 - Tidy (ADR-0006) and `nami_recursion` (dylint): no recursion in the tree code.
 - Determinism (ADR-0005): the planned `determinism-hash` job compares runs, and a test that
   processes blocks in a shuffled order and compares bits is planned with M4.
