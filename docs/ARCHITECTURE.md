@@ -10,7 +10,7 @@
 | 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
 | 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
 | 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
-| 4 | Core architecture | (a) agreed as a hypothesis, waiting for the prototype; (b), (c) agreed | [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
+| 4 | Core architecture | agreed; (a) confirmed by the layout prototype | [0031](design/0031-data-layout-and-kernel-shape.md), [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
 | 5 | Performance and parallelism | Agreed (problem sizes open until M7) | [0027](design/0027-parallelism-and-communication.md), [0028](design/0028-infiniband-binding-crate.md) |
 | 6 | Interface, output and determinism guarantees | Agreed | [0029](design/0029-interface-output-and-guarantees.md) |
 | 7 | Verification strategy | Agreed | [0030](design/0030-verification-strategy.md) |
@@ -243,7 +243,7 @@ The topic has three parts:
 - (b) the extension-point interfaces and how they compose;
 - (c) the mesh and blocks, and what happens at init versus in the time loop.
 
-### 4(a) Data layout and kernel shape (agreed as a hypothesis, waiting for the prototype)
+### 4(a) Data layout and kernel shape (agreed, confirmed by the prototype)
 
 - **Structure of arrays.** A block stores one array per variable, laid out `[var][k][j][i]` with
   i fastest, as Athena++ and AthenaK do.
@@ -264,11 +264,18 @@ The topic has three parts:
   - typed gathers stay;
   - raw indexing stays banned.
 
-  The ADR is written once the prototype confirms the layout.
-- **The prototype** measures zone-cycles per second for 3D Euler (PLM, HLLC, RK2, single core,
-  64³ and 128³). It compares structure of arrays with row stencils, array of structures, and a
-  hybrid, against Athena++ built on the same workstation. The code stays on a branch, and the
-  results go to `docs/research/`.
+  ADR-0031 records it.
+- **The prototype** (`docs/research/layout-prototype.md`) measured 3D Euler (PLM, HLLC, SSP-RK2,
+  one core):
+  - structure of arrays with row stencils ran at 1.9× Athena++'s fastest build at 64³ and 1.86×
+    at 128³;
+  - array of structures and the hybrid reached 1.1–1.2×;
+  - every layout gave bitwise-identical output, with Athena++'s L1 error to seven digits;
+  - block sizes known at compile time changed neither the code nor the speed.
+
+  It also found that `kernels::math::sqrt` as written today (libm's legacy-SSE `sqrtsd`, with an
+  `assert!` on every call) drops nami to 0.1× or 0.9× of Athena++, depending on inlining. That
+  needs its own decision before M2.
 
 ### 4(b) Extension points and how they compose (agreed)
 
