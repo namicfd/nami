@@ -23,15 +23,17 @@
 //! the exit code. The checkout's own code runs only as a check, a plain command with a deadline
 //! whose process group is killed when the deadline passes:
 //!
-//! - At stop, the gate is `just check dylint` in the checkout. A gate that fails, cannot start
-//!   or runs out of time is a failed gate, never a pass.
-//! - After an edit in another worktree of this repository, the file is checked by that
-//!   worktree's `cargo xtask tidy --file`, and formatted by its toolchain's rustfmt, so that new
-//!   rules on a branch apply to it. If that check cannot run, for example because the toolchain
-//!   it pins is missing or its xtask is too old to know `--file`, this process checks the file
-//!   with its own rules and says so. Any other checkout, and any checkout whose repository git
-//!   cannot name, is checked with this process's rules: the hooks build no code that the
-//!   project's repository does not hold.
+//! - At stop, the gate is `just check dylint` in whatever nami checkout is around the `cwd`, as
+//!   on `main`: that runs the checkout's own `justfile` and code, wherever it came from. A gate
+//!   that fails, cannot start or runs out of time is a failed gate, never a pass.
+//! - After an edit in another worktree of this repository, the file is formatted by the rustfmt
+//!   of the toolchain that worktree pins and checked by its `cargo xtask tidy --file`, so that
+//!   new rules on a branch apply to it. A worktree is one whose git toplevel is the checkout and
+//!   whose git common directory is this repository's. If its formatting or check cannot run, for
+//!   example because the toolchain it pins is missing or its xtask is too old to know `--file`,
+//!   this process formats or checks the file itself and says so. Any other checkout, and any
+//!   that git cannot name, is formatted and checked by this process: an edit builds no code
+//!   from outside this repository.
 //!
 //! # The stop gate
 //!
@@ -42,6 +44,12 @@
 //! [`STOP_BLOCKS_MAX`] times in a row per session; after that it lets the agent go and tells the
 //! human. The state is kept in `target/stop-gate/` of the checkout, which git ignores, so each
 //! worktree has its own.
+//!
+//! The fingerprint is taken before the gate runs, and a pass is recorded under it. A file that
+//! changes while the gate runs, for example by a background process, may not have been seen by
+//! the gate, yet the recorded pass names the state from before. Any later change makes a new
+//! fingerprint and runs the gate again; only a state that returns exactly to the recorded one
+//! is skipped. CI checks every pushed state regardless (ADR-0009).
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -182,8 +190,9 @@ pub fn hook_root(event: Event, payload: &str, project: Option<&Path>) -> Option<
 }
 
 /// True if `root` is another worktree of the repository that this process runs in, so that its
-/// own checks may run: git names the same common directory for both. A checkout that git cannot
-/// name, or that is this process's own, is not.
+/// own checks may run: git names `root` as its own toplevel, and the same common directory for
+/// both. A checkout that git cannot name, a nami-looking directory inside another checkout, and
+/// this process's own checkout are not.
 fn is_other_worktree(root: &Path) -> bool {
     let current = std::env::current_dir().ok().and_then(|directory| checkout_around(&directory));
     let Some(current) = current else {
@@ -191,6 +200,10 @@ fn is_other_worktree(root: &Path) -> bool {
     };
     let canonical = |path: &Path| fs::canonicalize(path).ok();
     if canonical(&current).is_none() || canonical(&current) == canonical(root) {
+        return false;
+    }
+    let toplevel = git(root, None, &["rev-parse", "--show-toplevel"]);
+    if toplevel.and_then(|toplevel| canonical(Path::new(&toplevel))) != canonical(root) {
         return false;
     }
     let common = |checkout: &Path| {
@@ -201,44 +214,63 @@ fn is_other_worktree(root: &Path) -> bool {
     current_common.is_some() && current_common == common(root)
 }
 
+/// What a check printed, stream by stream.
+#[derive(Debug, PartialEq, Eq)]
+struct Printed {
+    stdout: String,
+    stderr: String,
+}
+
+impl Printed {
+    /// Both streams, stdout first.
+    fn both(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+    }
+}
+
 /// What became of a check that ran in a checkout.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
-    /// It exited with this code and printed this output.
-    Exited(i32, String),
+    /// It exited with this code and printed this.
+    Exited(i32, Printed),
     /// It could not start, was killed at its deadline, or ended by a signal.
     CouldNotRun(String),
 }
 
-/// Runs `command` in its own process group, with its output in `log`, and waits for it for at
-/// most `polls_max` polls of [`POLL_INTERVAL_MILLISECONDS`]. The deadline counts polls, not
-/// wall-clock time (ADR-0005).
-fn run_bounded(command: &mut Command, log: &Path, polls_max: u32) -> Outcome {
+/// Runs `command` in its own process group, with stdin from `input` (or nothing), stdout and
+/// stderr in files next to `log`, and waits for it for at most `polls_max` polls of
+/// [`POLL_INTERVAL_MILLISECONDS`]. The deadline counts polls, not wall-clock time (ADR-0005).
+fn run_bounded(command: &mut Command, input: Option<&Path>, log: &Path, polls_max: u32) -> Outcome {
     assert!(polls_max > 0, "a check gets at least one poll");
-    let files = fs::File::create(log).and_then(|file| Ok((file.try_clone()?, file)));
+    let (out_log, err_log) = (log.with_extension("out"), log.with_extension("err"));
+    let stdin = match input.map(fs::File::open).transpose() {
+        Ok(file) => file.map_or_else(Stdio::null, Stdio::from),
+        Err(error) => return Outcome::CouldNotRun(format!("cannot read its input: {error}")),
+    };
+    let files = fs::File::create(&out_log).and_then(|out| Ok((out, fs::File::create(&err_log)?)));
     let (stdout, stderr) = match files {
         Ok(files) => files,
         Err(error) => {
             return Outcome::CouldNotRun(format!("cannot create {}: {error}", log.display()));
         }
     };
-    let command = command.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
-    let mut child = match in_own_process_group(command).spawn() {
-        Ok(child) => child,
-        Err(error) => return Outcome::CouldNotRun(format!("cannot start: {error}")),
-    };
-    let status = wait_until(&mut child, polls_max);
-    let output = match fs::read(log) {
+    let command = command.stdin(stdin).stdout(stdout).stderr(stderr);
+    let spawned = in_own_process_group(command).spawn();
+    let status = spawned.map(|mut child| wait_until(&mut child, polls_max));
+    let read = |file: &Path| match fs::read(file) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(error) => format!("(cannot read the output in {}: {error})", log.display()),
+        Err(error) => format!("(cannot read the output in {}: {error})", file.display()),
     };
-    discard(Some(log));
+    let printed = Printed { stdout: read(&out_log), stderr: read(&err_log) };
+    discard(Some(&out_log));
+    discard(Some(&err_log));
     match status {
-        Ok(status) => match status.code() {
-            Some(code) => Outcome::Exited(code, output),
-            None => Outcome::CouldNotRun(format!("ended by {status}\n{output}")),
+        Err(error) => Outcome::CouldNotRun(format!("cannot start: {error}")),
+        Ok(Ok(status)) => match status.code() {
+            Some(code) => Outcome::Exited(code, printed),
+            None => Outcome::CouldNotRun(format!("ended by {status}\n{}", printed.both())),
         },
-        Err(error) => Outcome::CouldNotRun(format!("{error}\n{output}")),
+        Ok(Err(error)) => Outcome::CouldNotRun(format!("{error}\n{}", printed.both())),
     }
 }
 
@@ -256,7 +288,14 @@ fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => std::thread::sleep(interval),
-            Err(error) => return Err(format!("cannot be waited for: {error}")),
+            Err(error) => {
+                // A child that cannot be waited for is not left running.
+                let killed = match kill_process_group(child) {
+                    Ok(()) => "its process group was killed".to_owned(),
+                    Err(kill_error) => kill_error,
+                };
+                return Err(format!("cannot be waited for: {error}; {killed}"));
+            }
         }
     }
     if let Ok(Some(status)) = child.try_wait() {
@@ -387,14 +426,15 @@ fn own_file_check(root: &Path, file: &Path) -> Result<ExitCode, String> {
         .env_remove(TOOLCHAIN_VARIABLES[1]);
     let log = output_log(root, "edit-check");
     let violations = i32::from(crate::tidy::cli::EXIT_VIOLATIONS);
-    match run_bounded(command, &log, polls_in(EDIT_CHECK_SECONDS_MAX)) {
+    match run_bounded(command, None, &log, polls_in(EDIT_CHECK_SECONDS_MAX)) {
         Outcome::Exited(0, _) => Ok(ExitCode::SUCCESS),
-        Outcome::Exited(code, output) if code == violations => {
-            eprint!("{output}");
+        Outcome::Exited(code, printed) if code == violations => {
+            eprint!("{}", printed.both());
             Ok(ExitCode::from(EXIT_FEEDBACK))
         }
-        Outcome::Exited(code, output) => {
-            Err(format!("`cargo xtask tidy --file` exited {code}: {}", tail(&output, 10)))
+        Outcome::Exited(code, printed) => {
+            let output = tail(&printed.both(), 10);
+            Err(format!("`cargo xtask tidy --file` exited {code}: {output}"))
         }
         Outcome::CouldNotRun(reason) => Err(format!("`cargo xtask tidy --file` {reason}")),
     }
@@ -410,12 +450,16 @@ fn format_in_place(
     original: &str,
     checkout_toolchain: bool,
 ) -> Result<String, ExitCode> {
-    let formatted = match format_source(root, original, checkout_toolchain) {
-        Err(error) if checkout_toolchain => format_source(root, original, false).inspect(|_| {
-            let first = error.lines().next().unwrap_or_default();
-            eprintln!("note: the rustfmt that {} pins did not run ({first})", root.display());
-        }),
-        result => result,
+    let formatted = if checkout_toolchain {
+        match format_with_checkout_toolchain(root, original) {
+            Err(error) => format_source(root, original).inspect(|_| {
+                let first = error.lines().next().unwrap_or_default();
+                eprintln!("note: the rustfmt that {} pins did not run ({first})", root.display());
+            }),
+            formatted => formatted,
+        }
+    } else {
+        format_source(root, original)
     };
     let text = match formatted {
         Ok(formatted) => formatted,
@@ -473,9 +517,9 @@ fn run_gate(root: &Path) -> Result<(), String> {
         .current_dir(root)
         .env_remove(TOOLCHAIN_VARIABLES[0])
         .env_remove(TOOLCHAIN_VARIABLES[1]);
-    match run_bounded(command, &output_log(root, "gate"), polls_in(GATE_SECONDS_MAX)) {
+    match run_bounded(command, None, &output_log(root, "gate"), polls_in(GATE_SECONDS_MAX)) {
         Outcome::Exited(0, _) => Ok(()),
-        Outcome::Exited(_, output) => Err(output),
+        Outcome::Exited(_, printed) => Err(printed.both()),
         Outcome::CouldNotRun(reason) => Err(format!("`just check dylint` {reason}")),
     }
 }
@@ -704,17 +748,12 @@ fn git(root: &Path, index: Option<&Path>, arguments: &[&str]) -> Option<String> 
 }
 
 /// Formats one file's source through stdin, so that rustfmt does not follow `mod` declarations
-/// into sibling files, which may not exist yet. Runs in `root` to pick up `rustfmt.toml`, and
-/// with `checkout_toolchain`, with the toolchain that `root` pins rather than this process's.
-fn format_source(root: &Path, source: &str, checkout_toolchain: bool) -> Result<String, String> {
-    let mut command = Command::new("rustfmt");
-    let command = command.args(["--edition", "2024", "--emit", "stdout"]).current_dir(root);
-    let command = if checkout_toolchain {
-        command.env_remove(TOOLCHAIN_VARIABLES[0]).env_remove(TOOLCHAIN_VARIABLES[1])
-    } else {
-        command
-    };
-    let mut child = command
+/// into sibling files, which may not exist yet. Runs in `root` to pick up `rustfmt.toml`, with
+/// this process's toolchain.
+fn format_source(root: &Path, source: &str) -> Result<String, String> {
+    let mut child = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -728,6 +767,30 @@ fn format_source(root: &Path, source: &str, checkout_toolchain: bool) -> Result<
         String::from_utf8(output.stdout).map_err(|error| error.to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// Formats one file's source like [`format_source`], but with the rustfmt of the toolchain that
+/// `root` pins, as a bounded check: within [`EDIT_CHECK_SECONDS_MAX`], its process group killed
+/// at the deadline. Returns what went wrong if it did not format the source, so that the caller
+/// can fall back to this process's rustfmt.
+fn format_with_checkout_toolchain(root: &Path, source: &str) -> Result<String, String> {
+    let input = output_log(root, "format-input");
+    let written = fs::write(&input, source);
+    written.map_err(|error| format!("cannot write {}: {error}", input.display()))?;
+    let mut command = Command::new("rustfmt");
+    let command = command
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .current_dir(root)
+        .env_remove(TOOLCHAIN_VARIABLES[0])
+        .env_remove(TOOLCHAIN_VARIABLES[1]);
+    let log = output_log(root, "format");
+    let outcome = run_bounded(command, Some(&input), &log, polls_in(EDIT_CHECK_SECONDS_MAX));
+    discard(Some(&input));
+    match outcome {
+        Outcome::Exited(0, printed) => Ok(printed.stdout),
+        Outcome::Exited(code, printed) => Err(format!("exit {code}: {}", printed.stderr)),
+        Outcome::CouldNotRun(reason) => Err(reason),
     }
 }
 
@@ -947,7 +1010,8 @@ mod tests {
         let signal = std::os::unix::process::ExitStatusExt::signal(&member_status);
         assert_eq!(signal, Some(9), "the group kill reached the member: {member_status}");
         let mut quick = std::process::Command::new("true").spawn().unwrap();
-        let status = wait_until(&mut quick, 500).expect("`true` ends in time");
+        let status = wait_until(&mut quick, super::polls_in(super::GATE_SECONDS_MAX));
+        let status = status.expect("`true` ends by itself");
         assert!(status.success(), "its status is kept: {status}");
     }
 
@@ -962,33 +1026,46 @@ mod tests {
         assert!(!status.success(), "the child was killed: {status}");
     }
 
-    // Goal: a bounded run reports the exit code with stdout and stderr together, and a check
-    // that cannot start, is ended by a signal or outlives its deadline as one that could not
-    // run, never as an exit code. Method: each case ends by itself or blocks on a FIFO that
-    // has no writer, so no case depends on the clock.
+    // Goal: a bounded run reads its input from a file, reports the exit code with stdout and
+    // stderr apart, and a check that cannot start, is ended by a signal or outlives its deadline
+    // as one that could not run, never as an exit code. Method: no case depends on the clock.
+    // A case that ends by itself gets the gate's whole deadline; the one that must be killed
+    // blocks on a FIFO that the test made and never writes, so it cannot end by itself.
     #[test]
     fn bounded_runs_tell_an_exit_from_a_check_that_could_not_run() {
-        use super::{Outcome, run_bounded};
+        use super::{GATE_SECONDS_MAX, Outcome, Printed, polls_in, run_bounded};
         let scratch = Scratch::new("hook-bounded");
         let log = scratch.root().join("run.log");
-        let shell = |script: &str, polls| {
+        let ample = polls_in(GATE_SECONDS_MAX);
+        let shell = |script: &str, input: Option<&std::path::Path>, polls| {
             let mut command = std::process::Command::new("sh");
-            run_bounded(command.args(["-c", script]).current_dir(scratch.root()), &log, polls)
+            let command = command.args(["-c", script]).current_dir(scratch.root());
+            run_bounded(command, input, &log, polls)
         };
-        let exited = shell("echo out; echo err >&2; exit 7", 500);
-        assert_eq!(exited, Outcome::Exited(7, "out\nerr\n".to_owned()), "both streams");
-        assert!(!log.exists(), "the log is removed after the run");
-        let missing = run_bounded(&mut std::process::Command::new("/nonexistent"), &log, 500);
+        let exited = shell("echo out; echo err >&2; exit 7", None, ample);
+        let printed = Printed { stdout: "out\n".to_owned(), stderr: "err\n".to_owned() };
+        assert_eq!(exited, Outcome::Exited(7, printed), "both streams, apart");
+        assert!(!log.with_extension("out").exists(), "the logs are removed after the run");
+        assert!(!log.with_extension("err").exists(), "both of them");
+        scratch.write("input.txt", "from the file\n");
+        let input = scratch.root().join("input.txt");
+        let Outcome::Exited(0, read) = shell("cat", Some(&input), ample) else { panic!() };
+        assert_eq!(read.stdout, "from the file\n", "stdin comes from the input file");
+        let Outcome::Exited(0, empty) = shell("cat", None, ample) else { panic!() };
+        assert_eq!(empty.stdout, "", "and without one, stdin is empty");
+        let missing =
+            run_bounded(&mut std::process::Command::new("/nonexistent"), None, &log, ample);
         let Outcome::CouldNotRun(unstarted) = missing else { panic!("{missing:?}") };
         assert!(unstarted.starts_with("cannot start: "), "{unstarted}");
-        let signalled = shell("echo before; kill -TERM $$", 500);
+        let signalled = shell("echo before; kill -TERM $$", None, ample);
         let Outcome::CouldNotRun(ended) = signalled else { panic!("{signalled:?}") };
         assert!(ended.starts_with("ended by signal: 15"), "{ended}");
         assert!(ended.ends_with("before\n"), "with its output: {ended}");
-        let blocked = shell("mkfifo f; echo waiting; read x < f", 5);
-        let Outcome::CouldNotRun(killed) = blocked else { panic!("{blocked:?}") };
+        let mut fifo = std::process::Command::new("mkfifo");
+        let made = fifo.arg(scratch.root().join("f")).status().unwrap();
+        assert!(made.success(), "the FIFO is made before the check starts");
+        let Outcome::CouldNotRun(killed) = shell("read x < f", None, 5) else { panic!() };
         assert!(killed.starts_with("did not finish within 0 seconds and was killed"), "{killed}");
-        assert!(killed.ends_with("waiting\n"), "with its output: {killed}");
     }
 
     // Goal: each deadline leaves time before Claude Code's timeout in `.claude/settings.json`

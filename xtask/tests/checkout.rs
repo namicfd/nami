@@ -29,7 +29,9 @@ fi
 /// arguments, then runs the xtask under test, as `cargo xtask` would. While `broken-xtask`
 /// exists it fails like an xtask that does not build; while `missing-toolchain` exists, like
 /// rustup without the pinned toolchain; while `old-xtask` exists, like an xtask from before
-/// `tidy --file`.
+/// `tidy --file`. While `worktree-flags-everything` or `worktree-passes-everything` exists, it
+/// stands for a worktree whose own rules disagree with the project's: every file breaks a rule,
+/// or none does.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 mkdir -p target
 echo "$PWD|$RUSTUP_TOOLCHAIN|$RUSTUP_TOOLCHAIN_SOURCE|$*" >> target/cargo-calls
@@ -44,6 +46,13 @@ fi
 if [ -e old-xtask ]; then
     echo "usage: cargo xtask tidy [--root <dir> [--policy <dir>]] | rules [--write]" >&2
     exit 1
+fi
+if [ -e worktree-flags-everything ]; then
+    echo "$4:0: error[worktree-only]: a rule that only this worktree has" >&2
+    exit 2
+fi
+if [ -e worktree-passes-everything ]; then
+    exit 0
 fi
 shift
 exec "$NAMI_TEST_XTASK" "$@"
@@ -547,6 +556,57 @@ fn edits_in_a_worktree_use_its_own_check() {
     let stdout = String::from_utf8_lossy(&started.stdout);
     assert!(stdout.contains("error[doctor]: "), "the worktree's findings are shown: {stdout}");
     assert_eq!(cargo_calls(&project), Vec::<String>::new(), "the project never ran cargo");
+}
+
+// Goal: the worktree's own verdict decides for its own files, both ways (#27): a violation that
+// only the worktree's rules see blocks the edit, and a file that only the project's rules would
+// flag passes. Method: the fake `cargo` stands for a worktree whose rules disagree with the
+// project's, on a clean file and on an unreviewed snapshot that the project's rules flag.
+#[test]
+fn the_worktree_verdict_wins_for_its_own_files() {
+    let scratch = Scratch::new("edit-verdict");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let worktree = scratch.worktree("work");
+    let notes = worktree.join("notes.md");
+    fs::write(&notes, "notes\n").unwrap();
+    let draft = worktree.join("a.snap.new");
+    fs::write(&draft, "draft\n").unwrap();
+
+    fs::write(worktree.join("worktree-flags-everything"), "").unwrap();
+    let flagged = scratch.hook("post-edit", &edit_payload(&project, &notes), &[]);
+    let flagged_stderr = String::from_utf8_lossy(&flagged.stderr);
+    assert_eq!(flagged.status.code(), Some(2), "the worktree's rule blocks: {flagged_stderr}");
+    let expected = format!("{}:0: error[worktree-only]", notes.display());
+    assert!(flagged_stderr.contains(&expected), "its message is shown: {flagged_stderr}");
+    assert!(!flagged_stderr.contains("could not run"), "the check ran: {flagged_stderr}");
+    fs::remove_file(worktree.join("worktree-flags-everything")).unwrap();
+
+    fs::write(worktree.join("worktree-passes-everything"), "").unwrap();
+    let passed = scratch.hook("post-edit", &edit_payload(&project, &draft), &[]);
+    let passed_stderr = String::from_utf8_lossy(&passed.stderr);
+    let outcome = (passed.status.code(), passed_stderr.as_ref());
+    assert_eq!(outcome, (Some(0), ""), "the worktree's rules pass it, so it passes");
+    fs::remove_file(worktree.join("worktree-passes-everything")).unwrap();
+    assert_eq!(cargo_calls(&worktree).len(), 2, "both verdicts came from the worktree");
+}
+
+// Goal: a directory inside the project that merely looks like a checkout, untracked with its
+// own `rust-toolchain.toml` and `xtask/`, is not run as a worktree: git names the project as
+// its toplevel. Its files are checked by the project's rules, and none of its code runs.
+#[test]
+fn a_nami_looking_directory_inside_the_project_is_not_a_worktree() {
+    let scratch = Scratch::new("inner");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    scratch.write("vendor/inner/rust-toolchain.toml", "[toolchain]\n");
+    scratch.write("vendor/inner/xtask/README", "tooling\n");
+    scratch.write("vendor/inner/a.snap.new", "draft\n");
+    let inner = project.join("vendor/inner");
+    let edited = scratch.hook("post-edit", &edit_payload(&project, &inner.join("a.snap.new")), &[]);
+    let stderr = String::from_utf8_lossy(&edited.stderr);
+    assert_eq!(edited.status.code(), Some(2), "the file is checked: {stderr}");
+    assert!(stderr.contains("a.snap.new:0: error[snapshot-draft]"), "by the project: {stderr}");
+    assert!(!stderr.contains("could not run"), "no worktree check was tried: {stderr}");
+    assert_eq!(cargo_calls(&inner), Vec::<String>::new(), "none of its code ran");
 }
 
 // Goal: a worktree check that cannot run, because the toolchain it pins is missing, its xtask
