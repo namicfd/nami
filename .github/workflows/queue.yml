@@ -48,46 +48,23 @@ jobs:
   # Ownership of queue failures: when the required checks fail on a merge-queue branch and the
   # PR has really left the queue, file an issue of kind `bug` for it, as nami-agent[bot], so
   # that `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on
-  # its own branch (ADR-0021, point 6). A re-run finds the open issue and files nothing.
+  # its own branch (ADR-0021, point 6). One issue per failed run: the title names the run, so a
+  # re-run of it finds its open issue and files nothing. No concurrency group: two runs file
+  # two different issues, and a group could cancel a pending job and lose a failure.
   #
-  # The PR's number is read first, so that the runs for one PR are handled one at a time.
-  queue-entry:
-    name: queue entry
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.path == '.github/workflows/ci.yml' &&
-      github.event.workflow_run.event == 'merge_group' &&
-      github.event.workflow_run.conclusion == 'failure'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions: {}
-    outputs:
-      pull: ${{ steps.entry.outputs.pull }}
-    steps:
-      - name: The PR that the queue branch names
-        id: entry
-        env:
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-        run: |
-          pattern='^gh-readonly-queue/.+/pr-([1-9][0-9]*)-[0-9a-f]{40}$'
-          if [[ ! "${HEAD_BRANCH}" =~ $pattern ]]; then
-            echo "::error::The failed merge-group run is not on a merge-queue branch"
-            exit 1
-          fi
-          echo "pull=${BASH_REMATCH[1]}" >> "${GITHUB_OUTPUT}"
-
   # `workflow_run` runs main's version of this file and of xtask, never a PR's, so the bot's
   # key never meets a PR's code. The key lives in the `nami-agent` environment, which only
   # main may use (docs/operations/github-setup.md, step 8). The token is narrowed to what the
   # job needs: read the run, its jobs and logs, the PR and the repository; write issues.
   queue-failure:
     name: file queue failure
-    needs: queue-entry
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+      github.event.workflow_run.event == 'merge_group' &&
+      github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    concurrency:
-      group: queue-failure-pr-${{ needs.queue-entry.outputs.pull }}
-      cancel-in-progress: false
     environment: nami-agent
     permissions:
       contents: read
