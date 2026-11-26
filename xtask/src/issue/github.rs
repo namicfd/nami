@@ -83,6 +83,12 @@ impl Timestamp {
         }
         Ok(Self(text.to_owned()))
     }
+
+    /// The day, `YYYY-MM-DD`, in UTC.
+    #[must_use]
+    pub fn day(&self) -> &str {
+        self.0.get(..10).expect("`parse` checked that a time starts with its day")
+    }
 }
 
 /// What the issue commands need from GitHub. Every error says what failed and how to fix it.

@@ -6,8 +6,8 @@
 //! - `show <number>` prints a trusted issue and its trusted comments. Agents read issues only
 //!   this way: it refuses an issue by anyone but the bot and the code owners.
 //! - `decide <number> --by <login> --date <YYYY-MM-DD> --source <text> <decision.md>` records a
-//!   code owner's decision on an issue with `needs-decision`, then removes the label (ADR-0021,
-//!   point 7). The file holds the decision: one paragraph.
+//!   code owner's decision on an issue that the bot opened and that has `needs-decision`, then
+//!   removes the label (ADR-0021, point 7). The file holds the decision: one paragraph.
 //!
 //! They act on the checkout's GitHub repository, as whoever `GH_TOKEN` names. The code owners
 //! come from `.github/CODEOWNERS` on `<remote>/main`; the remote is `$NAMI_TASK_REMOTE`, or
@@ -138,20 +138,21 @@ fn main_of(remote: &str) -> String {
     format!("{remote}/main")
 }
 
-/// The label events of issue `number`, and its comments if [`trust::unworkable`] needs them:
-/// only when the bot removed `needs-decision` last.
+/// The label events of `found`, and its comments if [`trust::unworkable`] needs them: only
+/// when the bot removed `needs-decision` last from an issue that the bot opened.
 ///
 /// # Errors
 ///
 /// When GitHub cannot be asked.
 pub fn history(
     github: &dyn GitHub,
-    number: u32,
+    found: &Issue,
 ) -> Result<(Vec<LabelEvent>, Vec<Comment>), String> {
-    let events = github.label_events(number)?;
-    let comments = if trust::needs_record(&events) { github.comments(number)? } else { Vec::new() };
-    assert!(comments.is_empty() || trust::needs_record(&events), "comments only when needed");
-    Ok((events, comments))
+    let events = github.label_events(found.number)?;
+    if !trust::needs_record(found, &events) {
+        return Ok((events, Vec::new()));
+    }
+    Ok((events, github.comments(found.number)?))
 }
 
 /// Prints a trusted issue and its trusted comments.
@@ -325,8 +326,8 @@ impl<'arguments> DecideOptions<'arguments> {
     }
 }
 
-/// Posts `record` on issue `number`, then removes `needs-decision`. Refuses unless the issue
-/// is trusted and waits for a decision, and the decider is a code owner.
+/// Posts `record` on issue `number`, then removes `needs-decision`. Refuses unless the bot
+/// opened the issue, it waits for a decision, and the decider is a code owner.
 fn decide(
     number: u32,
     record: &Record,
@@ -343,6 +344,13 @@ fn decide(
     let found = github.issue(number)?;
     if let Some(reason) = trust::refused(&found, trust) {
         return Err(reason);
+    }
+    if found.author != BOT_LOGIN {
+        return Err(format!(
+            "#{number} was opened by `{}`, not by the bot; on such an issue only a code owner \
+             removes `{NEEDS_DECISION}` (ADR-0021, point 7)",
+            found.author
+        ));
     }
     if !found.labels.iter().any(|label| label == NEEDS_DECISION) {
         return Err(format!(
@@ -736,7 +744,8 @@ mod tests {
     }
 
     // Goal: `decide` posts the record and then removes the label, only for a code owner's
-    // decision on a trusted issue that waits for one; a failed removal says what is done.
+    // decision on an issue that the bot opened and that waits for one; a failed removal says
+    // what is done.
     #[test]
     fn decisions_are_recorded_then_the_label_goes() {
         let waiting = Issue {
@@ -752,12 +761,15 @@ mod tests {
         assert_eq!(*fake.posted.borrow(), [(9, record.render())]);
         assert_eq!(*fake.removed.borrow(), [(9, "needs-decision".to_owned())]);
 
-        let quiet = Fake { issues: vec![untrusted, issue(8, BOT_LOGIN, "Gap")], ..Fake::default() };
+        let owners = Issue { number: 6, author: "owner".to_owned(), ..waiting.clone() };
+        let issues = vec![untrusted, issue(8, BOT_LOGIN, "Gap"), owners];
+        let quiet = Fake { issues, ..Fake::default() };
         let outsider = decide_options("outsider").record("Do it.").unwrap();
         for (number, by, expected) in [
             (9, &outsider, "`outsider` is not a code owner"),
             (9, &record, "neither the bot nor a code owner"),
             (8, &record, "#8 has no `needs-decision` label"),
+            (6, &record, "#6 was opened by `owner`, not by the bot"),
             (7, &record, "no #7"),
         ] {
             let error = decide(number, by, &quiet, &trust()).expect_err("refused");

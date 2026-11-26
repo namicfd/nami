@@ -260,7 +260,7 @@ fn is_workable(
     trust: &trust::Trust,
     repository: Option<&str>,
 ) -> Result<bool, String> {
-    let (events, comments) = issue::history(github, found.number)?;
+    let (events, comments) = issue::history(github, found)?;
     if trust::unworkable(found, &events, &comments, trust).is_some() {
         return Ok(false);
     }
@@ -305,7 +305,7 @@ fn claim_issue(
     }
     let found = github.issue(number)?;
     let trust = trust::load(root, &format!("{remote}/main"))?;
-    let (events, comments) = issue::history(github, number)?;
+    let (events, comments) = issue::history(github, &found)?;
     if let Some(reason) = trust::unworkable(&found, &events, &comments, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }

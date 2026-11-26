@@ -103,11 +103,9 @@ pub fn is_one_line(text: &str) -> bool {
 #[must_use]
 pub fn is_login(text: &str) -> bool {
     let is_shaped = !text.starts_with('-') && !text.ends_with('-') && !text.contains("--");
-    let is_login = is_shaped
+    is_shaped
         && (1..=LOGIN_MAX).contains(&text.len())
-        && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    assert!(!is_login || !text.contains('['), "a user's login is never the bot's");
-    is_login
+        && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 /// True for a calendar day written `YYYY-MM-DD`.
@@ -132,15 +130,13 @@ pub fn is_date(text: &str) -> bool {
 /// The number of days in `month` of `year`, or 0 if there is no such month.
 fn days_in_month(year: u32, month: u32) -> u32 {
     let is_leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let days = match month {
+    match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 if is_leap => 29,
         2 => 28,
         _ => 0,
-    };
-    assert!(days <= 31, "no month is longer than 31 days");
-    days
+    }
 }
 
 #[cfg(test)]
@@ -193,7 +189,9 @@ mod tests {
     // Goal: only calendar days in the form YYYY-MM-DD are dates, leap days included.
     #[test]
     fn dates_are_calendar_days() {
-        for day in ["2026-11-26", "2024-02-29", "2000-02-29", "2026-01-31", "2026-04-30"] {
+        for day in
+            ["2026-11-26", "2024-02-29", "2000-02-29", "2026-02-28", "2026-01-31", "2026-04-30"]
+        {
             assert!(is_date(day), "{day}");
         }
         for day in [
