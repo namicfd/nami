@@ -151,12 +151,14 @@ The authoritative list is `.github/CODEOWNERS`.
   `main`.
 - **You act as `nami-agent[bot]`.** In Claude Code, `.claude/settings.json` already makes git
   commit and push as the bot, so use plain commands: `git push origin <branch>`. Prefix gh with
-  `GH_TOKEN=$(xtask/agent-token.sh)`. Without it, gh fails with "not logged in": sessions see
-  no human login. If a push or token is refused, stop and ask. Never use a human's credentials
-  (`docs/operations/github-setup.md`, step 6).
+  `GH_TOKEN=$(xtask/agent-token.sh)`. Without it, gh fails with "To get started with GitHub
+  CLI, please run: gh auth login", because sessions see no human login. If a push or token is
+  refused, stop and ask. Never use a human's credentials (`docs/operations/github-setup.md`,
+  step 6).
 - **Write files with the Write tool, never with a shell heredoc.** A heredoc that ends early
   makes bash run the rest of the text as commands. Once it ran a `gh` command from a runbook.
   Commit messages and PR bodies count too: write them to a file, then pass the file (`-F`).
+  No check enforces this yet (#74).
 - **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
   `docs/exec-plans/README.md`).
   - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
