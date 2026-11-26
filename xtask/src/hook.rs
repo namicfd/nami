@@ -9,8 +9,8 @@
 //! - `stop`: runs `just check dylint` before an agent or subagent may finish, unless the working
 //!   state is the unchanged base or has already passed.
 //! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH`, reports tools whose
-//!   version is not the pinned one, and stops a session whose gh can reach a person's GitHub
-//!   login (`hook/github_login.rs`).
+//!   version is not the pinned one, and reports any person's GitHub login that gh can still
+//!   reach (`hook/github_login.rs`). It does not stop the session (issue #75).
 //!
 //! # Which checkout, and whose rules
 //!
@@ -704,37 +704,69 @@ fn stop_failed(attempts: Option<&Path>, stop_hook_active: bool, output_tail: &st
 /// finding in the report, and every failure of the hook itself a fixed error report
 /// ([`session_start_failed`]).
 fn session_start(root: Option<&Path>) -> ExitCode {
-    let mut findings: Vec<github_login::Finding> =
-        export_cargo_bin().err().map(|error| env_file_finding(&error)).into_iter().collect();
-    let report = match doctor_within(root, DOCTOR_SECONDS_MAX) {
-        Err(reason) => session_start_failed("the doctor", &reason),
-        Ok(doctor) => {
-            // The login check fails closed: a panic in it is an error finding, never a pass.
-            findings.extend(github_login::checked(|| login_findings(root)));
-            let output = std::panic::catch_unwind(|| session_start_output(&doctor, &findings));
-            output
-                .unwrap_or_else(|panic| session_start_failed("the report", &panic_reason(&*panic)))
-        }
-    };
-    assert!(report.is_empty() || report.ends_with('\n'), "the report ends its last line");
+    let env_file = export_cargo_bin();
+    let doctor = doctor_within(root, DOCTOR_SECONDS_MAX);
+    let report = session_start_report(env_file, doctor, || login_findings(root));
     print!("{report}");
     ExitCode::SUCCESS
+}
+
+/// The report of session start from its three parts: extending the env file, the doctor, and
+/// the login check, which `login` runs. Each part's failure is a finding of its own, and the
+/// other parts still run: a doctor that panicked is a warning, and the login check runs anyway.
+fn session_start_report(
+    env_file: io::Result<()>,
+    doctor: Result<Vec<String>, String>,
+    login: impl FnOnce() -> Vec<github_login::Finding>,
+) -> String {
+    let mut findings: Vec<github_login::Finding> =
+        env_file.err().map(|error| env_file_finding(&error)).into_iter().collect();
+    let doctor = doctor.unwrap_or_else(|reason| {
+        findings.push(doctor_panic_finding(&reason));
+        Vec::new()
+    });
+    // The login check fails closed: a panic in it is an error finding, never a pass.
+    findings.extend(github_login::checked(login));
+    let output = std::panic::catch_unwind(|| session_start_output(&doctor, &findings));
+    let report =
+        output.unwrap_or_else(|panic| session_start_failed("the report", &panic_reason(&*panic)));
+    assert!(report.is_empty() || report.ends_with('\n'), "the report ends its last line");
+    report
 }
 
 /// A panic that would print nothing, or exit 101, would let the session start unchecked.
 const _: () = assert!(cfg!(panic = "unwind"), "the session-start hook catches its own panics");
 
 /// The finding for an env file that session start cannot extend: the session would start
-/// without `$HOME/.cargo/bin` on its `PATH`, so it stops.
+/// without `$HOME/.cargo/bin` on its `PATH`.
 fn env_file_finding(error: &io::Error) -> github_login::Finding {
     let error = error.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
-    let message = format!(
-        "error[session-start]: cannot add `$HOME/.cargo/bin` to the session's PATH through the \
-         file that CLAUDE_ENV_FILE names ({error}), so `just` and `cargo` would not be found; \
-         make that file writable, then start a new session"
-    );
-    assert!(!message.contains('\n'), "a finding is one line");
-    github_login::Finding { severity: github_login::Severity::Error, message }
+    let finding = github_login::Finding {
+        severity: github_login::Severity::Error,
+        topic: github_login::Topic::CargoPath,
+        message: format!(
+            "error[session-start]: cannot add `$HOME/.cargo/bin` to the session's PATH through \
+             the file that CLAUDE_ENV_FILE names ({error})"
+        ),
+        remedy: "make that file writable, end this session, and start a new one".to_owned(),
+    };
+    assert!(finding.is_well_formed(), "{finding:?}");
+    finding
+}
+
+/// The finding for a doctor that panicked with `reason`: the tools are unchecked, and nothing
+/// else is affected.
+fn doctor_panic_finding(reason: &str) -> github_login::Finding {
+    let finding = github_login::Finding {
+        severity: github_login::Severity::Warning,
+        topic: github_login::Topic::Doctor,
+        message: format!(
+            "warning[doctor]: the doctor failed ({reason}), so the tools are unchecked"
+        ),
+        remedy: "report it as a bug; `cargo xtask doctor` checks the tools by hand".to_owned(),
+    };
+    assert!(finding.is_well_formed(), "{finding:?}");
+    finding
 }
 
 /// The login check of this session, with the real gh and environment.
@@ -760,7 +792,7 @@ fn doctor_within(root: Option<&Path>, seconds: u32) -> Result<Vec<String>, Strin
     Ok(finished.unwrap_or_else(|| {
         vec![format!(
             "warning[doctor]: the doctor did not finish within {seconds} seconds, so the tools \
-             are unchecked; run `cargo xtask doctor` by hand"
+             are unchecked; `cargo xtask doctor` checks them"
         )]
     }))
 }
@@ -820,25 +852,43 @@ fn session_start_failed(stage: &str, reason: &str) -> String {
     let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     let message = format!(
         "error[session-start]: {stage} failed ({reason}), so it is not known whether gh can \
-         reach a person's GitHub login; report it as a bug (docs/operations/github-setup.md, \
-         step 6)"
+         reach a person's GitHub login"
     );
-    let context = format!("{message}\n{UNSTOPPED_NOTE}");
+    let human = format!(
+        "{message}. For the human: report it as a bug, and end this session \
+         (docs/operations/github-setup.md, step 6).\n{HUMAN_UNSTOPPED_NOTE}"
+    );
+    let context = format!("{message}\n{AGENT_GH_LOGIN_NOTE}");
     let output = format!(
         "{{\"continue\":false,\"stopReason\":{},\"systemMessage\":{},\"hookSpecificOutput\":\
          {{\"hookEventName\":\"SessionStart\",\"additionalContext\":{}}}}}\n",
         crate::json::quote(STOP_REASON),
-        crate::json::quote(&message),
+        crate::json::quote(&human),
         crate::json::quote(&context)
     );
     assert!(output.lines().count() == 1, "the report is one line of JSON");
     output
 }
 
-/// What the agent is told after an error, since Claude Code does not stop the session for it.
-const UNSTOPPED_NOTE: &str = "note[session-start]: the errors above should stop this session, \
-                              but Claude Code ignores a stop at SessionStart (issue #75): run \
-                              no gh command in this session, and tell the human.";
+/// What the agent is told with a gh-login finding. Safe to act on literally: the bot-token
+/// prefix makes gh act as the bot whatever else it could reach.
+const AGENT_GH_LOGIN_NOTE: &str = "note[gh-login] for the agent: do not run gh without the \
+                                   bot-token prefix (`GH_TOKEN=$(xtask/agent-token.sh) gh ...`), \
+                                   stop and ask if that script fails, and tell the human about \
+                                   the gh-login findings above. Claude Code does not stop this \
+                                   session for them (issue #75).";
+
+/// What the agent is told when `$HOME/.cargo/bin` could not be put on the session's `PATH`.
+const AGENT_CARGO_PATH_NOTE: &str = "note[session-start] for the agent: `$HOME/.cargo/bin` is \
+                                     not on this session's PATH, so `just` and `cargo` may not \
+                                     be found; call them as `$HOME/.cargo/bin/just` and \
+                                     `$HOME/.cargo/bin/cargo`, and tell the human.";
+
+/// What the human is told with an error, since Claude Code does not stop the session for it.
+const HUMAN_UNSTOPPED_NOTE: &str = "note[session-start] for the human: this session keeps \
+                                    running, because Claude Code ignores a stop at SessionStart \
+                                    (issue #75). End it, fix the errors above, then start a new \
+                                    session.";
 
 /// Seconds that the doctor may take (hook timeout: 120). Its commands are not bounded one by
 /// one; past this, the hook goes on without it.
@@ -858,11 +908,13 @@ const STOP_REASON: &str = "The session-start hook found a problem that must be f
 
 /// What the session-start hook prints. Claude Code adds plain stdout to the agent's context, so
 /// without a finding that is the doctor's findings, one per line. With one, it is a JSON
-/// object: every finding goes to the agent (`additionalContext`) and to the human
-/// (`systemMessage`).
+/// object. The agent gets each finding's message, and one note per topic that says what it
+/// should do ([`AGENT_GH_LOGIN_NOTE`], [`AGENT_CARGO_PATH_NOTE`]); no other text tells it to do
+/// anything. The human gets each message with its remedy.
 ///
-/// With an error, the object also asks for a stop (`continue: false`), and the agent is told
-/// what to do instead ([`UNSTOPPED_NOTE`]). Claude Code ignores the stop at `SessionStart`: its
+/// With an error, the object also asks for a stop (`continue: false`), and the human is told
+/// that the session keeps running ([`HUMAN_UNSTOPPED_NOTE`]). Claude Code ignores the stop at
+/// `SessionStart`: its
 /// hooks reference calls the event "Context only ... No blocking or decision control", and a
 /// live check in PR #72 confirmed it. The environment is what keeps a stored login out; this
 /// check reports what it misses. Enforcing the verdict is issue #75.
@@ -875,11 +927,21 @@ fn session_start_output(doctor: &[String], findings: &[github_login::Finding]) -
         }
         return lines;
     }
-    let human: Vec<&str> = findings.iter().map(|finding| finding.message.as_str()).collect();
-    context.extend(&human);
+    context.extend(findings.iter().map(|finding| finding.message.as_str()));
+    let about = |topic| findings.iter().any(|finding| finding.topic == topic);
+    if about(github_login::Topic::GhLogin) {
+        context.push(AGENT_GH_LOGIN_NOTE);
+    }
+    if about(github_login::Topic::CargoPath) {
+        context.push(AGENT_CARGO_PATH_NOTE);
+    }
+    let mut human: Vec<String> = findings
+        .iter()
+        .map(|finding| format!("{}. For the human: {}.", finding.message, finding.remedy))
+        .collect();
     let stops = findings.iter().any(|finding| finding.severity == github_login::Severity::Error);
     if stops {
-        context.push(UNSTOPPED_NOTE);
+        human.push(HUMAN_UNSTOPPED_NOTE.to_owned());
     }
     let mut fields = Vec::new();
     if stops {
@@ -1683,63 +1745,108 @@ mod tests {
         assert_eq!(super::env_file_addition(&format!("  {export}")), None);
     }
 
-    // Goal: without a login finding, session start prints the doctor's findings as plain lines;
-    // with one, a JSON object that tells the agent everything and the human the login findings,
-    // and that asks for a stop, and tells the agent what to do instead, only for an error.
+    /// The `systemMessage` and the `additionalContext` of a session-start report.
+    fn human_and_agent(report: &str) -> (String, String) {
+        let output = crate::json::parse(report).expect("the report is one JSON object");
+        let text = |value: Option<&crate::json::Value>| {
+            value.and_then(crate::json::Value::as_str).unwrap_or_default().to_owned()
+        };
+        let specific = output.get("hookSpecificOutput");
+        let event = specific.and_then(|part| part.get("hookEventName"));
+        assert_eq!(text(event), "SessionStart", "{report}");
+        let context = specific.and_then(|part| part.get("additionalContext"));
+        (text(output.get("systemMessage")), text(context))
+    }
+
+    // Goal: without a finding, session start prints the doctor's findings as plain lines. With
+    // one, the agent gets each message and the note for its topic, and the human each message
+    // with its remedy. An error asks for a stop and tells the human that the session keeps
+    // running; a warning does neither.
     #[test]
-    fn session_start_asks_for_a_stop_only_for_an_error() {
-        use super::github_login::{Finding, Severity};
+    fn session_start_tells_each_reader_their_part() {
+        use super::github_login::{Finding, Severity, Topic};
         use super::session_start_output;
         let doctor = vec!["error[doctor]: a".to_owned(), "error[doctor]: b".to_owned()];
         assert_eq!(session_start_output(&doctor, &[]), "error[doctor]: a\nerror[doctor]: b\n");
         assert_eq!(session_start_output(&[], &[]), "");
-        let finding = |severity, message: &str| Finding { severity, message: message.to_owned() };
-        let unsure = [finding(Severity::Warning, "warning[gh-login]: \"odd\"")];
-        let printed = session_start_output(&doctor, &unsure);
-        let output = crate::json::parse(&printed).expect("the output is one JSON object");
-        assert!(output.get("continue").is_none(), "a warning asks for no stop: {printed}");
-        let message = output.get("systemMessage").and_then(crate::json::Value::as_str);
-        assert_eq!(message, Some("warning[gh-login]: \"odd\""), "the human sees the finding");
-        let specific = output.get("hookSpecificOutput").expect("the agent's part");
-        let event = specific.get("hookEventName").and_then(crate::json::Value::as_str);
-        assert_eq!(event, Some("SessionStart"));
-        let context = specific.get("additionalContext").and_then(crate::json::Value::as_str);
-        let expected = "error[doctor]: a\nerror[doctor]: b\nwarning[gh-login]: \"odd\"";
-        assert_eq!(context, Some(expected), "the agent sees every finding");
-        let both = [unsure[0].clone(), finding(Severity::Error, "error[gh-login]: x")];
-        let erring = session_start_output(&[], &both);
+        let warning = Finding {
+            severity: Severity::Warning,
+            topic: Topic::GhLogin,
+            message: "warning[gh-login]: \"odd\"".to_owned(),
+            remedy: "look".to_owned(),
+        };
+        let printed = session_start_output(&doctor, std::slice::from_ref(&warning));
+        let parsed = crate::json::parse(&printed).expect("the output is one JSON object");
+        assert!(parsed.get("continue").is_none(), "a warning asks for no stop: {printed}");
+        let (human, agent) = human_and_agent(&printed);
+        assert_eq!(human, "warning[gh-login]: \"odd\". For the human: look.", "with the remedy");
+        let expected = format!("error[doctor]: a\nerror[doctor]: b\n{}", warning.message);
+        assert_eq!(agent, format!("{expected}\n{}", super::AGENT_GH_LOGIN_NOTE), "no remedy");
+        let path = Finding {
+            severity: Severity::Error,
+            topic: Topic::CargoPath,
+            message: "error[session-start]: x".to_owned(),
+            remedy: "fix".to_owned(),
+        };
+        let erring = session_start_output(&[], std::slice::from_ref(&path));
         let errors = crate::json::parse(&erring).expect("the output is one JSON object");
         let stop = errors.get("continue").and_then(crate::json::Value::as_bool);
         assert_eq!(stop, Some(false), "an error asks for a stop: {erring}");
         let reason = errors.get("stopReason").and_then(crate::json::Value::as_str);
         assert_eq!(reason, Some(super::STOP_REASON));
-        let told = errors.get("systemMessage").and_then(crate::json::Value::as_str);
-        assert_eq!(told, Some("warning[gh-login]: \"odd\"\nerror[gh-login]: x"));
-        let agent = errors.get("hookSpecificOutput").and_then(|part| part.get("additionalContext"));
-        let agent = agent.and_then(crate::json::Value::as_str).unwrap_or_default();
-        assert!(agent.ends_with(super::UNSTOPPED_NOTE), "the agent is told to run no gh: {agent}");
-        assert!(!context.unwrap_or_default().contains("note["), "a warning has no note");
+        let (told, given) = human_and_agent(&erring);
+        let note = super::HUMAN_UNSTOPPED_NOTE;
+        assert_eq!(told, format!("error[session-start]: x. For the human: fix.\n{note}"));
+        let cargo = super::AGENT_CARGO_PATH_NOTE;
+        assert_eq!(given, format!("error[session-start]: x\n{cargo}"), "no gh-login note");
+    }
+
+    // Goal: each part of session start is reported on its own, and a failing part does not hide
+    // another: with an env file that cannot be extended and a doctor that panicked, the login
+    // check still runs, and all three findings are in the report.
+    #[test]
+    fn a_failing_part_of_session_start_keeps_the_others() {
+        use super::github_login::{Finding, Severity};
+        let denied = Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+        let login = || {
+            let message = "error[gh-login]: GH_TOKEN holds a test token".to_owned();
+            vec![Finding::gh_login(Severity::Error, message, "unset it".to_owned())]
+        };
+        let report = super::session_start_report(denied, Err("doctor broke".to_owned()), login);
+        let (human, agent) = human_and_agent(&report);
+        for expected in [
+            "error[session-start]: cannot add `$HOME/.cargo/bin`",
+            "warning[doctor]: the doctor failed (doctor broke)",
+            "error[gh-login]: GH_TOKEN holds a test token",
+            super::AGENT_GH_LOGIN_NOTE,
+            super::AGENT_CARGO_PATH_NOTE,
+        ] {
+            assert!(agent.contains(expected), "the agent is told {expected:?}: {agent}");
+        }
+        assert!(human.contains("For the human: unset it."), "{human}");
+        let clean = super::session_start_report(Ok(()), Ok(Vec::new()), Vec::new);
+        assert_eq!(clean, "", "nothing to report");
     }
 
     // Goal: what session start prints when a stage of it failed is an error report that Claude
     // Code can read: one line of JSON that names the stage and the reason, on one line even if
-    // the reason spans several, for the human and for the agent, with the note that tells the
-    // agent to run no gh command, since the stop it asks for is ignored.
+    // the reason spans several. The human gets the remedy and the note that the session keeps
+    // running; the agent gets the message and the gh-login note.
     #[test]
     fn a_failed_session_start_is_an_error_for_both() {
-        let failed = super::session_start_failed("the doctor", "broken \"quoted\"\n  doctor");
+        let failed = super::session_start_failed("the report", "broken \"quoted\"\n  report");
         assert!(failed.ends_with("}\n") && failed.lines().count() == 1, "one line: {failed}");
         let output = crate::json::parse(&failed).expect("the report is JSON");
         let stop = output.get("continue").and_then(crate::json::Value::as_bool);
         assert_eq!(stop, Some(false), "it asks for a stop: {failed}");
-        let told = output.get("systemMessage").and_then(crate::json::Value::as_str).unwrap();
-        let start = "error[session-start]: the doctor failed (broken \"quoted\" doctor), so it is";
-        assert!(told.starts_with(start), "{told}");
-        let agent = output.get("hookSpecificOutput").and_then(|part| part.get("additionalContext"));
-        let agent = agent.and_then(crate::json::Value::as_str).unwrap();
-        assert_eq!(agent, format!("{told}\n{}", super::UNSTOPPED_NOTE), "the agent is told too");
         let reason = output.get("stopReason").and_then(crate::json::Value::as_str);
         assert_eq!(reason, Some(super::STOP_REASON));
+        let (human, agent) = human_and_agent(&failed);
+        let message = "error[session-start]: the report failed (broken \"quoted\" report), so it \
+                       is not known whether gh can reach a person's GitHub login";
+        assert!(human.starts_with(&format!("{message}. For the human: ")), "{human}");
+        assert!(human.ends_with(super::HUMAN_UNSTOPPED_NOTE), "{human}");
+        assert_eq!(agent, format!("{message}\n{}", super::AGENT_GH_LOGIN_NOTE));
     }
 
     // Goal: work that ends in time is returned, work that panics is its panic's message on one

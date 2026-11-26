@@ -88,13 +88,53 @@ pub enum Severity {
     Warning,
 }
 
-/// One problem found at session start.
+/// What a finding is about, which decides the note the agent gets with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Topic {
+    /// A person's GitHub login in reach of gh, or a check of it that could not tell.
+    GhLogin,
+    /// The session's `PATH`, without `$HOME/.cargo/bin`.
+    CargoPath,
+    /// The doctor, which checks tool versions.
+    Doctor,
+}
+
+/// One problem found at session start. Both texts are one line and name no token.
+///
+/// The agent gets `message` alone, with the note for its topic. The human also gets `remedy`.
+/// `message` therefore says what is wrong and never what to do, so that an agent that acts on
+/// it literally does nothing unsafe; `remedy` is written to the human.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
     /// Whether it is an error or a warning.
     pub severity: Severity,
-    /// What is wrong and how to fix it, as one line that names no token.
+    /// What it is about.
+    pub topic: Topic,
+    /// What is wrong, for the human and the agent.
     pub message: String,
+    /// What the human should do about it.
+    pub remedy: String,
+}
+
+impl Finding {
+    /// A finding about gh's login.
+    #[must_use]
+    pub fn gh_login(severity: Severity, message: String, remedy: String) -> Self {
+        let finding = Self { severity, topic: Topic::GhLogin, message, remedy };
+        assert!(finding.is_well_formed(), "{finding:?}");
+        finding
+    }
+
+    /// True if both texts are one line, and `message` opens with its severity's tag.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        let tag = match self.severity {
+            Severity::Error => "error[",
+            Severity::Warning => "warning[",
+        };
+        let one_line = !self.message.contains('\n') && !self.remedy.contains('\n');
+        one_line && self.message.starts_with(tag) && !self.remedy.is_empty()
+    }
 }
 
 /// What gh did when the check ran it.
@@ -149,7 +189,7 @@ pub fn findings(gh: &mut Gh<'_>, variable: &dyn Fn(&str) -> Option<String>) -> V
         findings.extend(token_finding(&token, variable(BUS_VARIABLE).as_deref()));
     }
     assert!(findings.len() <= FINDINGS_MAX, "one finding per source at most: {findings:?}");
-    assert!(findings.iter().all(|finding| !finding.message.contains('\n')), "one line each");
+    assert!(findings.iter().all(Finding::is_well_formed), "one line each: {findings:?}");
     findings
 }
 
@@ -164,11 +204,10 @@ pub fn checked(check: impl FnOnce() -> Vec<Finding>) -> Vec<Finding> {
     let reason = super::panic_reason(&*panic);
     let message = format!(
         "error[gh-login]: the login check itself failed ({reason}), so a person's login in reach \
-         of gh is not ruled out; run no gh command in this session, and report it as a bug \
-         ({RUNBOOK})"
+         of gh is not ruled out"
     );
-    assert!(!message.contains('\n'), "the finding is one line");
-    vec![Finding { severity: Severity::Error, message }]
+    let remedy = format!("report it as a bug, and end this session ({RUNBOOK})");
+    vec![Finding::gh_login(Severity::Error, message, remedy)]
 }
 
 /// The finding for the token in `variable`, if it is not an installation token. The message
@@ -183,44 +222,52 @@ fn variable_finding(variable: &str, value: &str) -> Option<Finding> {
         .find(|(prefix, _kind)| value.starts_with(prefix))
         .map_or("a token that is not an app's installation token", |(_prefix, kind)| kind);
     let message = format!(
-        "error[gh-login]: {variable} holds {kind}, so gh in this session acts as a person, not \
-         as nami-agent[bot]; unset it before the session starts, and let each command name the \
-         bot's token: `GH_TOKEN=$(xtask/agent-token.sh) gh ...` ({RUNBOOK})"
+        "error[gh-login]: {variable} holds {kind}, so a gh command in this session without the \
+         bot-token prefix acts as a person, not as nami-agent[bot]"
+    );
+    let remedy = format!(
+        "unset {variable} where the session is launched, end this session, and start a new one \
+         ({RUNBOOK})"
     );
     // Not `!message.contains(value)`: a value such as `a` is in any message (issue #69 review).
     assert!(message.starts_with(&format!("error[gh-login]: {variable} holds ")), "names it");
-    Some(Finding { severity: Severity::Error, message })
+    Some(Finding::gh_login(Severity::Error, message, remedy))
 }
 
 /// The finding for what `gh auth status` answered without a token in the environment. `config`
 /// is the session's `GH_CONFIG_DIR`.
 fn status_finding(answer: &Answer, config: Option<&str>) -> Option<Finding> {
     let config = config.map_or_else(|| "unset".to_owned(), |directory| format!("`{directory}`"));
-    let (severity, message) = match answer {
+    let (severity, message, remedy) = match answer {
         Answer::Failure(printed) if printed.contains(NO_LOGIN) => return None,
-        Answer::Success(printed) => {
-            let accounts = accounts(printed);
-            let message = format!(
+        Answer::Success(printed) => (
+            Severity::Error,
+            format!(
                 "error[gh-login]: `gh auth status` without GH_TOKEN reports a stored login \
-                 ({accounts}), so a gh command without `GH_TOKEN=$(xtask/agent-token.sh)` acts \
-                 as that account; gh reads it from GH_CONFIG_DIR ({config}), which \
-                 `.claude/settings.json` sets to a directory that holds no login: start agents \
-                 with that file's `env` block ({RUNBOOK})"
-            );
-            (Severity::Error, message)
-        }
-        Answer::Failure(printed) | Answer::CouldNotRun(printed) | Answer::OutOfTime(printed) => {
-            let message = format!(
+                 ({}), read from GH_CONFIG_DIR ({config}), so a gh command without the \
+                 bot-token prefix acts as that account",
+                accounts(printed)
+            ),
+            format!(
+                "start agents with the `env` block of `.claude/settings.json`, which sets \
+                 GH_CONFIG_DIR to a directory that holds no login; end this session ({RUNBOOK})"
+            ),
+        ),
+        Answer::Failure(_) | Answer::CouldNotRun(_) | Answer::OutOfTime(_) => (
+            Severity::Warning,
+            format!(
                 "warning[gh-login]: `gh auth status` without GH_TOKEN answered in a way this \
-                 check does not know ({}), so a stored gh login is not ruled out; run it by hand \
-                 and check that it reports no login ({RUNBOOK})",
-                first_line(printed)
-            );
-            (Severity::Warning, message)
-        }
+                 check does not know ({}), so a stored gh login is not ruled out",
+                said(answer)
+            ),
+            format!(
+                "in a shell with this session's environment, run `gh auth status` and check that \
+                 it reports no login ({RUNBOOK})"
+            ),
+        ),
     };
-    assert!(message.contains(RUNBOOK), "a finding says where to read on");
-    Some(Finding { severity, message })
+    assert!(remedy.contains(RUNBOOK), "a remedy says where to read on");
+    Some(Finding::gh_login(severity, message, remedy))
 }
 
 /// The accounts that the output of `gh auth status` names, from its `Logged in to` lines. The
@@ -243,43 +290,51 @@ fn accounts(printed: &str) -> String {
 /// the session's `DBUS_SESSION_BUS_ADDRESS`.
 fn token_finding(answer: &Answer, bus: Option<&str>) -> Option<Finding> {
     let bus = bus.map_or_else(|| "unset".to_owned(), |address| format!("`{address}`"));
-    let (severity, message) = match answer {
+    let (severity, message, remedy) = match answer {
         Answer::Failure(printed) if printed.contains(NO_TOKEN) => return None,
-        Answer::Success(_) => {
-            let message = format!(
+        Answer::Success(_) => (
+            Severity::Error,
+            format!(
                 "error[gh-login]: gh finds a token for {HOST} without GH_TOKEN and without a \
-                 login in GH_CONFIG_DIR: the one that `gh auth login` keeps in the system \
-                 keyring, so a gh command without `GH_TOKEN=$(xtask/agent-token.sh)` acts as its \
-                 owner; on Linux, `.claude/settings.json` cuts gh off from the keyring with \
-                 DBUS_SESSION_BUS_ADDRESS (now {bus}); on macOS nothing in the environment can: \
-                 run `gh auth logout`, then `gh auth login --insecure-storage`, so that the \
-                 keychain holds no gh token ({RUNBOOK})"
-            );
-            (Severity::Error, message)
-        }
+                 login in GH_CONFIG_DIR, most likely the one that `gh auth login` keeps in the \
+                 system keyring, so a gh command without the bot-token prefix acts as its owner"
+            ),
+            format!(
+                "on Linux, start agents with the `env` block of `.claude/settings.json`, whose \
+                 DBUS_SESSION_BUS_ADDRESS (now {bus} here) cuts gh off from the keyring; on \
+                 macOS, run `gh auth logout`, then `gh auth login --insecure-storage`, so that the \
+                 keychain holds no gh token; end this session ({RUNBOOK})"
+            ),
+        ),
         // A keyring that does not answer is a keyring gh can reach, unless the bus is cut off.
-        Answer::OutOfTime(printed) if bus != format!("`{BUS_CUT_OFF}`") => {
-            let message = format!(
+        Answer::OutOfTime(_) if bus != format!("`{BUS_CUT_OFF}`") => (
+            Severity::Error,
+            format!(
                 "error[gh-login]: `gh auth token` without GH_TOKEN did not answer in time ({}), \
                  and DBUS_SESSION_BUS_ADDRESS (now {bus}) does not cut gh off from the system \
-                 keyring, so a token there is not ruled out; start agents with the `env` block \
-                 of `.claude/settings.json` ({RUNBOOK})",
-                first_line(printed)
-            );
-            (Severity::Error, message)
-        }
-        Answer::Failure(printed) | Answer::CouldNotRun(printed) | Answer::OutOfTime(printed) => {
-            let message = format!(
+                 keyring, so a token there is not ruled out",
+                said(answer)
+            ),
+            format!(
+                "start agents with the `env` block of `.claude/settings.json`; end this session \
+                 ({RUNBOOK})"
+            ),
+        ),
+        Answer::Failure(_) | Answer::CouldNotRun(_) | Answer::OutOfTime(_) => (
+            Severity::Warning,
+            format!(
                 "warning[gh-login]: `gh auth token` without GH_TOKEN answered in a way this check \
-                 does not know ({}), so a token in the system keyring is not ruled out; check by \
-                 hand that `gh api user` fails in this session ({RUNBOOK})",
-                first_line(printed)
-            );
-            (Severity::Warning, message)
-        }
+                 does not know ({}), so a token in the system keyring is not ruled out",
+                said(answer)
+            ),
+            format!(
+                "in a shell with this session's environment, check that `gh api user` fails with \
+                 \"gh auth login\" ({RUNBOOK})"
+            ),
+        ),
     };
-    assert!(message.contains(RUNBOOK), "a finding says where to read on");
-    Some(Finding { severity, message })
+    assert!(remedy.contains(RUNBOOK), "a remedy says where to read on");
+    Some(Finding::gh_login(severity, message, remedy))
 }
 
 /// Runs gh with `arguments`, as a command without the bot's token would: without
@@ -316,17 +371,32 @@ fn ask(gh: &mut Gh<'_>, arguments: &[&str], stdout: Stdout) -> Answer {
 /// What a finding shows instead of gh output that looks like a token.
 const TOKEN_HIDDEN: &str = "gh printed something that looks like a token; it is not shown";
 
-/// The first line of what gh printed that is not blank, or a placeholder. A line that looks
-/// like a token, even a masked one, is not shown.
-fn first_line(printed: &str) -> &str {
+/// What a finding says gh answered: the first line of what gh printed, quoted
+/// ([`first_line`]), or this check's own account of a gh that could not run or ran out of time.
+fn said(answer: &Answer) -> String {
+    match answer {
+        Answer::Success(printed) | Answer::Failure(printed) => first_line(printed),
+        Answer::CouldNotRun(why) | Answer::OutOfTime(why) => {
+            let first = why.lines().map(str::trim).find(|line| !line.is_empty());
+            first.unwrap_or("gh did not run").to_owned()
+        }
+    }
+}
+
+/// The first line of what gh printed that is not blank, quoted as gh's words so that an agent
+/// does not take an instruction in it (such as "please run: gh auth login") as its own; or a
+/// placeholder. A line that looks like a token, even a masked one, is not shown.
+fn first_line(printed: &str) -> String {
     let first = printed.lines().map(str::trim).find(|line| !line.is_empty());
     let token_like =
         |line: &str| PERSONAL_TOKEN_KINDS.iter().any(|(prefix, _)| line.contains(prefix));
-    match first {
-        None => "no output",
-        Some(line) if token_like(line) => "a line that looks like a token, not shown",
-        Some(line) => line,
-    }
+    let shown = match first {
+        None => "gh printed nothing".to_owned(),
+        Some(line) if token_like(line) => "gh printed a line that looks like a token".to_owned(),
+        Some(line) => format!("gh printed \"{}\"", line.replace('"', "'")),
+    };
+    assert!(!shown.contains('\n'), "one line");
+    shown
 }
 
 #[cfg(test)]
@@ -466,11 +536,11 @@ mod tests {
         let odd = Answer::Failure("\n  HTTP 502\nmore\n".to_owned());
         let odd = status_finding(&odd, Some("/x")).expect("an unknown answer is reported");
         assert_eq!(odd.severity, Severity::Warning);
-        assert!(odd.message.contains("(HTTP 502)"), "its first line: {odd:?}");
+        assert!(odd.message.contains("(gh printed \"HTTP 502\")"), "its first line: {odd:?}");
         let missing = Answer::CouldNotRun(String::new());
         let missing = status_finding(&missing, None).expect("a gh that cannot run is reported");
         assert_eq!(missing.severity, Severity::Warning);
-        assert!(missing.message.contains("(no output)"), "{missing:?}");
+        assert!(missing.message.contains("(gh did not run)"), "{missing:?}");
     }
 
     // Goal: the accounts come from the `Logged in to` lines alone.
@@ -497,13 +567,16 @@ mod tests {
         let found = token_finding(&Answer::Success(String::new()), Some("disabled:"));
         let found = found.expect("a token in reach is found");
         assert_eq!(found.severity, Severity::Error);
-        assert!(found.message.contains("DBUS_SESSION_BUS_ADDRESS (now `disabled:`)"), "{found:?}");
+        assert!(
+            found.remedy.contains("DBUS_SESSION_BUS_ADDRESS (now `disabled:` here)"),
+            "{found:?}"
+        );
         let unset = token_finding(&Answer::Success(String::new()), None).expect("found");
-        assert!(unset.message.contains("(now unset)"), "{unset:?}");
+        assert!(unset.remedy.contains("(now unset here)"), "{unset:?}");
         let odd = Answer::Failure("keyring timeout\n".to_owned());
         let odd = token_finding(&odd, None).expect("an unknown answer is reported");
         assert_eq!(odd.severity, Severity::Warning);
-        assert!(odd.message.contains("(keyring timeout)"), "{odd:?}");
+        assert!(odd.message.contains("(gh printed \"keyring timeout\")"), "{odd:?}");
         let missing = token_finding(&Answer::CouldNotRun("cannot start gh".to_owned()), None);
         assert_eq!(missing.map(|finding| finding.severity), Some(Severity::Warning));
     }
@@ -597,7 +670,7 @@ mod tests {
         let status = Answer::Failure("\n  - Token: gho_****\n".to_owned());
         let shown = status_finding(&status, None).expect("an unknown answer is reported");
         assert!(!shown.message.contains("gho_"), "not even a masked token: {shown:?}");
-        assert!(shown.message.contains("(a line that looks like a token, not shown)"), "{shown:?}");
+        assert!(shown.message.contains("(gh printed a line that looks like a token)"), "{shown:?}");
     }
 
     // Goal: every source at once gives the most findings there can be, and the check still
@@ -619,7 +692,7 @@ mod tests {
     // message on one line; a check that returns is passed through.
     #[test]
     fn a_check_that_panics_is_an_error() {
-        let fine = Finding { severity: Severity::Warning, message: "warning".to_owned() };
+        let fine = Finding::gh_login(Severity::Warning, "warning[x]: y".to_owned(), "z".to_owned());
         let kept = fine.clone();
         assert_eq!(super::checked(move || vec![kept]), [fine]);
         assert_eq!(super::checked(Vec::new), []);
@@ -688,11 +761,95 @@ mod tests {
         let config = std::path::Path::new(&config);
         assert!(config.is_absolute(), "the same in every directory: {}", config.display());
         assert!(!config.exists(), "it holds no login: {}", config.display());
-        let parent = config.parent().expect("an absolute path below the root has a parent");
-        assert!(!parent.exists(), "and nothing below `/` can create it: {}", parent.display());
+        // Only root could create it: its nearest existing ancestor is root's, and only root's
+        // to write.
+        let existing = config.ancestors().find(|ancestor| ancestor.exists()).expect("`/` exists");
+        let metadata = std::fs::metadata(existing).expect("the ancestor is readable");
+        let owner = std::os::unix::fs::MetadataExt::uid(&metadata);
+        let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+        assert_eq!(owner, 0, "{} belongs to root", existing.display());
+        assert_eq!(mode & 0o022, 0, "{} is writable by root alone: {mode:o}", existing.display());
         assert_eq!(variable(super::BUS_VARIABLE).as_deref(), Some(super::BUS_CUT_OFF), "no bus");
         for token in super::TOKEN_VARIABLES {
             assert_eq!(variable(token), None, "the settings name no token: {token}");
+        }
+    }
+
+    /// Every finding session start can make, with gh output that itself gives an instruction.
+    fn every_kind_of_finding() -> Vec<Finding> {
+        let gh_says = "To get started with GitHub CLI, please run:  gh auth login".to_owned();
+        let mut every: Vec<Finding> = ["gho_x", "ghp_x", "github_pat_x", "ghu_x", "a"]
+            .iter()
+            .filter_map(|token| variable_finding("GH_TOKEN", token))
+            .collect();
+        let answers = [
+            Answer::Success(STATUS_LOGGED_IN.to_owned()),
+            Answer::Failure(gh_says),
+            Answer::CouldNotRun("gh cannot start: no such file".to_owned()),
+            Answer::OutOfTime("gh did not finish within 30 seconds".to_owned()),
+        ];
+        for answer in &answers {
+            every.extend(status_finding(answer, Some("/x")));
+            every.extend(token_finding(answer, None));
+            every.extend(token_finding(answer, Some(super::BUS_CUT_OFF)));
+        }
+        every.extend(super::checked(|| panic!("broken")));
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        every.push(crate::hook::env_file_finding(&denied));
+        every.push(crate::hook::doctor_panic_finding("broken"));
+        assert_eq!(every.len(), 20, "every kind is there: {every:?}");
+        every
+    }
+
+    /// `text` without the parts in double quotes: what gh printed, quoted as its words.
+    fn unquoted(text: &str) -> String {
+        text.split('"').step_by(2).collect()
+    }
+
+    // Goal: no text that reaches the agent tells it to run gh without the bot-token prefix, or
+    // to do anything else that is the human's to do. Only a note says what the agent should
+    // do, and it says that it is for the agent. Method: every kind of finding, through the
+    // report and through the fixed error report, including gh output that says "please run:
+    // gh auth login".
+    #[test]
+    fn nothing_tells_the_agent_to_run_gh_without_the_prefix() {
+        const HUMAN_ONLY: [&str; 11] = [
+            "run ",
+            "run:",
+            "check that",
+            "by hand",
+            "unset ",
+            "start agents",
+            "end this session",
+            "report it",
+            "make that file",
+            "gh auth logout",
+            "--insecure-storage",
+        ];
+        let report = crate::hook::session_start_output(&[], &every_kind_of_finding());
+        let failed = crate::hook::session_start_failed("the report", "broken");
+        for printed in [report, failed] {
+            let output = crate::json::parse(&printed).expect("the report is JSON");
+            let context = output.get("hookSpecificOutput").and_then(|part| {
+                part.get("additionalContext").and_then(crate::json::Value::as_str)
+            });
+            let context = context.expect("the agent is told");
+            assert!(context.contains("`GH_TOKEN=$(xtask/agent-token.sh) gh ...`"), "{context}");
+            context.lines().for_each(|line| is_safe_for_the_agent(line, &HUMAN_ONLY));
+        }
+    }
+
+    /// Asserts that `line` of the agent's context is a note that says it is for the agent and
+    /// names no bare gh command, or holds none of the phrases in `human_only`.
+    fn is_safe_for_the_agent(line: &str, human_only: &[&str]) {
+        let bare = unquoted(line).to_lowercase();
+        if line.starts_with("note[") {
+            assert!(line.contains("] for the agent: "), "the note says whom: {line}");
+            assert!(!bare.contains("`gh "), "no bare gh command: {line}");
+            return;
+        }
+        for phrase in human_only {
+            assert!(!bare.contains(phrase), "{phrase:?} is for the human: {line}");
         }
     }
 }

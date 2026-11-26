@@ -209,7 +209,7 @@ impl Scratch {
             .env("PATH", self.path())
             .env("NAMI_TEST_XTASK", &xtask)
             .env_remove("CLAUDE_PROJECT_DIR")
-            // A personal token exported in the developer's shell would stop session start.
+            // A personal token exported in the developer's shell is an error at session start.
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
             .envs(environment.iter().copied())
@@ -498,14 +498,15 @@ fn session_start_reports_a_person_s_gh_login() {
     let told = printed.get("systemMessage").and_then(xtask::json::Value::as_str).unwrap();
     assert!(told.starts_with("error[gh-login]: `gh auth status` without GH_TOKEN"), "{told}");
     assert!(told.contains("account human"), "the human learns whose login it is: {told}");
+    assert!(told.contains("For the human: start agents with the `env` block"), "{told}");
+    assert!(told.contains("this session keeps running"), "and that it must end it: {told}");
     let specific = printed.get("hookSpecificOutput").expect("the agent's part");
     let context = specific.get("additionalContext").and_then(xtask::json::Value::as_str).unwrap();
     assert!(context.starts_with("error[doctor]: "), "the doctor's findings stay: {context}");
-    assert!(context.contains(told), "and the agent is told too: {context}");
-    assert!(
-        context.ends_with("run no gh command in this session, and tell the human."),
-        "{context}"
-    );
+    assert!(context.contains("reports a stored login"), "the agent is told too: {context}");
+    assert!(!context.contains("For the human"), "but not the human's part: {context}");
+    let note = "note[gh-login] for the agent: do not run gh without the bot-token prefix";
+    assert!(context.contains(note), "the agent is told what to do: {context}");
 }
 
 /// The `continue` field and the `systemMessage` of what session start printed, after checking
