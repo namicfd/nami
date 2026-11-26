@@ -78,25 +78,26 @@ The checks run when the head changes anything under `xtask/` or `lints/`, or a r
 | **Tidy corpus** | For each base fixture, at each placement, the head's `tidy --file` misses a `(rule, line)` that the base's tidy reports there (firing fixture), or reports one that the base does not (passing fixture). |
 | **Lint corpus** | The base's UI cases are compiled with the base's library, in the judging job, and with the head's library, in the observing job under a random package name. A `(lint, line, column, level)` of the base is missing in the head's output. The base's run must first reproduce the base's `.stderr` locations. A run whose exit code disagrees with its error diagnostics (0 beside an error, or an error code without one) gives no verdict, here and end to end. |
 | **End to end** | The head's `cargo xtask tidy` misses a firing case planted in a scratch copy of the head tree (regular files only), or the head's `cargo xtask dylint` misses a UI case planted as an example with a random name in a crate drawn from the head tree. This catches changes to the walk and to the wrapper. It does not prove which files a rule applies to; point 3 hardens that. |
-| **Mutants** | `cargo mutants --in-diff` over the rule-path diff, per workspace, misses a mutant. The judge reads the listing, `outcomes.json`, `missed.txt` and the exit code. All four must agree, or there is no verdict. A mutant that times out is neither caught nor missed, so any timeout is no verdict, naming the mutants. The summary prints the mutant count. A changed rule-path source that yields no mutant is unproven: a changed constant or a deleted line makes none. |
+| **Mutants** | `cargo mutants --in-diff` over the rule-path diff, per workspace, misses a mutant. The judge reads the listing, `outcomes.json`, `missed.txt` and the exit code. All four must agree, or there is no verdict. A mutant that times out is neither caught nor missed, so any timeout is no verdict, naming the mutants. The summary prints the mutant count. Coverage counts per changed hunk of a rule-path Rust file: each hunk must contain a mutant that starts on one of its lines, or be comments only, or lie in the test module or inside a constant or static, which the dialect holds to the base. The registry's hunks need none, because the rule-set check reads its tables as data, so a change to the tables alone (rows added, scopes widened, allowed lists shrunk) passes with no mutant at all. Any other hunk, a pure deletion among them, is unproven: a changed literal, a deleted line or a moved statement makes no mutant, and another function's mutant does not test it. |
 | **Review** | See point 5. |
 
 **The dialect.** The rule-set check reads Rust as data, which is sound only if the code the compiler builds is the code that was read. So the rule paths are held to a dialect of Rust defined by what it allows (`xtask/src/ratchet/dialect.rs`). A file outside it gives no verdict, so the code owner decides; it never passes. In every rule-path Rust file, no raw identifier (`r#name`) appears anywhere. Beyond that:
 
 - **The registry.** The tables `RULES`, `PATH_BANS`, `MACRO_BANS` and `PLANNED`, each once, written as `&[..]` of struct literals of the row type (of `planned(..)` calls for `PLANNED`). Every value is a plain string literal, `&[..]` of them, or a variant written with its full type path, `BanScope::Everywhere` or `RuleKind::Source`, of a variant the ratchet knows. The tables carry doc comments only, and nothing inside them carries an attribute. An inline `#[cfg(test)] mod tests` is allowed. Every other item, the enums, the row types, their code and the imports included, must be token for token what the base has: a change there needs the code owner.
 - **A rule module.** Attributes only on items, fields and variants, and only `doc`, `derive`, `must_use`, `inline` and `expect`. `#[cfg(test)]` only on an inline `mod tests`, which the readers skip. No other module, no item macro, and no macro but the standard expression macros (`assert!`, `format!`, `vec!` and their like; `concat!` of string literals only). No glob or renamed import, and no local `impl`. A table and the `registry` module are named or imported only as the registry's own (`super::registry`, `crate::tidy::registry`), and nothing else is bound to their names. Every `check_*` name is the definition of a top-level function or of a method in an inherent `impl`, or a call `self.check_*(..)` or `check_*(..)` that resolves to such a definition in the same file; the ratchet counts the names, macro bodies included.
-- **The lint library.** Exactly the files that `lints/src/lib.rs` declares with `mod`, and no other `.rs` file below `lints/src/`. No `#[path]`, no `include!` and no `macro_rules!`; `#[cfg(test)]` only on an inline `mod tests`. Each lint is declared at the top of a file with `declare_lint!` or `declare_tool_lint!`, in the form `pub NAME, Level, "description"` with doc comments only; no other macro whose name says `lint` declares one. Nothing else binds a declared name, and the registration is `register_lints(&[NAME, ..])` in `lib.rs`.
+- **The lint library.** Exactly the files that `lints/src/lib.rs` declares with `mod`, and no other `.rs` file below `lints/src/`. No `#[path]`, no `include!` and no `macro_rules!`; `#[cfg(test)]` only on an inline `mod tests`. Each lint is declared at the top of a file with `declare_lint!` or `declare_tool_lint!`, in the form `pub NAME, Level, "description"` with doc comments only; no other macro whose name says `lint` declares one. Nothing else binds a declared name, and the registration is `register_lints(&[NAME, ..])` in `lib.rs`: a statement of its own in the body of the top-level function `register_lints`, with no `return`, `?` or macro in a statement before it. Any other `register_lints` call gives no verdict.
+- **Constants and reads from outside, in a rule module and the lint library.** Every `const` and `static` item, at any depth outside the test module, must be token for token one of the base's: mutation testing cannot prove a changed value, and the corpus pins a limit only at the values its cases use. So must every item or `impl` member whose tokens name `env`, `option_env`, `process`, `Command`, `fs`, `File`, `OpenOptions`, `io`, `read_to_string` or `read_dir`: code that reads the environment, starts a process or touches files can behave differently in CI than where the ratchet observes it.
 
 Today's rule paths are in the dialect without changes.
 
-**Placements.** Each case is planted at its virtual path and at up to two paths drawn from a seed of the base's corpus and the PR's head commit, with a fixed, public salt. The same pair always gets the same placements, so re-running the check cannot draw new ones. The fixture's `// path:` header is replaced by a random comment on the same line, so that rule code cannot recognise a case by it. The paths drawn are:
+**Placements.** Each case is planted at its virtual path, and at paths drawn from a seed of the base's corpus and the PR's head commit, with a fixed, public salt. The same pair always gets the same placements, so re-running the check cannot draw new ones. The fixture's `// path:` header is replaced by a random comment on the same line, so that rule code cannot recognise a case by it. The paths drawn are:
 
-- one existing file of the head tree, overwritten;
-- one new file with a random name in an existing directory.
+- one existing file of the head tree, overwritten, in the same scope as the virtual path;
+- one new file with a random name in an existing directory, in the same scope;
+- for a firing case, one new file with a random name in each scope class of the head tree: each crate (`crates/<name>`, `crates/kernels` among them), each crate's integration tests (`crates/<name>/tests`), `xtask`, `lints`, `tools` and `docs`. So a rule narrowed in code to spare one of these meets a case there (#57's review, round 3).
 
 A drawn path counts only if:
 
-- it is in the same scope as the virtual path;
 - tidy's walk reads it;
 - the base's own tidy reports the same `(rule, line)` pairs there.
 
@@ -124,6 +125,7 @@ The judge draws the placements again from the recorded seed, after checking that
 
 - **Sound against honest mistakes by agents**, which is what #31 showed: a rule that goes silent on cases written down, a deleted check, a narrowed table, a walk that skips a directory, tests that do not pin the change.
 - **The `syn` checks are sound for files in the dialect** (point 2): for those, the rule ids, ban rows, scopes, allowed lists, the presence of each `check_*` call site, and the lints' levels and registrations that the base reads from the head's source are what the compiler builds, and no output of the head's code is involved. A rule-path file outside the dialect gives no verdict. Whether a call that is present also runs (`if false { self.check_x() }`) the reading does not show; the corpus and mutation testing do.
+- **How a rule module applies a row is code**, which the `syn` checks do not read: they prove that the tables only tighten, not that tidy enforces them as written. The corpus shows it only at the paths where it plants a case: the virtual path, the two drawn ones, and for a firing case one per scope class (point 2). A rule narrowed in code to spare a single file or a deeper directory that no placement reaches is not shown. Mutation testing of every changed hunk, the constants held to the base, and the reviewer app stand against that.
 - **The review gate** counts only the bot that `NAMI_REVIEWER_LOGIN` names, matched by account type and exact login, never the authoring app and never a user account with a look-alike name. The review runs in CI (pending #59), where no authoring session holds the reviewer app's key (point 5).
 - **Defence in depth only** against head code written to deceive. Such code can recognise inputs, behave differently when observed, or lie in the records it prints, which the judge reads as data. The placements (point 2) are hardening against code that special-cases the planted cases, not proof. The reviewer app (point 5), sampled audits after merge (ADR-0008) and the trusted core, which deceptive code would have to get past, back the ratchet here.
 
@@ -141,7 +143,7 @@ The judge draws the placements again from the recorded seed, after checking that
 
 Both jobs run on `pull_request` and `merge_group`. `ratchet` runs `if: always()` and is never skipped by a condition, because a skipped job counts as passed. A base without a ratchet skips with a note, as `base gate` does.
 
-**After a review.** A review arrives after the push, so `.github/workflows/ratchet-review.yml` runs only the judge, on `pull_request_review` and on `pull_request_review_thread`. The record names the commit observed (GitHub's test merge) and the PR head. The review run takes the record of the latest `guardrails` run for the PR head, waiting for it if needed, fetches that commit by SHA, checks that its second parent is the PR head and its first parent an ancestor of the base branch, and judges exactly that commit against that parent; the judge refuses a record of another commit or head. If the commit is gone or does not check out, the job keeps the conclusion of the latest `ratchet` check on the head and says that the ratchet re-runs on the next push. Only events that can change the gate run under the name `ratchet`: the reviewer app's reviews and thread resolutions, reviews by accounts with write access, and dismissals. Any other account's review runs under another name and changes nothing, so an outsider can neither turn `ratchet` red nor cancel a run that counts. No review can start or cancel `ratchet (head)`.
+**After a review.** A review arrives after the push, so `.github/workflows/ratchet-review.yml` runs only the judge, on `pull_request_review` and on `pull_request_review_thread`. The record names the commit observed (GitHub's test merge) and the PR head. The review run takes the record of the latest `guardrails` run for the PR head, waiting for it if needed, fetches that commit by SHA, checks that its second parent is the PR head and its first parent an ancestor of the base branch, and judges exactly that commit against that parent; the judge refuses a record of another commit or head. If the record cannot be fetched, or the commit is gone or does not check out, the job gives no verdict (exit 2) and says to re-run the `guardrails` workflow for the head, or to push. It never reuses an earlier conclusion: a green one would hide a request for changes or a dismissed approval that came after it. Only a base branch without a ratchet skips, as in `guardrails.yml`. The record is kept for 90 days, the longest GitHub keeps an artifact of a public repository. Only events that can change the gate run under the name `ratchet`: the reviewer app's reviews and thread resolutions, reviews by accounts with write access, dismissals, and threads unresolved, which only the PR's author and writers can do. Any other account's review runs under another name and changes nothing, so an outsider can neither turn `ratchet` red nor cancel a run that counts. No review can start or cancel `ratchet (head)`.
 
 In a merge group, the judge diffs the group's head against the group's parent commit (`merge_group.base_sha`), and the summary names that range, so that what was judged can be checked. The reviews and approvals are those of the PR named in the queue's ref, and its head must be the commit in that ref.
 
@@ -160,9 +162,11 @@ Everyone else's threads are left to the ruleset, which requires every conversati
 
 **Where the review runs.** The gate counts the reviews that the bot posts, whatever posts them. The reviewer is to run in CI (pending #59), from a workflow that holds the app's key as a secret and runs no PR code, so that no authoring session can post as it. The gate does not depend on that: until the app exists and the variable is set, the review gate gives no verdict, so a rule-path PR needs a code owner's approval of its head commit, as today: the safe default.
 
+**A requirement on the CI-hosted reviewer (#59):** it must be able to submit `APPROVE`, not only `COMMENT`. Only the app's approval withdraws a request for changes by it that a writer dismissed, so a reviewer that can only comment leaves such a PR blocked until the app requests changes again and then comments.
+
 ### 6. Staging
 
-The ratchet lands in shadow mode first: the core moves, then `ratchet observe` and `ratchet judge` with both CI jobs, not required, with every guardrail path still owned. The CI-hosted reviewer lands separately (#59). The policy flip comes last and alone: this ADR, the owner-less CODEOWNERS lines with their last-match rule, and making `ratchet` a required check. It merges only after the ratchet has given correct verdicts on real PRs in shadow mode.
+The ratchet lands in shadow mode first: the core moves, then `ratchet observe` and `ratchet judge` with both CI jobs, not required, with every guardrail path still owned. The CI-hosted reviewer lands separately (#59). The policy flip comes last and alone: this ADR, the owner-less CODEOWNERS lines with their last-match rule, and making `ratchet` a required check. It merges right after the ratchet (#57), without a period of shadow evidence (maintainer's decision), once `ratchet` is a required check (`docs/operations/github-setup.md`, step 9). Until the CI-hosted reviewer (#59) exists, the review gate gives no verdict, so a rule-only PR still needs a code owner's approval of its head commit.
 
 ### 7. A PR that touches both, deliberate loosenings, and the residual risks
 
@@ -182,7 +186,8 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
   - a deleted `check_*` call;
   - a dropped, lowered and twice-declared lint, and a dylint run whose exit code disagrees with its output;
   - changes outside the rule paths;
-  - mutation results that are missing, empty or timed out;
+  - mutation results that are missing, empty or timed out, a changed constant next to a mutated function, and a changed hunk without a mutant of its own;
+  - a ban narrowed in code to spare a crate outside its case's scope;
   - reviews by the wrong app or by a user named like it, threads resolved by the wrong account, a head that moved, and other people's threads left to the ruleset;
   - a code owner's approval of the head commit standing in for what is unproven, and cancelled by a later request for changes;
   - a corpus changed in the head job, a head changed between the jobs, and a head with a symbolic link;
@@ -197,7 +202,8 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 ## Consequences
 
 - A PR that adds fixtures and UI cases, or tightens a rule's code without touching its documentation, merges when its gates pass, the reviewer app has reviewed it, and mutation testing pins it.
-- **A pure data change in a rule path yields no mutant, so it needs the owner unless the owner reviews anyway.** This includes a new ban row with its fixtures. A refinement would accept a zero-mutant diff that the `syn` checks fully cover; it is not built.
+- **A changed constant in a rule module, or changed code there that reads the environment, a process or a file, gives no verdict**, so it needs the owner.
+- **A data-only change to the registry's tables needs no mutant** (maintainer's decision on #57). The rule-set check reads the tables as data and proves that they only tighten, so a new ban row with its fixtures merges on the ratchet. A diff that also changes code needs a mutant in each code hunk.
 - **Most new rules still need the owner for now.** A new tidy rule is tagged in `docs/TIGER_STYLE.md`, which is core (#53).
 - **Until the reviewer app exists, every rule-path-only PR needs a code owner's approval of its head commit**, as today, but never the admin bypass.
 - **Time.** Measured on the maintainer's 32-core machine with warm caches:
@@ -249,6 +255,14 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 | An allowed entry added to `debug-assert-placement` | pass (by reading) | fail: rule set, "is allowed in [\"crates/solver\"] as well", plus corpus and end-to-end findings |
 | `check_float_equality` call deleted | pass (by reading) | fail: rule set, "`check_body` no longer calls `check_float_equality`", plus 30 corpus and end-to-end findings |
 | Base fixtures deleted in the head job before observing | pass (by reading) | no verdict: "the observations do not cover the base's corpus" |
+
+**#57's round-3 exploits replayed** (base = #57's head, head = the base with one change, `--no-review --no-mutants`):
+
+| Exploit | Before | Now |
+|---|---|---|
+| `MAGIC_TOLERANCE_MAX` from `1.0e-6` to `1.0e-9`, with the head's unit test edited to match | pass, with mutants on | no verdict: "a constant or static that is not the base's, `MAGIC_TOLERANCE_MAX`" |
+| `crates/solver/src/lib.rs` added to `direct-libm`'s exceptions through a private `PATH_BAN_ROWS` and `allowed_of` | pass, with mutants on | no verdict: "a constant or static that is not the base's, `PATH_BAN_ROWS`" |
+| `if self.path.starts_with("crates/solver") { return; }` at the top of `check_path_start` | pass (0 source findings, no case in `crates/solver`) | fail: 3 corpus and 3 end-to-end findings, at a case planted in `crates/solver` |
 
 **#34 replayed with mutation testing** (first version): pass, 35 mutants, 33 caught and 2 unviable.
 
