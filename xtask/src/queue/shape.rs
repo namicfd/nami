@@ -283,4 +283,33 @@ pub(crate) mod tests {
         let smaller = Vocabulary { names: set(&["gate"]), ..vocabulary };
         assert!(!is_finding(&title, &body, &smaller), "a name that main no longer defines");
     }
+
+    // Goal: the parts of a job line are read only in the forms that the finding writes, so
+    // that the check does not rest on the comparison alone.
+    #[test]
+    fn job_lines_are_read_only_in_their_own_form() {
+        let vocabulary = vocabulary();
+        let url = "([log](https://github.com/o/r/actions/runs/9/job/7))";
+        let line = format!("- Job `gate` failed {url}. Read the log for the error.");
+        let read = super::job_of_line(&line, &vocabulary).expect("a job line");
+        assert_eq!((read.job.id, read.job.name.as_str()), (7, "gate"));
+        assert_eq!(read.codes, Some(super::Codes::default()));
+        let stray = format!("- Job `gate` failed!{url}. Read the log for the error.");
+        assert!(super::job_of_line(&stray, &vocabulary).is_none(), "no blank before the link");
+        assert!(
+            super::job_of_line(&line.replace(" failed ", " failed and "), &vocabulary).is_none()
+        );
+        let rules = super::codes_of_text("Tidy rules reported: `adr-number`.", &vocabulary);
+        assert_eq!(rules.map(|codes| codes.rules), Some(set(&["adr-number"])));
+        let trailing = "Tidy rules reported: `adr-number`. And more.";
+        assert_eq!(super::codes_of_text(trailing, &vocabulary), None, "text after the codes");
+        assert_eq!(super::codes_of_text("Tidy rules reported: `x`.", &vocabulary), None);
+        let steps = super::steps_of_list("`a`, another step, `b, c`");
+        assert_eq!(steps, Some(vec!["a".to_owned(), String::new(), "b, c".to_owned()]));
+        assert_eq!(
+            super::steps_of_list("`a`,`b`"),
+            None,
+            "a list separates with a comma and a blank"
+        );
+    }
 }
