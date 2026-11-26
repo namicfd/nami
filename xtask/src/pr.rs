@@ -903,6 +903,7 @@ mod tests {
             "```\nFixes #3\n```",
             "  ```rust\nFixes #3\n  ```",
             "~~~\nFixes #3\n```\nstill code\n",
+            "~~~\n```\nFixes #3, still inside the tilde block\n",
             "**Fixes #3",
             "Fixes #3**",
             "*Fixes** #3",
