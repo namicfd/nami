@@ -204,6 +204,9 @@ impl Scratch {
             .env("PATH", self.path())
             .env("NAMI_TEST_XTASK", &xtask)
             .env_remove("CLAUDE_PROJECT_DIR")
+            // A personal token exported in the developer's shell would stop session start.
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .envs(environment.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

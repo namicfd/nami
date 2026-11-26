@@ -10,7 +10,7 @@
 //!   state is the unchanged base or has already passed.
 //! - `session-start`: puts `$HOME/.cargo/bin` on the session's `PATH`, reports tools whose
 //!   version is not the pinned one, and stops a session whose gh can reach a person's GitHub
-//!   login ([`github_login`]).
+//!   login (`hook/github_login.rs`).
 //!
 //! # Which checkout, and whose rules
 //!
@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
 
-pub mod github_login;
+mod github_login;
 
 /// Exit code that makes Claude Code show stderr to the agent.
 const EXIT_FEEDBACK: u8 = 2;
@@ -274,6 +274,27 @@ fn run_bounded(
     log: &Path,
     budget: &mut Budget,
 ) -> Outcome {
+    run_bounded_with(command, input, log, budget, Stdout::Kept)
+}
+
+/// What a bounded run does with the check's stdout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stdout {
+    /// It goes to a file next to the log, and is read back after the run.
+    Kept,
+    /// It goes nowhere, and the run's printed stdout is empty: for a check whose stdout may
+    /// hold a secret, such as `gh auth token`.
+    Discarded,
+}
+
+/// [`run_bounded`], with stdout kept or discarded.
+fn run_bounded_with(
+    command: &mut Command,
+    input: Option<&Path>,
+    log: &Path,
+    budget: &mut Budget,
+    kept_or_not: Stdout,
+) -> Outcome {
     assert!(log.is_absolute(), "the logs of a run are named by an absolute path");
     assert!(input.is_none_or(Path::is_absolute), "the input of a run is an absolute path");
     if budget.deadline() == 0 {
@@ -284,7 +305,9 @@ fn run_bounded(
         Ok(file) => file.map_or_else(Stdio::null, Stdio::from),
         Err(error) => return Outcome::CouldNotRun(format!("cannot read its input: {error}")),
     };
-    let files = fs::File::create(&out_log).and_then(|out| Ok((out, fs::File::create(&err_log)?)));
+    let kept = kept_or_not == Stdout::Kept;
+    let out = if kept { fs::File::create(&out_log).map(Stdio::from) } else { Ok(Stdio::null()) };
+    let files = out.and_then(|out| Ok((out, fs::File::create(&err_log)?)));
     let (stdout, stderr) = match files {
         Ok(files) => files,
         Err(error) => {
@@ -298,7 +321,11 @@ fn run_bounded(
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) => format!("(cannot read the output in {}: {error})", file.display()),
     };
-    let printed = Printed { stdout: read(&out_log), stderr: read(&err_log) };
+    let printed = Printed {
+        stdout: if kept { read(&out_log) } else { String::new() },
+        stderr: read(&err_log),
+    };
+    assert!(kept || !out_log.exists(), "a discarded stdout is never written to a file");
     discard(Some(&out_log));
     discard(Some(&err_log));
     match status {
@@ -674,13 +701,50 @@ fn session_start(root: Option<&Path>) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    // A doctor finding informs; it never fails the hook.
-    let doctor = root.map_or_else(Vec::new, crate::doctor::findings);
-    let gh = || Command::new("gh");
-    let logins = github_login::findings(&gh, &|name| std::env::var(name).ok());
-    print!("{}", session_start_output(&doctor, &logins));
+    // The login check fails closed: whatever goes wrong in it, or in the report around it,
+    // stops the session rather than letting it start unchecked.
+    let report = std::panic::catch_unwind(|| session_start_report(root));
+    print!("{}", report.unwrap_or_else(|_panic| SESSION_START_FAILED.to_owned()));
     status
 }
+
+/// A panic that would print nothing, or exit 101, would let the session start unchecked.
+const _: () = assert!(cfg!(panic = "unwind"), "the session-start hook catches its own panics");
+
+/// What session start prints when building its report panicked: a stop, for the human and the
+/// agent, since the login check is not known to have passed.
+const SESSION_START_FAILED: &str = concat!(
+    r#"{"continue":false,"stopReason":"Session stopped: the session-start hook failed, so it "#,
+    r#"is not known whether gh can reach a person's GitHub login "#,
+    r#"(docs/operations/github-setup.md, step 6). Report it as a bug.","#,
+    r#""systemMessage":"error[gh-login]: the session-start hook failed before it could check "#,
+    r#"gh's login; the session is stopped"}"#,
+    "\n"
+);
+
+/// The doctor's findings and the login check, as [`session_start_output`] prints them.
+fn session_start_report(root: Option<&Path>) -> String {
+    // A doctor finding informs; it never fails the hook.
+    let doctor = root.map_or_else(Vec::new, crate::doctor::findings);
+    let log = root.map_or_else(
+        || std::env::temp_dir().join(format!("nami-gh-login-{}.log", std::process::id())),
+        |root| output_log(root, "gh-login"),
+    );
+    let logins = github_login::checked(|| {
+        let command = || Command::new("gh");
+        let budget = &mut Budget::of_seconds(LOGIN_CHECK_SECONDS_MAX);
+        let mut gh = github_login::Gh { command: &command, log: &log, budget };
+        github_login::findings(&mut gh, &|name| std::env::var(name).ok())
+    });
+    let report = session_start_output(&doctor, &logins);
+    assert!(logins.is_empty() || report.starts_with('{'), "a login finding is reported as JSON");
+    report
+}
+
+/// Seconds that the gh calls of the login check may take together, each run's reap after a kill
+/// included (hook timeout: 120). gh waits up to 60 seconds for a keyring that does not answer;
+/// a check that runs out of time cannot tell, and says so.
+const LOGIN_CHECK_SECONDS_MAX: u32 = 30;
 
 /// Why a session whose gh can reach a person's login is stopped, for the human.
 const LOGIN_STOP_REASON: &str = "Session stopped: gh can reach a person's GitHub login, so a gh \
@@ -718,9 +782,13 @@ fn session_start_output(doctor: &[String], logins: &[github_login::Finding]) -> 
         r#""hookSpecificOutput":{{"hookEventName":"SessionStart","additionalContext":{}}}"#,
         crate::json::quote(&context.join("\n"))
     ));
-    assert!(fields.len() >= 2, "the human and the agent are both told");
-    assert!(context.len() == doctor.len() + logins.len(), "the agent is told everything");
-    format!("{{{}}}\n", fields.join(","))
+    let output = format!("{{{}}}\n", fields.join(","));
+    // Claude Code ignores stdout that is not JSON, and a stop it cannot read is no stop.
+    let parsed = crate::json::parse(&output);
+    let proceeds = parsed.as_ref().ok().and_then(|value| value.get("continue")?.as_bool());
+    assert!(parsed.is_ok(), "the session-start output is JSON: {output}");
+    assert_eq!(proceeds, stops.then_some(false), "the output stops exactly when a login is found");
+    output
 }
 
 /// Appends [`CARGO_BIN_EXPORT`] to the file that `CLAUDE_ENV_FILE` names, unless the session's
@@ -1351,6 +1419,10 @@ mod tests {
             assert!(stop <= timeout(event), "{stop} s exceed the {event} hook's timeout");
         }
         assert_eq!((timeout("PostToolUse"), timeout("Stop")), (120, 600), "the timeouts read");
+        // The doctor's commands are not bounded; they take a few seconds, the rest is theirs.
+        let login = seconds(worst(super::LOGIN_CHECK_SECONDS_MAX)) + OWN_WORK_SECONDS_MIN;
+        let start = timeout("SessionStart");
+        assert!(2 * login <= start, "{login} s leave too little of the {start} s session start");
     }
 
     // Goal: every event name round-trips, and anything else is not an event.
@@ -1532,5 +1604,19 @@ mod tests {
         assert_eq!(reason, Some(super::LOGIN_STOP_REASON));
         let told = stopped.get("systemMessage").and_then(crate::json::Value::as_str);
         assert_eq!(told, Some("warning[gh-login]: \"odd\"\nerror[gh-login]: x"));
+    }
+
+    // Goal: what session start prints when its report panicked is a stop that Claude Code can
+    // read: one JSON object with `continue: false` and a message for the human.
+    #[test]
+    fn a_failed_session_start_stops_the_session() {
+        let failed = super::SESSION_START_FAILED;
+        assert!(failed.ends_with("}\n"), "one line: {failed}");
+        let output = crate::json::parse(failed).expect("the fallback is JSON");
+        let stop = output.get("continue").and_then(crate::json::Value::as_bool);
+        assert_eq!(stop, Some(false), "it stops the session: {failed}");
+        let told = output.get("systemMessage").and_then(crate::json::Value::as_str);
+        assert!(told.is_some_and(|told| told.starts_with("error[gh-login]: ")), "{failed}");
+        assert!(output.get("stopReason").is_some(), "and says why: {failed}");
     }
 }

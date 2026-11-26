@@ -20,11 +20,14 @@
 //!   would be, goes nowhere.
 //!
 //! `GH_TOKEN` and `GITHUB_TOKEN`, if the session has them, must hold an app's installation token
-//! (`ghs_`), not a person's. A login in reach stops the session ([`Severity::Reachable`]); a check
-//! that cannot run, or that gh answers in a way the check does not know, is reported and the
-//! session goes on ([`Severity::Unverified`]).
+//! (`ghs_`), not a person's. A login in reach stops the session ([`Severity::Reachable`]); a gh
+//! that cannot run, does not answer within the check's deadline, or answers in a way the check
+//! does not know, is reported and the session goes on ([`Severity::Unverified`]). The check
+//! itself fails closed: if it panics, [`checked`] turns that into a stop.
 
-use std::process::{Command, Stdio};
+use super::{Budget, Outcome, Stdout, run_bounded_with};
+use std::path::Path;
+use std::process::Command;
 
 /// The variables through which gh takes a token for github.com, in the order it reads them.
 pub const TOKEN_VARIABLES: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
@@ -92,34 +95,69 @@ enum Answer {
     CouldNotRun(String),
 }
 
-/// The findings for this session. `gh` makes a command that runs gh, and `variable` reads one
-/// variable of the session's environment.
+/// The most findings a session can have: one per token variable, one for `gh auth status` and
+/// one for `gh auth token`.
+pub const FINDINGS_MAX: usize = TOKEN_VARIABLES.len() + 2;
+
+/// How gh is run: the command that starts it, the log next to which a run's output is kept, and
+/// the time budget that every run of the check shares.
+pub struct Gh<'a> {
+    /// Makes a command that runs gh.
+    pub command: &'a dyn Fn() -> Command,
+    /// The log of [`super::run_bounded`]: an absolute path.
+    pub log: &'a Path,
+    /// The polls that the check's runs may still take together.
+    pub budget: &'a mut Budget,
+}
+
+/// The findings for this session. `variable` reads one variable of the session's environment.
+/// A gh that runs out of time cannot tell; a personal token in a variable is found regardless.
 #[must_use]
-pub fn findings(
-    gh: &dyn Fn() -> Command,
-    variable: &dyn Fn(&str) -> Option<String>,
-) -> Vec<Finding> {
+pub fn findings(gh: &mut Gh<'_>, variable: &dyn Fn(&str) -> Option<String>) -> Vec<Finding> {
     let mut findings: Vec<Finding> = TOKEN_VARIABLES
         .iter()
         .filter_map(|name| variable(name).and_then(|value| variable_finding(name, &value)))
         .collect();
     let config = variable(CONFIG_VARIABLE);
-    let status = ask(gh, &["auth", "status", "--hostname", HOST], true);
+    let status = ask(gh, &["auth", "status", "--hostname", HOST], Stdout::Kept);
     let stored = status_finding(&status, config.as_deref());
     let stored_login =
         stored.as_ref().is_some_and(|finding| finding.severity == Severity::Reachable);
     findings.extend(stored);
     // A stored login also has a token; the second finding would say the same again.
     if !stored_login {
-        let mut token = ask(gh, &["auth", "token", NO_REFRESH, "--hostname", HOST], false);
+        let arguments = ["auth", "token", NO_REFRESH, "--hostname", HOST];
+        let mut token = ask(gh, &arguments, Stdout::Discarded);
         if matches!(&token, Answer::Failure(printed) if printed.contains(UNKNOWN_NO_REFRESH)) {
-            token = ask(gh, &["auth", "token", "--hostname", HOST], false);
+            token = ask(gh, &["auth", "token", "--hostname", HOST], Stdout::Discarded);
         }
         findings.extend(token_finding(&token, variable(BUS_VARIABLE).as_deref()));
     }
-    assert!(findings.len() <= TOKEN_VARIABLES.len() + 1, "one finding per source at most");
+    assert!(findings.len() <= FINDINGS_MAX, "one finding per source at most: {findings:?}");
     assert!(findings.iter().all(|finding| !finding.message.contains('\n')), "one line each");
     findings
+}
+
+/// The findings of `check`, or, if it panics, one finding that stops the session: a check that
+/// cannot finish never lets a session through. The panic's own report goes to stderr as usual.
+#[must_use]
+pub fn checked(check: impl FnOnce() -> Vec<Finding>) -> Vec<Finding> {
+    let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
+        Ok(findings) => return findings,
+        Err(panic) => panic,
+    };
+    let reason = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("a panic without a message");
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let message = format!(
+        "error[gh-login]: the login check itself failed ({reason}), so a person's login in reach \
+         of gh is not ruled out and the session is stopped; report it as a bug ({RUNBOOK})"
+    );
+    assert!(!message.contains('\n'), "the finding is one line");
+    vec![Finding { severity: Severity::Reachable, message }]
 }
 
 /// The finding for the token in `variable`, if it is not an installation token. The message
@@ -224,42 +262,38 @@ fn token_finding(answer: &Answer, bus: Option<&str>) -> Option<Finding> {
 }
 
 /// Runs gh with `arguments`, as a command without the bot's token would: without
-/// [`TOKEN_VARIABLES`], without a prompt and with nothing on stdin. Its stdout is read only if
-/// `keep_stdout`; otherwise it goes nowhere, so that a token gh prints never reaches this process.
-fn ask(gh: &dyn Fn() -> Command, arguments: &[&str], keep_stdout: bool) -> Answer {
+/// [`TOKEN_VARIABLES`], without a prompt and with nothing on stdin, within the budget of `gh`.
+/// A discarded stdout goes nowhere, so that a token gh prints never reaches this process.
+fn ask(gh: &mut Gh<'_>, arguments: &[&str], stdout: Stdout) -> Answer {
     assert!(arguments.first() == Some(&"auth"), "the check asks gh only about its login");
-    let mut command = gh();
-    let stdout = if keep_stdout { Stdio::piped() } else { Stdio::null() };
+    let mut command = (gh.command)();
     let command = TOKEN_VARIABLES
         .iter()
         .fold(&mut command, |command, variable| command.env_remove(variable))
         .args(arguments)
         .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(Stdio::piped());
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) => return Answer::CouldNotRun(format!("cannot start gh: {error}")),
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    let answer = match run_bounded_with(command, None, gh.log, gh.budget, stdout) {
+        Outcome::Exited(0, printed) => Answer::Success(printed.both()),
+        Outcome::Exited(_, printed) => Answer::Failure(printed.both()),
+        Outcome::CouldNotRun(why) => Answer::CouldNotRun(format!("gh {why}")),
     };
-    assert!(keep_stdout || output.stdout.is_empty(), "a discarded stdout is never read");
-    let printed = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    match output.status.code() {
-        Some(0) => Answer::Success(printed),
-        Some(_) => Answer::Failure(printed),
-        None => Answer::CouldNotRun(format!("gh was ended by {}", output.status)),
-    }
+    let printed = match &answer {
+        Answer::Success(printed) | Answer::Failure(printed) | Answer::CouldNotRun(printed) => {
+            printed
+        }
+    };
+    // `gh auth token` prints a token on stdout and nothing like one on stderr.
+    let token_shown = PERSONAL_TOKEN_KINDS.iter().any(|(prefix, _kind)| printed.contains(prefix));
+    assert!(stdout == Stdout::Kept || !token_shown, "a discarded stdout is never read");
+    answer
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, Finding, Severity, ask, findings, status_finding, token_finding};
+    use super::{Answer, Budget, Finding, Gh, Severity, Stdout, ask, findings};
     use super::{accounts, variable_finding};
+    use super::{status_finding, token_finding};
     use crate::tidy::scratch::Scratch;
     use std::process::Command;
 
@@ -308,11 +342,51 @@ mod tests {
         found.iter().map(|finding| finding.severity).collect()
     }
 
+    /// A budget that no fake gh of these tests uses up, unless it blocks.
+    fn ample() -> Budget {
+        Budget::of_seconds(crate::hook::GATE_SECONDS_MAX)
+    }
+
+    /// The findings for a session whose gh is `command`, logged in `scratch`, within `budget`.
+    fn found_within(
+        scratch: &Scratch,
+        command: &dyn Fn() -> Command,
+        variable: &dyn Fn(&str) -> Option<String>,
+        budget: &mut Budget,
+    ) -> Vec<Finding> {
+        let log = scratch.root().join("gh.log");
+        findings(&mut Gh { command, log: &log, budget }, variable)
+    }
+
+    /// [`found_within`] an ample budget.
+    fn found(
+        scratch: &Scratch,
+        command: &dyn Fn() -> Command,
+        variable: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<Finding> {
+        found_within(scratch, command, variable, &mut ample())
+    }
+
+    /// What gh `command` answers to `arguments`, logged in `scratch`, within an ample budget.
+    fn asked(
+        scratch: &Scratch,
+        command: &dyn Fn() -> Command,
+        arguments: &[&str],
+        stdout: Stdout,
+    ) -> Answer {
+        let log = scratch.root().join("gh.log");
+        ask(&mut Gh { command, log: &log, budget: &mut ample() }, arguments, stdout)
+    }
+
     /// The message of the one finding for a session, which must be a stop.
-    fn the_stop(gh: &dyn Fn() -> Command, variable: &dyn Fn(&str) -> Option<String>) -> String {
-        let found = findings(gh, variable);
-        assert_eq!(severities(&found), [Severity::Reachable], "one stop: {found:?}");
-        found.into_iter().map(|finding| finding.message).collect()
+    fn the_stop(
+        scratch: &Scratch,
+        command: &dyn Fn() -> Command,
+        variable: &dyn Fn(&str) -> Option<String>,
+    ) -> String {
+        let stops = found(scratch, command, variable);
+        assert_eq!(severities(&stops), [Severity::Reachable], "one stop: {stops:?}");
+        stops.into_iter().map(|finding| finding.message).collect()
     }
 
     // Goal: only an installation token passes; every personal token is a stop that names its
@@ -412,19 +486,74 @@ mod tests {
             let _command = command.env("GH_TOKEN", "gho_a").env("GITHUB_TOKEN", "gho_b");
             command
         };
-        let status = ask(&leaky, &["auth", "status"], true);
+        let status = asked(&scratch, &leaky, &["auth", "status"], Stdout::Kept);
         assert_eq!(status, Answer::Success("none|none|1 err\n".to_owned()), "no token, no prompt");
-        let token = ask(&leaky, &["auth", "token"], false);
+        let token = asked(&scratch, &leaky, &["auth", "token"], Stdout::Discarded);
         assert_eq!(token, Answer::Success(String::new()), "the token went nowhere");
+        assert!(!scratch.root().join("gh.out").exists(), "not even into a file");
         let failing = fake_gh(&scratch, "failing", &says("bad", 3), "kill -TERM $$");
-        assert_eq!(ask(&failing, &["auth", "status"], true), Answer::Failure("bad".to_owned()));
-        let killed = ask(&failing, &["auth", "token"], false);
+        let bad = asked(&scratch, &failing, &["auth", "status"], Stdout::Kept);
+        assert_eq!(bad, Answer::Failure("bad".to_owned()));
+        let killed = asked(&scratch, &failing, &["auth", "token"], Stdout::Discarded);
         let Answer::CouldNotRun(killed) = killed else { panic!("it exited: {killed:?}") };
-        assert!(killed.starts_with("gh was ended by signal: 15"), "{killed}");
+        assert!(killed.starts_with("gh ended by signal: 15"), "{killed}");
         let missing = || Command::new("/nonexistent/gh");
-        let missing = ask(&missing, &["auth", "status"], true);
+        let missing = asked(&scratch, &missing, &["auth", "status"], Stdout::Kept);
         let Answer::CouldNotRun(missing) = missing else { panic!("it ran: {missing:?}") };
-        assert!(missing.starts_with("cannot start gh: "), "{missing}");
+        assert!(missing.starts_with("gh cannot start: "), "{missing}");
+    }
+
+    // Goal: a gh that does not answer in time is killed at the check's deadline, and the runs
+    // after it are not started: both count as "cannot tell", while a personal token in a
+    // variable is still a stop. Method: event-driven, no clock: the fake gh blocks on a FIFO
+    // that nothing writes, so only the deadline ends it.
+    #[test]
+    fn a_gh_that_does_not_answer_in_time_cannot_tell() {
+        let scratch = Scratch::new("gh-login-deadline");
+        let fifo = scratch.root().join("f");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success(), "the FIFO is made before gh starts");
+        let blocked = format!("read x < {}", fifo.display());
+        let gh = fake_gh(&scratch, "blocked", &blocked, &blocked);
+        let variable = |name: &str| (name == "GH_TOKEN").then(|| "gho_secret".to_owned());
+        let polls = 5 + crate::hook::polls_in(crate::hook::REAP_SECONDS_MAX);
+        let budget = &mut Budget { polls_left: polls };
+        let late = found_within(&scratch, &gh, &variable, budget);
+        let expected = [Severity::Reachable, Severity::Unverified, Severity::Unverified];
+        assert_eq!(severities(&late), expected, "{late:?}");
+        assert!(late[1].message.contains("did not finish within 0 seconds"), "{late:?}");
+        assert!(late[2].message.contains("was not started: its time budget"), "{late:?}");
+        assert_eq!(budget.deadline(), 0, "the check kept to its budget");
+    }
+
+    // Goal: every source at once gives the most findings there can be, and the check still
+    // returns them: two personal tokens, and a gh that answers neither question as expected.
+    #[test]
+    fn every_source_can_have_a_finding() {
+        let scratch = Scratch::new("gh-login-every");
+        let odd = fake_gh(&scratch, "odd", &says("HTTP 502", 1), &says("keyring timeout", 1));
+        let both = |name: &str| Some(format!("ghp_{name}"));
+        let every = found(&scratch, &odd, &both);
+        assert_eq!(every.len(), super::FINDINGS_MAX, "{every:?}");
+        let tokens = [Severity::Reachable, Severity::Reachable];
+        assert_eq!(severities(&every)[..2], tokens, "the tokens: {every:?}");
+        let unsure = [Severity::Unverified, Severity::Unverified];
+        assert_eq!(severities(&every)[2..], unsure, "and gh: {every:?}");
+    }
+
+    // Goal: a check that panics stops the session with one finding that gives the panic's
+    // message on one line; a check that returns is passed through.
+    #[test]
+    fn a_check_that_panics_stops_the_session() {
+        let fine = Finding { severity: Severity::Unverified, message: "warning".to_owned() };
+        let kept = fine.clone();
+        assert_eq!(super::checked(move || vec![kept]), [fine]);
+        assert_eq!(super::checked(Vec::new), []);
+        let failed = super::checked(|| panic!("broken\n  check"));
+        assert_eq!(severities(&failed), [Severity::Reachable], "{failed:?}");
+        assert!(failed[0].message.contains("failed (broken check)"), "{failed:?}");
+        let formatted = super::checked(|| panic!("{} {}", "formatted", 7));
+        assert!(formatted[0].message.contains("(formatted 7)"), "{formatted:?}");
     }
 
     // Goal: a session whose gh finds neither a login nor a token has no finding; a stored login
@@ -434,15 +563,15 @@ mod tests {
         let scratch = Scratch::new("gh-login-sources");
         let no_token = says("no oauth token found for github.com", 1);
         let clean = fake_gh(&scratch, "clean", &says(STATUS_NONE, 1), &no_token);
-        assert_eq!(findings(&clean, &no_variables), []);
+        assert_eq!(found(&scratch, &clean, &no_variables), []);
         let stored = fake_gh(&scratch, "stored", &format!("echo '{STATUS_LOGGED_IN}'"), "exit 0");
-        let login = the_stop(&stored, &no_variables);
+        let login = the_stop(&scratch, &stored, &no_variables);
         assert!(login.contains("stored login"), "{login}");
         let keyring = fake_gh(&scratch, "keyring", &says(STATUS_NONE, 1), "exit 0");
-        let kept = the_stop(&keyring, &no_variables);
+        let kept = the_stop(&scratch, &keyring, &no_variables);
         assert!(kept.contains("system keyring"), "{kept}");
         let variable = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_secret".to_owned());
-        let exported = the_stop(&clean, &variable);
+        let exported = the_stop(&scratch, &clean, &variable);
         assert!(exported.contains("GITHUB_TOKEN holds"), "{exported}");
     }
 
@@ -463,9 +592,9 @@ mod tests {
             &says(STATUS_NONE, 1),
             &old(&says("no oauth token found", 1)),
         );
-        assert_eq!(findings(&none, &no_variables), []);
+        assert_eq!(found(&scratch, &none, &no_variables), []);
         let token = fake_gh(&scratch, "token", &says(STATUS_NONE, 1), &old("exit 0"));
-        assert_eq!(severities(&findings(&token, &no_variables)), [Severity::Reachable]);
+        assert_eq!(severities(&found(&scratch, &token, &no_variables)), [Severity::Reachable]);
     }
 
     // Goal: the session environment that this check guards is still there: `GH_CONFIG_DIR` is
