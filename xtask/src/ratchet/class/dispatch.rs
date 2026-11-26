@@ -4,7 +4,8 @@
 //! A dispatch call is a statement of its own, ending in `;`, in one of these forms:
 //!
 //! - `f(args);` or `module::f(args);`, a call of a new function, or `Type::f(args);` of a
-//!   function of a new type;
+//!   function of a new type, each resolved by its path to the file that defines it
+//!   ([`module_file`]);
 //! - `place.extend(call);`, where `call` is such a call and `place` a path or a field of one,
 //!   such as `self.violations`: a new rule's reports are added to the existing ones;
 //! - `place.register_lints(&[NEW, ..]);` with new lints only, and the base's
@@ -41,15 +42,15 @@ pub struct Sides<'a> {
     pub head: &'a str,
 }
 
-/// The new items that `statement` dispatches, if it is a dispatch call of the module
-/// `module` (see the module documentation).
+/// The new items that `statement` dispatches, if it is a dispatch call in the file
+/// `caller` (see the module documentation).
 #[must_use]
-pub fn names(statement: &Stmt, module: &str, new: &NewNames) -> Option<Vec<String>> {
+pub fn names(statement: &Stmt, caller: &str, new: &NewNames) -> Option<Vec<String>> {
     let Stmt::Expr(expression, Some(_)) = statement else {
         return None;
     };
     if let Expr::Call(call) = expression {
-        return new_call(call, module, new).map(|name| vec![name]);
+        return new_call(call, caller, new).map(|name| vec![name]);
     }
     let Expr::MethodCall(call) = expression else {
         return None;
@@ -64,7 +65,7 @@ pub fn names(statement: &Stmt, module: &str, new: &NewNames) -> Option<Vec<Strin
     if method == EXTEND
         && let Expr::Call(inner) = argument
     {
-        return new_call(inner, module, new).map(|name| vec![name]);
+        return new_call(inner, caller, new).map(|name| vec![name]);
     }
     if method == LINT_REGISTRATION {
         let names = lint_names(argument)?;
@@ -72,7 +73,7 @@ pub fn names(statement: &Stmt, module: &str, new: &NewNames) -> Option<Vec<Strin
         return all_new.then_some(names);
     }
     if PASS_REGISTRATIONS.contains(&method.as_str()) {
-        return new_pass(argument, new).map(|name| vec![name]);
+        return new_pass(argument, caller, new).map(|name| vec![name]);
     }
     None
 }
@@ -109,30 +110,56 @@ pub fn appended_lints(
     (base_place == head_place && prefix && all_new).then(|| appended.to_vec())
 }
 
-/// The name a call `f(args)` dispatches, if `f` is a new function of `module` or a path to one,
-/// or a function of a new type, and every argument is read only.
-fn new_call(call: &syn::ExprCall, module: &str, new: &NewNames) -> Option<String> {
+/// The file of the module that the path `segments` names, seen from the file `caller`:
+/// `crate`, `self` and `super` first, then child modules, below the crate's `src/`. A module is
+/// `name.rs` and the crate root `lib.rs`. `None` for a path that leaves the crate.
+#[must_use]
+pub fn module_file(caller: &str, segments: &[String]) -> Option<String> {
+    let start = caller.find("src/")? + "src/".len();
+    let (root, relative) = (caller.get(..start)?, caller.get(start..)?);
+    let mut module: Vec<&str> = relative.strip_suffix(".rs")?.split('/').collect();
+    if module.last().is_some_and(|last| ["lib", "main", "mod"].contains(last)) {
+        let _root = module.pop();
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        match segment.as_str() {
+            "crate" if index == 0 => module.clear(),
+            "self" if index == 0 => {}
+            "super" => {
+                let _parent = module.pop()?;
+            }
+            name => module.push(name),
+        }
+    }
+    let file = if module.is_empty() { "lib".to_owned() } else { module.join("/") };
+    Some(format!("{root}{file}.rs"))
+}
+
+/// The name a call `f(args)` from the file `caller` dispatches, if `f` resolves by its path to
+/// a function new in the file that defines it, or to a function of a type new in its file, and
+/// every argument is read only. A name alone would let a new `fn line_of` in one file make a
+/// call of an existing `line_of` in another look new (review of #57, round 5).
+fn new_call(call: &syn::ExprCall, caller: &str, new: &NewNames) -> Option<String> {
     let Expr::Path(function) = &*call.func else {
         return None;
     };
-    if !call.attrs.is_empty() || !function.attrs.is_empty() || function.qself.is_some() {
+    let plain = function.path.leading_colon.is_none() && function.qself.is_none();
+    if !call.attrs.is_empty() || !function.attrs.is_empty() || !plain {
         return None;
     }
     let segments: Vec<&syn::PathSegment> = function.path.segments.iter().collect();
     if segments.iter().any(|segment| !segment.arguments.is_none()) {
         return None;
     }
-    let last = segments.last()?.ident.to_string();
-    let named = match segments.len().checked_sub(2).and_then(|index| segments.get(index)) {
-        None => new.functions.contains(&(module.to_owned(), last.clone())),
-        Some(owner) => {
-            let owner = owner.ident.to_string();
-            new.functions.contains(&(owner.clone(), last.clone())) || new.types.contains(&owner)
-        }
-    };
+    let names: Vec<String> = segments.iter().map(|segment| segment.ident.to_string()).collect();
+    let (last, owners) = names.split_last()?;
+    let in_module = module_file(caller, owners)
+        .is_some_and(|file| new.functions.contains(&(file, last.clone())));
+    let of_type = owners.split_last().is_some_and(|(owner, modules)| {
+        module_file(caller, modules).is_some_and(|file| new.types.contains(&(file, owner.clone())))
+    });
     let read_only = call.args.iter().all(is_read_only);
-    let name = segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>();
-    (named && read_only).then(|| name.join("::"))
+    ((in_module || of_type) && read_only).then(|| names.join("::"))
 }
 
 /// True for an argument that gives the callee no way to change existing state: a literal, or a
@@ -207,7 +234,7 @@ fn boxed(expression: &Expr) -> Option<&Expr> {
 }
 
 /// The new pass that `Box::new(|_| Box::new(Pass))` registers.
-fn new_pass(argument: &Expr, new: &NewNames) -> Option<String> {
+fn new_pass(argument: &Expr, caller: &str, new: &NewNames) -> Option<String> {
     let Expr::Closure(closure) = boxed(argument)? else {
         return None;
     };
@@ -224,5 +251,6 @@ fn new_pass(argument: &Expr, new: &NewNames) -> Option<String> {
         return None;
     };
     let name = pass.path.get_ident()?.to_string();
-    (plain && pass.attrs.is_empty() && new.types.contains(&name)).then_some(name)
+    (plain && pass.attrs.is_empty() && new.types.contains(&(caller.to_owned(), name.clone())))
+        .then_some(name)
 }

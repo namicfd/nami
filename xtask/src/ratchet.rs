@@ -17,12 +17,13 @@
 //! the options.
 //!
 //! **Two classes.** Each rule-path diff is additive or an edit ([`class`]). An additive diff
-//! adds rules and leaves every existing item as it is; it passes on the ratchet's checks
-//! alone. An edit changes existing rule code; every check still runs, and the review gate also
-//! needs the reviewer app's approval of the head commit, or until the app exists (#59) a code
-//! owner's. The reason: every honest loosening that the review of #57 found edited existing
-//! rule code together with its tests, which mutation testing cannot see, and the independent
-//! review caught each one.
+//! adds rules and leaves every existing item as it is; it merges on the ratchet's proof alone,
+//! with no review by the reviewer app needed, though none of the app's requests for changes or
+//! threads may be open. An edit changes existing rule code; every check still runs, and the
+//! review gate also needs the reviewer app's approval of the head commit, or until the app
+//! exists (#59) a code owner's. The reason: every honest loosening that the review of #57 found
+//! edited existing rule code together with its tests, which mutation testing cannot see, and
+//! the independent review caught each one.
 //!
 //! **Threat model.** The ratchet is sound against honest mistakes, within what it checks. Its
 //! `syn` checks are sound for files in the dialect of [`dialect`], and a rule-path file outside
@@ -570,28 +571,38 @@ fn unapproved_edit(class: &class::Class) -> Option<String> {
     ))
 }
 
-/// The review gate ([`review::check`]): its findings and what it could not show go into
-/// `verdict`. Returns true if the reviewer app approved the head commit, which an edit to
-/// existing rule code needs.
+/// The review gate ([`review::check`]): its findings go into `verdict`. An additive diff needs
+/// nothing more, so a head that the reviewer app has not reviewed, or a repository without the
+/// app, is a note. Returns true if the app approved the head commit with no finding, which an
+/// edit to existing rule code needs.
 fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> Result<bool, String> {
     let Some(source) = &tools.review else {
-        verdict.unprovable("the review check was skipped (`--no-review`)".to_owned());
+        verdict.unprovable(
+            "the review check was skipped (`--no-review`), so a request for changes or an open \
+             thread by the reviewer app is not seen"
+                .to_owned(),
+        );
         return Ok(false);
     };
     let Some(reviewer) = &source.reviewer else {
-        verdict.unprovable(format!(
-            "no reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}), so no review \
-             independent of the author is shown; the reviewer runs in CI (pending #59)",
+        verdict.notes.push(format!(
+            "No reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}; it runs in CI, \
+             #59). An additive diff needs none; an edit needs a code owner's approval.",
             review::REVIEWER_APP
         ));
         return Ok(false);
     };
     let gate = review::check(source.reviews, source.pull, &source.head, reviewer)?;
-    let clean = gate.findings.is_empty() && gate.unproven.is_empty();
+    let clean = gate.findings.is_empty();
+    verdict.notes.push(format!(
+        "{reviewer} {} the head commit.",
+        match (gate.approved, gate.reviewed) {
+            (true, _) => "approved",
+            (false, true) => "reviewed, without approving,",
+            (false, false) => "has not reviewed",
+        }
+    ));
     verdict.add(Check::Review, gate.findings);
-    for what in gate.unproven {
-        verdict.unprovable(what);
-    }
     Ok(gate.approved && clean)
 }
 

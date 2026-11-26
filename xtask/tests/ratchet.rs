@@ -774,41 +774,43 @@ fn mutation_results_are_read_strictly() {
     assert!(owned.owner_reviews && owned.unproven.is_empty(), "{}", owned.summary());
 }
 
-// Goal: the review gate counts only the reviewer app: a review by the author's app, a thread
-// resolved by someone else, or no reviewer app set up at all is no proof.
+// Goal: an additive diff merges on the ratchet's proof alone: it passes when the reviewer app
+// has not reviewed the head, and when no app is set up; but a request for changes or an open
+// thread by the app fails it, and so does a thread resolved by someone else. An edit needs the
+// app's approval: the author's app does not count, and a code owner's approval stands in.
 #[test]
-fn only_the_reviewer_app_counts() {
+fn an_additive_diff_needs_no_review_and_an_edit_the_app_s_approval() {
     let case = Case::new("reviewer");
-    let own = FakeReviews {
-        state: "COMMENTED",
-        approval: None,
-        reviewer: AUTHOR_APP,
-        commit: "head",
-        resolved_by: Some(REVIEWER_APP),
+    let run = |reviews: &FakeReviews| {
+        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, reviews)).unwrap()
     };
-    let verdict =
-        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &own)).unwrap();
-    assert_eq!(found(&verdict), vec![], "no review by the app is unproven, not a finding");
-    assert!(verdict.unproven.iter().any(|what| what.contains("has not reviewed the head")));
-    let approved = FakeReviews { approval: Some(("owner", "head")), ..own };
-    let approving = case.tools(NOTHING, "any", NOTHING, &approved);
-    let cleared = check(&case.base(), &case.head(), &approving).unwrap();
-    assert!(cleared.unproven.is_empty(), "an owner's approval clears it: {}", cleared.summary());
-    let resolved = FakeReviews {
-        state: "COMMENTED",
-        approval: None,
-        reviewer: REVIEWER_APP,
-        commit: "head",
-        resolved_by: Some(AUTHOR_APP),
-    };
-    let by_other =
-        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &resolved)).unwrap();
-    assert!(by_other.findings[0].message.contains("resolved by nami-agent[bot]"));
+    let own = FakeReviews { reviewer: AUTHOR_APP, ..REVIEWED };
+    let unreviewed = run(&own);
+    assert_eq!(unreviewed.line(), "ratchet: pass (additive)", "{}", unreviewed.summary());
+    assert!(unreviewed.notes.iter().any(|note| note.contains("has not reviewed the head")));
+    let objections = [
+        (FakeReviews { state: "CHANGES_REQUESTED", ..REVIEWED }, "requests changes"),
+        (FakeReviews { resolved_by: None, ..REVIEWED }, "is not resolved"),
+        (FakeReviews { resolved_by: Some(AUTHOR_APP), ..REVIEWED }, "resolved by nami-agent[bot]"),
+    ];
+    for (reviews, expected) in &objections {
+        let objected = run(reviews);
+        assert!(objected.findings[0].message.contains(expected), "{}", objected.summary());
+        assert!(objected.line().starts_with("ratchet: fail (additive)"), "{}", objected.line());
+    }
     let mut tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     tools.review =
         Some(ReviewSource { reviews: &REVIEWED, pull: 7, head: "head".to_owned(), reviewer: None });
     let unset = check(&case.base(), &case.head(), &tools).unwrap();
-    assert!(unset.unproven[0].contains("no reviewer app is configured"), "{}", unset.summary());
+    assert_eq!(unset.line(), "ratchet: pass (additive)", "{}", unset.summary());
+    assert!(unset.notes.iter().any(|note| note.contains("No reviewer app is configured")));
+    let fixture = "xtask/fixtures/tidy/line-length.fires.fixture";
+    write(&case.head(), fixture, &format!("{}\n", real(fixture)));
+    let edit = run(&FakeReviews { state: "APPROVED", ..own });
+    assert!(edit.line().starts_with("ratchet: no verdict (edit), 1"), "{}", edit.summary());
+    let owner = run(&FakeReviews { approval: Some(("owner", "head")), ..own });
+    assert_eq!(owner.line(), "ratchet: pass (edit)", "an owner's approval: {}", owner.summary());
+    assert_eq!(check(&case.base(), &case.head(), &tools).unwrap().unproven.len(), 1, "no app");
 }
 
 // Goal: the observer and the judge read one head: a head with a symbolic link is no verdict,
@@ -974,8 +976,8 @@ fn the_command_line_reports_the_verdict_in_its_exit_code() {
     assert_eq!(bad.expect("xtask runs").status.code(), Some(2), "no `--head`");
 }
 
-// Goal: an approval of the head commit by a code owner turns what the ratchet cannot prove (no
-// reviewer app, no mutant) into notes, so a rule-only PR needs the owner and never the bypass;
+// Goal: an approval of the head commit by a code owner turns what the ratchet cannot prove (a
+// hunk without a mutant) into notes, so a rule-only PR needs the owner and never the bypass;
 // an approval of an earlier commit, or by someone else, does not.
 #[test]
 fn a_code_owner_approval_stands_in_for_what_is_unproven() {
@@ -995,11 +997,11 @@ fn a_code_owner_approval_stands_in_for_what_is_unproven() {
         check(&case.base(), &case.head(), &tools).unwrap()
     };
     let unapproved = verdict(None);
-    assert_eq!(unapproved.unproven.len(), 2, "{}", unapproved.summary());
+    assert_eq!(unapproved.unproven.len(), 1, "{}", unapproved.summary());
     let approved = verdict(Some(("owner", "head")));
     assert!(approved.owner_approved && approved.unproven.is_empty(), "{}", approved.summary());
     assert_eq!(approved.line(), "ratchet: pass (additive)");
     assert!(approved.notes.iter().any(|note| note.contains("approval of the head stands in")));
-    assert_eq!(verdict(Some(("owner", "earlier"))).unproven.len(), 2, "an earlier commit");
-    assert_eq!(verdict(Some(("someone", "head"))).unproven.len(), 2, "not a code owner");
+    assert_eq!(verdict(Some(("owner", "earlier"))).unproven.len(), 1, "an earlier commit");
+    assert_eq!(verdict(Some(("someone", "head"))).unproven.len(), 1, "not a code owner");
 }

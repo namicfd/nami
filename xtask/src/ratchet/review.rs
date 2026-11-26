@@ -1,20 +1,20 @@
 //! The independent review has run on the pull request, and everything raised is resolved by
 //! the reviewer (ADR-0008, ADR-0022).
 //!
-//! The rule: the reviewer app, the bot that the repository variable `NAMI_REVIEWER_LOGIN` names
-//! (such as `nami-reviewer[bot]`, a GitHub App separate from the agents' `nami-agent[bot]`), has
-//! reviewed the PR's head commit, and its latest review there is neither dismissed nor a
-//! request for changes; the PR
-//! was not opened by that app; and every review thread that the app opened is resolved, by that
-//! app. The ratchet counts only the app's own threads. Everyone else's threads, resolved or not
-//! and by whomever, are left to the ruleset, which requires every conversation resolved before
-//! merge, and are never a ratchet finding. A review of an earlier commit does not count, not
-//! even when the later commits are fixes: the reviewer re-reviews the new head and resolves the
-//! threads that are fixed then.
+//! The rule, for every rule-path PR: no request for changes by the reviewer app stands, the bot
+//! that the repository variable `NAMI_REVIEWER_LOGIN` names (such as `nami-reviewer[bot]`, a
+//! GitHub App separate from the agents' `nami-agent[bot]`); the PR was not opened by that app;
+//! and every review thread that the app opened is resolved, by that app. The ratchet counts
+//! only the app's own threads. Everyone else's threads, resolved or not and by whomever, are
+//! left to the ruleset, which requires every conversation resolved before merge, and are never
+//! a ratchet finding.
 //!
-//! An edit to existing rule code ([`super::class`]) needs more: the app's latest decision must
-//! be an approval of the head commit ([`Gate::approved`]). Until the app exists (#59), a code
-//! owner's approval of the head stands in, as for everything else the ratchet cannot prove.
+//! An additive diff ([`super::class`]) merges on the ratchet's proof alone, so it needs no
+//! review by the app. An edit to existing rule code needs the app's latest decision to be an
+//! approval of the head commit ([`Gate::approved`]). A review of an earlier commit does not
+//! count, not even when the later commits are fixes: the reviewer re-reviews the new head.
+//! Until the app exists (#59), a code owner's approval of the head stands in for an edit, as
+//! for everything else the ratchet cannot prove.
 //!
 //! The gate counts the reviews that bot posts, whatever posts them. The review is meant to run
 //! in CI (pending #59), where no authoring session holds the app's key; the gate itself does
@@ -197,17 +197,17 @@ fn same_head(request: &Pull, judged: &str, pull: u32) -> Result<(), String> {
     ))
 }
 
-/// What the review gate showed: findings, and what it could not show, which a code owner's
-/// approval of the head stands in for.
+/// What the review gate showed. An additive diff needs only that there are no findings; an
+/// edit to existing rule code also needs the approval (ADR-0022).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Gate {
     /// A request for changes that stands, an open thread, a thread resolved by someone else, or
     /// a pull request that the reviewer opened.
     pub findings: Vec<Finding>,
-    /// No review of the head by the reviewer.
-    pub unproven: Vec<String>,
+    /// True if the reviewer commented on or approved the head commit, for the summary.
+    pub reviewed: bool,
     /// True if the reviewer's latest decision is an approval of the head commit: what an edit
-    /// to existing rule code needs besides the rest of the gate (ADR-0022).
+    /// to existing rule code needs besides the rest of the gate.
     pub approved: bool,
 }
 
@@ -325,12 +325,7 @@ pub fn check(
         report(problem);
     }
     gate.approved = approved;
-    if !reviewed_head {
-        gate.unproven.push(format!(
-            "{reviewer} has not reviewed the head commit {judged} of #{pull}, so no review \
-             independent of the author is shown; have the reviewer review the head"
-        ));
-    }
+    gate.reviewed = reviewed_head;
     Ok(gate)
 }
 
@@ -614,17 +609,19 @@ mod tests {
         Thread { author: Some(Actor::user("maintainer")), ..thread(resolved_by) }
     }
 
-    /// The findings' messages, then what is unproven.
+    /// The findings' messages, then `not reviewed` if the reviewer did not review the head.
     fn messages(fixed: &Fixed) -> Vec<String> {
         let gate = check(fixed, 7, "b", REVIEWER_APP).unwrap();
+        let unreviewed = (!gate.reviewed).then(|| "not reviewed".to_owned());
         let findings = gate.findings.into_iter().map(|finding| finding.message);
-        findings.chain(gate.unproven).collect()
+        findings.chain(unreviewed).collect()
     }
 
     // Goal: the reviewer app's review on the head, with every thread resolved by it, passes.
     // A later request for changes, an open thread, a thread resolved by someone else, and a PR
     // opened by the reviewer are findings; no review of the head by the app (the author's own,
-    // a dismissed or an earlier one) is unproven; a head that moved on is no verdict.
+    // a dismissed or an earlier one) is no finding, only shown as such; a head that moved on is
+    // no verdict.
     #[test]
     fn review_rule_holds_on_the_head() {
         let good =
@@ -632,8 +629,8 @@ mod tests {
         assert_eq!(messages(&good), Vec::<String>::new());
         let own = fixed(vec![review(Actor::app(AUTHOR_APP), "b", "COMMENTED")], vec![]);
         let gate = check(&own, 7, "b", REVIEWER_APP).unwrap();
-        assert!(gate.findings.is_empty(), "a missing review is unproven, not a finding");
-        assert!(gate.unproven[0].contains("has not reviewed the head commit b"));
+        assert!(gate.findings.is_empty(), "a missing review is no finding");
+        assert!(!gate.reviewed && !gate.approved, "{gate:?}");
         let dismissed = messages(&fixed(vec![review(reviewer(), "b", "DISMISSED")], vec![]));
         assert!(dismissed[0].contains("was dismissed") && dismissed.len() == 2, "{dismissed:?}");
         let earlier = fixed(vec![review(reviewer(), "a", "APPROVED")], vec![]);
@@ -697,7 +694,7 @@ mod tests {
     fn a_user_named_like_the_reviewer_is_not_the_reviewer() {
         let impostor = Actor::user("nami-reviewer");
         let review_by_user = fixed(vec![review(impostor.clone(), "b", "COMMENTED")], vec![]);
-        assert!(messages(&review_by_user)[0].contains("has not reviewed the head commit"));
+        assert_eq!(messages(&review_by_user), ["not reviewed"]);
         let threads = vec![thread(Some(impostor.clone())), human_thread(None)];
         let resolved_by_user = fixed(vec![review(reviewer(), "b", "COMMENTED")], threads);
         let found = messages(&resolved_by_user);
