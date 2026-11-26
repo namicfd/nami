@@ -73,6 +73,14 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 - This ADR replaces point 2 of ADR-0020. Its other points stand; where they say "learning", read "issue".
 - ADR-0011, point 5, changes. GitHub Issues carry human input and findings from agents. Plans stay the source of planned work. A trusted issue that one small PR closes is work without a plan.
 
+### 6. Amendment (Proposed, 2026-11-26): a merge-queue failure is fixed on the failing PR's own branch
+
+The workflow `queue` files an issue `PR #<n> failed in the merge queue`, of kind `bug`, when the required checks fail on PR #n's merge-queue branch and #n has left the queue: it is open, not merged, not queued, and no newer queue run tested it (issue #51). Most such failures are clashes that git merged without a conflict, such as two ADRs with one number. Only #n's own branch can take the fix: a rebase or a renumber of #n itself. A new PR would repeat the change and its review.
+
+- **If the bot opened #n,** the issue is work for agents, with one exception to point 3. The fixing session claims `issue-<m>` as usual, but works on #n's branch, not on `task/issue-<m>`. It rebases or renumbers, pushes to #n's branch, adds `Fixes #<m>` to #n's description, and adds #n to the merge queue again. #n's merge closes the issue. No PR comes from `task/issue-<m>`, so the claim goes stale after two hours, as point 3 says. A session that later claims the issue while #n is queued and says `Fixes #<m>` releases the claim and takes other work.
+- **If anyone else opened #n,** agents do not push to it. The issue says that a human rebases it, and it carries `needs-decision`, so `cargo xtask task ready` does not list it.
+- **The issue quotes only checked text.** The queue ran the PRs' own code and workflow files, so the run's logs and its job and step names are untrusted (point 2). The issue names jobs and steps only by names that `main`'s `.github/workflows/ci.yml` defines, reports codes only as tidy's rule IDs and the dylint lints' names, and builds its links from the repository name and IDs. The fixer reads the log through the link.
+
 ## Enforcement
 
 - `cargo xtask issue file`: the body's sections, one kind label, and the duplicate search.
@@ -81,7 +89,9 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 - The plan rules in tidy: a plan task ID never starts with `issue-`.
 - `cargo xtask pr-body`: the `Follow-up issues` section, and `Fixes #<number>` on an issue's branch.
 - `.claude/settings.json`: deny rules for reading issues with `gh` directly. A speed bump, not a guarantee.
+- `cargo xtask queue failed`, which `.github/workflows/queue.yml` runs as the bot (point 6): it files only for a PR that left the queue, finds an open issue by its exact title, quotes only the closed vocabulary, and adds `needs-decision` to a PR that the bot did not open.
 - **No mechanism:**
+  - whether the session that fixes a queue failure adds `Fixes #<m>` to the failing PR's description. `cargo xtask pr-body` checks `Fixes` only on `task/issue-<m>` branches;
   - whether an agent files an issue when it should. As before, the PR description forces an explicit `None`, and the sampled audits (ADR-0008) look for a `None` that is wrong;
   - whether a filing agent copied untrusted text into an issue;
   - two sessions that file the same finding within the same minute. The worker closes the duplicate.
@@ -96,6 +106,7 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 - An outsider's report costs the maintainer a re-filing before agents can act on it. That is the price of the trust rule.
 - A trusted author can still carry untrusted text into an issue, for example an agent that quotes a web page. Review of the fix's PR remains the backstop, and an issue never justifies loosening a check (`AGENTS.md`, "When a check fails").
 - More small PRs. Guardrail ones wait for the code owner, as ADR-0020 intends.
+- A push that fixes a queue failure dismisses the failing PR's approval, so a PR with protected paths waits for the code owner again (point 6).
 
 ## Alternatives considered
 
@@ -105,6 +116,8 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 - **Issue assignees, or a `claimed` label, as the mutex.** Rejected. All agents are the same bot, and adding an assignee is not a compare-and-swap.
 - **Trust by an `accepted` label.** Rejected. The bot can apply labels, and an outsider can edit their issue after it is accepted.
 - **Trust by GitHub's `author_association`.** Rejected. `COLLABORATOR` includes read-only collaborators, and the reviewed list of who decides is already `.github/CODEOWNERS`.
+- **Fix a queue failure in a new PR from `task/issue-<m>`** (point 3 as written). Rejected for queue failures (point 6): the fix is a rebase or a renumber of the failing PR itself, and a second PR would repeat the change and its review.
+- **Quote the failed run's error lines in the issue, marked as untrusted.** Rejected (point 6): an agent reads the raw body of a trusted issue, and any marking is text that a PR can imitate.
 - **Let only collaborators open issues.** Not available. On a public repository, GitHub's interaction limits expire after at most six months.
 
 ## Evidence
