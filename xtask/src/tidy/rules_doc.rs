@@ -6,7 +6,7 @@
 //! forgotten either.
 
 use super::registry::{self, BanScope, RuleKind};
-use super::{Violation, docs, lints, style_guide};
+use super::{Violation, lints, style_guide};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -68,7 +68,7 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
 pub fn check_planned_tasks(root: &Path) -> io::Result<Vec<Violation>> {
     let mut tasks = String::new();
     if root.join(ACTIVE_PLANS).is_dir() {
-        for plan in docs::entries_of(root, ACTIVE_PLANS)? {
+        for plan in super::entries_of(root, ACTIVE_PLANS)? {
             let file = root.join(plan).join(TASKS_FILE);
             if file.is_file() {
                 tasks.push_str(&fs::read_to_string(file)?);

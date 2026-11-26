@@ -1,6 +1,11 @@
 //! Rules about the workspace as a whole: the `#[expect]` budget, assertion density, snapshots.
+//!
+//! The counting that the budget adds up lives here too, with its own token walk, not with the
+//! token rules: workspace rules have no fixtures, so the ratchet cannot prove that a change to
+//! them only tightens, and their code stays with the code owner (ADR-0022).
 
 use super::{AssertionStats, Violation};
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,6 +14,87 @@ use std::path::{Path, PathBuf};
 
 /// File holding the maximum number of `#[expect]` attributes. Only humans raise it (ADR-0006).
 pub const EXPECT_BUDGET_FILE: &str = "xtask/expect-budget.txt";
+
+/// The attribute argument that suppresses a lint: `expect(lint, reason = "...")`.
+const EXPECT: &str = "expect";
+
+/// Upper bound on the token groups in one file, so the walk is bounded.
+const TOKEN_GROUPS_MAX: u32 = 4_000_000;
+
+/// Counts the lint suppressions in one file: every `expect(...)` inside an attribute, inner or
+/// outer, at any depth. That includes `#[cfg_attr(.., expect(..))]` and attributes inside macro
+/// bodies. A file that does not lex counts as zero; the `parse` rule reports it.
+#[must_use]
+pub fn expect_count(text: &str) -> u32 {
+    let Ok(stream) = text.parse::<TokenStream>() else {
+        return 0;
+    };
+    let mut count: u32 = 0;
+    for sequence in sequences(stream) {
+        for attribute in attributes(&sequence) {
+            count += expect_calls(attribute.stream());
+        }
+    }
+    count
+}
+
+/// The bracket groups of the attributes in one sequence: `#[...]` and `#![...]`.
+fn attributes(sequence: &[TokenTree]) -> Vec<&Group> {
+    let mut found = Vec::new();
+    let mut after_hash = false;
+    for tree in sequence {
+        let is_bang = after_hash && is_punct(tree, '!');
+        if let TokenTree::Group(group) = tree
+            && after_hash
+            && group.delimiter() == Delimiter::Bracket
+        {
+            found.push(group);
+        }
+        after_hash = is_punct(tree, '#') || is_bang;
+    }
+    found
+}
+
+/// Counts `expect(...)` in the tokens of one attribute, at any depth.
+fn expect_calls(attribute: TokenStream) -> u32 {
+    let mut count: u32 = 0;
+    for sequence in sequences(attribute) {
+        for pair in sequence.windows(2) {
+            if let [TokenTree::Ident(ident), TokenTree::Group(group)] = pair
+                && ident == EXPECT
+                && group.delimiter() == Delimiter::Parenthesis
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Every token sequence in `stream`: the stream itself and the content of every group inside
+/// it, at any depth, with an explicit work list (no recursion, ADR-0006).
+fn sequences(stream: TokenStream) -> Vec<Vec<TokenTree>> {
+    let mut pending = vec![stream];
+    let mut found = Vec::new();
+    for _ in 0..TOKEN_GROUPS_MAX {
+        let Some(next) = pending.pop() else {
+            assert!(!found.is_empty(), "the stream itself is a sequence");
+            return found;
+        };
+        let sequence: Vec<TokenTree> = next.into_iter().collect();
+        for tree in &sequence {
+            if let TokenTree::Group(group) = tree {
+                pending.push(group.stream());
+            }
+        }
+        found.push(sequence);
+    }
+    panic!("more than {TOKEN_GROUPS_MAX} token groups in one stream");
+}
+
+fn is_punct(tree: &TokenTree, character: char) -> bool {
+    matches!(tree, TokenTree::Punct(punct) if punct.as_char() == character)
+}
 
 /// Counts that only mean something once every file has been seen.
 pub struct Tally {
@@ -95,10 +181,47 @@ pub fn density_violations(stats_by_crate: &BTreeMap<PathBuf, AssertionStats>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{Tally, check_expect_budget, crate_root, density_violations, is_snapshot_draft};
+    use super::is_snapshot_draft;
+    use super::{Tally, check_expect_budget, crate_root, density_violations, expect_count};
     use crate::tidy::AssertionStats;
     use crate::tidy::scratch::Scratch;
     use std::path::Path;
+
+    // Goal: suppressions are counted as tokens: plain, inner, inside `cfg_attr`, several in one
+    // attribute, and inside a macro body.
+    #[test]
+    fn expect_attributes_are_counted_on_tokens() {
+        assert_eq!(expect_count("#[expect(dead_code, reason = \"x\")]\nfn a() {}"), 1);
+        assert_eq!(expect_count("#![expect(dead_code, reason = \"x\")]"), 1);
+        assert_eq!(expect_count("# [ expect ( dead_code ) ]\nfn a() {}"), 1, "spacing is free");
+        let hidden = "#[cfg_attr(all(), expect(clippy::indexing_slicing, reason = \"x\"))]";
+        assert_eq!(expect_count(hidden), 1, "cfg_attr does not hide a suppression");
+        let two = "#[cfg_attr(test, expect(a, reason = \"x\"), expect(b, reason = \"y\"))]";
+        assert_eq!(expect_count(two), 2, "each suppression counts");
+        let in_macro = "macro_rules! m { () => { #[expect(dead_code)] fn a() {} }; }";
+        assert_eq!(expect_count(in_macro), 1, "macro bodies are counted");
+        let deep = "mod tests { impl A { fn b() { { #[cfg_attr(all(), cfg_attr(all(), \
+                    expect(dead_code)))] let _c = 1; } } } }";
+        assert_eq!(expect_count(deep), 1, "any depth");
+    }
+
+    // Goal: only suppressions count: the method `expect`, text in strings and comments, other
+    // attributes and a file that does not lex all count as zero.
+    #[test]
+    fn expect_count_ignores_everything_else() {
+        assert_eq!(expect_count("fn a() { b().expect(\"reason\"); }"), 0, "a method call");
+        assert_eq!(expect_count("const A: &str = \"#[expect(dead_code)]\";"), 0, "a string");
+        assert_eq!(expect_count("/// #[expect(dead_code)]\nfn a() {}"), 0, "a doc comment");
+        assert_eq!(expect_count("// #[expect(dead_code)]\nfn a() {}"), 0, "a comment");
+        assert_eq!(expect_count("#[should_panic(expected = \"x\")]\nfn a() {}"), 0, "expected");
+        assert_eq!(expect_count("#[derive(Debug)]\nstruct A;"), 0, "another attribute");
+        assert_eq!(expect_count("#[expect]\nfn a() {}"), 0, "no parenthesised lint");
+        assert_eq!(expect_count("fn a() { expect(1); }"), 0, "a function outside an attribute");
+        assert_eq!(expect_count("fn a() { m![expect(1)]; }"), 0, "a macro's brackets");
+        let after_attribute = "#[derive(Debug)] static A: [u8; expect(3)] = [0; 3];";
+        assert_eq!(expect_count(after_attribute), 0, "brackets later in the same sequence");
+        assert_eq!(expect_count("fn a( {"), 0, "a file that does not lex");
+    }
 
     // Goal: unreviewed insta snapshots are recognised by their extension.
     #[test]

@@ -3,10 +3,10 @@
 use super::Violation;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Directory of the ADRs and their index (ADR-0000).
-pub const ADR_DIRECTORY: &str = "docs/design";
+// Which files are ADRs decides which files the ADR rules check, so it is core (ADR-0022).
+pub use super::{ADR_DIRECTORY, is_adr_file_name};
 
 /// Sections every ADR must have (ADR-0000).
 const ADR_SECTIONS: [&str; 6] = [
@@ -25,19 +25,6 @@ const ADR_STATUSES: [&str; 4] = [
     "- Status: Superseded by ADR-",
     "- Status: Deprecated",
 ];
-
-/// The entries directly inside `directory`, as paths relative to `root`, sorted.
-pub fn entries_of(root: &Path, directory: &str) -> io::Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(root.join(directory))?
-        .map(|entry| entry.map(|entry| Path::new(directory).join(entry.file_name())))
-        .collect::<io::Result<_>>()?;
-    paths.sort();
-    assert!(
-        paths.iter().all(|path| path.starts_with(directory)),
-        "entries are below the directory"
-    );
-    Ok(paths)
-}
 
 /// The ADR index, which every ADR must be listed in.
 pub fn adr_index(root: &Path) -> io::Result<String> {
@@ -70,7 +57,7 @@ pub fn check_adr(relative: &Path, text: &str, index: &str) -> Vec<Violation> {
 
 /// The names of the ADR files in the tree, sorted: the context of the rule `adr-number`.
 pub fn adr_file_names(root: &Path) -> io::Result<Vec<String>> {
-    let names: Vec<String> = entries_of(root, ADR_DIRECTORY)?
+    let names: Vec<String> = super::entries_of(root, ADR_DIRECTORY)?
         .iter()
         .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
         .filter(|name| is_adr_file_name(name))
@@ -109,17 +96,10 @@ pub fn check_adr_number(relative: &Path, text: &str, adr_names: &[String]) -> Ve
     violations
 }
 
-/// True for `NNNN-<title>.md`, the name of an ADR file.
-pub fn is_adr_file_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let has_number = bytes.iter().take(4).filter(|byte| byte.is_ascii_digit()).count() == 4;
-    let is_markdown = Path::new(name).extension().is_some_and(|extension| extension == "md");
-    has_number && bytes.get(4) == Some(&b'-') && is_markdown
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{adr_file_names, check_adr, check_adr_number, entries_of, is_adr_file_name};
+    use super::{adr_file_names, check_adr, check_adr_number};
+    use crate::tidy::entries_of;
     use std::path::Path;
 
     fn rules(violations: &[super::Violation]) -> Vec<&'static str> {
@@ -185,17 +165,6 @@ mod tests {
         let violations = check_adr(Path::new("docs/design/0002-y.md"), bad, index);
         assert_eq!(rules(&violations)[..2], ["adr-index", "adr-status"]);
         assert_eq!(violations.len(), 7, "index, status and five missing sections");
-    }
-
-    // Goal: ADR files are recognised by their four-digit prefix.
-    #[test]
-    fn adr_file_names_are_recognised() {
-        assert!(is_adr_file_name("0013-lint-table-refinements.md"));
-        assert!(!is_adr_file_name("README.md"));
-        assert!(!is_adr_file_name("13-x.md"));
-        assert!(!is_adr_file_name("0013_x.md"), "the number must be followed by a dash");
-        assert!(!is_adr_file_name("abcd-x.md"), "the prefix must be digits");
-        assert!(!is_adr_file_name("0013-x.txt"), "ADRs are Markdown");
     }
 
     // Goal: a directory lists as sorted relative paths, and a missing directory is an error.

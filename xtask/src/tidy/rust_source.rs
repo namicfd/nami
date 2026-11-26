@@ -10,7 +10,7 @@
 
 use super::registry::{self, MACRO_BANS, PATH_BANS};
 use super::tokens;
-use super::{Scope, Violation};
+use super::{Scope, Violation, assertions};
 use proc_macro2::{Ident, Span, TokenTree};
 use std::path::Path;
 use syn::spanned::Spanned;
@@ -20,18 +20,11 @@ use syn::{Attribute, Block, Expr, Signature, Type, UseTree, Visibility};
 /// Hard limit on physical lines per function, closures included (`TIGER_STYLE.md`).
 const FUNCTION_LINES_MAX: u32 = 70;
 
-/// Functions up to this many lines are trivial and excluded from the density average.
-const FUNCTION_LINES_TRIVIAL_MAX: u32 = 5;
-
 /// Functions longer than this must contain at least one assertion (ADR-0004).
 const FUNCTION_LINES_UNASSERTED_MAX: u32 = 10;
 
 /// The only crate that may contain `unsafe` code (ADR-0014).
 const UNSAFE_ALLOWED_CRATE: &str = "crates/alloc-guard";
-
-/// Macros that count as assertions.
-const ASSERTION_MACROS: [&str; 6] =
-    ["assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne"];
 
 /// Largest float literal that is taken for a tolerance, epsilon or floor. A literal in
 /// `(0, MAGIC_TOLERANCE_MAX]` must be a documented constant (`TIGER_STYLE.md`, Floating point).
@@ -53,39 +46,9 @@ const USE_TREES_MAX: u32 = 100_000;
 /// The directory of a crate's integration tests, which are test code as a whole.
 const TESTS_DIRECTORY: &str = "tests";
 
-/// Assertion counts over the non-trivial, non-test functions of a file or crate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AssertionStats {
-    /// Number of non-trivial functions.
-    pub functions: u32,
-    /// Number of assertions in those functions.
-    pub assertions: u32,
-}
-
-impl AssertionStats {
-    /// No functions, no assertions.
-    #[must_use]
-    pub const fn zero() -> Self {
-        Self { functions: 0, assertions: 0 }
-    }
-
-    /// Adds another set of counts to this one.
-    pub fn add(&mut self, other: Self) {
-        self.functions += other.functions;
-        self.assertions += other.assertions;
-    }
-
-    /// True if the average is at least two assertions per non-trivial function.
-    #[must_use]
-    pub fn meets_density(self) -> bool {
-        u64::from(self.assertions) >= 2 * u64::from(self.functions)
-    }
-}
-
 /// The result of checking one file.
 pub struct Report {
     pub violations: Vec<Violation>,
-    pub stats: AssertionStats,
 }
 
 /// Parses `text` and runs every syntax rule that applies to `scope`.
@@ -96,7 +59,7 @@ pub fn check(path: &Path, text: &str, scope: Scope) -> Report {
             let line = line_of(error.span());
             let message = format!("cannot parse this file: {error}");
             let violations = vec![Violation::new(path, line, "parse", message)];
-            return Report { violations, stats: AssertionStats::zero() };
+            return Report { violations };
         }
     };
     let mut visitor = Visitor {
@@ -109,12 +72,11 @@ pub fn check(path: &Path, text: &str, scope: Scope) -> Report {
         const_depth: 0,
         const_holds_tolerance: false,
         violations: Vec::new(),
-        stats: AssertionStats::zero(),
     };
     visitor.visit_file(&file);
     assert_eq!(visitor.test_depth, 0, "every test module that was entered was left");
     assert_eq!(visitor.const_depth, 0, "every constant that was entered was left");
-    Report { violations: visitor.violations, stats: visitor.stats }
+    Report { violations: visitor.violations }
 }
 
 struct Visitor<'a> {
@@ -133,7 +95,6 @@ struct Visitor<'a> {
     /// True once the innermost `const` item around the current expression holds a tolerance.
     const_holds_tolerance: bool,
     violations: Vec<Violation>,
-    stats: AssertionStats,
 }
 
 /// The parts of a function with a body that the rules look at.
@@ -204,18 +165,13 @@ impl Visitor<'_> {
     }
 
     fn count_assertions(&mut self, function: &Function<'_>, lines: u32) {
-        let mut counter = AssertionCounter { count: 0 };
-        counter.visit_block(function.block);
-        if lines > FUNCTION_LINES_UNASSERTED_MAX && counter.count == 0 {
+        if lines > FUNCTION_LINES_UNASSERTED_MAX && assertions::count_in(function.block) == 0 {
             let message = format!(
                 "function `{}` has {lines} lines and no assertions; assert its arguments, results \
                  and invariants (ADR-0004)",
                 function.signature.ident
             );
             self.report(function.signature.fn_token.span, "unasserted-function", message);
-        }
-        if lines > FUNCTION_LINES_TRIVIAL_MAX {
-            self.stats.add(AssertionStats { functions: 1, assertions: counter.count });
         }
     }
 
@@ -560,21 +516,6 @@ impl<'ast> Visit<'ast> for Visitor<'_> {
         }
         for sequence in tokens::sequences(node.tokens.clone()) {
             self.check_macro_tokens(&sequence);
-        }
-        visit::visit_macro(self, node);
-    }
-}
-
-/// Counts assertion macros inside one function body.
-struct AssertionCounter {
-    count: u32,
-}
-
-impl<'ast> Visit<'ast> for AssertionCounter {
-    fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        let name = node.path.segments.last().map(|segment| segment.ident.to_string());
-        if name.is_some_and(|name| ASSERTION_MACROS.contains(&name.as_str())) {
-            self.count += 1;
         }
         visit::visit_macro(self, node);
     }
@@ -1139,7 +1080,7 @@ fn line_of_end(span: Span) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssertionStats, check};
+    use super::check;
     use crate::tidy::Scope;
     use std::path::Path;
 
@@ -1183,14 +1124,10 @@ mod tests {
         assert_eq!(rules(&over_limit, Scope::Tooling), ["function-length"]);
     }
 
-    // Goal: density counts only non-trivial functions; long unasserted functions are flagged.
+    // Goal: long unasserted functions in nami crates are flagged; tooling is exempt.
     #[test]
     fn assertion_rules_fire() {
-        let trivial = check(Path::new("f.rs"), &function_with_lines("a", 3, 0), Scope::Crate);
-        assert_eq!(trivial.stats, AssertionStats::zero());
-        let dense = check(Path::new("f.rs"), &function_with_lines("a", 8, 2), Scope::Crate);
-        assert_eq!(dense.stats, AssertionStats { functions: 1, assertions: 2 });
-        assert!(dense.stats.meets_density(), "two assertions meet the density");
+        assert_eq!(rules(&function_with_lines("a", 9, 1), Scope::Crate), NONE);
         assert_eq!(rules(&function_with_lines("a", 9, 0), Scope::Crate), ["unasserted-function"]);
         assert_eq!(rules(&function_with_lines("a", 9, 0), Scope::Tooling), NONE);
     }
@@ -1420,13 +1357,6 @@ mod tests {
         assert_eq!(rules(after_tests, Scope::Kernels), ["kernel-indirection"]);
         let other_cfg = "#[cfg(unix)]\nmod m { fn a(f: &dyn Fn()) {} }";
         assert_eq!(rules(other_cfg, Scope::Kernels), ["kernel-indirection"]);
-    }
-
-    // Goal: the density threshold is exactly two assertions per function.
-    #[test]
-    fn density_threshold_is_two() {
-        assert!(AssertionStats { functions: 2, assertions: 4 }.meets_density(), "4 / 2 meets");
-        assert!(!AssertionStats { functions: 2, assertions: 3 }.meets_density(), "3 / 2 fails");
     }
 
     // Goal: `#[ignore]` needs a reason.

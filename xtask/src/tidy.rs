@@ -14,6 +14,7 @@
 //! Every violation reads `path:line: error[rule]: what; fix (reference)`, so the message tells
 //! the reader how to fix it.
 
+mod assertions;
 pub mod cli;
 mod docs;
 #[cfg(test)]
@@ -35,7 +36,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use rust_source::AssertionStats;
+pub use assertions::AssertionStats;
 
 /// Upper bound on directories visited, so the walk is bounded (`TIGER_STYLE.md`, Limits).
 const DIRECTORIES_MAX: u32 = 100_000;
@@ -50,6 +51,16 @@ const FIXTURE_DIRECTORY: &str = "xtask/fixtures";
 /// are other checkouts. Copies of the tree (cargo-mutants) drop the worktrees' `.git` files, so
 /// the nested-checkout rule alone does not catch them there.
 const ROOT_AGENT_DIRECTORY: &str = ".claude";
+
+/// What precedes the virtual path in the first line of a tidy fixture.
+pub(crate) const FIXTURE_PATH_MARKER: &str = "path: ";
+
+/// Directory of the ADRs and their index (ADR-0000). File kinds are core: they decide which
+/// files the rules check (ADR-0022).
+pub const ADR_DIRECTORY: &str = "docs/design";
+
+/// The style guide, relative to the root.
+pub const STYLE_GUIDE: &str = "docs/TIGER_STYLE.md";
 
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
 const INDEX_MODULE: &str = "crates/base/src/index.rs";
@@ -86,6 +97,27 @@ impl fmt::Display for Violation {
         let path = self.path.display();
         write!(formatter, "{path}:{}: error[{}]: {}", self.line, self.rule, self.message)
     }
+}
+
+/// True for `NNNN-<title>.md`, the name of an ADR file.
+#[must_use]
+pub fn is_adr_file_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let has_number = bytes.iter().take(4).filter(|byte| byte.is_ascii_digit()).count() == 4;
+    let is_markdown = Path::new(name).extension().is_some_and(|extension| extension == "md");
+    has_number && bytes.get(4) == Some(&b'-') && is_markdown
+}
+
+/// Reads the virtual path from the first line of a tidy fixture: `// path: <path>`,
+/// `# path: <path>` or `<!-- path: <path> -->`. The path decides which rules apply to the
+/// fixture. The fixture tests and the ratchet (ADR-0022) both read it here.
+#[must_use]
+pub fn fixture_virtual_path(first_line: &str) -> Option<PathBuf> {
+    let line = first_line.trim();
+    let body = ["//", "<!--", "#"].iter().find_map(|prefix| line.strip_prefix(prefix))?;
+    let body = body.strip_suffix("-->").unwrap_or(body).trim();
+    let path = body.strip_prefix(FIXTURE_PATH_MARKER)?.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// Where a source file lives, which decides the rules that apply to it.
@@ -154,9 +186,9 @@ impl FileKind {
             Self::CrateManifest
         } else if relative == Path::new("Cargo.toml") {
             Self::WorkspaceManifest
-        } else if directory == Path::new(docs::ADR_DIRECTORY) && docs::is_adr_file_name(&name) {
+        } else if directory == Path::new(ADR_DIRECTORY) && is_adr_file_name(&name) {
             Self::Adr
-        } else if relative == Path::new(style_guide::STYLE_GUIDE) {
+        } else if relative == Path::new(STYLE_GUIDE) {
             Self::StyleGuide
         } else {
             Self::Other
@@ -266,7 +298,7 @@ fn check_file(root: &Path, relative: &Path, text: &str) -> io::Result<FileReport
     match FileKind::of(relative) {
         FileKind::RustSource => {
             (report.violations, report.stats) = check_rust_source(relative, text);
-            report.expect_count = tokens::expect_count(text);
+            report.expect_count = workspace::expect_count(text);
         }
         FileKind::CrateManifest => {
             let crates = manifest::workspace_crates(root)?;
@@ -299,15 +331,28 @@ pub fn check_rust_source(relative: &Path, text: &str) -> (Vec<Violation>, Assert
     let mut violations = text::check(relative, text);
     let report = rust_source::check(relative, text, scope);
     violations.extend(report.violations);
-    (violations, report.stats)
+    (violations, assertions::stats(text, scope))
 }
 
 /// The documents that have rules. They live under `docs/`, which the source walk skips. The
 /// ADR directory must exist.
 fn document_files(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut paths = docs::entries_of(root, docs::ADR_DIRECTORY)?;
-    paths.push(PathBuf::from(style_guide::STYLE_GUIDE));
+    let mut paths = entries_of(root, ADR_DIRECTORY)?;
+    paths.push(PathBuf::from(STYLE_GUIDE));
     paths.retain(|relative| root.join(relative).is_file());
+    Ok(paths)
+}
+
+/// The entries directly inside `directory`, as paths relative to `root`, sorted.
+pub(crate) fn entries_of(root: &Path, directory: &str) -> io::Result<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(root.join(directory))?
+        .map(|entry| entry.map(|entry| Path::new(directory).join(entry.file_name())))
+        .collect::<io::Result<_>>()?;
+    paths.sort();
+    assert!(
+        paths.iter().all(|path| path.starts_with(directory)),
+        "entries are below the directory"
+    );
     Ok(paths)
 }
 
@@ -598,6 +643,18 @@ mod tests {
         assert_eq!(Scope::of(Path::new("crates/base/src/lib.rs")), Scope::Crate);
         assert_eq!(Scope::of(Path::new("crates/kernels/src/reduce.rs")), Scope::Kernels);
         assert_eq!(Scope::of(Path::new("xtask/src/tidy.rs")), Scope::Tooling);
+    }
+
+    // Goal: ADR files are recognised by their four-digit prefix.
+    #[test]
+    fn adr_file_names_are_recognised() {
+        use super::is_adr_file_name;
+        assert!(is_adr_file_name("0013-lint-table-refinements.md"));
+        assert!(!is_adr_file_name("README.md"));
+        assert!(!is_adr_file_name("13-x.md"));
+        assert!(!is_adr_file_name("0013_x.md"), "the number must be followed by a dash");
+        assert!(!is_adr_file_name("abcd-x.md"), "the prefix must be digits");
+        assert!(!is_adr_file_name("0013-x.txt"), "ADRs are Markdown");
     }
 
     // Goal: paths map to the file kinds whose rules apply to them, and near misses do not.
