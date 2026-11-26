@@ -447,7 +447,46 @@ fn a_changed_constant_and_a_hunk_without_a_mutant_are_not_proven() {
     let uncovered =
         verdict.unproven.iter().any(|what| what.contains("text.rs:47 contains no mutant"));
     assert!(uncovered, "{}", verdict.summary());
+    let per_hunk = verdict.unproven.iter().all(|what| !what.contains("yields no mutant"));
+    assert!(per_hunk, "a workspace with a mutant is judged per hunk: {}", verdict.summary());
     assert!(verdict.line().starts_with("ratchet: no verdict"), "{}", verdict.summary());
+}
+
+// Goal: a data-only change that the rule-set check covers passes without a mutant: a new rule
+// with its ban row in the registry. Beside it, a code hunk without a mutant is unproven.
+#[test]
+fn a_pure_new_ban_row_passes_without_mutants() {
+    let case = Case::new("data-only");
+    let registry = "xtask/src/tidy/registry.rs";
+    let rule = "    Rule {\n        id: \"adr-index\",";
+    let new_rule = "    Rule {\n        id: \"a-new-ban\",\n        kind: \
+                    RuleKind::Source,\n        summary: \"A new ban.\",\n        reference: \
+                    \"ADR-0000\",\n    },\n";
+    let ban = "pub const PATH_BANS: &[PathBan] = &[PathBan {";
+    let new_ban = "pub const PATH_BANS: &[PathBan] = &[PathBan {\n    id: \"a-new-ban\",\n    \
+                   segment: \"banned_crate\",\n    allowed: &[],\n    scope: \
+                   BanScope::Everywhere,\n    message: \"a new ban\",\n}, PathBan {";
+    let edited =
+        replaced(&replaced(&real(registry), rule, &format!("{new_rule}{rule}")), ban, new_ban);
+    write(&case.head(), registry, &edited);
+    for tree in [case.base(), case.head()] {
+        write(&tree, "src/fake-mutants.txt", "");
+    }
+    let data = case.run(NOTHING, "any");
+    assert!(data.checks.contains(&Check::Mutants), "{}", data.summary());
+    assert!(
+        data.notes.iter().any(|note| note == "Mutants in xtask: 0, missed: 0."),
+        "{:?}",
+        data.notes
+    );
+    assert!(data.findings.is_empty() && data.unproven.is_empty(), "{}", data.summary());
+    assert!(data.line().starts_with("ratchet: pass"), "{}", data.summary());
+    write(&case.head(), "xtask/src/tidy/text.rs", "fn rule() -> bool { true }\n");
+    let mixed = case.run(NOTHING, "any");
+    assert_eq!(mixed.unproven.len(), 1, "{}", mixed.summary());
+    let what = &mixed.unproven[0];
+    assert!(what.contains("yields no mutant") && what.contains("text.rs:1 contains"), "{what}");
+    assert!(mixed.line().starts_with("ratchet: no verdict"), "{}", mixed.summary());
 }
 
 // Goal: a ban narrowed in code outside the scope of its case fails: the review's exploit, which

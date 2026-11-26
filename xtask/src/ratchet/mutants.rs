@@ -9,8 +9,10 @@
 //! cargo-mutants runs the head's tests, so it runs in the observing job ([`observe`]), which
 //! records its exit code, the number of mutants it listed, `outcomes.json` and `missed.txt`.
 //! The judge reads them strictly ([`judge`]): anything missing, unexpected or inconsistent is
-//! no verdict. A changed rule-path source that yields no mutant at all proves nothing either,
-//! because a changed constant or a deleted line makes none.
+//! no verdict. A changed hunk without a mutant of its own proves nothing either, because a
+//! changed constant or a deleted line makes none ([`super::hunks`]). The registry's tables are
+//! the exception: the rule-set check reads them as data, so a change to them alone passes with
+//! no mutant.
 
 use super::observations::{Observations, Run};
 use super::{Check, Finding, Tools};
@@ -130,17 +132,23 @@ pub fn judge(
         judged
             .notes
             .push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
-        if count == 0 {
+        // A hunk that the data checks cover (the registry's tables) needs no mutant, so a
+        // data-only change passes with none; every other hunk needs one of its own.
+        let starts =
+            if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
+        let mut uncovered = Vec::new();
+        for path in changed_sources(rule_paths, workspace) {
+            uncovered.extend(uncovered_hunks(base, head, path, &starts, work)?);
+        }
+        assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
+        if count > 0 {
+            judged.unproven.extend(uncovered);
+        } else if let Some(first) = uncovered.first() {
             judged.unproven.push(format!(
                 "the rule-path change in {} yields no mutant, so mutation testing proves \
-                 nothing about it (a changed constant or a deleted line makes none)",
+                 nothing about it (a changed constant or a deleted line makes none); {first}",
                 workspace.name
             ));
-        } else {
-            let starts = mutant_starts(run, workspace.directory)?;
-            for path in changed_sources(rule_paths, workspace) {
-                judged.unproven.extend(uncovered_hunks(base, head, path, &starts, work)?);
-            }
         }
         judged.findings.extend(missed_findings(&missed, workspace.directory));
     }
