@@ -417,8 +417,16 @@ mod tests {
         ] {
             assert_eq!(super::repository_of_url(url), None, "{url}");
         }
-        let root = crate::workspace_root();
-        assert_eq!(super::repository_of(&root, "no-such-remote"), None);
+        let scratch = crate::tidy::scratch::Scratch::new("repository-of");
+        let git = |arguments: &[&str]| {
+            crate::task::claims::git(scratch.root(), arguments, &[], None).expect("git runs")
+        };
+        let _ = git(&["init", "--quiet"]);
+        let _ = git(&["remote", "add", "origin", "git@github.com:namicfd/nami.git"]);
+        let _ = git(&["remote", "add", "elsewhere", "https://gitlab.com/namicfd/nami"]);
+        assert_eq!(super::repository_of(scratch.root(), "origin").as_deref(), Some("namicfd/nami"));
+        assert_eq!(super::repository_of(scratch.root(), "elsewhere"), None, "not on GitHub");
+        assert_eq!(super::repository_of(scratch.root(), "no-such-remote"), None);
     }
 
     // Goal: `gh --jq '.[]'` output becomes one value per line; blank lines are skipped, and a
