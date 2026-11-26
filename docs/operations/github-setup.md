@@ -161,7 +161,7 @@ claude -p "..."
 
 `env` exports the variables above, with the script's absolute path as the helper, plus a `GH_TOKEN` that expires after an hour. Run it again for longer sessions. An orchestrator that cannot run a command at launch can copy the `env` block from `.claude/settings.json` as it stands, and set `NAMI_AGENT_KEY` if the key is not at the default path.
 
-`xtask/agent-token.sh` alone prints one token, and `jwt` prints the app's own JWT for debugging.
+`xtask/agent-token.sh` alone prints one token, and `jwt` prints the app's own JWT for debugging. In CI the script refuses to act as `nami-agent` at all, and it refuses `jwt` for the CI app (step 8).
 
 ## 7. Issue labels
 
@@ -182,7 +182,7 @@ Which issues agents act on depends on who opened them, never on labels: only the
 
 Workflow tokens act as `github-actions[bot]`, whom agents do not trust (ADR-0021). A CI job whose output agents must act on therefore acts as a GitHub App. CI has its own app, `nami-ci`, separate from the agents' `nami-agent` (step 5): one app per role, each with the least permissions its role needs (ADR-0023). The agents' key is never in CI.
 
-Today one job uses it: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch and the PR has really left the queue, it files an issue `PR #<n> failed in the merge queue (run <id>)` of kind `bug`, so that `cargo xtask task ready` lists it (issue #51, ADR-0021, point 6). Agents trust `nami-ci[bot]` for that title only. The `bot/passes` PR (#62) will be its second job. The CI-hosted reviewer (#59) gets an app of its own.
+Today one job uses it: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch and the PR has really left the queue, it files an issue `PR #<n> failed in the merge queue (run <id>)` of kind `bug`, so that `cargo xtask task ready` lists it (issue #51, ADR-0021, point 6). Agents trust `nami-ci[bot]` for that title, and, once PR #70 (issue #62) lands, for the `bot/passes` PR in the shape that #70 defines and checks. That PR will be its second job. The CI-hosted reviewer (#59) gets an app of its own.
 
 ADR-0023 sets the rules for every CI job that holds an app's key. Read it before you add one. The queue-failure job follows them:
 
@@ -190,7 +190,7 @@ ADR-0023 sets the rules for every CI job that holds an app's key. Read it before
 - the key is in an environment that only `main` may use, so a PR that edits a workflow to read it is refused;
 - the key is in the environment of one step only, which writes it to a file. The next step mints the token from the file and deletes it before xtask starts, and a last step that always runs deletes it if anything failed in between;
 - it files only for runs of `.github/workflows/ci.yml`, so a workflow that a PR adds under the name `ci` triggers nothing;
-- every read uses the workflow's own token, with `actions`, `contents` and `pull-requests` read. The `nami-ci` token is narrowed to `issues: write`, and expires within an hour;
+- every read, of the open issues too, uses the workflow's own token, with `actions`, `contents`, `issues` and `pull-requests` read. The `nami-ci` token is narrowed to `issues: write`, only creates the issue, and expires within an hour;
 - it restores no cache, and builds xtask from a clean checkout.
 
 The other job in that workflow, `adr clashes (advisory)`, comments with the workflow's own token and needs no setup.
@@ -202,12 +202,12 @@ The other job in that workflow, `adr clashes (advisory)`, comments with the work
 | GitHub App | `nami-ci`, client ID `Iv23ctUmyQzRCojbV2Em`, webhooks off |
 | Bot | `nami-ci[bot]`, user ID 361707243 |
 | Installation | `namicfd/nami` only |
-| Repository permissions | Contents: read and write. Issues: read and write. Pull requests: read and write. Metadata: read. No Actions permission: jobs read runs and logs with the workflow's own token. |
+| Repository permissions | Contents: read and write. Issues: read and write. Pull requests: read and write. Metadata: read. Contents and pull requests write are for the `bot/passes` PR of PR #70, granted before it lands; the queue-failure job never asks for them. No Actions permission: jobs read runs and logs with the workflow's own token. |
 | Environment | `nami-ci`, deployment branches limited to `main`, no required reviewers |
 | Environment secret | `NAMI_CI_PRIVATE_KEY`: the full contents of a private key of `nami-ci` |
 | Repository variable | `NAMI_CI_CLIENT_ID`: `Iv23ctUmyQzRCojbV2Em` |
 
-There is no `nami-agent` environment, and there must not be one. A job that names a missing environment makes GitHub create it with no branch rule, so that every branch may use any secret added to it later. Create an environment, and limit it to `main`, before any job names it.
+There is no `nami-agent` environment, and there must not be one. A job that names a missing environment makes GitHub create it with no branch rule, so that every branch may use any secret added to it later. Create an environment, and limit it to `main`, before any job names it. Until ADR-0023's PR (#64) merged, `main`'s `queue.yml` named `environment: nami-agent`, so a merge-queue failure before then may have created one. After that merge, run "Check it" below, and delete any `nami-agent` environment it lists.
 
 ### Set it up again
 
