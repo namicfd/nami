@@ -63,9 +63,10 @@ jobs:
   # - one step has the secret in its environment, and the key file is deleted before xtask
   #   starts (rule 3);
   # - two tokens, each narrow (rule 2). Every read (the run, its jobs and logs, the PR, its
-  #   merge-queue entry, the repository's contents) uses the workflow's own token, GH_TOKEN,
-  #   with the read permissions below: nami-ci has no Actions permission. The CI app's token,
-  #   NAMI_FILING_TOKEN, is narrowed to `issues: write` and does only the filing;
+  #   merge-queue entry, the repository's contents and the open issues) uses the workflow's
+  #   own token, GH_TOKEN, with the read permissions below: nami-ci has no Actions permission.
+  #   The CI app's token, NAMI_FILING_TOKEN, is narrowed to `issues: write` and only creates
+  #   the issue;
   # - no cache is restored (rule 5). Main's caches are written by jobs without a key, which run
   #   the build scripts and tests of code that no human may have read, so the job does not use
   #   ./.github/actions/setup. It builds xtask from a clean checkout, with the toolchain that
@@ -84,6 +85,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      issues: read
       pull-requests: read
     steps:
       - uses: actions/checkout@v7
