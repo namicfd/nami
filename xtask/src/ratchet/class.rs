@@ -1382,6 +1382,8 @@ mod tests {
             Some("xtask/src/tidy/rust_source/inner.rs")
         );
         assert_eq!(resolve(lib, &["super"]), None, "above the crate");
+        assert_eq!(resolve(RULES, &["super", "crate"]), None, "`crate` only first");
+        assert_eq!(resolve(RULES, &["inner", "self"]), None, "`self` only first");
         assert_eq!(resolve("README.md", &[]), None, "no crate");
     }
 

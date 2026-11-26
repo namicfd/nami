@@ -111,7 +111,7 @@ pub fn appended_lints(
 }
 
 /// The file of the module that the path `segments` names, seen from the file `caller`:
-/// `crate`, `self` and `super` first, then child modules, below the crate's `src/`. A module is
+/// `crate` or `self` first, `super`, then child modules, below the crate's `src/`. A module is
 /// `name.rs` and the crate root `lib.rs`. `None` for a path that leaves the crate.
 #[must_use]
 pub fn module_file(caller: &str, segments: &[String]) -> Option<String> {
@@ -125,6 +125,7 @@ pub fn module_file(caller: &str, segments: &[String]) -> Option<String> {
         match segment.as_str() {
             "crate" if index == 0 => module.clear(),
             "self" if index == 0 => {}
+            "crate" | "self" => return None,
             "super" => {
                 let _parent = module.pop()?;
             }
