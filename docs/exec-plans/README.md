@@ -130,7 +130,7 @@ A claim on such an issue is stale only if #n has had no push since the claim and
 
 If #n fails in the queue again, CI files a new issue #m2 for the new run. #m2 is ready, because #n does not say `Fixes #<m2>` yet, and it names #m. Keep `Fixes #<m>`, add `Fixes #<m2>`, and fix the new cause.
 
-The issue names only jobs, steps, tidy rules and lints that `main` defines. Read the log through its link. If the bot did not open #n, the issue carries `needs-decision` and a human rebases #n. If #n is closed, or merged without closing the issue, `ready` leaves the issue out and `claim` refuses it: a human closes it.
+The issue names only jobs, steps, tidy rules and lints that `main` defines. Read the log through its link. If the bot did not open #n, the issue carries `needs-decision` and a human rebases #n. If #n is closed, or merged without closing the issue, `ready` leaves the issue out and `claim` refuses it: a human closes it. While #n is in the merge queue, `ready` and `claim` hold the issue too: never push to a queued PR.
 
 ## Setting `passes`
 
