@@ -20,24 +20,51 @@
 #   - gh uses GH_TOKEN, which expires after an hour. Run `env` again for longer sessions.
 #
 # Configuration, from the environment:
-#   NAMI_AGENT_KEY        the app's private key (default: ~/.config/nami/nami-agent.pem)
-#   NAMI_AGENT_CLIENT_ID  the app's client ID (default: nami-agent's)
-#   NAMI_AGENT_REPO       owner/name of the repository (default: namicfd/nami)
+#   NAMI_AGENT_APP           which app to act as: `agent` (default) or `reviewer`
+#   NAMI_AGENT_KEY           the agents' app's private key (default: ~/.config/nami/nami-agent.pem)
+#   NAMI_AGENT_CLIENT_ID     the agents' app's client ID (default: nami-agent's)
+#   NAMI_REVIEWER_KEY        the reviewer app's private key
+#                            (default: ~/.config/nami/nami-reviewer.pem)
+#   NAMI_REVIEWER_CLIENT_ID  the reviewer app's client ID (no default; set once the app exists)
+#   NAMI_AGENT_REPO          owner/name of the repository (default: namicfd/nami)
+#
+# The reviewer app, `nami-reviewer[bot]`, posts the AI review that the ratchet counts (ADR-0022).
+# It only reads, reviews and resolves threads: `env` and `git-credential` refuse it, and it
+# never reads the agents' key or falls back to it. Its key lives where authoring sessions cannot
+# read it (docs/operations/github-setup.md, step 5b).
 #
 # Needs bash, openssl, curl and jq.
 set -euo pipefail
 
+fail() {
+  echo "agent-token: $*" >&2
+  exit 1
+}
+
 readonly api="https://api.github.com"
-readonly key="${NAMI_AGENT_KEY:-$HOME/.config/nami/nami-agent.pem}"
-readonly client_id="${NAMI_AGENT_CLIENT_ID:-Iv23liAQwForBGxIuQZv}"
 readonly repo="${NAMI_AGENT_REPO:-namicfd/nami}"
+readonly app="${NAMI_AGENT_APP:-agent}"
+case "$app" in
+  agent)
+    readonly key="${NAMI_AGENT_KEY:-$HOME/.config/nami/nami-agent.pem}"
+    readonly client_id="${NAMI_AGENT_CLIENT_ID:-Iv23liAQwForBGxIuQZv}"
+    ;;
+  reviewer)
+    readonly key="${NAMI_REVIEWER_KEY:-$HOME/.config/nami/nami-reviewer.pem}"
+    readonly client_id="${NAMI_REVIEWER_CLIENT_ID:-}"
+    [[ -n "$client_id" ]] ||
+      fail "NAMI_REVIEWER_CLIENT_ID is not set; see docs/operations/github-setup.md, step 5b"
+    ;;
+  *) fail "unknown app '$app' in NAMI_AGENT_APP; use agent or reviewer" ;;
+esac
 # The bot's user ID (not the app ID) comes from `gh api 'users/nami-agent%5Bbot%5D' --jq .id`.
 readonly bot_name="nami-agent[bot]"
 readonly bot_email="360897210+nami-agent[bot]@users.noreply.github.com"
 
-fail() {
-  echo "agent-token: $*" >&2
-  exit 1
+# The reviewer app reviews; it never commits or pushes.
+agent_only() {
+  [[ "$app" == "agent" ]] ||
+    fail "the reviewer app does not commit or push; '$1' is for the agents' app"
 }
 
 base64url() {
@@ -47,7 +74,7 @@ base64url() {
 # The app's JWT, signed with its private key (RS256). GitHub allows at most 10 minutes of
 # lifetime. `iat` is backdated by 60 seconds to tolerate clock drift.
 jwt() {
-  [[ -r "$key" ]] || fail "cannot read the private key at $key; set NAMI_AGENT_KEY"
+  [[ -r "$key" ]] || fail "cannot read the $app app's private key at $key"
   local now header payload signature
   now=$(date +%s)
   header=$(printf '{"alg":"RS256","typ":"JWT"}' | base64url)
@@ -122,8 +149,8 @@ EOF
 
 case "${1:-token}" in
   token) token ;;
-  env) env_exports ;;
-  git-credential) git_credential "${2:-}" ;;
+  env) agent_only env && env_exports ;;
+  git-credential) agent_only git-credential && git_credential "${2:-}" ;;
   jwt) jwt ;;
   *) fail "unknown command '$1'; use token, env, git-credential or jwt" ;;
 esac

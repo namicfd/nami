@@ -130,6 +130,30 @@ The bot's commit email is `<bot user id>+<app-slug>[bot]@users.noreply.github.co
 - **To rotate:** generate a new key in the app's settings, replace the file, then delete the old key there.
 - **If a key leaks:** delete it in the app's settings first. Tokens already issued expire within an hour.
 
+## 5b. The reviewer's GitHub App (ADR-0022)
+
+The `ratchet` check (ADR-0022, proposed) counts only reviews by a second app, `nami-reviewer[bot]`, and only threads that it resolved. Agents cannot stand in for it, because the authoring sessions never hold its key. Until it exists, `ratchet` gives no verdict on PRs that only change rule paths unless a code owner approves the head commit, so those still need your approval, as today: the safe default.
+
+1. **Create it** like the agents' app (step 5), named `nami-reviewer`, with **fewer permissions**:
+
+   | Permission | Access | Why |
+   |---|---|---|
+   | Pull requests | read and write | Post reviews, resolve review threads. |
+   | Contents | read | Read the PR's code. |
+   | Metadata | read | Set automatically. |
+
+   No contents write, no workflows, no issues: it never pushes. Give it no bypass and do not make it a code owner.
+2. **Install it** on this repository only.
+3. **Tell CI its login.** Settings → Secrets and variables → Actions → Variables → New repository variable: `NAMI_REVIEWER_LOGIN` = `nami-reviewer[bot]`. The `ratchet` job passes it to `--reviewer`. While the variable is unset, the review gate gives no verdict.
+4. **Keep the key away from authoring sessions.** Every authoring session can read the files of the user it runs as, so the reviewer's key must belong to another user:
+   - create a separate OS account (for example `nami-review`) on the machine that runs reviews, or use a separate machine or orchestrator secret;
+   - store the key there only, as `~/.config/nami/nami-reviewer.pem` with mode 600, or at `NAMI_REVIEWER_KEY`;
+   - set `NAMI_REVIEWER_CLIENT_ID` in that account's environment (`gh api apps/nami-reviewer --jq .client_id`);
+   - start `/review-pr` sessions as that account, in their own clone; never as the authoring user, and never put the reviewer key in `NAMI_AGENT_KEY`, a repository or a shared directory.
+5. **Check it.** As the reviewer account: `GH_TOKEN=$(NAMI_AGENT_APP=reviewer xtask/agent-token.sh) gh api repos/$REPO --jq .full_name`. As the authoring user, the same command must fail: it cannot read the key.
+
+`xtask/agent-token.sh` selects the app with `NAMI_AGENT_APP` (`agent` by default, or `reviewer`). The reviewer app only mints tokens; `env` and `git-credential` refuse it.
+
 ## 6. Running something as the bot
 
 Agents act as the bot, never with a human's credentials. A maintainer's key reaches every repository they can access and is the ruleset's bypass actor; the bot's token reaches this repository only and expires within an hour.
