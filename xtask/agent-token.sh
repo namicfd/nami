@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Acts as the agents' GitHub App, `nami-agent` (ADR-0008): mints short-lived tokens so that
-# agents push, open PRs and comment as `nami-agent[bot]`, never as the maintainer. Code-owner
-# review only works if the author of a PR is not the code owner.
+# Acts as one of nami's GitHub Apps and mints short-lived tokens for it:
+# - `nami-agent` (the default): agents push, open PRs and comment as `nami-agent[bot]`, never
+#   as the maintainer (ADR-0008). Code-owner review only works if the author of a PR is not the
+#   code owner.
+# - `nami-ci` (`NAMI_AGENT_APP=ci`): CI jobs file the issues that agents act on as
+#   `nami-ci[bot]` (ADR-0023). It never reads the agents' key or falls back to it, and `env`
+#   refuses it: its jobs mint one token and use it, and make no commits as the agents.
 #
 # Usage:
 #   xtask/agent-token.sh [token]             print an installation token (valid for 1 hour)
@@ -21,27 +25,53 @@
 #   - gh uses GH_TOKEN, which expires after an hour. Run `env` again for longer sessions.
 #
 # Configuration, from the environment:
-#   NAMI_AGENT_KEY        the app's private key (default: ~/.config/nami/nami-agent.pem)
-#   NAMI_AGENT_CLIENT_ID  the app's client ID (default: nami-agent's)
-#   NAMI_AGENT_REPO       owner/name of the repository (default: namicfd/nami)
+#   NAMI_AGENT_APP          which app to act as: `agent` (default) or `ci`
+#   NAMI_AGENT_KEY          the agents' app's private key
+#                           (default: ~/.config/nami/nami-agent.pem)
+#   NAMI_AGENT_CLIENT_ID    the agents' app's client ID (default: nami-agent's)
+#   NAMI_CI_KEY             the CI app's private key (no default: CI writes it to a file)
+#   NAMI_CI_CLIENT_ID       the CI app's client ID (no default: a repository variable)
+#   NAMI_AGENT_REPO         owner/name of the repository (default: namicfd/nami)
 #   NAMI_AGENT_PERMISSIONS  a JSON object that narrows the token to fewer permissions than the
-#                         app has, such as '{"issues":"write"}' (default: all of the app's)
+#                           app has, such as '{"issues":"write"}'. Unset or empty, the token
+#                           has all of the app's permissions. That is refused in CI (CI or
+#                           GITHUB_ACTIONS is `true`) and for the CI app anywhere (ADR-0023,
+#                           rule 2). `{}` narrows nothing and is always refused.
 #
 # Needs bash, openssl, curl and jq.
 set -euo pipefail
 
+fail() {
+  echo "agent-token: $*" >&2
+  exit 1
+}
+
 readonly api="https://api.github.com"
-readonly key="${NAMI_AGENT_KEY:-$HOME/.config/nami/nami-agent.pem}"
-readonly client_id="${NAMI_AGENT_CLIENT_ID:-Iv23liAQwForBGxIuQZv}"
 readonly repo="${NAMI_AGENT_REPO:-namicfd/nami}"
 readonly permissions="${NAMI_AGENT_PERMISSIONS:-}"
+readonly app="${NAMI_AGENT_APP:-agent}"
+case "$app" in
+  agent)
+    readonly key="${NAMI_AGENT_KEY:-$HOME/.config/nami/nami-agent.pem}"
+    readonly client_id="${NAMI_AGENT_CLIENT_ID:-Iv23liAQwForBGxIuQZv}"
+    ;;
+  ci)
+    readonly key="${NAMI_CI_KEY:-}"
+    readonly client_id="${NAMI_CI_CLIENT_ID:-}"
+    [[ -n "$key" ]] || fail "NAMI_CI_KEY is not set; it names the file with the CI app's key"
+    [[ -n "$client_id" ]] ||
+      fail "NAMI_CI_CLIENT_ID is not set; see docs/operations/github-setup.md, step 8"
+    ;;
+  *) fail "unknown app '$app' in NAMI_AGENT_APP; use agent or ci" ;;
+esac
 # The bot's user ID (not the app ID) comes from `gh api 'users/nami-agent%5Bbot%5D' --jq .id`.
 readonly bot_name="nami-agent[bot]"
 readonly bot_email="360897210+nami-agent[bot]@users.noreply.github.com"
 
-fail() {
-  echo "agent-token: $*" >&2
-  exit 1
+# True when the token must be narrowed: inside a CI run, where GitHub Actions sets both
+# variables to `true`, and for the CI app wherever it runs.
+must_narrow() {
+  [[ "${CI:-}" == "true" || "${GITHUB_ACTIONS:-}" == "true" || "$app" == "ci" ]]
 }
 
 base64url() {
@@ -51,7 +81,7 @@ base64url() {
 # The app's JWT, signed with its private key (RS256). GitHub allows at most 10 minutes of
 # lifetime. `iat` is backdated by 60 seconds to tolerate clock drift.
 jwt() {
-  [[ -r "$key" ]] || fail "cannot read the private key at $key; set NAMI_AGENT_KEY"
+  [[ -r "$key" ]] || fail "cannot read the $app app's private key at $key"
   local now header payload signature
   now=$(date +%s)
   header=$(printf '{"alg":"RS256","typ":"JWT"}' | base64url)
@@ -82,15 +112,25 @@ github() {
 }
 
 # The body of the token request: this one repository, and the permissions if any are named.
+# CI and the CI app must name them, so that no job holds a token with all of an app's
+# permissions.
 token_request() {
   local request
   request=$(jq -cn --arg name "${repo#*/}" '{repositories: [$name]}')
-  if [[ -n "$permissions" ]]; then
-    request=$(jq -c --argjson permissions "$permissions" \
-      'if ($permissions | type) == "object" then . + {permissions: $permissions} else error end' \
-      <<<"$request" 2>/dev/null) ||
-      fail "NAMI_AGENT_PERMISSIONS must be a JSON object, such as '{\"issues\":\"write\"}'"
+  if [[ -z "$permissions" ]]; then
+    ! must_narrow || fail "CI and the CI app must narrow the token: set" \
+      "NAMI_AGENT_PERMISSIONS to the permissions the job needs, such as" \
+      "'{\"issues\":\"write\"}' (ADR-0023, rule 2)"
+    printf '%s' "$request"
+    return 0
   fi
+  request=$(jq -c --argjson permissions "$permissions" \
+    'if ($permissions | type) == "object" then . + {permissions: $permissions} else error end' \
+    <<<"$request" 2>/dev/null) ||
+    fail "NAMI_AGENT_PERMISSIONS must be a JSON object, such as '{\"issues\":\"write\"}'"
+  [[ $(jq '.permissions | length' <<<"$request") -gt 0 ]] ||
+    fail "NAMI_AGENT_PERMISSIONS is {}, which narrows nothing; name the permissions" \
+      "the token needs, such as '{\"issues\":\"write\"}'"
   printf '%s' "$request"
 }
 
@@ -124,6 +164,8 @@ git_credential() {
 # clears the helpers from the user's own config (for example osxkeychain), so the maintainer's
 # credentials are never used.
 env_exports() {
+  [[ "$app" == "agent" ]] ||
+    fail "'env' makes git commit as nami-agent[bot], so it is for the agents' app only"
   local self gh_token
   self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   gh_token=$(token)
