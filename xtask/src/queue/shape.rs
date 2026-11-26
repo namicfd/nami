@@ -29,7 +29,8 @@ const EARLIER: (&str, &str) =
 const GROUP: (&str, &str) = (" The same merge group also held ", ", so the failure");
 
 /// True if `body` is the body that `cargo xtask queue failed` writes for the issue titled
-/// `title` in `repository`, with every quoted name in `vocabulary`.
+/// `title` in `repository`, with every quoted name in `vocabulary`. Repository names are
+/// compared without ASCII case, as GitHub compares them.
 #[must_use]
 pub fn is_finding(title: &str, body: &str, vocabulary: &Vocabulary, repository: &str) -> bool {
     let Some((pull, run)) = entry_of_title(title) else {
@@ -39,7 +40,7 @@ pub fn is_finding(title: &str, body: &str, vocabulary: &Vocabulary, repository: 
     let Some(failure) = failure_of_body(pull, run, &body, vocabulary) else {
         return false;
     };
-    if failure.repository != repository {
+    if !failure.repository.eq_ignore_ascii_case(repository) {
         return false;
     }
     let ascii_end = |text: &str| text.trim_end_matches(|c: char| c.is_ascii_whitespace()).len();
@@ -295,6 +296,8 @@ pub(crate) mod tests {
             assert!(!is_finding(&other, &body, &vocabulary(), here), "another run's title");
             let elsewhere = "attacker/evil";
             assert!(!is_finding(&title, &body, &vocabulary(), elsewhere), "links elsewhere");
+            let upper = here.to_ascii_uppercase();
+            assert!(is_finding(&title, &body, &vocabulary(), &upper), "GitHub ignores case");
         }
     }
 

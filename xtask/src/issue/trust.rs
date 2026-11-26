@@ -100,6 +100,12 @@ impl Trust {
     pub fn is_owner(&self, login: &str) -> bool {
         !login.ends_with("[bot]") && self.owners.contains(&login.to_ascii_lowercase())
     }
+
+    /// Why the CI app's issues cannot be checked here, or `None` if they can.
+    #[must_use]
+    pub fn ci_unavailable(&self) -> Option<&str> {
+        self.ci.as_ref().err().map(String::as_str)
+    }
 }
 
 /// The trust list from `.github/CODEOWNERS` at `reference`, such as `origin/main`, with what

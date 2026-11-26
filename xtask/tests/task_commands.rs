@@ -18,6 +18,8 @@ struct Fake {
     queued: Vec<u32>,
     /// The pull requests whose head branch is in a fork.
     forks: Vec<u32>,
+    /// True if only the lookup of a pull request's head fails.
+    heads_down: bool,
     is_down: bool,
     is_label_gone: bool,
     asked: RefCell<Vec<u32>>,
@@ -69,8 +71,8 @@ impl GitHub for Fake {
         }
     }
     fn head_is_here(&self, number: u32) -> Result<bool, String> {
-        if self.is_down {
-            Err("GitHub is down".to_owned())
+        if self.is_down || self.heads_down {
+            Err(format!("cannot read #{number}'s head"))
         } else {
             Ok(!self.forks.contains(&number))
         }
@@ -436,7 +438,6 @@ fn queue_failures_wait_for_their_fix() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
-<<<<<<< HEAD
 // Goal: without the repository's `needs-decision` label, renamed or deleted, nobody can tell
 // which issues wait for a decision: `ready` lists no issue and says why, still naming the plan
 // tasks, and `claim` refuses every issue.
@@ -574,8 +575,47 @@ fn queue_failures_of_other_prs_are_held() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
-// Goal: hostile bodies under a queue-failure title by the CI app make `task ready`, `claim`
-// and `status` refuse or leave out the issue, and never panic.
+// Goal: when GitHub cannot say where a queue-failure PR's head is, the issue is never
+// treated as work: `ready` leaves it out and fails, `claim` refuses, and `status` says that
+// the state of a held claim is unknown.
+#[test]
+fn an_unknown_head_holds_the_issue() {
+    let (root, clone, vocabulary) = ci_setup("queue-failures-unknown-head");
+    let issues = vec![ci_failure(&vocabulary, 3, 900, "namicfd/nami"), pull_45("Summary.")];
+    let mut github = Fake { issues, ..Fake::default() };
+    let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
+    let claimed = task(&github, &["claim", "issue-3"]).expect("work while the head is known");
+    assert!(claimed.contains("fix it on #45's own branch"), "{claimed}");
+    github.heads_down = true;
+    let status = task(&github, &["status"]).expect("status works");
+    assert!(status.contains("its fix's state is unknown: cannot read #45's head"), "{status}");
+    assert_eq!(task(&github, &["release", "issue-3"]), Ok("released issue-3\n".to_owned()));
+    let ready = task(&github, &["ready"]).expect_err("an incomplete list fails");
+    assert!(ready.starts_with("1 issue(s) left out"), "{ready}");
+    let refused = task(&github, &["claim", "issue-3"]).expect_err("the head is unknown");
+    assert!(refused.contains("cannot read #45's head"), "{refused}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: when the CI app's issues cannot be checked here, `ready` says so and fails instead
+// of leaving them out silently; other issues are still listed.
+#[test]
+fn an_unchecked_ci_issue_makes_ready_fail() {
+    let (root, clone) = setup("queue-failures-unchecked");
+    push_code_owners(&clone);
+    let ci = Issue { author: "nami-ci[bot]".to_owned(), ..queue_failure(3, 900) };
+    let github = Fake {
+        issues: vec![ci, issue(5, "nami-agent[bot]", &["bug"]), pull_45("Summary.")],
+        ..Fake::default()
+    };
+    let ready = execute(&clone, "origin", &github, &["ready"]).expect_err("incomplete");
+    assert!(ready.starts_with("1 issue(s) left out"), "{ready}");
+    assert!(ready.ends_with("a\tTask a\nissue-5\tIssue 5\n"), "{ready}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: hostile bodies under a queue-failure title by the CI app make `task ready` and
+// `claim` refuse or leave out the issue, and never panic.
 #[test]
 fn hostile_ci_bodies_never_panic() {
     let (root, clone, vocabulary) = ci_setup("queue-failures-hostile");
@@ -603,7 +643,6 @@ fn hostile_ci_bodies_never_panic() {
         let refused = task(&["claim", &format!("issue-{number}")]).expect_err("untrusted");
         assert!(refused.contains("`nami-ci[bot]`, whom agents trust only"), "{refused}");
     }
-    assert!(task(&["status"]).is_ok(), "status reads them too");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

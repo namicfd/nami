@@ -318,12 +318,18 @@ fn as_number(value: &Value) -> Option<u32> {
 /// repository also for a PR from a fork, so CI reads the right name.
 ///
 /// The URL is the one configured for the remote, before any `url.<base>.insteadOf` rewrite:
-/// the name that the remote stands for, wherever git fetches it from.
+/// the name that the remote stands for, wherever git fetches it from. A remote with more than
+/// one URL names no single repository, so it gives `None`.
 #[must_use]
 pub fn repository_of(root: &Path, remote: &str) -> Option<String> {
     let key = format!("remote.{remote}.url");
-    let url = crate::task::claims::git(root, &["config", "--get", &key], &[], None).ok()?;
-    repository_of_url(url.trim())
+    let urls = crate::task::claims::git(root, &["config", "--get-all", &key], &[], None).ok()?;
+    let mut lines = urls.lines().map(str::trim).filter(|line| !line.is_empty());
+    let url = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    repository_of_url(url)
 }
 
 /// The `owner/name` of a GitHub remote URL: `https://github.com/owner/name(.git)`,
@@ -715,6 +721,12 @@ mod tests {
         assert_eq!(super::repository_of(scratch.root(), "origin").as_deref(), Some("namicfd/nami"));
         assert_eq!(super::repository_of(scratch.root(), "elsewhere"), None, "not on GitHub");
         assert_eq!(super::repository_of(scratch.root(), "no-such-remote"), None);
+        let rewritten = "url./elsewhere/mirror.git.insteadOf";
+        let _ = git(&["config", rewritten, "git@github.com:namicfd/nami.git"]);
+        let name = super::repository_of(scratch.root(), "origin");
+        assert_eq!(name.as_deref(), Some("namicfd/nami"), "the name before any rewrite");
+        let _ = git(&["config", "--add", "remote.origin.url", "https://github.com/attacker/evil"]);
+        assert_eq!(super::repository_of(scratch.root(), "origin"), None, "two URLs name none");
     }
 
     // Goal: `gh --jq '.[]'` output becomes one value per line; blank lines are skipped, and a

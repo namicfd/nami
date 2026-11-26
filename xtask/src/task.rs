@@ -235,6 +235,17 @@ fn ready_issues(
     let mut left_out = Vec::new();
     for found in candidates {
         let id = issue::id_of(found.number);
+        // An issue by the CI app that cannot be checked here is left out loudly, not silently:
+        // it may be work, and the reason says what to fix.
+        let unchecked = (found.author == trust::CI_LOGIN).then(|| trust.ci_unavailable());
+        if let Some(Some(reason)) = unchecked.filter(|_| !held.contains(id.as_str())) {
+            eprintln!(
+                "task: {id} is left out of the list: the CI app's issues cannot be checked \
+                 here: {reason}"
+            );
+            left_out.push(found.number);
+            continue;
+        }
         // The cheap checks first: label events cost one request per issue, and comments one
         // more when the bot removed `needs-decision` last.
         if held.contains(id.as_str()) || trust::unworkable(found, &[], &[], &trust).is_some() {
