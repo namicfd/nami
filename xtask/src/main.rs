@@ -14,6 +14,7 @@ fn main() -> ExitCode {
         ["tidy", "--root", root, "--policy", policy] => xtask::tidy::cli::tidy(root, Some(policy)),
         ["rules"] => xtask::tidy::cli::rules(&xtask::workspace_root(), false),
         ["rules", "--write"] => xtask::tidy::cli::rules(&xtask::workspace_root(), true),
+        ["ratchet", options @ ..] => xtask::ratchet::cli::run(options),
         ["doctor"] => xtask::doctor::run(),
         ["dylint"] => xtask::dylint::run(&xtask::workspace_root()),
         ["protected", options @ ..] => xtask::pr::run_protected(options),
@@ -24,7 +25,7 @@ fn main() -> ExitCode {
         ["queue", rest @ ..] => xtask::queue::run(rest),
         _ => {
             eprintln!("usage: cargo xtask tidy [--file <path> | --root <dir> [--policy <dir>]]");
-            eprintln!("       | rules [--write]");
+            eprintln!("       | rules [--write] | ratchet <options>");
             eprintln!(
                 "       | doctor | dylint | protected [--base <ref>] | pr-body [--base <ref>]"
             );

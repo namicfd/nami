@@ -23,7 +23,7 @@ const LINT_SOURCES: &str = "lints/src";
 const DIRECTORIES_MAX: u32 = 1_000;
 
 /// Offset basis of the 64-bit FNV-1a hash.
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Prime of the 64-bit FNV-1a hash.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -105,7 +105,7 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 /// Continues a 64-bit FNV-1a hash over `bytes`.
-fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
     // FNV multiplies modulo 2^64 by definition, so wrapping is the intended arithmetic.
     bytes.iter().fold(hash, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME))
 }

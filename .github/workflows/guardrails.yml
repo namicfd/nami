@@ -1,17 +1,26 @@
-# Checks on what a pull request does to the guardrails themselves (ADR-0020).
-# Neither job is a required check: a guardrail change waits for the code owner anyway
-# (ADR-0015). These jobs tell the code owner where to look first.
+# Checks on what a pull request does to the guardrails themselves (ADR-0020, ADR-0022).
+# `pr body` and `base gate` are not required checks: they tell the code owner where to look
+# first. `ratchet` proves that a PR which changes only rule paths only tightens them (proposed in
+# ADR-0022). It runs in shadow mode: its verdict shows in the job summary of every PR, but it is
+# not a required check, and every guardrail path keeps its code owner, until the policy flip.
 name: guardrails
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # The ratchet reads the AI review, which arrives after the push, so a review runs it again.
+  pull_request_review:
+    types: [submitted, dismissed]
+  # The merge queue waits for every required check on the rebased result (ADR-0009).
+  merge_group:
 
 permissions:
   contents: read
 
+# A review or an edit replaces the run for the same pull request, every job included, so that no
+# job of an older run is left skipped or stale beside the new one.
 concurrency:
-  group: guardrails-${{ github.ref }}
+  group: guardrails-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,6 +31,8 @@ jobs:
   # and a PR from a claimed issue's branch closes that issue (ADR-0021).
   pr-body:
     name: pr body
+    # A merge group has no description.
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Reading issues lets the check confirm that each listed issue is a trusted follow-up.
@@ -36,8 +47,8 @@ jobs:
       - name: cargo xtask pr-body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-          PR_BRANCH: ${{ github.head_ref }}
-          BASE_REF: ${{ github.base_ref }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask pr-body --base "origin/${BASE_REF}"
 
@@ -46,6 +57,7 @@ jobs:
   # rule. It then runs the PR's tidy on the base tree and reports what the PR tightened.
   base-gate:
     name: base gate
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -55,7 +67,7 @@ jobs:
       - uses: ./.github/actions/setup
       - name: Check out the base branch next to the PR
         env:
-          BASE_REF: ${{ github.base_ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: git worktree add "${RUNNER_TEMP}/base" "origin/${BASE_REF}"
       - name: Base tidy on the PR tree (red means the PR loosened a rule it needed)
         working-directory: ${{ runner.temp }}/base
@@ -80,3 +92,118 @@ jobs:
               echo '```'
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
+
+  # The ratchet (ADR-0022) in two jobs, so that the job that judges never runs the PR's code.
+  #
+  # `ratchet (head)` builds and runs the PR's tools on the base's cases, with the base's
+  # `cargo xtask ratchet observe`, and uploads only what they printed, as JSON. Its steps get no
+  # token: checkout uses a read-only one and does not keep it.
+  ratchet-head:
+    name: ratchet (head)
+    runs-on: ubuntu-latest
+    # Mutation testing of a large lint change is the slow part (ADR-0022, Consequences).
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Check out the base next to the PR
+        env:
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          # A PR is checked out as GitHub's test merge, whose first parent is the base branch.
+          # A merge group names its base.
+          base="${QUEUE_BASE:-$(git rev-parse HEAD^1)}"
+          git worktree add --detach "${RUNNER_TEMP}/base" "${base}"
+      - name: The base's ratchet observes the PR's tools
+        working-directory: ${{ runner.temp }}/base
+        env:
+          # The base's binary is built outside every cached path.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+        run: |
+          mkdir -p "${RUNNER_TEMP}/observations"
+          if ! grep --quiet '"observe"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          cargo xtask ratchet observe --base . --head "${GITHUB_WORKSPACE}" \
+            --out "${RUNNER_TEMP}/observations/observations.json" --work "${RUNNER_TEMP}/work"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ratchet-observations
+          path: ${{ runner.temp }}/observations/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # `ratchet` judges: the base's binary, built here from the base's own checkout, reads the
+  # base's corpus from that checkout, the PR's source as data, and the observations. It runs no
+  # PR code, and its tools come from a pinned install here, never from a cache the PR's code
+  # could have written. It is meant to become the required check, so it already runs on every
+  # event and is never skipped: a skipped job counts as passed for a required check.
+  ratchet:
+    name: ratchet
+    needs: ratchet-head
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Reading the reviews and their threads is the review check.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the base next to the PR
+        env:
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          base="${QUEUE_BASE:-$(git rev-parse HEAD^1)}"
+          git worktree add --detach "${RUNNER_TEMP}/base" "${base}"
+      - name: Toolchains and the pinned dylint, installed in this job
+        working-directory: ${{ runner.temp }}/base
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            exit 0
+          fi
+          rustup toolchain install
+          (cd lints && rustup toolchain install)
+          # The versions are those of .github/actions/setup/action.yml.
+          cargo install --locked --root "${RUNNER_TEMP}/tools" cargo-dylint@6.4.0 dylint-link@6.4.0
+          echo "${RUNNER_TEMP}/tools/bin" >> "${GITHUB_PATH}"
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: ratchet-observations
+          path: ${{ runner.temp }}/observations
+      - name: The base's ratchet judges
+        working-directory: ${{ runner.temp }}/base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          # The reviewer app's login, once the maintainer has set it up (github-setup.md, 5b).
+          REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          # A merge group's ref is gh-readonly-queue/<base>/pr-<number>-<sha>.
+          number="${PR_NUMBER:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')}"
+          set +e
+          cargo xtask ratchet judge --base . --head "${GITHUB_WORKSPACE}" \
+            --observations "${RUNNER_TEMP}/observations/observations.json" \
+            --pr "${number}" --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" \
+            > "${RUNNER_TEMP}/ratchet.md"
+          status=$?
+          cat "${RUNNER_TEMP}/ratchet.md" >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"

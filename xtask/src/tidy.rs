@@ -59,6 +59,9 @@ pub const ADR_DIRECTORY: &str = "docs/design";
 /// The style guide, relative to the root.
 pub const STYLE_GUIDE: &str = "docs/TIGER_STYLE.md";
 
+/// What precedes the virtual path in the first line of a tidy fixture.
+pub(crate) const FIXTURE_PATH_MARKER: &str = "path: ";
+
 /// The one file allowed to use `usize` in signatures and fields (ADR-0002).
 const INDEX_MODULE: &str = "crates/base/src/index.rs";
 
@@ -103,6 +106,18 @@ pub fn is_adr_file_name(name: &str) -> bool {
     let has_number = bytes.iter().take(4).filter(|byte| byte.is_ascii_digit()).count() == 4;
     let is_markdown = Path::new(name).extension().is_some_and(|extension| extension == "md");
     has_number && bytes.get(4) == Some(&b'-') && is_markdown
+}
+
+/// Reads the virtual path from the first line of a tidy fixture: `// path: <path>`,
+/// `# path: <path>` or `<!-- path: <path> -->`. The path decides which rules apply to the
+/// fixture. The fixture tests and the ratchet (ADR-0022) both read it here.
+#[must_use]
+pub fn fixture_virtual_path(first_line: &str) -> Option<PathBuf> {
+    let line = first_line.trim();
+    let body = ["//", "<!--", "#"].iter().find_map(|prefix| line.strip_prefix(prefix))?;
+    let body = body.strip_suffix("-->").unwrap_or(body).trim();
+    let path = body.strip_prefix(FIXTURE_PATH_MARKER)?.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// Where a source file lives, which decides the rules that apply to it.
@@ -364,6 +379,16 @@ fn files_below(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
         }
     }
     panic!("tidy visited more than {DIRECTORIES_MAX} directories under {}", root.display());
+}
+
+/// True if [`check`] reads the file at `relative` below `root`: a document with rules, or a
+/// file below no skipped directory. The ratchet plants cases only where this holds.
+#[must_use]
+pub fn is_walked(root: &Path, relative: &Path) -> bool {
+    let is_document =
+        relative.parent() == Some(Path::new(ADR_DIRECTORY)) || relative == Path::new(STYLE_GUIDE);
+    let mut directories = relative.ancestors().skip(1).filter(|path| !path.as_os_str().is_empty());
+    is_document || !directories.any(|directory| is_skipped(root, directory))
 }
 
 fn is_skipped(root: &Path, relative: &Path) -> bool {
@@ -665,6 +690,19 @@ mod tests {
             counted += u32::from(fires);
         }
         assert_eq!(counted, 7, "both exempt only test modules, test functions and tooling");
+    }
+
+    // Goal: the walk reads sources below no skipped directory, and the documents with rules,
+    // and nothing below `docs/`, `target/`, tidy's fixtures or the root `.claude/`.
+    #[test]
+    fn walked_files_are_recognised() {
+        let root = crate::workspace_root();
+        let walked = |path: &str| super::is_walked(&root, Path::new(path));
+        assert!(walked("crates/solver/src/r1.rs") && walked("xtask/src/r1.rs") && walked("r1.rs"));
+        assert!(walked("docs/design/0099-x.md") && walked("docs/TIGER_STYLE.md"));
+        assert!(!walked("docs/exec-plans/completed/r1.rs") && !walked(".claude/agents/r1.rs"));
+        assert!(!walked("crates/a/target/r1.rs") && !walked("xtask/fixtures/tidy/r1.rs"));
+        assert!(walked("crates/a/.claude/r1.rs"), "only the root .claude is skipped");
     }
 
     // Goal: ADR files are recognised by their four-digit prefix.

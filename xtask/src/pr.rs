@@ -107,7 +107,9 @@ pub fn parse_codeowners(text: &str) -> Result<Vec<Pattern>, String> {
     Ok(patterns)
 }
 
-fn parse_pattern(pattern: &str) -> Option<Pattern> {
+/// Parses one CODEOWNERS pattern in a supported form: `/path/file`, `/dir/` or `**/name`.
+#[must_use]
+pub fn parse_pattern(pattern: &str) -> Option<Pattern> {
     if let Some(name) = pattern.strip_prefix("**/") {
         let is_name = is_plain_path(name) && !name.contains('/');
         return is_name.then(|| Pattern::AnyDepth(name.to_owned()));
