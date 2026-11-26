@@ -77,16 +77,23 @@ The ratchet sorts each rule-path diff into one class (`xtask/src/ratchet/class.r
 
 **Additive** means that every change in the rule paths is one of these:
 
-- **(a) New items, new files and modules for a new rule.** A new top-level item of a Rust file, new or existing: a function, a struct, enum, union or trait, an `impl` whose type is itself new, a lint or lint pass declared with `declare_lint!`, `declare_tool_lint!` or `declare_lint_pass!`, a test module; in a new file also an import without a glob, and in an existing file a file module `mod name;` for a new file. A new item carries only the attributes `doc`, `derive`, `must_use`, `inline`, `expect` and `test`, and names nothing that reaches the environment, a process or the file system (`env`, `option_env`, `process`, `Command`, `fs`, `io`, and the `Path` methods that ask the file system, such as `exists` and `metadata`). In an existing file, its name is no identifier of the base's file, so that it shadows nothing the existing code names: a prelude item such as `drop`, an import, a glob. An `impl` for a type that is not new is an edit, because it can override a trait's default method or change which method a call resolves to.
+- **(a) New items, new files and modules for a new rule.** A new top-level item of a Rust file, new or existing: a function, a struct, enum, union or trait, a lint or lint pass declared with `declare_lint!`, `declare_tool_lint!` or `declare_lint_pass!`, a test module; in a new file also an import without a glob, and in an existing file a file module `mod name;` for a new file. A new item:
+  - carries only the attributes `doc`, `derive`, `must_use`, `inline`, `expect` and `test`;
+  - names nothing that reaches the environment, a process or the file system (`env`, `option_env`, `process`, `Command`, `fs`, `io`, and the `Path` methods that ask the file system, such as `exists` and `metadata`);
+  - uses none of `include!`, `include_str!`, `include_bytes!`, `file!`, `env!` and `option_env!`, a test among them: a test that pins `include_str!(file!())` kills every mutant of the file without testing a rule;
+  - holds no `impl`, trait, module or `macro_rules!` nested inside it;
+  - in an existing file, has a name that is no identifier of the base's file, so that it shadows nothing the existing code names: a prelude item such as `drop`, an import, a glob.
+
+  **A new `impl` is additive only** when it is a top-level item of the same file that defines its new self type; the self type is a single-segment path naming that type, with no generics, lifetimes or type parameters on the `impl`; and a trait `impl` is of a trait new in the same file, or of one of `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Default` and `Display`, which cannot change which method a call on an existing type resolves to. Anything else is an edit: an `impl` of an existing type, an inherent `impl` in another file, a blanket or generic `impl` (`impl<T>`, even when its parameter shadows the new type's name), and an `impl` of a visitor trait such as `Visit` or `LateLintPass`, whose default methods are rule code (#57's review, round 5). So a new lint is additive in its file, declaration, pass and registration, and its `impl LateLintPass` makes the diff an edit.
 - **(b) One dispatch call per new item, at the existing dispatch sites.** A statement inserted at the top level of an existing function's body, in one of these forms:
-  - `f(args);`, `module::f(args);` or `Type::f(args);`, calling a new function or a function of a new type;
+  - `f(args);`, `module::f(args);` or `Type::f(args);`, calling a function new in the file that the path resolves to, or a function of a type new there;
   - `place.extend(call);`, where `call` is such a call and `place` a path or a field of one, such as `self.violations`, so that the new rule's reports join the existing ones;
   - `place.register_lints(&[NEW, ..]);` with new lints only, or the base's registration with new lints appended;
   - `place.register_late_lint_pass(Box::new(|_| Box::new(NewPass)));`, or the early form, for a new lint pass.
 
   Every argument is a literal or a shared reference to a path or a field of one: no `&mut`, no value that may be a reborrowed `&mut`, no method call, block or closure. So the new code gets no way to change the state that the existing rules read. Each new item is dispatched at most once.
 - **(c) New registry rows, and rows that the data checks prove only tighten:** every field that a change touches is one that the rule-set check compares, or one that only documents (point 3).
-- **(d) New fixtures and UI cases,** and new items inside an existing test module, whose existing items stay as they are. Existing fixtures and UI cases stay byte for byte.
+- **(d) New fixtures and UI cases,** and new items inside an existing test module, whose existing items stay as they are, if they use none of the macros above that read the source tree or the environment. Existing fixtures and UI cases stay byte for byte.
 - **(e) Documentation:** the documentation-only fields of a registry row, and doc comments anywhere.
 - **(f) The regenerated `docs/RULES.md`.**
 
@@ -94,13 +101,14 @@ The ratchet sorts each rule-path diff into one class (`xtask/src/ratchet/class.r
 
 - a changed or removed function, method, constant, static, type, `impl`, trait, import, macro or test;
 - a new member of an existing `impl`, or a new item inside an existing inline module other than the test module;
+- an `impl` that is not a plain `impl` of a type new in the same file (above);
 - a new constant or static (mutation testing makes no mutant for its value), a new macro or inline module, an import into an existing module;
 - a registry row change that no data check proves, such as a new planned row or a changed `mechanism`;
 - a changed or deleted fixture, UI case or other file.
 
 **What each class needs.**
 
-- **Additive:** every check of point 3 holds, and the review gate of point 6 as it stands for any rule-path PR. Nothing else.
+- **Additive: it merges on the ratchet's proof alone.** Every check of point 3 holds, and no request for changes or thread by the reviewer app is open (point 6). The app need not have reviewed the head, nor exist: an unreviewed additive diff passes.
 - **Edit:** every check of point 3 still runs, and its findings still fail the PR. In addition, the review gate needs **an `APPROVE` by the reviewer app on the head commit**, as its latest decision, with every one of its threads resolved by it. Without that, the verdict is "no verdict: edit to existing rule code needs the reviewer app's approval or a code owner's". A code owner's approval of the head commit settles it, as for everything else the ratchet cannot prove. With the app's approval, the approval also stands in for a changed hunk without a mutant of its own, because a test edited together with the code it tests proves nothing about the edit.
 
 Both verdict lines of the shadow summary name the class (`ratchet: pass (additive)`, `ratchet: no verdict (edit), ..`), and the summary lists each change that makes a diff an edit.
@@ -165,7 +173,7 @@ The judge draws the placements again from the recorded seed, after checking that
   - a base corpus that is empty or differs from the one observed, or a head tree that differs from the one observed;
   - a head with a symbolic link, or a source form the `syn` reading cannot vouch for;
   - a pull request whose head moved on from the commit judged;
-  - something unproven (no mutant, no reviewer app, a skipped check, an edit without the reviewer app's approval) when no code owner reviews the PR.
+  - something unproven (a hunk without a mutant, a skipped check, an edit without the reviewer app's approval) when no code owner reviews the PR.
 
   When the base's CODEOWNERS owns a changed path, the owner reviews anyway, and the unproven items become notes. So do they when a user whom the base's CODEOWNERS names has approved the PR's head commit: a rule-only PR that the ratchet cannot vouch for then needs the owner's approval, never the admin bypass.
 
@@ -200,26 +208,27 @@ In a merge group, the judge diffs the group's head against the group's parent co
 
 ### 6. The review gate
 
-For every rule-path PR, the check passes when all of these hold:
+The reviewer app is the bot that the repository variable `NAMI_REVIEWER_LOGIN` names (`nami-reviewer[bot]`, a GitHub App separate from the agents' `nami-agent[bot]`). For every rule-path PR, additive or edit, the check fails unless all of these hold:
 
-- the reviewer app, the bot that the repository variable `NAMI_REVIEWER_LOGIN` names (`nami-reviewer[bot]`, a GitHub App separate from the agents' `nami-agent[bot]`), has a comment or approval on the PR's head commit; without one, the review is unproven, so a code owner's approval of the head stands in;
 - no request for changes by the app stands: a later comment or approval by the app withdraws one, but a dismissed request, which any writer can dismiss, the authoring app included, stands until the app approves; a dismissed review whose earlier state is not known counts as a dismissed request;
 - the PR was not opened by that app;
 - every review thread that the app opened is resolved, and resolved by that app.
 
-**For an edit** (point 2), the app's latest decision must in addition be an `APPROVE` of the head commit. A comment does not decide, so a later comment leaves the approval standing; a later request for changes, a dismissal of the approval, or an approval of an earlier commit does not count.
+**For an additive diff, that is all** (maintainer's decision: additive diffs merge on the ratchet's proof alone). The app need not have reviewed the head commit, and need not be set up; the summary notes whether it reviewed.
+
+**For an edit** (point 2), the app's latest decision must in addition be an `APPROVE` of the head commit. A comment does not decide, so a later comment leaves the approval standing; a later request for changes, a dismissal of the approval, or an approval of an earlier commit does not count. Without the approval, a code owner's approval of the head commit stands in.
 
 Everyone else's threads are left to the ruleset, which requires every conversation resolved before merge; they are never a ratchet finding, whoever resolved them. A review of an earlier commit does not count, not even for fixes: the reviewer re-reviews the new head and resolves the fixed threads then. The judge passes the head commit it judged, and gives no verdict when the PR's head has moved on by the time the reviews are read.
 
 **Identity.** An app is matched by its account type and exact login with `[bot]`, never by a login alone, so a user account named `nami-reviewer` is not the reviewer. GitHub logins cannot contain `[`, so only an app has such a login. A code owner's approval counts by that owner's latest review that decided something: a later request for changes, or the dismissal of the approval, cancels it, and any owner's standing request for changes blocks.
 
-**Where the review runs.** The gate counts the reviews that the bot posts, whatever posts them. The reviewer is to run in CI (#59), from a workflow that holds the app's key as a secret and runs no PR code, so that no authoring session can post as it. The gate does not depend on that: until the app exists and the variable is set, the review gate gives no verdict, so a rule-path PR, additive or edit, needs a code owner's approval of its head commit, as today: the safe default.
+**Where the review runs.** The gate counts the reviews that the bot posts, whatever posts them. The reviewer is to run in CI (#59), from a workflow that holds the app's key as a secret and runs no PR code, so that no authoring session can post as it. The gate does not depend on that. Until the app exists and the variable is set, an additive PR merges on the ratchet alone, and an edit needs a code owner's approval of its head commit, as today.
 
 **A requirement on the CI-hosted reviewer (#59):** it must be able to submit `APPROVE`, not only `COMMENT`. An edit merges only on the app's approval, and only the app's approval withdraws a request for changes by it that a writer dismissed.
 
 ### 7. Staging
 
-The ratchet lands in shadow mode first: the core moves, then `ratchet observe` and `ratchet judge` with both CI jobs, not required, with every guardrail path still owned. The CI-hosted reviewer lands separately (#59). The policy flip comes last and alone: this ADR, the owner-less CODEOWNERS lines with their last-match rule, and making `ratchet` a required check. It merges right after the ratchet (#57), without a period of shadow evidence (maintainer's decision), once `ratchet` is a required check (`docs/operations/github-setup.md`, step 9). Until the CI-hosted reviewer (#59) exists, the review gate gives no verdict, so a rule-only PR still needs a code owner's approval of its head commit, whatever its class.
+The ratchet lands in shadow mode first: the core moves, then `ratchet observe` and `ratchet judge` with both CI jobs, not required, with every guardrail path still owned. The CI-hosted reviewer lands separately (#59). The policy flip comes last and alone: this ADR, the owner-less CODEOWNERS lines with their last-match rule, and making `ratchet` a required check. It merges right after the ratchet (#57), without a period of shadow evidence (maintainer's decision), once `ratchet` is a required check (`docs/operations/github-setup.md`, step 9). Until the CI-hosted reviewer (#59) exists, an additive rule-only PR merges on the ratchet alone once this flip lands, and an edit still needs a code owner's approval of its head commit.
 
 ### 8. A PR that touches both, deliberate loosenings, and the residual risks
 
@@ -241,6 +250,7 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
   - a dropped, lowered and twice-declared lint, and a dylint run whose exit code disagrees with its output;
   - changes outside the rule paths;
   - mutation results that are missing, empty or timed out, and a changed hunk without a mutant of its own;
+  - an additive diff that passes with no review by the app and with no app set up, and fails on its open request for changes or thread;
   - an edit that gives "no verdict (edit)" while the reviewer app has only commented, and passes once it approves the head or a code owner does;
   - a ban narrowed in code to spare a crate outside its case's scope;
   - a registry change that only rewords a message, and one that changes a field no data check compares;
@@ -249,7 +259,7 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
   - a corpus changed in the head job, a head changed between the jobs, and a head with a symbolic link;
   - the head build;
   - the command line, including `observe` then `judge`.
-- The class (`xtask/src/ratchet/class.rs`): a test for each exploit of rounds 3 and 4 of #57's review, each an edit; tests that what the dialect used to hold to the base (a changed or new constant, a new read of the environment, a new `impl` of an existing type, a changed function that applies a ban row, the registry's forms outside its tables) is an edit; and tests that a new tidy rule with its dispatch call and a new lint are additive, while look-alike dispatch calls are edits.
+- The class (`xtask/src/ratchet/class.rs`): a test for each exploit of rounds 3, 4 and 5 of #57's review, each an edit; tests that what the dialect used to hold to the base (a changed or new constant, a new read of the environment, a new `impl` of an existing type, a changed function that applies a ban row, the registry's forms outside its tables) is an edit; tests that only plain `impl`s of a type new in the same file are additive, that nested items and the macros that read the source tree are edits, and that dispatch calls resolve by path; and tests that a new tidy rule with its dispatch call, and a new lint but for its `impl LateLintPass`, are additive, while look-alike dispatch calls are edits.
 - The review gate (`xtask/src/ratchet/review.rs`): a test that an approval counts only as the reviewer's latest decision on the head commit.
 - The required `ratchet` check (`.github/workflows/guardrails.yml`, and `.github/workflows/ratchet-review.yml` for reviews; ruleset per `docs/operations/github-setup.md`, step 9; the reviewer in CI, #59).
 - `.github/CODEOWNERS`. `xtask/src/pr.rs` applies GitHub's last-match rule and refuses owner-less lines outside `RULE_PATHS`. Its tests hold the owner-less lines equal to `RULE_PATHS`, and the file equal to what `flipped_codeowners` (`xtask/src/ratchet/scope.rs`) makes of its owned lines, which is the file the "after ADR-0022" verdict in shadow mode assumes.
@@ -259,12 +269,12 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 
 ## Consequences
 
-- **An additive PR merges on the ratchet alone,** once the reviewer app has reviewed its head: new fixtures and UI cases, a new ban row with its fixtures, a new lint in its own file with its registration, a new tidy rule as new functions with one dispatch call, reworded documentation.
+- **An additive PR merges on the ratchet's proof alone,** with no review needed: new fixtures and UI cases, a new ban row with its fixtures, a new tidy rule as new functions with one dispatch call, reworded documentation. An open request for changes or thread by the reviewer app still blocks it. A new lint's `impl LateLintPass`, and a new rule's own `impl Visit`, are edits.
 - **A data-only change to the registry's tables needs no mutant** (maintainer's decision on #57). The rule-set check reads the tables as data and proves that they only tighten. That holds only for the fields that check compares and those that only document (point 3); a change to any other field is an edit.
 - **An edit to existing rule code waits for the reviewer app's approval of its head commit,** or a code owner's: a changed constant, function, `impl` or test, a fixture changed or deleted, a reworked lint like #31's. Its checks still run, and still fail it on a finding.
 - **The dialect no longer holds code to the base.** Rounds 3 and 4 of #57's review added hold lists for constants, reads of the environment and the functions that apply a ban row; each round found a form they missed. The class replaces them: any change to an existing item is an edit.
 - **Most new rules still need the owner for now.** A new tidy rule is tagged in `docs/TIGER_STYLE.md`, which is core (#53).
-- **Until the reviewer app exists, every rule-path-only PR needs a code owner's approval of its head commit**, additive or edit, as today, but never the admin bypass.
+- **Until the reviewer app exists, an edit needs a code owner's approval of its head commit**, as today, but never the admin bypass. An additive PR does not wait for the app.
 - **Time.** Measured on the maintainer's 32-core machine with warm caches:
   - the ratchet without mutants takes about 30 s for a tidy change and a minute for a lint change, with three placements per case;
   - mutation testing of #34's diff (35 mutants) took about 2 minutes, and of #31's (122 lint mutants) about 6.
@@ -333,6 +343,13 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 | 4 | `is_tolerance` scaled by `1.0e-3`, inline or through a `let`, with the unit test edited | `is_tolerance` changed, and the test module's test changed |
 | 4 | `&& !self.scope.is_nami()` on `function-length` in `check_body` | `Visitor::check_body` changed beyond a dispatch call |
 | 4 | `runtime-dependency` spared for `crates/kernels` in `check_manifest` | `check_manifest` changed beyond a dispatch call |
+
+**#57's exploits of round 5** went at the class itself. The first version of the class took an `impl` for additive when the last segment of its self type was a new type of any changed file. Both exploits passed as additive; both are edits now, each with a test in `class.rs` (`a_new_type_elsewhere_does_not_vouch_for_an_impl`, `only_plain_impls_of_new_types_are_additive`):
+
+| Exploit | Then | Now |
+|---|---|---|
+| a new `struct Visitor` with its rule in `text.rs`, and in `rust_source.rs` an inherent `impl Visitor<'_> { fn visit_file(..) }` that skips a file starting with `#!`, which turned every rule off there (honest-plausible) | additive | edit: the new `impl Visitor<'_>` is not an `impl` of a type new in its file |
+| `trait Quiet { fn visit_file(..) {} } struct Quieted; impl<Quieted> Quiet for Quieted {}`, a blanket `impl` whose parameter shadows the new struct (deliberate) | additive | edit: an `impl` with generics |
 
 **#34 replayed with mutation testing** (first version): pass, 35 mutants, 33 caught and 2 unviable.
 
