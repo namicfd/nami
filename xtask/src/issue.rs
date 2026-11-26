@@ -174,9 +174,10 @@ fn heading(comment: &Comment, answer: &Result<&Comment, String>) -> String {
     }
     match answer {
         Ok(counting) if std::ptr::eq(*counting, comment) => format!("decision record by {author}"),
-        Ok(_) => format!(
-            "comment by {author}: a decision record that does not count: a later one answers \
-             the last removal"
+        Ok(counting) => format!(
+            "comment by {author}: a decision record that does not count: the record posted at \
+             {} answers the last removal",
+            counting.created_at.as_str()
         ),
         Err(why) => format!("comment by {author}: a decision record that does not count: {why}"),
     }
@@ -345,8 +346,8 @@ impl<'arguments> DecideOptions<'arguments> {
 /// Posts `record` on issue `number`, then removes `needs-decision`, if the removal will count
 /// (ADR-0021, point 7). Before it posts, it refuses unless the decider is a code owner, the
 /// issue is [`decidable`], [`trust::bot_owns_label`] holds, and the decision does not predate
-/// the question. After it posts, it runs [`trust::answering_record`] itself, as if the label
-/// were removed now, and removes the label only if the posted comment is the answer.
+/// the question. After it posts, it [`answers`] on fresh label events and comments, and removes
+/// the label only if the posted comment is the record that counts.
 fn decide(
     number: u32,
     record: &Record,
@@ -362,7 +363,7 @@ fn decide(
     }
     let found = github.issue(number)?;
     decidable(&found, trust)?;
-    let mut events = github.label_events(number)?;
+    let events = github.label_events(number)?;
     let added = trust::bot_owns_label(&found, &events)
         .map_err(|why| format!("#{number}: {why} (ADR-0021, point 7)"))?;
     let asked = added.created_at.day();
@@ -374,19 +375,8 @@ fn decide(
         ));
     }
     let posted = github.comment(number, &record.render())?;
-    let mut comments = github.comments(number)?;
-    if !comments.contains(&posted) {
-        comments.push(posted.clone());
-    }
-    let created_at = posted.created_at.clone();
-    let label = NEEDS_DECISION.to_owned();
-    events.push(LabelEvent { label, actor: BOT_LOGIN.to_owned(), added: false, created_at });
-    let verdict = match trust::answering_record(&found, &events, &comments, trust) {
-        Ok(counting) if *counting == posted => Ok(()),
-        Ok(_) => Err("another comment by the bot would answer instead".to_owned()),
-        Err(why) => Err(why),
-    };
-    verdict.map_err(|why| not_counted(number, record, &posted, &why))?;
+    answers(&found, &posted, github, trust)
+        .map_err(|why| not_counted(number, record, &posted, &why))?;
     github.remove_label(number, NEEDS_DECISION).map_err(|error| {
         format!(
             "posted the decision record on #{number}, but cannot remove `{NEEDS_DECISION}`: \
@@ -394,6 +384,45 @@ fn decide(
         )
     })?;
     Ok(format!("decided #{number}: posted the decision record and removed `{NEEDS_DECISION}`\n"))
+}
+
+/// Whether `posted` would be the record that counts if the bot removed `needs-decision` from
+/// `found` now. It reads the label events and comments again, after posting, so that a label
+/// that someone touched meanwhile is never removed.
+///
+/// # Errors
+///
+/// Why the record would not count.
+fn answers(
+    found: &Issue,
+    posted: &Comment,
+    github: &dyn GitHub,
+    trust: &Trust,
+) -> Result<(), String> {
+    if posted.author != BOT_LOGIN {
+        return Err(format!(
+            "it was posted as `{}`, not as the bot; run it as the bot, with \
+             `GH_TOKEN=$(xtask/agent-token.sh)`",
+            posted.author
+        ));
+    }
+    let mut events = github.label_events(found.number)?;
+    let last = events.iter().rev().find(|event| event.label == NEEDS_DECISION);
+    if !last.is_some_and(|last| last.added) {
+        return Err(format!("`{NEEDS_DECISION}` is no longer on the issue by its events"));
+    }
+    let mut comments = github.comments(found.number)?;
+    if !comments.contains(posted) {
+        comments.push(posted.clone());
+    }
+    let created_at = posted.created_at.clone();
+    let label = NEEDS_DECISION.to_owned();
+    events.push(LabelEvent { label, actor: BOT_LOGIN.to_owned(), added: false, created_at });
+    match trust::answering_record(found, &events, &comments, trust) {
+        Ok(counting) if counting == posted => Ok(()),
+        Ok(_) => Err("another comment by the bot would answer instead".to_owned()),
+        Err(why) => Err(why),
+    }
 }
 
 /// The error of `decide` when the record it posted would not count: nothing else changed. A
@@ -577,14 +606,17 @@ mod tests {
     /// records what is filed, posted and removed. It posts comments as the bot at `posted_at`,
     /// or at 2026-11-26T09:00:00Z if that is empty, and lists them after `comments` and before
     /// `racing`, which another session posts in the same second. It refuses to remove a label
-    /// if asked to.
+    /// if asked to. Once something is posted, `meanwhile` label events follow `events`: another
+    /// hand on the label while the record was posted.
     #[derive(Default)]
     struct Fake {
         issues: Vec<Issue>,
         comments: Vec<Comment>,
         racing: Vec<Comment>,
         events: Vec<LabelEvent>,
+        meanwhile: Vec<LabelEvent>,
         posted_at: &'static str,
+        posted_as: &'static str,
         filed: RefCell<Vec<(String, String, Vec<String>)>>,
         posted: RefCell<Vec<(u32, String)>>,
         removed: RefCell<Vec<(u32, String)>>,
@@ -595,7 +627,8 @@ mod tests {
         fn posted_comment(&self, body: &str) -> Comment {
             let time =
                 if self.posted_at.is_empty() { "2026-11-26T09:00:00Z" } else { self.posted_at };
-            Comment { body: body.to_owned(), ..at_comment(BOT_LOGIN, time) }
+            let author = if self.posted_as.is_empty() { BOT_LOGIN } else { self.posted_as };
+            Comment { body: body.to_owned(), ..at_comment(author, time) }
         }
     }
 
@@ -613,7 +646,8 @@ mod tests {
             Ok(self.comments.iter().cloned().chain(posted).chain(self.racing.clone()).collect())
         }
         fn label_events(&self, _number: u32) -> Result<Vec<LabelEvent>, String> {
-            Ok(self.events.clone())
+            let meanwhile = if self.posted.borrow().is_empty() { &[][..] } else { &self.meanwhile };
+            Ok([&self.events[..], meanwhile].concat())
         }
         fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String> {
             let labels = labels.iter().map(|label| (*label).to_owned()).collect();
@@ -630,6 +664,9 @@ mod tests {
             }
             self.removed.borrow_mut().push((number, label.to_owned()));
             Ok(())
+        }
+        fn repository_labels(&self) -> Result<Vec<String>, String> {
+            Err("the issue commands never list the labels".to_owned())
         }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
             Err(format!("the issue commands never ask whether #{number} is queued"))
@@ -994,6 +1031,37 @@ mod tests {
         assert!(noted.removed.borrow().is_empty(), "the label stays");
     }
 
+    // Goal: `decide` reads the label events again after it posts, so a label that someone
+    // touched while the record was posted is never removed; a record posted as anyone but the
+    // bot never lifts the label either.
+    #[test]
+    fn decide_rereads_the_label_after_posting() {
+        let record = decide_options("owner").record("Do it.").unwrap();
+        let at_time = |actor: &str, added: bool, time: &str| LabelEvent {
+            added,
+            created_at: at(time),
+            ..addition(actor)
+        };
+        let reasked = vec![
+            at_time("owner", false, "2026-11-26T08:30:00Z"),
+            at_time("owner", true, "2026-11-26T08:31:00Z"),
+        ];
+        let lifted = vec![at_time(BOT_LOGIN, false, "2026-11-26T08:30:00Z")];
+        for (meanwhile, expected) in [
+            (reasked, "`owner` removed `needs-decision` once, so only a code owner lifts it"),
+            (lifted, "`needs-decision` is no longer on the issue by its events"),
+        ] {
+            let fake = Fake { meanwhile, ..on_nine(labelled(BOT_LOGIN, 8)) };
+            let error = decide(9, &record, &fake, &trust()).expect_err("the label changed");
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert!(fake.removed.borrow().is_empty(), "the owner's label stays: {error}");
+        }
+        let human = Fake { posted_as: "owner", ..on_nine(labelled(BOT_LOGIN, 8)) };
+        let error = decide(9, &record, &human, &trust()).expect_err("not the bot");
+        assert!(error.contains("it was posted as `owner`, not as the bot"), "{error}");
+        assert!(human.removed.borrow().is_empty(), "the label stays");
+    }
+
     // Goal: `show` calls the bot's record a decision record only when it answers the last
     // removal of `needs-decision` now, and says of every other record why it does not count.
     #[test]
@@ -1009,6 +1077,7 @@ mod tests {
             posted("owner", record, "2026-11-26T07:40:00Z"),
             posted(BOT_LOGIN, "Working on it.", "2026-11-26T07:50:00Z"),
             posted(BOT_LOGIN, record, "2026-11-26T08:00:00Z"),
+            posted(BOT_LOGIN, record, "2026-11-26T09:00:00Z"),
         ];
         let removed =
             history(&[(BOT_LOGIN, "2026-11-26T07:00:00Z"), (BOT_LOGIN, "2026-11-26T08:30:00Z")]);
@@ -1017,15 +1086,17 @@ mod tests {
             assert!(output.contains(record.trim_end()), "the record is printed: {output}");
             output.lines().filter(|line| line.starts_with("--- ")).map(str::to_owned).collect()
         };
-        let older = "--- comment by nami-agent[bot]: a decision record that does not count: a \
-                     later one answers the last removal";
+        // The records before and after the one that counts both name it.
+        let other = "--- comment by nami-agent[bot]: a decision record that does not count: the \
+                     record posted at 2026-11-26T08:00:00Z answers the last removal";
         assert_eq!(
             headers(&removed),
             [
-                older,
+                other,
                 "--- comment by owner",
                 "--- comment by nami-agent[bot]",
-                "--- decision record by nami-agent[bot]"
+                "--- decision record by nami-agent[bot]",
+                other,
             ]
         );
         let mut asked = removed.clone();
@@ -1034,7 +1105,7 @@ mod tests {
                        bot did not remove `needs-decision` last";
         assert_eq!(
             headers(&asked),
-            [pending, "--- comment by owner", "--- comment by nami-agent[bot]", pending]
+            [pending, "--- comment by owner", "--- comment by nami-agent[bot]", pending, pending]
         );
     }
 }

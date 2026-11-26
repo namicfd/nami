@@ -911,6 +911,9 @@ impl GitHub for Issues {
     fn remove_label(&self, _number: u32, _label: &str) -> Result<(), String> {
         Err("not used".to_owned())
     }
+    fn repository_labels(&self) -> Result<Vec<String>, String> {
+        Err("not used".to_owned())
+    }
     fn is_queued(&self, _number: u32) -> Result<bool, String> {
         Err("not used".to_owned())
     }

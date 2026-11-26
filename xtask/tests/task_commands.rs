@@ -8,7 +8,8 @@ use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent, Timestamp};
 use xtask::task::execute;
 
 /// GitHub with fixed issues, label events, comments and merge-queue entries, or unreachable.
-/// It records whose comments were asked for, the comments posted and the labels removed.
+/// It records whose comments were asked for, the comments posted and the labels removed. The
+/// repository has the kind labels and `needs-decision`, unless `needs-decision` is gone.
 #[derive(Default)]
 struct Fake {
     issues: Vec<Issue>,
@@ -16,6 +17,7 @@ struct Fake {
     comments: Vec<(u32, Comment)>,
     queued: Vec<u32>,
     is_down: bool,
+    is_label_gone: bool,
     asked: RefCell<Vec<u32>>,
     posted: RefCell<Vec<(u32, String)>>,
     removed: RefCell<Vec<(u32, String)>>,
@@ -51,6 +53,11 @@ impl GitHub for Fake {
     fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
         self.removed.borrow_mut().push((number, label.to_owned()));
         Ok(())
+    }
+    fn repository_labels(&self) -> Result<Vec<String>, String> {
+        let names = ["bug", "docs", "guardrail-gap", "needs-decision"];
+        let kept = names.iter().filter(|name| !self.is_label_gone || **name != "needs-decision");
+        Ok(kept.map(|name| (*name).to_owned()).collect())
     }
     fn is_queued(&self, number: u32) -> Result<bool, String> {
         if self.is_down {
@@ -417,6 +424,27 @@ fn queue_failures_wait_for_their_fix() {
     assert_eq!(task(&github, &["ready"]), Ok(listed), "only the bot files queue failures");
     let plain = task(&github, &["claim", "issue-3"]).expect("an ordinary issue");
     assert!(plain.contains("work on the branch `task/issue-3`"), "{plain}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: without the repository's `needs-decision` label, renamed or deleted, nobody can tell
+// which issues wait for a decision: `ready` lists no issue and says why, still naming the plan
+// tasks, and `claim` refuses every issue.
+#[test]
+fn a_missing_decision_label_holds_every_issue() {
+    let (root, clone) = setup("label-gone");
+    push_code_owners(&clone);
+    let github = Fake {
+        issues: vec![issue(3, "nami-agent[bot]", &["bug"])],
+        is_label_gone: true,
+        ..Fake::default()
+    };
+    let task = |arguments: &[&str]| execute(&clone, "origin", &github, arguments);
+    let ready = task(&["ready"]).expect_err("an incomplete list");
+    assert!(ready.contains("has no `needs-decision` label: it was renamed or deleted"), "{ready}");
+    assert!(ready.ends_with("\na\tTask a\n"), "the plan tasks are still named: {ready}");
+    let claim = task(&["claim", "issue-3"]).expect_err("held");
+    assert!(claim.contains("cannot claim `issue-3`: the repository has no"), "{claim}");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

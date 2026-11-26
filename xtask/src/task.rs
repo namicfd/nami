@@ -228,6 +228,7 @@ fn ready_issues(
         return Ok((String::new(), Vec::new()));
     }
     let trust = trust::load(root, &format!("{remote}/main"))?;
+    trust::decision_label_exists(&github.repository_labels()?)?;
     let repository = issue::github::repository_of(root, remote);
     let held: BTreeSet<&str> = current.iter().map(|claim| claim.task.as_str()).collect();
     let mut lines = Vec::new();
@@ -305,6 +306,8 @@ fn claim_issue(
     }
     let found = github.issue(number)?;
     let trust = trust::load(root, &format!("{remote}/main"))?;
+    trust::decision_label_exists(&github.repository_labels()?)
+        .map_err(|why| format!("cannot claim `{id}`: {why}"))?;
     let (events, comments) = issue::history(github, &found)?;
     if let Some(reason) = trust::unworkable(&found, &events, &comments, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));

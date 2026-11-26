@@ -84,6 +84,12 @@ impl Timestamp {
         Ok(Self(text.to_owned()))
     }
 
+    /// The time as GitHub wrote it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// The day, `YYYY-MM-DD`, in UTC.
     #[must_use]
     pub fn day(&self) -> &str {
@@ -141,6 +147,13 @@ pub trait GitHub {
     ///
     /// When GitHub refuses it, the issue does not have the label, or GitHub cannot be asked.
     fn remove_label(&self, number: u32, label: &str) -> Result<(), String>;
+
+    /// The names of the repository's labels.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or there are more than [`LIST_MAX`].
+    fn repository_labels(&self) -> Result<Vec<String>, String>;
 
     /// True while pull request `number` has an entry in the merge queue.
     ///
@@ -406,6 +419,11 @@ impl GitHub for Gh {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/labels/{label}");
         let _ = self.api(&["--method", "DELETE", &path], None)?;
         Ok(())
+    }
+
+    fn repository_labels(&self) -> Result<Vec<String>, String> {
+        let labels = self.list("repos/{owner}/{repo}/labels?per_page=100")?;
+        labels.iter().map(|label| string_at(label, &["name"])).collect()
     }
 
     fn is_queued(&self, number: u32) -> Result<bool, String> {

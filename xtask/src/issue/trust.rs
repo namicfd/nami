@@ -129,9 +129,8 @@ pub fn unworkable(
     }
     open_decision(issue, events, comments, trust).map(|why| {
         format!(
-            "#{number} had `{NEEDS_DECISION}` removed {why}; it still waits for a decision. A \
-             code owner removes the label, or the bot with `cargo xtask issue decide` (ADR-0021, \
-             point 7)"
+            "#{number} {why}; it still waits for a decision. A code owner removes the label, or \
+             the bot with `cargo xtask issue decide` (ADR-0021, point 7)"
         )
     })
 }
@@ -188,9 +187,12 @@ pub fn bot_owns_label<'events>(
     latest_addition(events).ok_or_else(|| format!("no addition of `{NEEDS_DECISION}` is on record"))
 }
 
-/// Why the last removal of `needs-decision` is no decision, or `None` when the label was never
-/// removed, was added again, or its last removal counts: by a code owner, or by the bot with the
-/// [`answering_record`].
+/// Why the question that `needs-decision` asked on `issue` is still open, as a phrase after
+/// the issue's number, or `None` when the label was never on it or its last removal counts: by
+/// a code owner, or by the bot with the [`answering_record`].
+///
+/// A label that the events say is on, but that the issue does not carry, left without a
+/// removal on record: someone renamed or deleted the repository's label. That fails closed.
 fn open_decision(
     issue: &Issue,
     events: &[LabelEvent],
@@ -198,14 +200,31 @@ fn open_decision(
     trust: &Trust,
 ) -> Option<String> {
     let last = last_decision_event(events)?;
-    if last.added || trust.is_owner(&last.actor) {
+    if last.added {
+        let is_on = issue.labels.iter().any(|label| label == NEEDS_DECISION);
+        return (!is_on).then(|| {
+            format!(
+                "lost `{NEEDS_DECISION}` without a removal on record: the label vanished, so it \
+                 was renamed or deleted"
+            )
+        });
+    }
+    if trust.is_owner(&last.actor) {
         return None;
     }
     if last.actor != BOT_LOGIN {
-        return Some(format!("by `{}`, who is not a code owner", last.actor));
+        return Some(format!(
+            "had `{NEEDS_DECISION}` removed by `{}`, who is not a code owner",
+            last.actor
+        ));
     }
     let answer = answering_record(issue, events, comments, trust);
-    answer.err().map(|why| format!("by `{BOT_LOGIN}` without a decision record that counts: {why}"))
+    answer.err().map(|why| {
+        format!(
+            "had `{NEEDS_DECISION}` removed by `{BOT_LOGIN}` without a decision record that \
+             counts: {why}"
+        )
+    })
 }
 
 /// The decision record that makes the bot's last removal of `needs-decision` count: the one
@@ -272,6 +291,24 @@ pub fn misdated(date: &str, added: &Timestamp, posted: &Timestamp) -> Option<Str
         ));
     }
     None
+}
+
+/// Whether the repository, whose labels are `labels`, still has `needs-decision`. A renamed or
+/// deleted label leaves no removal in an issue's events, so without it nobody can tell which
+/// issues wait for a decision, and agents take none.
+///
+/// # Errors
+///
+/// That the label is missing, and who restores it.
+pub fn decision_label_exists(labels: &[String]) -> Result<(), String> {
+    if labels.iter().any(|label| label == NEEDS_DECISION) {
+        return Ok(());
+    }
+    Err(format!(
+        "the repository has no `{NEEDS_DECISION}` label: it was renamed or deleted, so agents \
+         cannot tell which issues wait for a decision, and take none until a code owner restores \
+         it (ADR-0021, point 7)"
+    ))
 }
 
 /// The comments by trusted authors, and how many others were left out.
@@ -556,6 +593,28 @@ mod tests {
             early,
             "dated 2026-11-24, before 2026-11-25, the UTC day the label was last added"
         );
+    }
+
+    // Goal: a label whose events end with an addition, but that the issue no longer carries,
+    // vanished without a removal on record, so the question stays open; and without the
+    // repository's `needs-decision` label, agents take no issue at all.
+    #[test]
+    fn a_vanished_label_keeps_the_question_open() {
+        let trust = trust();
+        let added = history(&[("owner", 2)]);
+        let gone = unworkable(&issue(BOT_LOGIN, &["bug"]), &added, &[], &trust).expect("open");
+        assert!(gone.contains("lost `needs-decision` without a removal on record"), "{gone}");
+        assert!(gone.contains("renamed or deleted"), "{gone}");
+        let on = unworkable(&issue(BOT_LOGIN, &["bug", "needs-decision"]), &added, &[], &trust);
+        assert!(on.expect("on").contains("waits for the maintainer"));
+
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|name| (*name).to_owned()).collect() };
+        assert_eq!(super::decision_label_exists(&names(&["bug", "needs-decision"])), Ok(()));
+        for labels in [names(&["bug", "needs-decisions"]), Vec::new()] {
+            let error = super::decision_label_exists(&labels).expect_err("missing");
+            assert!(error.contains("has no `needs-decision` label: it was renamed or deleted"));
+        }
     }
 
     // Goal: the comments are needed only when the bot removed `needs-decision` last from an

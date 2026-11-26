@@ -503,6 +503,9 @@ mod tests {
         fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
             Err(format!("the queue commands never remove `{label}` from #{number}"))
         }
+        fn repository_labels(&self) -> Result<Vec<String>, String> {
+            Err("the queue commands never list the labels".to_owned())
+        }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
             Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
         }
