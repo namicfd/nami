@@ -259,7 +259,9 @@ mod tests {
         assert_eq!(documentation_in(other_attribute), [], "the docs must end at the declaration");
         assert_eq!(documentation_in("fn broken( {"), [], "a file that does not lex");
         let real = documented(&crate::workspace_root()).unwrap();
-        assert!(real.iter().any(|(name, text)| name == "nami_recursion" && text.starts_with("R")));
+        assert!(
+            real.iter().any(|(name, text)| name == "nami_recursion" && text.starts_with("Reports"))
+        );
         assert_eq!(documented(&crate::workspace_root().join("no-such-dir")).unwrap(), []);
     }
 }
