@@ -20,6 +20,11 @@ phase-timers = []
 sqrt-debug-asserts = []
 # Data point: math::sqrt calls f64::sqrt (LLVM intrinsic, correctly rounded) instead of libm.
 intrinsic-sqrt = []
+# Configuration E: the sqrt checks of the per-face physics accumulate branch-free into a flag
+# that is asserted once per row, in release builds.
+deferred-checks = []
+# Configuration E2 (SoA): as E, but a failed row returns an Err up to the end of the stage.
+deferred-result = ["deferred-checks"]
 # Data point only (ADR-0005 forbids it): algebraic_* arithmetic in the per-face physics.
 algebraic = []
 # Hybrid only: per-group lane loops behind a call boundary, so the loop vectoriser sees them.

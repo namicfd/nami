@@ -4,7 +4,7 @@
 
 use crate::Block;
 use crate::grid::{self, Dims, Dir, Shape, row, row_mut, sub, sub_mut};
-use crate::kernels::{self, Rows, RowsMut};
+use crate::kernels::{self, RowFailure, Rows, RowsMut};
 use crate::timed;
 use crate::timers::Phase;
 
@@ -109,12 +109,20 @@ impl<D: Dims> Block for Soa<D> {
 }
 
 impl<D: Dims> Soa<D> {
-    /// Ghost fill, then the flux divergence of the primitives into `div`.
+    /// Ghost fill, then the flux divergence of the primitives into `div`. A row that failed its
+    /// deferred face checks ends the step with an assertion here (E2) or in the sweep (E).
     fn divergence(&mut self) {
+        let result = self.sweeps();
+        if let Err(failure) = result {
+            panic!("{failure:?}: a face failed its sqrt checks (deferred, returned as Err)");
+        }
+    }
+
+    fn sweeps(&mut self) -> Result<(), RowFailure> {
         timed!(Phase::Ghost, { fill_ghosts(&mut self.prim, self.shape) });
-        sweep_x(&self.prim, &mut self.div, &mut self.scratch, self.shape);
-        sweep_transverse(Dir::Y, &self.prim, &mut self.div, &mut self.scratch, self.shape);
-        sweep_transverse(Dir::Z, &self.prim, &mut self.div, &mut self.scratch, self.shape);
+        sweep_x(&self.prim, &mut self.div, &mut self.scratch, self.shape)?;
+        sweep_transverse(Dir::Y, &self.prim, &mut self.div, &mut self.scratch, self.shape)?;
+        sweep_transverse(Dir::Z, &self.prim, &mut self.div, &mut self.scratch, self.shape)
     }
 }
 
@@ -151,7 +159,12 @@ fn fill_ghosts<D: Dims>(prim: &mut Vars, shape: D) {
 }
 
 #[inline(never)]
-fn sweep_x<D: Dims>(prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: D) {
+fn sweep_x<D: Dims>(
+    prim: &Vars,
+    div: &mut Vars,
+    s: &mut Scratch,
+    shape: D,
+) -> Result<(), RowFailure> {
     let (n, p, g) = (shape.n(), shape.padded(), shape.ghost());
     let inv_dx = 1.0 / shape.dx();
     for k in 0..n {
@@ -164,7 +177,8 @@ fn sweep_x<D: Dims>(prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: D) {
             });
             let left = s.plus_x.each_ref().map(|r| sub(r, 0, n + 1));
             let right = s.minus_x.each_ref().map(|r| sub(r, 1, n + 1));
-            timed!(Phase::Riemann, { kernels::riemann_row(left, right, muts(&mut s.flux_x)) });
+            let ok = timed!(Phase::Riemann, { kernels::riemann_row(left, right, muts(&mut s.flux_x)) });
+            kernels::check_row(ok, Dir::X, (j, k))?;
             let d = div.each_mut().map(|v| row_mut(v, n, k * n + j));
             timed!(Phase::FluxDiff, {
                 for (f, dv) in s.flux_x.iter().zip(d) {
@@ -173,12 +187,19 @@ fn sweep_x<D: Dims>(prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: D) {
             });
         }
     }
+    Ok(())
 }
 
 /// A y- or z-sweep over row stencils. For each line `other` it walks the sweep index, keeps the
 /// previous cell's plus-face values and the previous face's flux, and so touches each row once.
 #[inline(never)]
-fn sweep_transverse<D: Dims>(dir: Dir, prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: D) {
+fn sweep_transverse<D: Dims>(
+    dir: Dir,
+    prim: &Vars,
+    div: &mut Vars,
+    s: &mut Scratch,
+    shape: D,
+) -> Result<(), RowFailure> {
     assert!(dir != Dir::X, "x is not a transverse sweep");
     let (n, p, g) = (shape.n(), shape.padded(), shape.ghost());
     let inv_dx = 1.0 / shape.dx();
@@ -197,9 +218,10 @@ fn sweep_transverse<D: Dims>(dir: Dir, prim: &Vars, div: &mut Vars, s: &mut Scra
                 }
             });
             if centre >= 2 {
-                timed!(Phase::Riemann, {
-                    kernels::riemann_row(refs(&s.plus_prev), refs(&s.minus), muts(&mut s.flux));
+                let ok = timed!(Phase::Riemann, {
+                    kernels::riemann_row(refs(&s.plus_prev), refs(&s.minus), muts(&mut s.flux))
                 });
+                kernels::check_row(ok, dir, (other, centre - 2))?;
                 if centre >= 3 {
                     let row_index = dir.interior_row(other, centre - 3, shape);
                     let d = dir.permute(div.each_mut().map(|v| row_mut(v, n, row_index)));
@@ -214,4 +236,5 @@ fn sweep_transverse<D: Dims>(dir: Dir, prim: &Vars, div: &mut Vars, s: &mut Scra
             core::mem::swap(&mut s.plus, &mut s.plus_prev);
         }
     }
+    Ok(())
 }

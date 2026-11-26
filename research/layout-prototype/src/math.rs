@@ -26,6 +26,16 @@ pub fn sqrt(value: f64) -> f64 {
     root
 }
 
+/// Square root with the same three checks as `sqrt`, accumulated into `ok` without branching
+/// (configuration E). The caller asserts `ok` once per row, so the per-face loop has no exit.
+#[inline(always)]
+pub fn sqrt_deferred(value: f64, ok: &mut bool) -> f64 {
+    *ok &= value.is_finite() & (value >= 0.0);
+    let root = root(value);
+    *ok &= root >= 0.0;
+    root
+}
+
 #[cfg(not(feature = "intrinsic-sqrt"))]
 #[inline(always)]
 fn root(value: f64) -> f64 {

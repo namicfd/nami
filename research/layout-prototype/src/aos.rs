@@ -133,7 +133,7 @@ fn convert<const SPEED: bool>(state: &[Cell], prim: &mut [Cell], shape: Shape) -
                 let state = physics::primitive_from_conserved(Conserved::from_vars(*cons));
                 physical &= state.is_physical();
                 if SPEED {
-                    speed = speed.max(physics::max_signal_speed(state));
+                    speed = speed.max(physics::max_signal_speed(state, &mut physical));
                 }
                 *out = state.to_vars();
             }
@@ -167,15 +167,18 @@ fn plm_cell(l: Cell, c: Cell, r: Cell) -> (Cell, Cell) {
 }
 
 #[inline(always)]
-fn riemann_cells(dir: Dir, left: &[Cell], right: &[Cell], flux: &mut [Cell]) {
+#[must_use]
+fn riemann_cells(dir: Dir, left: &[Cell], right: &[Cell], flux: &mut [Cell]) -> bool {
     assert!(left.len() == flux.len() && right.len() == flux.len(), "face rows must match");
+    let mut ok = true;
     for ((wl, wr), out) in left.iter().zip(right).zip(flux.iter_mut()) {
         let l = Primitive::from_vars(dir.permute(*wl));
         let r = Primitive::from_vars(dir.permute(*wr));
-        let f = physics::hllc(l, r);
+        let f = physics::hllc(l, r, &mut ok);
         debug_assert!(f.density.is_finite(), "flux must be finite");
         kernels::store5(dir.permute(out.each_mut()), f.to_vars());
     }
+    ok
 }
 
 #[inline(never)]
@@ -194,7 +197,8 @@ fn sweep_x(prim: &[Cell], div: &mut [Cell], s: &mut Scratch, shape: Shape) {
             });
             let left = sub(&s.plus_x, 0, n + 1);
             let right = sub(&s.minus_x, 1, n + 1);
-            timed!(Phase::Riemann, { riemann_cells(Dir::X, left, right, &mut s.flux_x) });
+            let ok = timed!(Phase::Riemann, { riemann_cells(Dir::X, left, right, &mut s.flux_x) });
+            assert!(ok, "x-sweep, row ({j}, {k}): a face failed its sqrt checks (deferred)");
             let d = row_mut(div, n, k * n + j);
             timed!(Phase::FluxDiff, {
                 assert_eq!(s.flux_x.len(), d.len() + 1, "one more face than cells");
@@ -225,7 +229,9 @@ fn sweep_transverse(dir: Dir, prim: &[Cell], div: &mut [Cell], s: &mut Scratch, 
                 }
             });
             if centre >= 2 {
-                timed!(Phase::Riemann, { riemann_cells(dir, &s.plus_prev, &s.minus, &mut s.flux) });
+                let ok =
+                    timed!(Phase::Riemann, { riemann_cells(dir, &s.plus_prev, &s.minus, &mut s.flux) });
+                assert!(ok, "{dir:?}-sweep, row ({other}, {centre}): a face failed its sqrt checks");
                 if centre >= 3 {
                     let d = row_mut(div, n, dir.interior_row(other, centre - 3, shape));
                     timed!(Phase::FluxDiff, {

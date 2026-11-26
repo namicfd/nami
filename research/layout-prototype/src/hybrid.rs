@@ -233,7 +233,8 @@ fn sweep_x<const W: usize>(
             let left = s.plus_x.each_ref().map(|r| sub(r, 0, n + 1));
             let right = s.minus_x.each_ref().map(|r| sub(r, 1, n + 1));
             let flux = s.flux_x.each_mut().map(|r| &mut **r);
-            timed!(Phase::Riemann, { kernels::riemann_row(left, right, flux) });
+            let ok = timed!(Phase::Riemann, { kernels::riemann_row(left, right, flux) });
+            assert!(ok, "x-sweep, row ({j}, {k}): a face failed its sqrt checks (deferred)");
             timed!(Phase::FluxDiff, {
                 for (f, dv) in s.flux_x.iter().zip(s.div_x.iter_mut()) {
                     kernels::diff_set(f, dv, inv_dx);
@@ -287,13 +288,16 @@ fn sweep_transverse<const W: usize>(
             let (l, c, r) = (stencil(centre - 1), stencil(centre), stencil(centre + 1));
             timed!(Phase::Reconstruct, { reconstruct_groups(l, c, r, &mut s.minus, &mut s.plus) });
             if centre >= 2 {
-                timed!(Phase::Riemann, {
+                let ok = timed!(Phase::Riemann, {
+                    let mut ok = true;
                     let faces = s.plus_prev.iter().zip(s.minus.iter()).zip(s.flux.iter_mut());
                     for ((pp, m), f) in faces {
                         let out = dir.permute(lanes_mut(f));
-                        riemann_lanes(dir.permute(lanes(pp)), dir.permute(lanes(m)), out);
+                        ok &= riemann_lanes(dir.permute(lanes(pp)), dir.permute(lanes(m)), out);
                     }
+                    ok
                 });
+                assert!(ok, "{dir:?}-sweep, row ({other}, {centre}): a face failed its sqrt checks");
                 if centre >= 3 {
                     let d = row_mut(div, gn, dir.interior_row(other, centre - 3, shape));
                     timed!(Phase::FluxDiff, { diff_groups(&s.flux_prev, &s.flux, d, inv_dx) });
@@ -342,11 +346,12 @@ fn diff_groups<const W: usize>(
 
 /// Per-group Riemann call. With the `outlined-lanes` feature it goes through a call boundary.
 #[inline(always)]
-fn riemann_lanes(left: Rows<'_>, right: Rows<'_>, flux: RowsMut<'_>) {
+#[must_use]
+fn riemann_lanes(left: Rows<'_>, right: Rows<'_>, flux: RowsMut<'_>) -> bool {
     if cfg!(feature = "outlined-lanes") {
-        kernels::riemann_row_outlined(left, right, flux);
+        kernels::riemann_row_outlined(left, right, flux)
     } else {
-        kernels::riemann_row(left, right, flux);
+        kernels::riemann_row(left, right, flux)
     }
 }
 

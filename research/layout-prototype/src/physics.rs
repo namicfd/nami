@@ -83,16 +83,28 @@ pub fn primitive_from_conserved(u: Conserved) -> Primitive {
     }
 }
 
+/// The square root of the per-face physics. With `deferred-checks` (configuration E) its domain
+/// checks go into `ok`, which the row loop asserts once; otherwise `math::sqrt` asserts per call
+/// (or debug-asserts, with `sqrt-debug-asserts`) and `ok` stays true.
 #[inline(always)]
-pub fn sound_speed(w: Primitive) -> f64 {
-    math::sqrt(GAMMA * w.pressure / w.density)
+fn face_sqrt(value: f64, ok: &mut bool) -> f64 {
+    if cfg!(feature = "deferred-checks") {
+        math::sqrt_deferred(value, ok)
+    } else {
+        math::sqrt(value)
+    }
+}
+
+#[inline(always)]
+pub fn sound_speed(w: Primitive, ok: &mut bool) -> f64 {
+    face_sqrt(GAMMA * w.pressure / w.density, ok)
 }
 
 /// Largest signal speed |v_d| + c over the three directions (cells are cubes).
 #[inline(always)]
-pub fn max_signal_speed(w: Primitive) -> f64 {
+pub fn max_signal_speed(w: Primitive, ok: &mut bool) -> f64 {
     let [vx, vy, vz] = w.velocity;
-    vx.abs().max(vy.abs()).max(vz.abs()) + sound_speed(w)
+    vx.abs().max(vy.abs()).max(vz.abs()) + sound_speed(w, ok)
 }
 
 /// PLM with the van Leer limiter on a uniform grid: returns the values at the minus and the plus
@@ -110,29 +122,29 @@ fn plm_exact(left: f64, centre: f64, right: f64) -> [f64; 2] {
 /// PVRS wave-speed factor of Athena++'s HLLC: 1 for a rarefaction, the shock factor otherwise.
 /// `ratio` is pmid / p clamped below at 1, which gives exactly 1.0 where Athena++ selects 1.0.
 #[inline(always)]
-fn wave_factor(pmid: f64, pressure: f64) -> f64 {
+fn wave_factor(pmid: f64, pressure: f64, ok: &mut bool) -> f64 {
     let ratio = if pmid > pressure { pmid / pressure } else { 1.0 };
-    math::sqrt(1.0 + SHOCK_FACTOR * (ratio - 1.0))
+    face_sqrt(1.0 + SHOCK_FACTOR * (ratio - 1.0), ok)
 }
 
 /// HLLC flux between two primitive states, normal velocity first (Athena++ `hllc.cpp`).
 #[inline(always)]
-fn hllc_exact(l: Primitive, r: Primitive) -> Conserved {
+fn hllc_exact(l: Primitive, r: Primitive, ok: &mut bool) -> Conserved {
     let [lvx, lvy, lvz] = l.velocity;
     let [rvx, rvy, rvz] = r.velocity;
     let el =
         l.pressure * INV_GAMMA_MINUS_ONE + 0.5 * l.density * (lvx * lvx + lvy * lvy + lvz * lvz);
     let er =
         r.pressure * INV_GAMMA_MINUS_ONE + 0.5 * r.density * (rvx * rvx + rvy * rvy + rvz * rvz);
-    let cl = sound_speed(l);
-    let cr = sound_speed(r);
+    let cl = sound_speed(l, ok);
+    let cr = sound_speed(r, ok);
 
     let rhoa = 0.5 * (l.density + r.density);
     let ca = 0.5 * (cl + cr);
     let pmid = 0.5 * (l.pressure + r.pressure + (lvx - rvx) * rhoa * ca);
 
-    let al = lvx - cl * wave_factor(pmid, l.pressure);
-    let ar = rvx + cr * wave_factor(pmid, r.pressure);
+    let al = lvx - cl * wave_factor(pmid, l.pressure, ok);
+    let ar = rvx + cr * wave_factor(pmid, r.pressure, ok);
     let bp = if ar > 0.0 { ar } else { TINY };
     let bm = if al < 0.0 { al } else { -TINY };
 
@@ -198,6 +210,6 @@ pub fn plm(left: f64, centre: f64, right: f64) -> [f64; 2] {
 
 /// HLLC flux; `algebraic::hllc` under the `algebraic` data-point feature.
 #[inline(always)]
-pub fn hllc(l: Primitive, r: Primitive) -> Conserved {
-    if cfg!(feature = "algebraic") { crate::algebraic::hllc(l, r) } else { hllc_exact(l, r) }
+pub fn hllc(l: Primitive, r: Primitive, ok: &mut bool) -> Conserved {
+    if cfg!(feature = "algebraic") { crate::algebraic::hllc(l, r) } else { hllc_exact(l, r, ok) }
 }
