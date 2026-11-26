@@ -51,7 +51,8 @@ dylint_linting::declare_lint! {
     /// `f64::add`, or a closure in which the accumulator is an operand of `+`, `-`, `+=`, `-=`,
     /// `add`, `sub`, `add_assign`, `sub_assign`, or the addend of a `mul_add`. An argmin or
     /// argmax closure, which only compares differences with the accumulator and returns its
-    /// parameters unchanged, is exempt; an addition never is. Test code is exempt.
+    /// parameters unchanged, is exempt; an addition never is. Test code is exempt. A sum
+    /// written as a `for` loop is not seen, and is for review.
     ///
     /// ### Why is this bad?
     ///

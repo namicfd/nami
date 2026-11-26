@@ -4,10 +4,10 @@
 ## Rules
 
 - A tag without a rule id says nothing that can be checked. `[tidy]`
-- A tidy rule that does not exist. `[tidy:no-such-rule]`
-- A clippy lint that the workspace lint table does not switch on. `[clippy:no_such_lint]`
-- A rustc lint that the workspace lint table does not switch on. `[rustc:no_such_lint]`
-- A dylint lint that nobody declared. `[dylint:nami_no_such_lint]`
+- A rule id that the registry does not have. `[tidy:no-such-rule]`
+- A lint of the first table that is not switched on. `[clippy:no_such_lint]`
+- A compiler lint that is not switched on. `[rustc:no_such_lint]`
+- A lint of the project library that nobody declared. `[dylint:nami_no_such_lint]`
 - A planned mechanism that is not in the registry. `[planned:no-such-plan]`
 - Hooks only give feedback. `[hook]`
 - The reference suite does not exist yet. `[reference]`

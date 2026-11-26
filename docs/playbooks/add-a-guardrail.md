@@ -94,7 +94,11 @@ replacement, not only the offence.
 Tidy fails until all of these are done.
 
 - Tag the rule in `docs/TIGER_STYLE.md`: `[tidy:<id>]`, `[clippy:<lint>]`, `[rustc:<lint>]` or
-  `[dylint:<lint>]`. If the rule is new, add its paragraph there.
+  `[dylint:<lint>]`. If the rule is new, add its paragraph there: the rule, its reason and an
+  example, never what the check sees. Tidy's `doc-tool-name` rejects rule prose that names a tool.
+- Write what the check sees and misses, its exemptions and its known gaps, in the `detail` of the
+  rule's row in the registry, or in the `### What it does` section of the lint's doc comment.
+  Tightening a rule later then changes only these, not the style guide.
 - Run `cargo xtask rules --write` to regenerate `docs/RULES.md`.
 - If the mechanism was planned: delete its row from `PLANNED` in the registry, and replace its
   `[planned:<id>]` tags. Leave `passes` in `tasks.json` alone.

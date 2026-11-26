@@ -1,0 +1,8 @@
+<!-- path: docs/TIGER_STYLE.md -->
+# A style guide whose rules describe the tools that check them
+
+## Rules
+
+- **Loops are bounded.** Tidy also sees `for` over `cycle`. `[review]`
+- **Sums are fixed-lane.** The lint sees `sum`; a `for` loop is for review. `[review]`
+- **No overrides.** `cargo deny` rejects a git override but not a path override. `[review]`

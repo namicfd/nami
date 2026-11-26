@@ -16,6 +16,11 @@ Tidy checks every tag (rule `doc-tag`): a tag must name a rule or a lint that ex
 switched on, so a tag can claim only what the tooling does today. `docs/RULES.md` lists what is
 behind the tags.
 
+A rule here states the rule, its reason and its tags, with an example where one helps. What a
+mechanism sees and misses, its exemptions and its known gaps, is in `docs/RULES.md`, generated
+from each rule's registry row and each lint's doc comment. Tightening a check then leaves this
+file alone. Tidy rejects rule prose that names a checking tool (rule `doc-tool-name`).
+
 | Tag | Mechanism |
 |---|---|
 | `[compiler]` | rustc itself: types, `no_std`, and its default lints, which `-D warnings` turns into errors |
@@ -109,11 +114,8 @@ Every loop, every iteration and every buffer has a fixed upper bound. Violations
 instead of hanging.
 
 - **Prefer `for` over a bounded range or a slice iterator.** `loop` and `while` are banned, and so
-  is `for` over a range without an end or over an iterator that never ends (`cycle`, and
-  `repeat`, `repeat_with`, `from_fn` and `successors` from `core::iter`), unless `take` or a
-  `zip` with a bounded iterator bounds it. A `for _ in 0..LIMIT` with an assertion after the loop
-  is almost always clearer anyway.
-  `[tidy:unbounded-loop]`
+  is `for` over an iterator that never ends. A `for _ in 0..LIMIT` with an assertion after the
+  loop is almost always clearer anyway. `[tidy:unbounded-loop]` `[review]`
 - **Iterative methods name their limit and assert convergence.** This applies to Newton for the
   exact Riemann solver, fixed-point iterations and implicit sources. Running out of iterations is a
   crash, not a silent "best effort":
@@ -235,9 +237,7 @@ multiply the bug-finding power of fuzzing and seeded simulation.
     `[compiler]`
   - Elsewhere, `Solver::init()` sizes every field, ghost layer, scratch pencil and output buffer
     once. `[review]`
-  - A counting allocator (`crates/alloc-guard`) fails any test that allocates inside
-    `assert_no_allocations`. Wrapping the time loop in it is still to do.
-    `[planned:alloc-after-init]`
+  - The time loop allocates nothing. `[planned:alloc-after-init]`
 - **Storage that must not grow is `Box<[T]>`, not `Vec<T>`.** A boxed slice has no `push`, so the
   type itself documents and enforces the fixed size. `[tidy:vec-field]`
 - **No hidden allocation in the data plane.** That means no `collect()`, `clone()` of buffers,
@@ -249,8 +249,8 @@ multiply the bug-finding power of fuzzing and seeded simulation.
 - **Declare variables in the smallest possible scope, and keep as few in scope as possible.**
   Shadow a name only to refine the same quantity, for example a unit conversion. Never reuse a name
   for a different quantity. `[clippy:shadow_unrelated]` `[review]`
-- **Functions are at most 70 lines,** counting physical lines and including closures. There is a
-  sharp discontinuity between a function that fits on a screen and one you have to scroll.
+- **Functions are at most 70 lines.** There is a sharp discontinuity between a function that fits
+  on a screen and one you have to scroll.
   `[tidy:function-length]` `[clippy:too_many_lines]`
   When splitting a function:
   - Aim for the inverse of an hourglass: few parameters, a simple return type, and a lot of meaty
@@ -262,9 +262,8 @@ multiply the bug-finding power of fuzzing and seeded simulation.
     the inner loop is branch-free and easy to vectorise.
   - Centralise state changes. The parent holds the state. Helpers compute what should change and
     return it. Keep leaf functions pure.
-- **Treat all compiler warnings at the strictest setting as errors from day one.** The workspace
-  lints are pedantic plus selected restriction lints, and `-D warnings` applies in `just` and CI.
-  Never put `#![deny(warnings)]` in source. `[clippy:pedantic]` `[review]`
+- **Treat all compiler warnings at the strictest setting as errors from day one.** Never put
+  `#![deny(warnings)]` in source. `[clippy:pedantic]` `[review]`
 
 ### External events and control flow
 
@@ -349,8 +348,6 @@ finite-volume codes, and especially in agent-written ones.
   - `mul_add` is allowed where written explicitly. Never rewrite an expression into `mul_add`
     without a reason, because doing so changes results. `[review]`
   - **Sums use `sum_fixed`** (or `sum_compensated` for conservation totals), never a naive fold.
-    The lint sees `sum`, `product`, `reduce` and the `fold` family; a sum written as a `for`
-    loop is for review.
     `[dylint:nami_float_reduction]` `[review]`
   - No iteration over `HashMap` or `HashSet`. `[clippy:iter_over_hash_type]`
     `[clippy:disallowed_types]`
@@ -435,7 +432,7 @@ finite-volume codes, and especially in agent-written ones.
 
   `[compiler]`
 - **Acronyms are written as words: `HllcSolver`, `MhdState`, not `HLLCSolver`.** This deviates
-  from TigerStyle (`VSRState`). We follow Rust's convention because the toolchain lints it and
+  from TigerStyle (`VSRState`). We follow Rust's convention because the toolchain checks it and
   every Rust reader expects it. `[clippy:upper_case_acronyms]`
 - **Do not abbreviate,** with one exception for numerical code: **the standard symbols of the
   referenced equations** (`rho`, `u`, `p`, `e`, `c` for sound speed, `q` for a state vector, `f` for
@@ -489,8 +486,8 @@ finite-volume codes, and especially in agent-written ones.
 - **Do not duplicate state or keep aliases of it.** Derived quantities (primitive variables from
   conserved ones, wave speeds) are recomputed or explicitly refreshed at a single point in the step.
   They are never cached in two places. `[review]`
-- **Pass small `Copy` states (`[f64; NVAR]`) by value and anything large by reference.** Clippy's
-  `large_types_passed_by_value` and `trivially_copy_pass_by_ref` enforce the thresholds.
+- **Pass small `Copy` states (`[f64; NVAR]`) by value and anything large by reference.** The
+  thresholds are those of `large_types_passed_by_value` and `trivially_copy_pass_by_ref`.
   `[clippy:pedantic]`
 - **Compute or check values close to where they are used.** A gap in time or space between the
   check and the use is where bugs live. For example, assert the CFL condition in the step that
@@ -513,10 +510,9 @@ finite-volume codes, and especially in agent-written ones.
 
 ### Style by the numbers
 
-- **Run `cargo fmt`.** Indentation is 4 spaces, the rustfmt default. `[fmt]`
+- **Run `cargo fmt`.** Indentation is 4 spaces, the default of `cargo fmt`. `[fmt]`
 - **Lines are at most 100 columns, without exception.** That is two copies of the code side by side
-  on one screen. rustfmt cannot wrap long string literals or comments, so tidy checks the limit.
-  `[tidy:line-length]`
+  on one screen. `[tidy:line-length]`
 - **Functions are at most 70 lines.** `[tidy:function-length]`
 
 ### Dependencies
@@ -527,7 +523,7 @@ finite-volume codes, and especially in agent-written ones.
   `[deny]`
 - **No `patch` or `replace` table in the workspace manifest.** An override swaps a dependency's
   source code while its name and version stay the same, so it would replace `libm` unnoticed.
-  `cargo deny` rejects a git override but not a path override. `[tidy:dependency-override]`
+  `[tidy:dependency-override]`
 
 ### Tooling
 
