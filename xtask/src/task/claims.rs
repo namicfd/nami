@@ -186,8 +186,9 @@ fn update(
     assert_eq!(attempts, PUSH_ATTEMPTS_MAX, "one attempt per pause");
     Err(ClaimError::Git(format!(
         "gave up after {PUSH_ATTEMPTS_MAX} attempts. The remote may be refusing the claim push \
-         (check its hooks, branch protection and permissions), or other claims kept landing \
-         first. The last attempt: {last_error}"
+         (check its hooks, branch protection and permissions), other claims kept landing \
+         first, or another push still holds the remote's ref lock; then retrying later may \
+         work. The last attempt: {last_error}"
     )))
 }
 
@@ -203,11 +204,21 @@ enum Pushed {
 /// Pushes `commit` to the claims branch if the branch is still at `tip` (`None`: if it does not
 /// exist yet). Whether it landed is decided by what the remote holds afterwards, not by git's
 /// output or exit code: a push can land and still fail, when the remote dies after updating the
-/// branch. A push that git did not report on (no network, a dead remote) is an error.
+/// branch. If the branch cannot be read back (no network, a dead remote), that is an error that
+/// says the claim may be held. If it can, but git reported nothing on our refspec, that is an
+/// error too.
 fn push(root: &Path, remote: &str, commit: &str, tip: Option<&str>) -> Result<Pushed, ClaimError> {
-    // Defence in depth: git already rejects a push that is not a fast-forward. The lease names
-    // the tip the commit was built on (empty: the branch must not exist yet), and the check
-    // below decides the win.
+    // With a lease that matches, `--force-with-lease` is a forced push: the lease is the only
+    // check, and git does not require a fast-forward. It is safe only because the commit's
+    // parent is the lease's tip, so the forced update is a fast-forward all the same; the
+    // assertion keeps it so. The lease names that tip (empty: the branch must not exist yet).
+    let parents = git(root, &["log", "-1", "--format=%P", commit], &[], None)?;
+    assert_eq!(
+        parents.trim(),
+        tip.unwrap_or_default(),
+        "a claim commit's only parent is the tip its lease names (none on an empty branch), so \
+         the forced push cannot drop another claim"
+    );
     let lease = format!("--force-with-lease=refs/heads/{BRANCH}:{}", tip.unwrap_or_default());
     let refspec = format!("{commit}:refs/heads/{BRANCH}");
     let mut command = Command::new("git");

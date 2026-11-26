@@ -179,7 +179,8 @@ fn a_claim_push_the_remote_keeps_rejecting_is_an_error_after_bounded_retries() {
         Err(ClaimError::Git(message)) => message.clone(),
         other => panic!("a rejected claim is a git error: {other:?}"),
     };
-    for part in ["may be refusing", "hooks, branch protection", "kept landing", "hook declined"] {
+    let parts = ["may be refusing", "hooks, branch protection", "kept landing", "ref lock"];
+    for part in parts.into_iter().chain(["retrying later", "hook declined"]) {
         assert!(message.contains(part), "the error names `{part}`: {message}");
     }
     let runs = std::fs::read_to_string(root.join("remote.git/pre-receive-runs"));
