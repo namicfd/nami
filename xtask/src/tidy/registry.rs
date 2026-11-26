@@ -44,175 +44,238 @@ pub struct Rule {
     pub reference: &'static str,
 }
 
-const fn source(id: &'static str, summary: &'static str, reference: &'static str) -> Rule {
-    Rule { id, kind: RuleKind::Source, summary, reference }
-}
-
-const fn workspace(id: &'static str, summary: &'static str, reference: &'static str) -> Rule {
-    Rule { id, kind: RuleKind::Workspace, summary, reference }
-}
-
-/// Every tidy rule that is written as code. Keep the rows sorted by id.
+/// Every tidy rule that is written as code. Keep the rows sorted by id. The rows are plain
+/// literals, so that the ratchet (pending, #57) can read them from a pull request's source
+/// without running it (ADR-0022, pending in #55).
 pub const RULES: &[Rule] = &[
-    source("adr-index", "Every ADR is listed in `docs/design/README.md`.", "ADR-0000"),
-    source(
-        "adr-number",
-        "No two ADR files share a number, and an ADR's title repeats the number of its file \
-         name.",
-        "ADR-0000",
-    ),
-    source("adr-section", "Every ADR has the six required sections.", "ADR-0000"),
-    source("adr-status", "Every ADR has a valid status line.", "ADR-0000"),
-    workspace(
-        "assertion-density",
-        "Each nami crate averages at least two assertions per non-trivial function.",
-        "ADR-0004",
-    ),
-    source(
-        "async",
-        "No `async` functions or blocks: functions run to completion.",
-        "TIGER_STYLE.md, Control flow",
-    ),
-    source(
-        "debt-marker",
-        "No unfinished-work markers in Rust sources; unfinished work is a task.",
-        "TIGER_STYLE.md, Zero technical debt",
-    ),
-    source(
-        "default",
-        "No `Default` derives or impls in nami crates: every field is spelled out.",
-        "TIGER_STYLE.md, External events and control flow",
-    ),
-    source(
-        "dependency-override",
-        "The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped for \
-         other source code under its own name.",
-        "ADR-0001",
-    ),
-    source(
-        "doc-tag",
-        "Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a \
-         lint that is switched on, or a planned mechanism that exists.",
-        "TIGER_STYLE.md, How rules are enforced",
-    ),
-    workspace(
-        "expect-budget",
-        "The number of `expect(...)` lint suppressions, counted on tokens so that `cfg_attr` and \
-         macro bodies are included, equals `xtask/expect-budget.txt`.",
-        "ADR-0006",
-    ),
-    source(
-        "float-eq-in-eq-fn",
-        "In nami crates outside tests, no `==` or `!=` with a float operand in a function whose \
-         name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. Without \
-         types, a float operand is a float literal, an `f32`/`f64` constant such as \
-         `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter declared \
-         `f32`/`f64` or an array or slice of them (or a reference to one), indexed or not, until \
-         a `let`, closure, `match` arm or `for` rebinds the name. Stricter than clippy on \
-         purpose: an exact `== 0.0` is reported too. Not seen: fields, `Option<f64>`, untyped \
-         locals, call results, macro arguments. A float parameter rebound by `if let` or \
-         `while let` is a false positive.",
-        "ADR-0006",
-    ),
-    source(
-        "function-length",
-        "Functions are at most 70 physical lines, closures included.",
-        "TIGER_STYLE.md, Scope and size",
-    ),
-    source("ignore-reason", "`#[ignore]` carries a reason.", "ADR-0006"),
-    source(
-        "kernel-indirection",
-        "No `dyn` trait objects and no function pointers in `crates/kernels`.",
-        "ADR-0003",
-    ),
-    source(
-        "line-length",
-        "Lines in Rust sources are at most 100 columns.",
-        "TIGER_STYLE.md, Style by the numbers",
-    ),
-    source(
-        "magic-tolerance",
-        "In nami crates outside tests, a float literal in (0, 1e-6] appears only in the \
-         initialiser of a `const` item that has a doc comment.",
-        "TIGER_STYLE.md, Floating point",
-    ),
-    source("parse", "Every Rust source file parses.", "ADR-0006"),
-    workspace(
-        "plan-files",
-        "Every plan directory under `docs/exec-plans/` holds both `plan.md` and `tasks.json`.",
-        "ADR-0011",
-    ),
-    workspace(
-        "plan-section",
-        "Every task has a `### <id>` section in its plan's `plan.md`.",
-        "ADR-0011",
-    ),
-    workspace("plan-stage", "A plan under `completed/` has no unfinished task.", "ADR-0011"),
-    workspace(
-        "planned-task",
-        "Every planned mechanism has a task with the same id in a `tasks.json` under \
-         `docs/exec-plans/active/`.",
-        "ADR-0018",
-    ),
-    workspace(
-        "rules-doc",
-        "`docs/RULES.md` matches what `cargo xtask rules` generates from the registry.",
-        "ADR-0018",
-    ),
-    source(
-        "runtime-dependency",
-        "Runtime and build dependencies of nami crates are `libm` and workspace crates only, \
-         and none is renamed with `package = \"...\"`.",
-        "ADR-0001",
-    ),
-    source("snapshot-draft", "No unreviewed insta snapshots (`*.snap.new`).", "ADR-0006"),
-    workspace(
-        "task-graph",
-        "Task ids are unique, every dependency exists, no task passes before its dependencies, \
-         and the dependencies form no cycle.",
-        "ADR-0011",
-    ),
-    workspace(
-        "task-owner-paths",
-        "Two unfinished tasks that can run at the same time own no common path.",
-        "ADR-0011",
-    ),
-    workspace(
-        "tasks-json",
-        "Every `tasks.json` is valid JSON with one `tasks` array, and every task has exactly the \
-         six fields of the schema.",
-        "ADR-0011",
-    ),
-    source(
-        "test-goal",
-        "Every test starts with a comment that states its goal.",
-        "TIGER_STYLE.md, Comments, docs and commits",
-    ),
-    source(
-        "unasserted-function",
-        "A function in a nami crate longer than 10 lines contains an assertion.",
-        "ADR-0004",
-    ),
-    source(
-        "unbounded-loop",
-        "No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, \
-         `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, unless \
-         `take` or `zip` bounds it: every loop has a fixed upper bound.",
-        "TIGER_STYLE.md, Put a limit on everything",
-    ),
-    source("unsafe", "`unsafe` appears only in `crates/alloc-guard`.", "ADR-0014"),
-    source(
-        "usize",
-        "In nami crates, `usize` appears in function signatures, fields, public constants and \
-         statics, and type aliases only in `base::index`. Trait impls and const generics are \
-         exempt.",
-        "ADR-0002",
-    ),
-    source(
-        "vec-field",
-        "No `Vec` anywhere inside a field type in nami crates: fixed-size storage is `Box<[T]>`.",
-        "ADR-0003",
-    ),
+    Rule {
+        id: "adr-index",
+        kind: RuleKind::Source,
+        summary: "Every ADR is listed in `docs/design/README.md`.",
+        reference: "ADR-0000",
+    },
+    Rule {
+        id: "adr-number",
+        kind: RuleKind::Source,
+        summary: "No two ADR files share a number, and an ADR's title repeats the number of its \
+                  file name.",
+        reference: "ADR-0000",
+    },
+    Rule {
+        id: "adr-section",
+        kind: RuleKind::Source,
+        summary: "Every ADR has the six required sections.",
+        reference: "ADR-0000",
+    },
+    Rule {
+        id: "adr-status",
+        kind: RuleKind::Source,
+        summary: "Every ADR has a valid status line.",
+        reference: "ADR-0000",
+    },
+    Rule {
+        id: "assertion-density",
+        kind: RuleKind::Workspace,
+        summary: "Each nami crate averages at least two assertions per non-trivial function.",
+        reference: "ADR-0004",
+    },
+    Rule {
+        id: "async",
+        kind: RuleKind::Source,
+        summary: "No `async` functions or blocks: functions run to completion.",
+        reference: "TIGER_STYLE.md, Control flow",
+    },
+    Rule {
+        id: "debt-marker",
+        kind: RuleKind::Source,
+        summary: "No unfinished-work markers in Rust sources; unfinished work is a task.",
+        reference: "TIGER_STYLE.md, Zero technical debt",
+    },
+    Rule {
+        id: "default",
+        kind: RuleKind::Source,
+        summary: "No `Default` derives or impls in nami crates: every field is spelled out.",
+        reference: "TIGER_STYLE.md, External events and control flow",
+    },
+    Rule {
+        id: "dependency-override",
+        kind: RuleKind::Source,
+        summary: "The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped \
+                  for other source code under its own name.",
+        reference: "ADR-0001",
+    },
+    Rule {
+        id: "doc-tag",
+        kind: RuleKind::Source,
+        summary: "Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy \
+                  rule, a lint that is switched on, or a planned mechanism that exists.",
+        reference: "TIGER_STYLE.md, How rules are enforced",
+    },
+    Rule {
+        id: "expect-budget",
+        kind: RuleKind::Workspace,
+        summary: "The number of `expect(...)` lint suppressions, counted on tokens so that \
+                  `cfg_attr` and macro bodies are included, equals `xtask/expect-budget.txt`.",
+        reference: "ADR-0006",
+    },
+    Rule {
+        id: "float-eq-in-eq-fn",
+        kind: RuleKind::Source,
+        summary: "In nami crates outside tests, no `==` or `!=` with a float operand in a function \
+                  whose name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is \
+                  silent. Without types, a float operand is a float literal, an `f32`/`f64` \
+                  constant such as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or \
+                  closure parameter declared `f32`/`f64` or an array or slice of them (or a \
+                  reference to one), indexed or not, until a `let`, closure, `match` arm or `for` \
+                  rebinds the name. Stricter than clippy on purpose: an exact `== 0.0` is reported \
+                  too. Not seen: fields, `Option<f64>`, untyped locals, call results, macro \
+                  arguments. A float parameter rebound by `if let` or `while let` is a false \
+                  positive.",
+        reference: "ADR-0006",
+    },
+    Rule {
+        id: "function-length",
+        kind: RuleKind::Source,
+        summary: "Functions are at most 70 physical lines, closures included.",
+        reference: "TIGER_STYLE.md, Scope and size",
+    },
+    Rule {
+        id: "ignore-reason",
+        kind: RuleKind::Source,
+        summary: "`#[ignore]` carries a reason.",
+        reference: "ADR-0006",
+    },
+    Rule {
+        id: "kernel-indirection",
+        kind: RuleKind::Source,
+        summary: "No `dyn` trait objects and no function pointers in `crates/kernels`.",
+        reference: "ADR-0003",
+    },
+    Rule {
+        id: "line-length",
+        kind: RuleKind::Source,
+        summary: "Lines in Rust sources are at most 100 columns.",
+        reference: "TIGER_STYLE.md, Style by the numbers",
+    },
+    Rule {
+        id: "magic-tolerance",
+        kind: RuleKind::Source,
+        summary: "In nami crates outside tests, a float literal in (0, 1e-6] appears only in the \
+                  initialiser of a `const` item that has a doc comment.",
+        reference: "TIGER_STYLE.md, Floating point",
+    },
+    Rule {
+        id: "parse",
+        kind: RuleKind::Source,
+        summary: "Every Rust source file parses.",
+        reference: "ADR-0006",
+    },
+    Rule {
+        id: "plan-files",
+        kind: RuleKind::Workspace,
+        summary: "Every plan directory under `docs/exec-plans/` holds both `plan.md` and \
+                  `tasks.json`.",
+        reference: "ADR-0011",
+    },
+    Rule {
+        id: "plan-section",
+        kind: RuleKind::Workspace,
+        summary: "Every task has a `### <id>` section in its plan's `plan.md`.",
+        reference: "ADR-0011",
+    },
+    Rule {
+        id: "plan-stage",
+        kind: RuleKind::Workspace,
+        summary: "A plan under `completed/` has no unfinished task.",
+        reference: "ADR-0011",
+    },
+    Rule {
+        id: "planned-task",
+        kind: RuleKind::Workspace,
+        summary: "Every planned mechanism has a task with the same id in a `tasks.json` under \
+                  `docs/exec-plans/active/`.",
+        reference: "ADR-0018",
+    },
+    Rule {
+        id: "rules-doc",
+        kind: RuleKind::Workspace,
+        summary: "`docs/RULES.md` matches what `cargo xtask rules` generates from the registry.",
+        reference: "ADR-0018",
+    },
+    Rule {
+        id: "runtime-dependency",
+        kind: RuleKind::Source,
+        summary: "Runtime and build dependencies of nami crates are `libm` and workspace crates \
+                  only, and none is renamed with `package = \"...\"`.",
+        reference: "ADR-0001",
+    },
+    Rule {
+        id: "snapshot-draft",
+        kind: RuleKind::Source,
+        summary: "No unreviewed insta snapshots (`*.snap.new`).",
+        reference: "ADR-0006",
+    },
+    Rule {
+        id: "task-graph",
+        kind: RuleKind::Workspace,
+        summary: "Task ids are unique, every dependency exists, no task passes before its \
+                  dependencies, and the dependencies form no cycle.",
+        reference: "ADR-0011",
+    },
+    Rule {
+        id: "task-owner-paths",
+        kind: RuleKind::Workspace,
+        summary: "Two unfinished tasks that can run at the same time own no common path.",
+        reference: "ADR-0011",
+    },
+    Rule {
+        id: "tasks-json",
+        kind: RuleKind::Workspace,
+        summary: "Every `tasks.json` is valid JSON with one `tasks` array, and every task has \
+                  exactly the six fields of the schema.",
+        reference: "ADR-0011",
+    },
+    Rule {
+        id: "test-goal",
+        kind: RuleKind::Source,
+        summary: "Every test starts with a comment that states its goal.",
+        reference: "TIGER_STYLE.md, Comments, docs and commits",
+    },
+    Rule {
+        id: "unasserted-function",
+        kind: RuleKind::Source,
+        summary: "A function in a nami crate longer than 10 lines contains an assertion.",
+        reference: "ADR-0004",
+    },
+    Rule {
+        id: "unbounded-loop",
+        kind: RuleKind::Source,
+        summary: "No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, \
+                  `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, \
+                  unless `take` or `zip` bounds it: every loop has a fixed upper bound.",
+        reference: "TIGER_STYLE.md, Put a limit on everything",
+    },
+    Rule {
+        id: "unsafe",
+        kind: RuleKind::Source,
+        summary: "`unsafe` appears only in `crates/alloc-guard`.",
+        reference: "ADR-0014",
+    },
+    Rule {
+        id: "usize",
+        kind: RuleKind::Source,
+        summary: "In nami crates, `usize` appears in function signatures, fields, public constants \
+                  and statics, and type aliases only in `base::index`. Trait impls and const \
+                  generics are exempt.",
+        reference: "ADR-0002",
+    },
+    Rule {
+        id: "vec-field",
+        kind: RuleKind::Source,
+        summary: "No `Vec` anywhere inside a field type in nami crates: fixed-size storage is \
+                  `Box<[T]>`.",
+        reference: "ADR-0003",
+    },
 ];
 
 /// Which files a ban applies to, before its `allowed` list is consulted.

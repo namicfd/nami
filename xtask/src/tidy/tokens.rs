@@ -7,13 +7,10 @@
 //! Token trees nest. Every walk here uses an explicit work list with a bound and no recursion,
 //! because the no-recursion lint also checks `xtask` (ADR-0006).
 
-use proc_macro2::{Delimiter, Group, Ident, Literal, TokenStream, TokenTree};
+use proc_macro2::{Ident, Literal, TokenStream, TokenTree};
 
 /// Upper bound on the token groups in one file, so the walk is bounded.
 const TOKEN_GROUPS_MAX: u32 = 4_000_000;
-
-/// The attribute argument that suppresses a lint: `expect(lint, reason = "...")`.
-const EXPECT: &str = "expect";
 
 /// Every token sequence in `stream`: the stream itself and the content of every group inside
 /// it, at any depth. Tokens that are neighbours in the source are neighbours in one sequence.
@@ -35,56 +32,6 @@ pub fn sequences(stream: TokenStream) -> Vec<Vec<TokenTree>> {
         found.push(sequence);
     }
     panic!("more than {TOKEN_GROUPS_MAX} token groups in one stream");
-}
-
-/// Counts the lint suppressions in one file: every `expect(...)` inside an attribute, inner or
-/// outer, at any depth. That includes `#[cfg_attr(.., expect(..))]` and attributes inside macro
-/// bodies. A file that does not lex counts as zero; the `parse` rule reports it.
-#[must_use]
-pub fn expect_count(text: &str) -> u32 {
-    let Ok(stream) = text.parse::<TokenStream>() else {
-        return 0;
-    };
-    let mut count: u32 = 0;
-    for sequence in sequences(stream) {
-        for attribute in attributes(&sequence) {
-            count += expect_calls(attribute.stream());
-        }
-    }
-    count
-}
-
-/// The bracket groups of the attributes in one sequence: `#[...]` and `#![...]`.
-fn attributes(sequence: &[TokenTree]) -> Vec<&Group> {
-    let mut found = Vec::new();
-    let mut after_hash = false;
-    for tree in sequence {
-        let is_bang = after_hash && is_punct(tree, '!');
-        if let TokenTree::Group(group) = tree
-            && after_hash
-            && group.delimiter() == Delimiter::Bracket
-        {
-            found.push(group);
-        }
-        after_hash = is_punct(tree, '#') || is_bang;
-    }
-    found
-}
-
-/// Counts `expect(...)` in the tokens of one attribute, at any depth.
-fn expect_calls(attribute: TokenStream) -> u32 {
-    let mut count: u32 = 0;
-    for sequence in sequences(attribute) {
-        for pair in sequence.windows(2) {
-            if let [TokenTree::Ident(ident), TokenTree::Group(group)] = pair
-                && ident == EXPECT
-                && group.delimiter() == Delimiter::Parenthesis
-            {
-                count += 1;
-            }
-        }
-    }
-    count
 }
 
 /// What the ban and literal rules look for in the tokens of a macro invocation.
@@ -149,7 +96,7 @@ pub fn is_punct(tree: &TokenTree, character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{expect_count, findings, sequences};
+    use super::{findings, sequences};
     use proc_macro2::TokenStream;
 
     fn names(idents: &[&proc_macro2::Ident]) -> Vec<String> {
@@ -179,39 +126,6 @@ mod tests {
         lengths.sort_unstable();
         assert_eq!(lengths, [1, 1, 3, 3], "the two inner groups, the outer group and the stream");
         assert_eq!(sequences(TokenStream::new()).len(), 1);
-    }
-
-    // Goal: suppressions are counted as tokens: plain, inner, inside `cfg_attr`, several in one
-    // attribute, and inside a macro body.
-    #[test]
-    fn expect_attributes_are_counted_on_tokens() {
-        assert_eq!(expect_count("#[expect(dead_code, reason = \"x\")]\nfn a() {}"), 1);
-        assert_eq!(expect_count("#![expect(dead_code, reason = \"x\")]"), 1);
-        assert_eq!(expect_count("# [ expect ( dead_code ) ]\nfn a() {}"), 1, "spacing is free");
-        let hidden = "#[cfg_attr(all(), expect(clippy::indexing_slicing, reason = \"x\"))]";
-        assert_eq!(expect_count(hidden), 1, "cfg_attr does not hide a suppression");
-        let two = "#[cfg_attr(test, expect(a, reason = \"x\"), expect(b, reason = \"y\"))]";
-        assert_eq!(expect_count(two), 2, "each suppression counts");
-        let in_macro = "macro_rules! m { () => { #[expect(dead_code)] fn a() {} }; }";
-        assert_eq!(expect_count(in_macro), 1, "macro bodies are counted");
-    }
-
-    // Goal: only suppressions count: the method `expect`, text in strings and comments, other
-    // attributes and a file that does not lex all count as zero.
-    #[test]
-    fn expect_count_ignores_everything_else() {
-        assert_eq!(expect_count("fn a() { b().expect(\"reason\"); }"), 0, "a method call");
-        assert_eq!(expect_count("const A: &str = \"#[expect(dead_code)]\";"), 0, "a string");
-        assert_eq!(expect_count("/// #[expect(dead_code)]\nfn a() {}"), 0, "a doc comment");
-        assert_eq!(expect_count("// #[expect(dead_code)]\nfn a() {}"), 0, "a comment");
-        assert_eq!(expect_count("#[should_panic(expected = \"x\")]\nfn a() {}"), 0, "expected");
-        assert_eq!(expect_count("#[derive(Debug)]\nstruct A;"), 0, "another attribute");
-        assert_eq!(expect_count("#[expect]\nfn a() {}"), 0, "no parenthesised lint");
-        assert_eq!(expect_count("fn a() { expect(1); }"), 0, "a function outside an attribute");
-        assert_eq!(expect_count("fn a() { m![expect(1)]; }"), 0, "a macro's brackets");
-        let after_attribute = "#[derive(Debug)] static A: [u8; expect(3)] = [0; 3];";
-        assert_eq!(expect_count(after_attribute), 0, "brackets later in the same sequence");
-        assert_eq!(expect_count("fn a( {"), 0, "a file that does not lex");
     }
 
     // Goal: an identifier starts a path when `::` follows it and no path segment precedes it.

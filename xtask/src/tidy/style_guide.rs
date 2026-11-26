@@ -13,8 +13,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// The style guide, relative to the root.
-pub const STYLE_GUIDE: &str = "docs/TIGER_STYLE.md";
+// Which file is the style guide decides what `doc-tag` checks, so it is core (ADR-0022, pending).
+pub use super::STYLE_GUIDE;
 
 /// The tag of a rule that no tool checks.
 const REVIEW: &str = "review";
