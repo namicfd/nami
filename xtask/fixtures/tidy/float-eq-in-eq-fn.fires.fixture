@@ -1,0 +1,26 @@
+// path: crates/kernels/src/example.rs
+//! Exact float comparisons in functions whose names make clippy's `float_cmp` look away: two
+//! parameters, an exact zero, two states, a float constant, and a comparison inside a
+//! `PartialEq` impl.
+
+fn states_eq(left: f64, right: f64) -> bool {
+    left == right
+}
+
+fn is_vacuum_eq(density: &f64) -> bool {
+    *density == 0.0
+}
+
+fn conserved_eq(left: &[f64; 3], right: &[f64; 3]) -> bool {
+    left == right && left[0] != right[0]
+}
+
+fn is_unbounded_eq(wave_speed: u32) -> bool {
+    speed_of(wave_speed) == f64::INFINITY
+}
+
+impl PartialEq for Pressure {
+    fn eq(&self, other: &Self) -> bool {
+        self.value != 1.0 && other.value != 1.0
+    }
+}

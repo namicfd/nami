@@ -102,6 +102,19 @@ pub const RULES: &[Rule] = &[
         "ADR-0006",
     ),
     source(
+        "float-eq-in-eq-fn",
+        "In nami crates outside tests, no `==` or `!=` with a float operand in a function whose \
+         name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. Without \
+         types, a float operand is a float literal, an `f32`/`f64` constant such as \
+         `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter declared \
+         `f32`/`f64` or an array or slice of them (or a reference to one), indexed or not, until \
+         a `let`, closure, `match` arm or `for` rebinds the name. Stricter than clippy on \
+         purpose: an exact `== 0.0` is reported too. Not seen: fields, `Option<f64>`, untyped \
+         locals, call results, macro arguments. A float parameter rebound by `if let` or \
+         `while let` is a false positive.",
+        "ADR-0006",
+    ),
+    source(
         "function-length",
         "Functions are at most 70 physical lines, closures included.",
         "TIGER_STYLE.md, Scope and size",
@@ -318,13 +331,6 @@ pub const PLANNED: &[Planned] = &[
         "The code blocks in `docs/TIGER_STYLE.md` are compiled and linted, so the examples cannot \
          drift from the rules.",
         "ADR-0013",
-    ),
-    planned(
-        "float-eq-in-eq-fn",
-        "tidy",
-        "Flag `==` and `!=` between floats in functions whose name contains `eq`, which clippy's \
-         `float_cmp` skips.",
-        "ADR-0006",
     ),
     planned(
         "floor-activation-count",

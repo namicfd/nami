@@ -1,0 +1,38 @@
+// path: crates/kernels/src/example.rs
+//! An `eq` function that compares floats bit for bit, one that compares against a named
+//! tolerance, one that tests for an exact zero of either sign, and a test that may compare
+//! exact values.
+
+use core::num::FpCategory;
+
+/// Relative difference below which two pressures are taken as equal: round-off for a 64-bit
+/// pressure of order one, with two digits to spare.
+const PRESSURE_TOLERANCE_RELATIVE: f64 = 1.0e-12;
+
+/// Bitwise equality, for determinism checks.
+fn states_bitwise_eq(left: f64, right: f64) -> bool {
+    left.to_bits() == right.to_bits()
+}
+
+fn pressures_eq(left: f64, right: f64) -> bool {
+    (left - right).abs() <= PRESSURE_TOLERANCE_RELATIVE * left.abs()
+}
+
+/// Exact zero, sentinel for vacuum: `-0.0` counts too.
+fn is_vacuum_eq(density: f64) -> bool {
+    density.classify() == FpCategory::Zero
+}
+
+#[cfg(test)]
+mod tests {
+    use super::states_bitwise_eq;
+
+    // Goal: a value is bitwise equal to itself.
+    #[test]
+    fn bitwise_eq_is_reflexive() {
+        let value = 0.5_f64;
+        assert!(states_bitwise_eq(value, value), "reflexive");
+        let is_exact = value == 0.5;
+        assert!(is_exact, "exact sentinel in a test");
+    }
+}

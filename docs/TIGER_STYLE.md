@@ -361,7 +361,7 @@ finite-volume codes, and especially in agent-written ones.
   `reference/thresholds.toml`. `f64::EPSILON` is not a tolerance: it is the spacing at 1.0, not
   at your value. `[tidy:magic-tolerance]` `[planned:thresholds-file]` `[review]`
 - **Do not compare floats with `==`** except against exact sentinels or in bitwise determinism
-  tests, and say which one it is. `[clippy:float_cmp]` `[planned:float-eq-in-eq-fn]`
+  tests, and say which one it is. `[clippy:float_cmp]` `[tidy:float-eq-in-eq-fn]`
 - **Guard every division by a quantity that can vanish** (density, pressure, wave-speed
   differences) with an assertion that it is positive or non-zero, placed before the division.
   `[review]`

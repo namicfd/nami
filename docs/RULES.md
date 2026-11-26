@@ -21,6 +21,7 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `dependency-override` | source | The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped for other source code under its own name. | ADR-0001 |
 | `doc-tag` | source | Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a lint that is switched on, or a planned mechanism that exists. | TIGER_STYLE.md, How rules are enforced |
 | `expect-budget` | workspace | The number of `expect(...)` lint suppressions, counted on tokens so that `cfg_attr` and macro bodies are included, equals `xtask/expect-budget.txt`. | ADR-0006 |
+| `float-eq-in-eq-fn` | source | In nami crates outside tests, no `==` or `!=` with a float operand in a function whose name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. Without types, a float operand is a float literal, an `f32`/`f64` constant such as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter declared `f32`/`f64` or an array or slice of them (or a reference to one), indexed or not, until a `let`, closure, `match` arm or `for` rebinds the name. Stricter than clippy on purpose: an exact `== 0.0` is reported too. Not seen: fields, `Option<f64>`, untyped locals, call results, macro arguments. A float parameter rebound by `if let` or `while let` is a false positive. | ADR-0006 |
 | `function-length` | source | Functions are at most 70 physical lines, closures included. | TIGER_STYLE.md, Scope and size |
 | `ignore-reason` | source | `#[ignore]` carries a reason. | ADR-0006 |
 | `kernel-indirection` | source | No `dyn` trait objects and no function pointers in `crates/kernels`. | ADR-0003 |
@@ -76,7 +77,6 @@ Promised in the documents and not built yet. The style guide tags the rules they
 | `clippy-fixtures` | test | One planted violation per clippy ban and configured lint proves that each still fires after a toolchain bump. | ADR-0006 |
 | `determinism-hash` | ci | CI hashes the output of a canonical problem set and compares Linux, macOS and a same-seed rerun. | ADR-0005 |
 | `doc-example-sync` | test | The code blocks in `docs/TIGER_STYLE.md` are compiled and linted, so the examples cannot drift from the rules. | ADR-0013 |
-| `float-eq-in-eq-fn` | tidy | Flag `==` and `!=` between floats in functions whose name contains `eq`, which clippy's `float_cmp` skips. | ADR-0006 |
 | `floor-activation-count` | test | A floor or limiter that is part of a scheme counts its activations, and a reference test fails on an unexpected count. | TIGER_STYLE.md, Physical admissibility |
 | `glossary` | docs | `docs/glossary.md` records the one meaning of each word that could be overloaded. | TIGER_STYLE.md, Naming |
 | `recursion-cross-crate` | dylint | Detect call cycles that cross crates through a generic callback; `nami_recursion` checks each crate on its own. | ADR-0006 |
