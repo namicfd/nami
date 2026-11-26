@@ -120,3 +120,14 @@ not ready: file an issue and leave it out.
   `Proposed`.
 
 CI's base gate then shows the code owner what your rule finds in `main`'s tree.
+
+If the PR changes only rule paths (ADR-0022: the rule tables and source-rule modules of tidy,
+`lints/src/`, the fixtures, the UI cases and `docs/RULES.md`), it needs no code owner. The
+required `ratchet` check runs `main`'s `cargo xtask ratchet` on your tree instead. It fails when
+a case that `main` writes down no longer holds through your tools, when a mutant of your changed
+lines survives your tests, or when the reviewer app has not reviewed your head commit or left a thread
+open. Only the reviewer app's review counts, not the agents' bot. A new ban row or another
+pure data change yields no mutant, so it still needs the code owner. A finding names the fixture
+or UI case and the line. Fix the rule, never the case: `main`'s
+cases count, whatever your branch did to its own copies. Run it yourself first, inside a checkout
+of `main`: `cargo xtask ratchet --base . --head <your tree> --no-review`.

@@ -16,6 +16,8 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 - `cargo xtask tidy`: style rules that clippy cannot express. `docs/RULES.md` lists them.
 - `cargo xtask doctor`: compare your tools with the pinned versions.
 - `cargo xtask protected`: list the protected paths your branch changes, for the PR description.
+- `cargo xtask ratchet --base . --head <your tree> --no-review`: run inside a checkout of `main` to
+  see what the required `ratchet` check will say about your rule change (ADR-0022).
 - `cargo xtask issue file` and `cargo xtask issue show <n>`: file a finding outside your task as
   a GitHub issue, and read an issue (ADR-0021). They run gh, so prefix them with
   `GH_TOKEN=$(xtask/agent-token.sh)`, like `cargo xtask task ready` and `claim`.
@@ -137,7 +139,12 @@ The protected paths are:
 - **Manifests and lockfile:** `Cargo.toml` (all of them) and `Cargo.lock`.
 - **Tool configuration:** `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`,
   `.cargo/` and `.config/`.
-- **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`.
+- **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`, except
+  the rule paths (ADR-0022): the files that define what a tidy rule or a dylint lint reports, their
+  fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths merges without the
+  code owner once the required `ratchet` check proves that every case `main` writes down still
+  holds, the rule tables only narrow, mutation testing misses nothing, and the reviewer app
+  (`nami-reviewer[bot]`, not the agents' bot) reviewed its head and resolved every thread.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
 - **Policy:** `docs/design/`, `docs/TIGER_STYLE.md` and `docs/operations/`.
 - **References:** `crates/reference/` and `tools/`.

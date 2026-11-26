@@ -4,7 +4,8 @@ How `namicfd/nami` is configured on GitHub, and how to set up the same thing aga
 
 - ADR-0008: the human review model and the agents' identity;
 - ADR-0009: hosting and the merge gate;
-- ADR-0015: protected paths gated at review.
+- ADR-0015: protected paths gated at review;
+- ADR-0022: rule paths that merge on the ratchet's proof.
 
 Every command below was run against `namicfd/nami` on 2026-11-25.
 
@@ -44,9 +45,9 @@ gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" \
 
 ## 2. Push `main` once, before the ruleset
 
-- The ruleset requires two status checks, `gate` and `lints (UI tests)`. These are job names in `.github/workflows/ci.yml`.
-- That workflow must keep its `merge_group:` trigger. Without it, the queue waits for checks that never run.
-- Push `main` and let CI run once, so that both checks exist when the ruleset refers to them. After step 3, nobody without bypass rights can push to `main` directly.
+- The ruleset requires three status checks: `gate` and `lints (UI tests)`, job names in `.github/workflows/ci.yml`, and `ratchet`, a job in `.github/workflows/guardrails.yml` (ADR-0022).
+- Both workflows must keep their `merge_group:` trigger. Without it, the queue waits for checks that never run.
+- Push `main` and let CI run once, so that the checks exist when the ruleset refers to them. After step 3, nobody without bypass rights can push to `main` directly.
 
 ## 3. Ruleset on the default branch
 
@@ -65,7 +66,7 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 | | dismiss stale approvals; approve the last push: on | An agent cannot push again after it has been approved. |
 | | conversation resolution: on | Blocking AI-review comments must be resolved. |
 | | merge methods: squash | |
-| Required status checks | `gate`, `lints (UI tests)`; "up to date" is off | The merge queue tests the combined result anyway. |
+| Required status checks | `gate`, `lints (UI tests)`, `ratchet`; "up to date" is off | The merge queue tests the combined result anyway. `ratchet` is what lets rule paths merge without the code owner (ADR-0022, step 9). |
 | Merge queue | squash; build 5; group of 1–5; wait 5 min; all green; timeout 30 min | ADR-0009. |
 | Bypass | Repository admin, **pull requests only** | The maintainer can merge PRs past the rules: their own, since GitHub never allows approving your own PR, and, as an exception, a `tasks.json` flip that the `passes` workflow cannot make (ADR-0017). Nobody can push to `main` directly, not even with the maintainer's credentials. In an emergency, open a PR and merge it with the bypass. |
 
@@ -77,6 +78,7 @@ To check the live ruleset against this table, print it with `gh api "repos/$REPO
 - **Write access.** The owner needs write access. Otherwise GitHub silently ignores the line.
 - **Syntax check.** Open the file on GitHub. Syntax errors are shown above its contents.
 - **Keep in sync.** The list must match the protected paths in `AGENTS.md`.
+- **Rule paths have no owner.** The lines without an owner after `/xtask/` and `/lints/` free the rule paths (ADR-0022); on GitHub the last matching line wins. They must equal `RULE_PATHS` in `xtask/src/ratchet/scope.rs`, which a test checks. Only those paths may be unowned: `cargo xtask pr-body` refuses any other line without an owner. Never free a path while `ratchet` is not a required check (step 9).
 
 ## 5. The agents' GitHub App
 
@@ -298,3 +300,27 @@ Then try the flow end to end:
 1. **Protected path.** As the bot, push a branch that touches a protected path (any path listed in `.github/CODEOWNERS`) and open a PR. It must show "Review required" from the code owner, and must not enter the queue until that review is given.
 2. **Unowned path.** A PR touching only unowned paths, for example `crates/kernels/src/`, must enter the queue once `gate` and `lints (UI tests)` pass, with no review.
 3. **Direct push.** A direct `git push origin main` by the bot must be rejected.
+4. **Rule path.** A PR that changes only rule paths, for example a new case in `xtask/fixtures/tidy/`, must show no "Review required", must show `ratchet` as required, and must enter the queue only once `ratchet` passes. `ratchet` stays red until `nami-reviewer[bot]` has reviewed the PR's head commit and resolved every thread.
+
+## 9. Turning on the ratchet (ADR-0022)
+
+The ratchet first runs in shadow mode: both jobs run and show their verdict in the job summary, nothing requires them, and CODEOWNERS owns every guardrail path. Flip the policy only once it has given correct verdicts on real PRs. The PR that flips it frees the rule paths in `.github/CODEOWNERS`. GitHub applies the base branch's CODEOWNERS, so the rule paths lose their owner the moment that PR merges. Make `ratchet` required first, so that there is no window in which a rule-path PR merges with neither the owner nor the proof.
+
+1. **Before merging the ratchet PR**, add the check. Settings → Rules → Rulesets → `main` → Require status checks to pass → Add checks → type `ratchet` → choose the GitHub Actions source → Save changes. Only `ratchet` is required; `ratchet (head)` is the job that runs the PR's code, and `ratchet` judges its output. The bot cannot do this: it has no administration permission, and must not have one.
+2. **Merge the ratchet PR.** On that PR, `ratchet` passes with "The base branch has no ratchet yet; skipped." in its summary, because the base cannot judge yet. The PR touches the trusted core, so it waits for your review in any case.
+3. **Rebase or close stale PRs.** A PR whose branch predates the ratchet has no `ratchet` job, so the required check never reports; it waits until it is rebased onto `main`.
+4. **Set up the reviewer app** (step 5b). Until you do, `ratchet` gives no verdict on PRs that only change rule paths unless you approve the head commit, so you review those as today. No admin bypass is needed.
+5. **Check it** with step 8, point 4.
+
+To print what the ruleset requires:
+
+```sh
+id=$(gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "main") | .id')
+gh api "repos/$REPO/rulesets/$id" --jq '.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context'
+```
+
+The list must contain `gate`, `lints (UI tests)` and `ratchet`.
+
+**A deliberate loosening.** The ratchet cannot pass a PR that loosens a rule on purpose, approved through an ADR. Merge such a PR with the admin bypass (step 3, Bypass), as for `passes` flips (ADR-0017).
+
+**Turning it off.** Remove the owner-less lines from `.github/CODEOWNERS` first, in a PR of its own, and only then the required check.
