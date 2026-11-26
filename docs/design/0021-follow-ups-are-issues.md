@@ -1,9 +1,11 @@
 # ADR-0021: Follow-ups are GitHub issues, claimed like tasks
 
-- Status: Proposed (point 6 Accepted, 2026-11-27, by the maintainer)
+- Status: Proposed (point 6 Accepted, 2026-11-26, by the maintainer)
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0011, ADR-0020
+
+Point 6 is frozen as accepted text: as for any accepted ADR (ADR-0000, point 4), only its status and links may change, and a change to its decision needs a new ADR. The rest of this ADR is still Proposed.
 
 ## Context
 
@@ -36,7 +38,7 @@ When an agent finds something that its task does not need fixed (a guardrail gap
 
 The repository is public, and anyone may open an issue or comment on one. Issue text is therefore untrusted input, and a route for prompt injection unless it is filtered.
 
-- **Trusted authors** are the GitHub App `nami-agent[bot]` and the users that `.github/CODEOWNERS` names on `main`. A GitHub user name cannot contain `[`, so no user can take the bot's name. A team in `CODEOWNERS` is not expanded and trusts nobody.
+- **Trusted authors** are the GitHub App `nami-agent[bot]` and the users that `.github/CODEOWNERS` names on `main`. A GitHub user name cannot contain `[`, so no user can take the bot's name. A team in `CODEOWNERS` is not expanded and trusts nobody. ADR-0023 adds the CI app `nami-ci[bot]`, for the queue-failure issues of point 6 only.
 - **Trust comes from the author, never from a label.** Every agent holds the bot's key, and the bot may apply labels, so a label proves nothing about who decided. An outsider can also edit their own issue after someone labelled it.
 - **An outsider's report reaches agents only when a trusted human files it again,** as a new issue in their own words. The new issue may link the old one. Agents do not follow links to issues.
 - **Agents read issues only through `cargo xtask issue show <number>`.** It refuses an issue by an untrusted author. For a trusted issue it prints the title, the labels, the body and the comments by trusted authors, and says how many other comments it left out, never their text.
@@ -73,7 +75,7 @@ In `.github/pull_request_template.md`, `## Guardrail gaps` becomes `## Follow-up
 - This ADR replaces point 2 of ADR-0020. Its other points stand; where they say "learning", read "issue".
 - ADR-0011, point 5, changes. GitHub Issues carry human input and findings from agents. Plans stay the source of planned work. A trusted issue that one small PR closes is work without a plan.
 
-### 6. Amendment (Accepted, 2026-11-27, deciders: maintainer; proposed 2026-11-26): a merge-queue failure is fixed on the failing PR's own branch
+### 6. Amendment (Accepted, 2026-11-26, deciders: maintainer; proposed 2026-11-26): a merge-queue failure is fixed on the failing PR's own branch
 
 The workflow `queue` files an issue `PR #<n> failed in the merge queue (run <id>)`, of kind `bug`, when the required checks fail on PR #n's merge-queue branch and #n has left the queue: it is open, not merged, not queued, and no newer queue run tested it (issue #51). There is one issue per failed run. A re-run of the same run files nothing, but a later failed run of #n is a new failure and gets a new issue #m2, even while #n says `Fixes #<m>` for the first one. #m2 names #m and asks for `Fixes #<m2>` beside it. Most such failures are clashes that git merged without a conflict, such as two ADRs with one number. Only #n's own branch can take the fix: a rebase or a renumber of #n itself. A new PR would repeat the change and its review.
 
@@ -129,7 +131,7 @@ The maintainer makes most decisions in a conversation with a session, not on Git
 - The plan rules in tidy: a plan task ID never starts with `issue-`.
 - `cargo xtask pr-body`: the `Follow-up issues` section, and `Fixes #<number>` on an issue's branch.
 - `.claude/settings.json`: deny rules for reading issues with `gh` directly. A speed bump, not a guarantee.
-- `cargo xtask queue failed`, which `.github/workflows/queue.yml` runs as the bot (point 6): it files only for a run of `ci.yml` whose PR left the queue, files one issue per failed run (the title names the run, so a re-run of it files nothing), quotes only the closed vocabulary, and adds `needs-decision` to the issue when the bot did not open the PR.
+- `cargo xtask queue failed`, which `.github/workflows/queue.yml` runs as `nami-ci[bot]` (point 6, ADR-0023): it files only for a run of `ci.yml` whose PR left the queue, files one issue per failed run (the title names the run, so a re-run of it files nothing), quotes only the closed vocabulary, and adds `needs-decision` to the issue when the bot did not open the PR.
 - `cargo xtask task ready`, `claim` and `status` for the bot's queue-failure issues (point 6): `ready` leaves the issue out and `claim` refuses it, with the reason, whenever the bot did not open #n, whatever the issue's labels (point 7), while #n is open and its description closes the issue, while #n is in the merge queue, and while #n is closed or no PR. A description closes the issue as on GitHub: `Fixes #<m>`, `Fixes (#<m>)`, or for this repository `<owner>/<name>#<m>` and the issue's URL, with paired emphasis or none, outside HTML comments and fenced code blocks. `status` shows the reason for a held claim. A lookup that fails for one issue leaves out only that issue, and `ready` then exits non-zero.
 - **No mechanism:**
   - whether the session that fixes a queue failure adds `Fixes #<m>` to the failing PR's description. `cargo xtask pr-body` checks `Fixes` only on `task/issue-<m>` branches;
