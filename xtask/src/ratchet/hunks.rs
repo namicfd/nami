@@ -6,7 +6,9 @@
 //! of its lines, or be one that cannot change what a rule reports: a hunk of comments and blank
 //! lines only, or a hunk inside the test module or inside a constant or static, which the
 //! dialect holds to the base ([`super::dialect::fixed`]). The registry is read as data, so its
-//! hunks need no mutant. Any other hunk, a pure deletion among them, is unproven.
+//! hunks need no mutant, but each changed field of a row must be one that the rule-set check
+//! compares or one that only documents ([`super::dialect::registry::unproven_rows`]). Any other
+//! hunk, a pure deletion among them, is unproven.
 
 use super::dialect;
 use std::path::Path;

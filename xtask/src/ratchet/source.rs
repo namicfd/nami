@@ -6,11 +6,15 @@
 //! Mutation testing makes no mutant for a changed table row. These checks cover the registry's
 //! tables as data: every base row must be in the head unchanged or narrowed in what it permits,
 //! and every base `check_*` call site must still be there. That is a statement about the
-//! tables and the call sites, not about what tidy enforces: how the rule modules apply a row is
-//! code, which the corpus shows only at the paths where it plants a case, one per scope class
-//! for a firing case ([`super::plant::scope_placements`]), and mutation testing per changed
-//! hunk ([`super::hunks`]). A narrowing to a single file that no placement reaches is not shown.
-//! A table in a form this module does not read is no verdict, never a pass.
+//! tables and the call sites, not about what tidy enforces. How the rule modules apply a ban
+//! row is code, so the functions that decide whether a row applies to a path or a name are held
+//! to the base ([`super::dialect::fixed`]). The rest of their code the corpus shows only at the
+//! paths where it plants a case, one per scope class for a firing case
+//! ([`super::plant::scope_placements`]), and mutation testing per changed hunk
+//! ([`super::hunks`]). Only the fields these checks compare, and those that only document, are
+//! covered: a change to any other field of a row is unproven
+//! ([`super::dialect::registry::unproven_rows`]). A table in a form this module does not read
+//! is no verdict, never a pass.
 
 use super::dialect;
 use super::{Check, Finding};

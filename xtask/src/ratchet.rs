@@ -20,13 +20,14 @@
 //! `syn` checks are sound for files in the dialect of [`dialect`], and a rule-path file outside
 //! it gives no verdict: for those files, the rule tables, scopes, allowed lists, the presence of
 //! each `check_*` call site, and the lints' levels and registrations are what the compiler
-//! builds, and the constants and the code that reads the environment or files are the base's.
-//! That the rule modules apply the tables as written, and that a call that is present also
-//! runs, the corpus shows at the paths it plants each case at (its own, two drawn ones in its
-//! scope, and for a firing case one in each crate, each crate's tests, `xtask`, `lints`, `tools`
-//! and `docs`, wherever the base reports the same), and mutation testing shows for every changed
-//! hunk. A narrowing to a single file or a deeper directory that no placement reaches is not
-//! shown.
+//! builds, and the constants, the code that reads the environment or files, and the functions
+//! that decide whether a ban row applies to a path or a name are the base's. That the other
+//! rule code applies its rules as written, and that a call that is present also runs, the
+//! corpus shows at the paths it plants each case at (its own, two drawn ones in its scope, and
+//! for a firing case one in each crate, each crate's tests, `xtask`, `lints`, `tools` and
+//! `docs`, wherever the base reports the same), and mutation testing shows for every changed
+//! hunk. A coded rule narrowed to a single file or a deeper directory that no placement
+//! reaches is not shown.
 //! Against head code written to deceive, the rest is defence in depth only; the reviewer app,
 //! sampled audits and the trusted core back it. The reviewer app is the bot that
 //! `NAMI_REVIEWER_LOGIN` names, and the review it posts runs in CI (pending #59), where no

@@ -366,6 +366,84 @@ mod tests {
         assert!(super::fixed::check("lints/src/lib.rs", Some(&lib), &device).is_err());
     }
 
+    // Goal: a change to a function that decides whether a ban row applies to a path or a name
+    // gives no verdict: the review's inline narrowing of `direct-libm`, an early return, a
+    // visitor that stops handing on paths, and changes to `report` and to the entry point. So
+    // does a new or removed one, found by what it names; a change to any other function is in
+    // the dialect.
+    #[test]
+    fn the_ban_application_stays_the_bases() {
+        let module = "xtask/src/tidy/rust_source.rs";
+        let base = real(module);
+        for (name, probe) in ban_application_probes(&base) {
+            assert_ne!(probe, base, "{name}: the probe changes the file");
+            let error = super::fixed::check(module, Some(&base), &probe).unwrap_err();
+            assert!(error.contains(name) && error.contains("decides whether"), "{error}");
+        }
+        let gone = replaced(&base, "fn check_macro_name(", "fn check_macro_names(");
+        assert!(super::fixed::check(module, Some(&base), &gone).is_err(), "a held function gone");
+        let other = replaced(
+            &base,
+            "    fn in_tests(&self) -> bool {\n",
+            "    fn in_tests(&self) -> bool {\n        let _ = 1;\n",
+        );
+        assert_eq!(super::fixed::check(module, Some(&base), &other), Ok(()), "another function");
+        assert_eq!(super::fixed::check("xtask/src/tidy/text.rs", None, "fn check() {}"), Ok(()));
+        let twice = "struct A;\nimpl A { fn f() { PATH_BANS; } }\nimpl A { fn f() { PATH_BANS; } }";
+        let error = super::fixed::check("m.rs", Some(twice), twice).unwrap_err();
+        assert!(error.contains("two functions that apply a ban row keyed `A::f`"), "{error}");
+    }
+
+    /// Each probe of [`the_ban_application_stays_the_bases`], with the function it changes.
+    fn ban_application_probes(base: &str) -> Vec<(&'static str, String)> {
+        let report_segment = format!("{}self.report(segment", " ".repeat(16));
+        let allowed = format!("!registry::is_allowed(ban.allowed, self.path) {{\n{report_segment}");
+        let inline = format!(
+            "!registry::is_allowed(if ban.id == \"direct-libm\" {{ \
+             &[\"crates/kernels/src/math.rs\", \"crates/solver/src/lib.rs\"] }} else {{ \
+             ban.allowed }}, self.path) {{\n{report_segment}"
+        );
+        let start = "    fn check_path_start(&mut self, segment: &Ident) {\n";
+        let early =
+            format!("{start}        if self.path.starts_with(\"crates/solver\") {{ return; }}\n");
+        let report = "        self.violations.push(Violation::new(self.path, line_of(span), \
+                      rule, message));";
+        let spared = format!("if rule != \"direct-libm\" {{ {report} }}");
+        let edits = [
+            ("Visitor::check_path_start", allowed.as_str(), inline.as_str()),
+            ("Visitor::check_path_start", start, early.as_str()),
+            (
+                "Visitor::check_macro_name",
+                "any(|banned| name == banned)",
+                "any(|banned| name == banned && name != \"debug_assert\")",
+            ),
+            ("Visitor::report", report, spared.as_str()),
+            (
+                "<Visitor as Visit>::visit_path",
+                "        if node.segments.len() > 1\n",
+                "        if node.segments.len() > 1 && !self.path.ends_with(\"lib.rs\")\n",
+            ),
+            (
+                "Visitor::check_macro_tokens",
+                "        for segment in found.path_starts {\n",
+                "        for segment in found.path_starts.into_iter().skip(1) {\n",
+            ),
+            (
+                "`check`",
+                "        scope,\n        test_depth",
+                "        scope: Scope::Tooling,\n        test_depth",
+            ),
+        ];
+        let mut probes: Vec<(&'static str, String)> =
+            edits.into_iter().map(|(name, from, to)| (name, replaced(base, from, to))).collect();
+        let spare = "fn spare() -> usize { registry::PATH_BANS.iter().filter(|ban| ban.id != \
+                     \"direct-libm\").count() }";
+        probes.push(("`spare`", format!("{base}\n{spare}\n")));
+        let apply = "trait Apply { fn apply(&self) { let _ = MACRO_BANS; } }";
+        probes.push(("Apply::apply", format!("{base}\n{apply}\n")));
+        probes
+    }
+
     // Goal: the registration counts only as an unconditional statement of `register_lints`.
     #[test]
     fn registration_is_unconditional() {
@@ -478,6 +556,91 @@ mod tests {
             let verdict = registry::check(&base, probe);
             assert!(verdict.is_err(), "probe {index} must give no verdict");
         }
+    }
+
+    // Goal: a registry row change needs no mutant if every field it changes is one the
+    // rule-set check compares or one that only documents: a reworded message, summary,
+    // reference or description, a shrunk allowed list and a new ban row are covered.
+    #[test]
+    fn registry_rows_are_covered_field_by_field() {
+        let base = real(super::super::source::REGISTRY);
+        let ban = "pub const PATH_BANS: &[PathBan] = &[PathBan {";
+        let covered = [
+            base.clone(),
+            replaced(&base, "direct use of `libm`;", "a direct use of `libm`;"),
+            replaced(
+                &base,
+                "summary: \"Every ADR is listed in `docs/design/README.md`.\",\n        \
+                 reference: \"ADR-0000\",",
+                "summary: \"Every ADR is listed.\",\n        reference: \"ADR-0001\",",
+            ),
+            replaced(&base, "proves that nothing allocates after init.", "proves it."),
+            replaced(&base, "allowed: &[\"crates/kernels/src/math.rs\"]", "allowed: &[]"),
+            replaced(
+                &base,
+                ban,
+                "pub const PATH_BANS: &[PathBan] = &[PathBan { id: \"a-new-ban\", segment: \
+                 \"banned\", allowed: &[], scope: BanScope::Everywhere, message: \"a ban\" }, \
+                 PathBan {",
+            ),
+        ];
+        for (index, probe) in covered.iter().enumerate() {
+            assert_eq!(registry::unproven_rows(&base, probe), Ok(Vec::new()), "probe {index}");
+        }
+    }
+
+    // Goal: a changed `mechanism`, a planned row added or removed, and a field no check knows
+    // are unproven, each naming the field, the row and the table. A row without an id, or two
+    // rows that share one, give no verdict.
+    #[test]
+    fn registry_rows_outside_the_checks_are_unproven() {
+        let base = real(super::super::source::REGISTRY);
+        let alloc = "    planned(\n        \"alloc-after-init\",\n        \"test\",";
+        let alloc_line = base[..base.find(alloc).unwrap()].lines().count() + 1;
+        let unproven = [
+            (
+                replaced(&base, alloc, &alloc.replace("\"test\"", "\"ci\"")),
+                format!(
+                    "the change at xtask/src/tidy/registry.rs:{alloc_line} to `mechanism` of \
+                     `alloc-after-init` in `PLANNED` is neither compared"
+                ),
+                1,
+            ),
+            (
+                replaced(
+                    &base,
+                    alloc,
+                    &format!("    planned(\"new\", \"ci\", \"A.\", \"ADR-0001\"),\n{alloc}"),
+                ),
+                "to `id` of `new` in `PLANNED`".to_owned(),
+                2,
+            ),
+            (
+                replaced(&base, alloc, &alloc.replace("alloc-after-init", "alloc-at-init")),
+                format!("registry.rs:{alloc_line} of the base to `id` of `alloc-after-init`"),
+                4,
+            ),
+            (
+                replaced(
+                    &base,
+                    "    segment: \"libm\",",
+                    "    segment: \"libm\",\n    also: \"x\",",
+                ),
+                "to `also` of `direct-libm` in `PATH_BANS`".to_owned(),
+                1,
+            ),
+        ];
+        for (probe, expected, count) in &unproven {
+            let found = registry::unproven_rows(&base, probe).unwrap();
+            assert!(found.iter().any(|item| item.contains(expected.as_str())), "{found:?}");
+            assert_eq!(found.len(), *count, "{found:?}");
+        }
+        let anonymous = replaced(&base, "    id: \"direct-libm\",\n", "");
+        let no_id = registry::unproven_rows(&base, &anonymous).unwrap_err();
+        assert!(no_id.contains("a row of `PATH_BANS` in xtask/src/tidy/registry.rs has no id"));
+        let twice = replaced(&base, "id: \"adr-number\"", "id: \"adr-index\"");
+        let shared = registry::unproven_rows(&base, &twice).unwrap_err();
+        assert!(shared.contains("two rows of `RULES`"), "{shared}");
     }
 
     // Goal: every form that the review of #57 used to hide a loosening in a rule module gives no

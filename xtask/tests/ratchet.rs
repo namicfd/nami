@@ -489,6 +489,31 @@ fn a_pure_new_ban_row_passes_without_mutants() {
     assert!(mixed.line().starts_with("ratchet: no verdict"), "{}", mixed.summary());
 }
 
+// Goal: a registry change counts as covered by the data checks only field by field: a
+// reworded ban message passes without a mutant, and a changed `mechanism` of a planned row,
+// which no data check compares and which is more than documentation, is unproven.
+#[test]
+fn a_registry_change_is_covered_only_in_the_fields_the_checks_read() {
+    let case = Case::new("row-fields");
+    let registry = "xtask/src/tidy/registry.rs";
+    for tree in [case.base(), case.head()] {
+        write(&tree, "src/fake-mutants.txt", "");
+    }
+    let reworded = replaced(&real(registry), "direct use of `libm`;", "a direct use of `libm`;");
+    write(&case.head(), registry, &reworded);
+    let message = case.run(NOTHING, "any");
+    assert!(message.findings.is_empty() && message.unproven.is_empty(), "{}", message.summary());
+    assert!(message.line().starts_with("ratchet: pass"), "{}", message.summary());
+    let alloc = "        \"alloc-after-init\",\n        \"test\",";
+    let mechanism = replaced(&reworded, alloc, &alloc.replace("\"test\"", "\"ci\""));
+    write(&case.head(), registry, &mechanism);
+    let changed = case.run(NOTHING, "any");
+    assert_eq!(changed.unproven.len(), 1, "{}", changed.summary());
+    let what = &changed.unproven[0];
+    assert!(what.contains("`mechanism` of `alloc-after-init` in `PLANNED`"), "{what}");
+    assert!(changed.line().starts_with("ratchet: no verdict"), "{}", changed.summary());
+}
+
 // Goal: a ban narrowed in code outside the scope of its case fails: the review's exploit, which
 // adds `crates/solver` to `direct-libm`'s exceptions through a private table, and the variant
 // that returns early for `crates/solver`. Each case that fires is also planted in every other

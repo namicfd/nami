@@ -12,7 +12,8 @@
 //! no verdict. A changed hunk without a mutant of its own proves nothing either, because a
 //! changed constant or a deleted line makes none ([`super::hunks`]). The registry's tables are
 //! the exception: the rule-set check reads them as data, so a change to them alone passes with
-//! no mutant.
+//! no mutant, as long as every field it changes is one that check compares or one that only
+//! documents ([`super::dialect::registry::unproven_rows`]).
 
 use super::observations::{Observations, Run};
 use super::{Check, Finding, Tools};
@@ -132,13 +133,19 @@ pub fn judge(
         judged
             .notes
             .push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
-        // A hunk that the data checks cover (the registry's tables) needs no mutant, so a
-        // data-only change passes with none; every other hunk needs one of its own.
+        // A hunk that the data checks cover (a registry row whose changed fields they compare
+        // or that only document) needs no mutant, so a data-only change passes with none;
+        // every other hunk needs one of its own.
         let starts =
             if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
         let mut uncovered = Vec::new();
         for path in changed_sources(rule_paths, workspace) {
             uncovered.extend(uncovered_hunks(base, head, path, &starts, work)?);
+        }
+        if rule_paths.iter().any(|path| path == super::source::REGISTRY)
+            && super::source::REGISTRY.starts_with(workspace.sources)
+        {
+            uncovered.extend(unproven_rows(base, head)?);
         }
         assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
         if count > 0 {
@@ -155,8 +162,24 @@ pub fn judge(
     Ok(judged)
 }
 
-/// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, which
-/// the rule-set check reads as data.
+/// The registry rows whose change no data check proves ([`dialect::registry::unproven_rows`]).
+///
+/// # Errors
+///
+/// No verdict: the registry is missing in either tree, or unreadable.
+fn unproven_rows(base: &Path, head: &Path) -> Result<Vec<String>, String> {
+    let registry = super::source::REGISTRY;
+    let read = |root: &Path| -> Result<String, String> {
+        super::source::read_optional(root, registry)?
+            .ok_or_else(|| format!("{registry} is missing in {}", root.display()))
+    };
+    let unproven = super::dialect::registry::unproven_rows(&read(base)?, &read(head)?)?;
+    assert!(unproven.iter().all(|item| item.contains(registry)), "each item names the registry");
+    Ok(unproven)
+}
+
+/// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, whose
+/// tables the rule-set check reads as data, and whose rows [`unproven_rows`] judges.
 fn changed_sources<'a>(rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
     rule_paths
         .iter()
