@@ -3,7 +3,9 @@
 # repetition so that a burst of load from elsewhere spreads over all of them.
 #
 # usage: ./bench.sh <athena-default-binary> <athena-simd-binary> <athena-input-dir> [reps] [cpu]
-# Writes results/raw.tsv: rep size code config variant cycles zone_cycles_per_second load1.
+# Environment: CONFIGS (default "A B C"), VARIANTS (default "soa aos hybrid4 hybrid8"),
+# ALGEBRAIC (default 1: also run CA soa), OUT (default results/raw.tsv).
+# Writes $OUT: rep size code config variant cycles zone_cycles_per_second load1.
 set -euo pipefail
 
 athena_default=$1
@@ -12,7 +14,7 @@ inputs=$3
 reps=${4:-5}
 cpu=${5:-8}
 here=$(cd "$(dirname "$0")" && pwd)
-out="$here/results/raw.tsv"
+out="$here/${OUT:-results/raw.tsv}"
 mkdir -p "$here/results"
 printf 'rep\tsize\tcode\tconfig\tvariant\tcycles\tzcps\tload1\n' > "$out"
 
@@ -54,12 +56,12 @@ for rep in $(seq 1 "$reps"); do
     for size in 64 128; do
         athena "$rep" "$size" g++ "$athena_default"
         athena "$rep" "$size" g++-simd "$athena_simd"
-        for config in A B C; do
-            for variant in soa aos hybrid4 hybrid8; do
+        for config in ${CONFIGS:-A B C}; do
+            for variant in ${VARIANTS:-soa aos hybrid4 hybrid8}; do
                 rust "$rep" "$size" "$config" "$variant"
             done
         done
-        rust "$rep" "$size" CA soa
+        if [ "${ALGEBRAIC:-1}" = 1 ]; then rust "$rep" "$size" CA soa; fi
         echo "rep $rep size $size done" >&2
     done
 done

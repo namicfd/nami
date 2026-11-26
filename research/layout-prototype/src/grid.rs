@@ -62,6 +62,78 @@ impl Shape {
     }
 }
 
+/// Block dimensions, either given at runtime (`Shape`) or known at compile time (`Fixed<N>`).
+/// The SoA layout is generic over it, to measure what compile-time trip counts buy.
+pub trait Dims: Copy {
+    /// Variant name in reports.
+    const SOA_NAME: &'static str;
+
+    /// Builds the dimensions from a runtime shape, asserting that they agree.
+    fn from_shape(shape: Shape) -> Self;
+
+    /// Interior cells per side.
+    fn n(self) -> usize;
+
+    /// Cells per side including ghosts.
+    #[inline(always)]
+    fn padded(self) -> usize {
+        self.n() + 2 * to_usize(GHOST)
+    }
+
+    #[inline(always)]
+    fn ghost(self) -> usize {
+        to_usize(GHOST)
+    }
+
+    #[inline(always)]
+    fn cells(self) -> usize {
+        self.n() * self.n() * self.n()
+    }
+
+    #[inline(always)]
+    fn padded_cells(self) -> usize {
+        self.padded() * self.padded() * self.padded()
+    }
+
+    /// Cell width in a unit cube.
+    #[inline(always)]
+    fn dx(self) -> f64 {
+        1.0 / to_f64(self.n())
+    }
+}
+
+impl Dims for Shape {
+    const SOA_NAME: &'static str = "soa";
+
+    fn from_shape(shape: Shape) -> Self {
+        shape
+    }
+
+    #[inline(always)]
+    fn n(self) -> usize {
+        to_usize(self.n)
+    }
+}
+
+/// Dimensions known at compile time: `N`³ interior cells.
+#[derive(Clone, Copy, Debug)]
+pub struct Fixed<const N: u32>;
+
+impl<const N: u32> Dims for Fixed<N> {
+    const SOA_NAME: &'static str = "soa-const";
+
+    fn from_shape(shape: Shape) -> Self {
+        assert_eq!(Shape::n(shape), to_usize(N), "runtime shape must match the compile-time size");
+        Self
+    }
+
+    #[inline(always)]
+    fn n(self) -> usize {
+        // `as` is banned; `usize::try_from` on a constant folds at compile time.
+        to_usize(N)
+    }
+}
+
 /// Lossless widening of a `u32`.
 pub fn to_usize(value: u32) -> usize {
     usize::try_from(value).expect("usize holds every u32 on supported targets")
@@ -74,7 +146,7 @@ pub fn to_f64(value: usize) -> f64 {
 }
 
 /// Row number `index` of length `len` in `data`.
-#[inline]
+#[inline(always)]
 pub fn row<T>(data: &[T], len: usize, index: usize) -> &[T] {
     assert!(len > 0, "row length must be positive");
     assert!(data.len() % len == 0, "data must hold whole rows");
@@ -85,7 +157,7 @@ pub fn row<T>(data: &[T], len: usize, index: usize) -> &[T] {
 }
 
 /// Mutable row number `index` of length `len` in `data`.
-#[inline]
+#[inline(always)]
 pub fn row_mut<T>(data: &mut [T], len: usize, index: usize) -> &mut [T] {
     assert!(len > 0, "row length must be positive");
     assert!(data.len() % len == 0, "data must hold whole rows");
@@ -96,7 +168,7 @@ pub fn row_mut<T>(data: &mut [T], len: usize, index: usize) -> &mut [T] {
 }
 
 /// The `len` elements starting at `start`.
-#[inline]
+#[inline(always)]
 pub fn sub<T>(data: &[T], start: usize, len: usize) -> &[T] {
     let Some(found) = data.get(start..start + len) else {
         panic!("sub-slice {start}+{len} out of range {}", data.len());
@@ -105,7 +177,7 @@ pub fn sub<T>(data: &[T], start: usize, len: usize) -> &[T] {
 }
 
 /// The `len` elements starting at `start`, mutably.
-#[inline]
+#[inline(always)]
 pub fn sub_mut<T>(data: &mut [T], start: usize, len: usize) -> &mut [T] {
     let total = data.len();
     let Some(found) = data.get_mut(start..start + len) else {
@@ -151,7 +223,8 @@ impl Dir {
 
     /// Row index of the ghosted cell at (other + GHOST, s) for Y, or (s, other + GHOST) for Z:
     /// `other` is the interior index of the fixed direction, `s` the ghosted sweep index.
-    pub fn padded_row(self, other: usize, s: usize, shape: Shape) -> usize {
+    #[inline(always)]
+    pub fn padded_row<D: Dims>(self, other: usize, s: usize, shape: D) -> usize {
         let p = shape.padded();
         let g = shape.ghost();
         match self {
@@ -162,7 +235,8 @@ impl Dir {
     }
 
     /// Row index of the interior cell row at (other, s) for Y, or (s, other) for Z.
-    pub fn interior_row(self, other: usize, s: usize, shape: Shape) -> usize {
+    #[inline(always)]
+    pub fn interior_row<D: Dims>(self, other: usize, s: usize, shape: D) -> usize {
         let n = shape.n();
         assert!(s < n && other < n, "interior row out of range");
         match self {

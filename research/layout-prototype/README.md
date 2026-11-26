@@ -14,7 +14,9 @@ use, measured on 3D Euler. Results and recommendation: `docs/research/layout-pro
   cube, with the wave vector along the grid diagonal.
 - Four layouts, all calling the same per-face functions in `src/physics.rs` with the same loop
   structure, so the arithmetic is the same operation for operation:
-  - `soa`: `[var][k][j][i]`, row stencils (the hypothesis);
+  - `soa`: `[var][k][j][i]`, row stencils (the hypothesis), sizes given at runtime;
+  - `soa-const`: the same code with the block size as a const generic (`Soa<Fixed<64>>`,
+    `Soa<Fixed<128>>`), to measure what compile-time trip counts buy;
   - `aos`: `[k][j][i][var]`, one `[f64; 5]` per cell;
   - `hybrid4`, `hybrid8`: `[k][j][i/W][var][i%W]` (AoSoA), groups of 4 or 8 cells along i.
 - Constraints kept from the real code: no raw slice indexing (`clippy::indexing_slicing` denied;
@@ -88,3 +90,7 @@ python3 -I tools/summarise.py results/raw.tsv
 - `results/phases.txt`: per-phase breakdown (config T) next to the untimed rate (config C).
 - `results/vectorisation.txt`: packed AVX2 instruction counts per function (`tools/vecstats.py`).
 - `results/algebraic-64-period.txt`: the `algebraic_*` data point over one period.
+- `results/raw-const.tsv`: `soa` against `soa-const` in configurations A, B and C
+  (`CONFIGS="A B C" VARIANTS="soa soa-const" ALGEBRAIC=0 OUT=results/raw-const.tsv ./bench.sh ...`).
+  This build also marks the row accessors `#[inline(always)]`, which by itself moves configuration
+  A's SoA from 0.7 to 6.6 Mzc/s (see the results document).

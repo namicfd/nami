@@ -3,7 +3,7 @@
 //! transposed or copied into pencils.
 
 use crate::Block;
-use crate::grid::{self, Dir, Shape, row, row_mut, sub, sub_mut};
+use crate::grid::{self, Dims, Dir, Shape, row, row_mut, sub, sub_mut};
 use crate::kernels::{self, Rows, RowsMut};
 use crate::timed;
 use crate::timers::Phase;
@@ -37,8 +37,8 @@ struct Scratch {
     flux_prev: Vars,
 }
 
-pub struct Soa {
-    shape: Shape,
+pub struct Soa<D: Dims = Shape> {
+    shape: D,
     state: Vars,
     stage: Vars,
     div: Vars,
@@ -46,10 +46,11 @@ pub struct Soa {
     scratch: Scratch,
 }
 
-impl Block for Soa {
-    const NAME: &'static str = "soa";
+impl<D: Dims> Block for Soa<D> {
+    const NAME: &'static str = D::SOA_NAME;
 
     fn new(shape: Shape, canonical: &[f64]) -> Self {
+        let shape = D::from_shape(shape);
         assert_eq!(canonical.len(), 5 * shape.cells(), "canonical state has five variables");
         let n = shape.n();
         let mut state = poisoned(shape.cells());
@@ -79,7 +80,7 @@ impl Block for Soa {
     }
 
     fn prepare(&mut self) -> f64 {
-        timed!(Phase::Convert, { convert::<true>(&self.state, &mut self.prim, self.shape) })
+        timed!(Phase::Convert, { convert::<true, D>(&self.state, &mut self.prim, self.shape) })
     }
 
     fn advance(&mut self, dt: f64) {
@@ -91,7 +92,7 @@ impl Block for Soa {
             }
         });
         let _speed =
-            timed!(Phase::Convert, { convert::<false>(&self.stage, &mut self.prim, self.shape) });
+            timed!(Phase::Convert, { convert::<false, D>(&self.stage, &mut self.prim, self.shape) });
         self.divergence();
         timed!(Phase::Update, {
             for ((u, s), d) in self.state.iter_mut().zip(&self.stage).zip(&self.div) {
@@ -107,7 +108,7 @@ impl Block for Soa {
     }
 }
 
-impl Soa {
+impl<D: Dims> Soa<D> {
     /// Ghost fill, then the flux divergence of the primitives into `div`.
     fn divergence(&mut self) {
         timed!(Phase::Ghost, { fill_ghosts(&mut self.prim, self.shape) });
@@ -118,7 +119,7 @@ impl Soa {
 }
 
 /// Conserved to primitive over the interior, with the per-block backstop.
-fn convert<const SPEED: bool>(state: &Vars, prim: &mut Vars, shape: Shape) -> f64 {
+fn convert<const SPEED: bool, D: Dims>(state: &Vars, prim: &mut Vars, shape: D) -> f64 {
     let (n, p, g) = (shape.n(), shape.padded(), shape.ghost());
     let mut speed = 0.0_f64;
     let mut physical = true;
@@ -135,7 +136,7 @@ fn convert<const SPEED: bool>(state: &Vars, prim: &mut Vars, shape: Shape) -> f6
     speed
 }
 
-fn fill_ghosts(prim: &mut Vars, shape: Shape) {
+fn fill_ghosts<D: Dims>(prim: &mut Vars, shape: D) {
     let (n, p) = (shape.n(), shape.padded());
     for v in prim.iter_mut() {
         assert_eq!(v.len(), p * p * p, "primitives include ghosts");
@@ -150,7 +151,7 @@ fn fill_ghosts(prim: &mut Vars, shape: Shape) {
 }
 
 #[inline(never)]
-fn sweep_x(prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: Shape) {
+fn sweep_x<D: Dims>(prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: D) {
     let (n, p, g) = (shape.n(), shape.padded(), shape.ghost());
     let inv_dx = 1.0 / shape.dx();
     for k in 0..n {
@@ -177,7 +178,7 @@ fn sweep_x(prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: Shape) {
 /// A y- or z-sweep over row stencils. For each line `other` it walks the sweep index, keeps the
 /// previous cell's plus-face values and the previous face's flux, and so touches each row once.
 #[inline(never)]
-fn sweep_transverse(dir: Dir, prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: Shape) {
+fn sweep_transverse<D: Dims>(dir: Dir, prim: &Vars, div: &mut Vars, s: &mut Scratch, shape: D) {
     assert!(dir != Dir::X, "x is not a transverse sweep");
     let (n, p, g) = (shape.n(), shape.padded(), shape.ghost());
     let inv_dx = 1.0 / shape.dx();

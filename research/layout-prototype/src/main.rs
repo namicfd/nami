@@ -1,6 +1,6 @@
 //! Benchmark driver.
 //!
-//! `layout-prototype run <soa|aos|hybrid4|hybrid8> <n> <cycles|period>` runs one layout and prints
+//! `layout-prototype run <soa|soa-const|aos|hybrid4|hybrid8> <n> <cycles|period>` runs one layout and prints
 //! one line: zone-cycles per second, the hash of the final state's bits, and the L1 error.
 //! `layout-prototype compare <n> <cycles|period>` runs every layout and asserts identical bits.
 
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use layout_prototype::aos::Aos;
-use layout_prototype::grid::Shape;
+use layout_prototype::grid::{Fixed, Shape};
 use layout_prototype::hybrid::Hybrid;
 use layout_prototype::problem::LinearWave;
 use layout_prototype::soa::Soa;
@@ -100,7 +100,12 @@ fn measure_named(name: &str, shape: Shape, stop: Stop) -> Report {
         "aos" => measure::<Aos>(shape, stop),
         "hybrid4" => measure::<Hybrid<4>>(shape, stop),
         "hybrid8" => measure::<Hybrid<8>>(shape, stop),
-        other => panic!("unknown variant {other}; use soa, aos, hybrid4 or hybrid8"),
+        "soa-const" => match shape.n() {
+            64 => measure::<Soa<Fixed<64>>>(shape, stop),
+            128 => measure::<Soa<Fixed<128>>>(shape, stop),
+            other => panic!("soa-const is compiled for 64 and 128 cells per side, not {other}"),
+        },
+        other => panic!("unknown variant {other}; use soa, soa-const, aos, hybrid4 or hybrid8"),
     }
 }
 
@@ -122,7 +127,7 @@ fn main() {
         }
         [_, "compare", n, stop] => {
             let shape = Shape::new(n.parse().expect("n is a cell count"));
-            let reports: Vec<Report> = ["soa", "aos", "hybrid4", "hybrid8"]
+            let reports: Vec<Report> = ["soa", "soa-const", "aos", "hybrid4", "hybrid8"]
                 .iter()
                 .map(|name| measure_named(name, shape, parse_stop(stop)))
                 .collect();
