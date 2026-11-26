@@ -1,8 +1,9 @@
 //! Rules about the workspace as a whole: the `#[expect]` budget, assertion density, snapshots.
 //!
 //! The counting that the budget adds up lives here too, with its own token walk, not with the
-//! token rules: workspace rules have no fixtures, so the ratchet cannot prove that a change to
-//! them only tightens, and their code stays with the code owner (ADR-0022).
+//! token rules: workspace rules have no fixtures, so the ratchet (pending, #57) could not prove
+//! that a change to them only tightens, and their code stays with the code owner (ADR-0022,
+//! pending in #55).
 
 use super::{AssertionStats, Violation};
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};

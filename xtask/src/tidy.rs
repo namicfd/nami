@@ -52,11 +52,8 @@ const FIXTURE_DIRECTORY: &str = "xtask/fixtures";
 /// the nested-checkout rule alone does not catch them there.
 const ROOT_AGENT_DIRECTORY: &str = ".claude";
 
-/// What precedes the virtual path in the first line of a tidy fixture.
-pub(crate) const FIXTURE_PATH_MARKER: &str = "path: ";
-
 /// Directory of the ADRs and their index (ADR-0000). File kinds are core: they decide which
-/// files the rules check (ADR-0022).
+/// files the rules check (ADR-0022, pending in #55).
 pub const ADR_DIRECTORY: &str = "docs/design";
 
 /// The style guide, relative to the root.
@@ -106,18 +103,6 @@ pub fn is_adr_file_name(name: &str) -> bool {
     let has_number = bytes.iter().take(4).filter(|byte| byte.is_ascii_digit()).count() == 4;
     let is_markdown = Path::new(name).extension().is_some_and(|extension| extension == "md");
     has_number && bytes.get(4) == Some(&b'-') && is_markdown
-}
-
-/// Reads the virtual path from the first line of a tidy fixture: `// path: <path>`,
-/// `# path: <path>` or `<!-- path: <path> -->`. The path decides which rules apply to the
-/// fixture. The fixture tests and the ratchet (ADR-0022) both read it here.
-#[must_use]
-pub fn fixture_virtual_path(first_line: &str) -> Option<PathBuf> {
-    let line = first_line.trim();
-    let body = ["//", "<!--", "#"].iter().find_map(|prefix| line.strip_prefix(prefix))?;
-    let body = body.strip_suffix("-->").unwrap_or(body).trim();
-    let path = body.strip_prefix(FIXTURE_PATH_MARKER)?.trim();
-    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// Where a source file lives, which decides the rules that apply to it.
@@ -643,6 +628,35 @@ mod tests {
         assert_eq!(Scope::of(Path::new("crates/base/src/lib.rs")), Scope::Crate);
         assert_eq!(Scope::of(Path::new("crates/kernels/src/reduce.rs")), Scope::Kernels);
         assert_eq!(Scope::of(Path::new("xtask/src/tidy.rs")), Scope::Tooling);
+    }
+
+    // Goal: `unasserted-function` (rust_source.rs) and `assertion-density` (assertions.rs)
+    // exempt the same test code, so that their two walks cannot drift apart. Method: one long
+    // unasserted function in every position; the first rule fires exactly where the second
+    // counts the function.
+    #[test]
+    fn test_code_exemptions_agree() {
+        let body = format!("fn f() {{\n{}}}\n", "    let _x = 1;\n".repeat(11));
+        let cases = [
+            ("crates/solver/src/a.rs", body.clone()),
+            ("crates/solver/src/a.rs", format!("#[cfg(test)]\nmod tests {{\n{body}}}\n")),
+            ("crates/solver/src/a.rs", format!("#[test]\n{body}")),
+            ("crates/solver/src/a.rs", format!("#[cfg(unix)]\nmod m {{\n{body}}}\n")),
+            ("crates/solver/src/a.rs", format!("#[cfg(all(test, unix))]\nmod m {{\n{body}}}\n")),
+            ("crates/solver/src/a.rs", format!("impl A {{\n{body}}}\n")),
+            ("crates/solver/src/a.rs", format!("trait T {{\n{body}}}\n")),
+            ("crates/solver/src/a.rs", format!("#[test]\nfn outer() {{\n{body}}}\n")),
+            ("crates/solver/tests/a.rs", body.clone()),
+            ("xtask/src/a.rs", body.clone()),
+        ];
+        let mut counted = 0;
+        for (path, text) in &cases {
+            let (violations, stats) = super::check_rust_source(Path::new(path), text);
+            let fires = violations.iter().any(|violation| violation.rule == "unasserted-function");
+            assert_eq!(fires, stats.functions > 0, "{path}: {text}");
+            counted += u32::from(fires);
+        }
+        assert_eq!(counted, 7, "both exempt only test modules, test functions and tooling");
     }
 
     // Goal: ADR files are recognised by their four-digit prefix.

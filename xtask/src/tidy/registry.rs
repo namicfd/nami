@@ -45,8 +45,8 @@ pub struct Rule {
 }
 
 /// Every tidy rule that is written as code. Keep the rows sorted by id. The rows are plain
-/// literals, so that the ratchet reads them from a pull request's source without running it
-/// (ADR-0022).
+/// literals, so that the ratchet (pending, #57) can read them from a pull request's source
+/// without running it (ADR-0022, pending in #55).
 pub const RULES: &[Rule] = &[
     Rule {
         id: "adr-index",
@@ -58,8 +58,7 @@ pub const RULES: &[Rule] = &[
         id: "adr-number",
         kind: RuleKind::Source,
         summary: "No two ADR files share a number, and an ADR's title repeats the number of its \
-                  file \
-         name.",
+                  file name.",
         reference: "ADR-0000",
     },
     Rule {
@@ -101,40 +100,37 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "dependency-override",
         kind: RuleKind::Source,
-        summary: "The workspace manifest has no `[patch]` or `[replace]`: no dependency is \
-                  swapped for \
-         other source code under its own name.",
+        summary: "The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped \
+                  for other source code under its own name.",
         reference: "ADR-0001",
     },
     Rule {
         id: "doc-tag",
         kind: RuleKind::Source,
         summary: "Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy \
-                  rule, a \
-         lint that is switched on, or a planned mechanism that exists.",
+                  rule, a lint that is switched on, or a planned mechanism that exists.",
         reference: "TIGER_STYLE.md, How rules are enforced",
     },
     Rule {
         id: "expect-budget",
         kind: RuleKind::Workspace,
         summary: "The number of `expect(...)` lint suppressions, counted on tokens so that \
-                  `cfg_attr` and \
-         macro bodies are included, equals `xtask/expect-budget.txt`.",
+                  `cfg_attr` and macro bodies are included, equals `xtask/expect-budget.txt`.",
         reference: "ADR-0006",
     },
     Rule {
         id: "float-eq-in-eq-fn",
         kind: RuleKind::Source,
-        summary: "In nami crates outside tests, no `==` or `!=` with a float operand in a \
-                  function whose \
-         name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. Without \
-         types, a float operand is a float literal, an `f32`/`f64` constant such as \
-         `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter declared \
-         `f32`/`f64` or an array or slice of them (or a reference to one), indexed or not, until \
-         a `let`, closure, `match` arm or `for` rebinds the name. Stricter than clippy on \
-         purpose: an exact `== 0.0` is reported too. Not seen: fields, `Option<f64>`, untyped \
-         locals, call results, macro arguments. A float parameter rebound by `if let` or \
-         `while let` is a false positive.",
+        summary: "In nami crates outside tests, no `==` or `!=` with a float operand in a function \
+                  whose name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is \
+                  silent. Without types, a float operand is a float literal, an `f32`/`f64` \
+                  constant such as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or \
+                  closure parameter declared `f32`/`f64` or an array or slice of them (or a \
+                  reference to one), indexed or not, until a `let`, closure, `match` arm or `for` \
+                  rebinds the name. Stricter than clippy on purpose: an exact `== 0.0` is reported \
+                  too. Not seen: fields, `Option<f64>`, untyped locals, call results, macro \
+                  arguments. A float parameter rebound by `if let` or `while let` is a false \
+                  positive.",
         reference: "ADR-0006",
     },
     Rule {
@@ -165,7 +161,7 @@ pub const RULES: &[Rule] = &[
         id: "magic-tolerance",
         kind: RuleKind::Source,
         summary: "In nami crates outside tests, a float literal in (0, 1e-6] appears only in the \
-         initialiser of a `const` item that has a doc comment.",
+                  initialiser of a `const` item that has a doc comment.",
         reference: "TIGER_STYLE.md, Floating point",
     },
     Rule {
@@ -197,7 +193,7 @@ pub const RULES: &[Rule] = &[
         id: "planned-task",
         kind: RuleKind::Workspace,
         summary: "Every planned mechanism has a task with the same id in a `tasks.json` under \
-         `docs/exec-plans/active/`.",
+                  `docs/exec-plans/active/`.",
         reference: "ADR-0018",
     },
     Rule {
@@ -210,8 +206,7 @@ pub const RULES: &[Rule] = &[
         id: "runtime-dependency",
         kind: RuleKind::Source,
         summary: "Runtime and build dependencies of nami crates are `libm` and workspace crates \
-                  only, \
-         and none is renamed with `package = \"...\"`.",
+                  only, and none is renamed with `package = \"...\"`.",
         reference: "ADR-0001",
     },
     Rule {
@@ -224,8 +219,7 @@ pub const RULES: &[Rule] = &[
         id: "task-graph",
         kind: RuleKind::Workspace,
         summary: "Task ids are unique, every dependency exists, no task passes before its \
-                  dependencies, \
-         and the dependencies form no cycle.",
+                  dependencies, and the dependencies form no cycle.",
         reference: "ADR-0011",
     },
     Rule {
@@ -238,8 +232,7 @@ pub const RULES: &[Rule] = &[
         id: "tasks-json",
         kind: RuleKind::Workspace,
         summary: "Every `tasks.json` is valid JSON with one `tasks` array, and every task has \
-                  exactly the \
-         six fields of the schema.",
+                  exactly the six fields of the schema.",
         reference: "ADR-0011",
     },
     Rule {
@@ -258,8 +251,8 @@ pub const RULES: &[Rule] = &[
         id: "unbounded-loop",
         kind: RuleKind::Source,
         summary: "No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, \
-         `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, unless \
-         `take` or `zip` bounds it: every loop has a fixed upper bound.",
+                  `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, \
+                  unless `take` or `zip` bounds it: every loop has a fixed upper bound.",
         reference: "TIGER_STYLE.md, Put a limit on everything",
     },
     Rule {
@@ -271,10 +264,9 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "usize",
         kind: RuleKind::Source,
-        summary: "In nami crates, `usize` appears in function signatures, fields, public \
-                  constants and \
-         statics, and type aliases only in `base::index`. Trait impls and const generics are \
-         exempt.",
+        summary: "In nami crates, `usize` appears in function signatures, fields, public constants \
+                  and statics, and type aliases only in `base::index`. Trait impls and const \
+                  generics are exempt.",
         reference: "ADR-0002",
     },
     Rule {

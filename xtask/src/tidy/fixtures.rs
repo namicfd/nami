@@ -14,9 +14,8 @@
 //! The extension is not `.rs` on purpose: rustfmt, the edit hook and tidy's own walk then leave
 //! the deliberate violations alone. Context such as the ADR index comes from the real workspace.
 
-use super::fixture_virtual_path as virtual_path;
 use super::registry::{self, RuleKind};
-use super::{FIXTURE_DIRECTORY, FIXTURE_PATH_MARKER as PATH_MARKER, check_single_file};
+use super::{FIXTURE_DIRECTORY, check_single_file};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,11 +23,23 @@ use std::path::{Path, PathBuf};
 /// Directory of tidy's fixtures, below [`FIXTURE_DIRECTORY`].
 const TIDY_FIXTURES: &str = "tidy";
 
+/// What precedes the virtual path in a fixture's first line.
+const PATH_MARKER: &str = "path: ";
+
 /// The two fixtures of every rule: one that fires and one that passes.
 const OUTCOMES: [&str; 2] = ["fires", "passes"];
 
 fn fixture_directory() -> PathBuf {
     crate::workspace_root().join(FIXTURE_DIRECTORY).join(TIDY_FIXTURES)
+}
+
+/// Reads the virtual path from a fixture's first line.
+fn virtual_path(first_line: &str) -> Option<PathBuf> {
+    let line = first_line.trim();
+    let body = ["//", "<!--", "#"].iter().find_map(|prefix| line.strip_prefix(prefix))?;
+    let body = body.strip_suffix("-->").unwrap_or(body).trim();
+    let path = body.strip_prefix(PATH_MARKER)?.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// Runs the source rules on the fixture `<id>.<outcome>.fixture` and returns the rules that
