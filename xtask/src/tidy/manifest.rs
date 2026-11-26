@@ -1,4 +1,4 @@
-//! Rules about manifests: runtime dependencies (ADR-0001).
+//! Rules about manifests: runtime dependencies and their overrides (ADR-0001).
 //!
 //! xtask has no TOML parser (ADR-0001), so manifests are read line by line. That is enough for
 //! the way manifests are written here. Where a line is ambiguous the rule reports it, so that an
@@ -9,8 +9,15 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// The rule that every violation in this module belongs to.
+/// The rule that the dependency tables are checked against.
 const RULE: &str = "runtime-dependency";
+
+/// The rule that reports `[patch]` and `[replace]` in the workspace manifest.
+const OVERRIDE_RULE: &str = "dependency-override";
+
+/// Top-level keys of the workspace manifest that make a dependency resolve to other source
+/// code than its name and version say.
+const OVERRIDE_KEYS: [&str; 2] = ["patch", "replace"];
 
 /// Tables whose entries are linked into the crate or its build script. Dev-dependencies are
 /// governed by the cargo-deny allow-list instead.
@@ -79,9 +86,10 @@ pub fn check_manifest(relative: &Path, text: &str, workspace_crates: &[String]) 
 }
 
 /// Checks the workspace manifest. Crates inherit `[workspace.dependencies]` with
-/// `name.workspace = true`, so a rename there would hide a crate from [`check_manifest`].
+/// `name.workspace = true`, so a rename there would hide a crate from [`check_manifest`]. A
+/// `[patch]` or `[replace]` there would swap the source of `libm` under its own name.
 pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
-    let mut violations = Vec::new();
+    let mut violations = check_overrides(relative, text);
     let mut section = Section::Other;
     for (line_index, line) in text.lines().enumerate() {
         let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
@@ -105,6 +113,68 @@ pub fn check_workspace_manifest(relative: &Path, text: &str) -> Vec<Violation> {
         }
     }
     violations
+}
+
+/// Reports every `[patch.<source>]` and `[replace]` table of the workspace manifest, and the
+/// same keys written as dotted or inline keys in its root table. Cargo applies only the root
+/// manifest's overrides, so crate manifests are not read.
+///
+/// `cargo deny check sources` rejects a git override but accepts a path override, because a
+/// path dependency has no source to check. So the rule bans both, and does not rely on it.
+///
+/// Tidy does not decode TOML escapes, so `"patch"` would read as another key. A top-level
+/// key with a backslash is reported too, because it could spell an override.
+fn check_overrides(relative: &Path, text: &str) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    let mut in_root_table = true;
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = u32::try_from(line_index + 1).expect("manifest has < 2^32 lines");
+        let line = line.trim();
+        let key = if line.starts_with('[') {
+            in_root_table = false;
+            header_segments(line).into_iter().next()
+        } else if in_root_table && !line.starts_with('#') {
+            key_of(line).and_then(|segments| segments.into_iter().next())
+        } else {
+            None
+        };
+        let message = match key {
+            Some(key) if OVERRIDE_KEYS.contains(&key.as_str()) => Some(overridden(&key)),
+            Some(key) if key.contains('\\') => Some(escaped(&key)),
+            Some(_) | None => None,
+        };
+        if let Some(message) = message {
+            violations.push(Violation::new(relative, line_number, OVERRIDE_RULE, message));
+        }
+    }
+    let line_count = text.lines().count();
+    assert!(
+        violations.is_sorted_by(|earlier, later| earlier.line < later.line),
+        "at most one violation per line, in line order"
+    );
+    assert!(
+        violations.iter().all(|violation| {
+            usize::try_from(violation.line).is_ok_and(|line| (1..=line_count).contains(&line))
+        }),
+        "every reported line is a line of the manifest"
+    );
+    violations
+}
+
+fn escaped(key: &str) -> String {
+    format!(
+        "cannot read the top-level key `{key}` of the workspace manifest: it holds an escape, \
+         which tidy does not decode, so it could spell `patch` or `replace`. Write the key \
+         without escapes (ADR-0001)"
+    )
+}
+
+fn overridden(key: &str) -> String {
+    format!(
+        "`[{key}]` in the workspace manifest swaps a dependency's source under its own name, \
+         and `cargo deny` does not see a path override; remove it and depend on the released \
+         crate. Changing `libm` needs an ADR approved by a human (ADR-0001)"
+    )
 }
 
 /// The lints that the table `[<table>]` of a manifest switches on: those set to `warn`, `deny`
@@ -372,6 +442,45 @@ mod tests {
         assert_eq!(lines("[workspace.package]\npackage = \"x\"\n"), NONE);
         assert_eq!(lines("[workspace.metadata.x]\nlibm = { package = \"serde\" }\n"), NONE);
         assert_eq!(lines("[dependencies]\nlibm = { package = \"serde\" }\n"), NONE);
+    }
+
+    // Goal: a `[patch]` or `[replace]` in the workspace manifest is reported in every spelling,
+    // path and git alike, because cargo deny does not see a path override. Keys of the same
+    // name inside other tables are not overrides.
+    #[test]
+    fn dependency_overrides_are_reported() {
+        let lines = |manifest: &str| -> Vec<u32> {
+            let violations = check_workspace_manifest(Path::new("Cargo.toml"), manifest);
+            assert!(violations.iter().all(|violation| violation.rule == "dependency-override"));
+            violations.iter().map(|violation| violation.line).collect()
+        };
+        assert_eq!(lines("[patch.crates-io]\nlibm = { path = \"../libm\" }\n"), [1]);
+        assert_eq!(lines("[patch.'https://github.com/a/b']\nlibm = { git = \"x\" }\n"), [1]);
+        assert_eq!(lines("[patch.crates-io.libm]\npath = \"../libm\"\n"), [1]);
+        assert_eq!(lines("[replace]\n\"libm:0.2.16\" = { path = \"../libm\" }\n"), [1]);
+        assert_eq!(lines("[ \"patch\" . crates-io ] # fork\nlibm = { path = \"x\" }\n"), [1]);
+        assert_eq!(lines("patch.crates-io.libm = { path = \"x\" }\n[workspace]\n"), [1]);
+        assert_eq!(lines("replace = { \"libm:0.2.16\" = { path = \"x\" } }\n"), [1]);
+        assert_eq!(lines("# [patch.crates-io]\n[workspace]\nmembers = []\n"), NONE);
+        assert_eq!(lines("[workspace.metadata.patch]\npatch = 1\nreplace = 2\n"), NONE);
+        assert_eq!(lines("[workspace]\npatch.crates-io.libm = { path = \"x\" }\n"), NONE);
+        // Escapes are not decoded, so an escaped top-level key is reported: it could spell
+        // `patch`. An escape below the top level cannot.
+        assert_eq!(lines("[\"p\\u0061tch\".crates-io]\nlibm = { path = \"x\" }\n"), [1]);
+        assert_eq!(lines("\"p\\u0061tch\".crates-io.libm = { path = \"x\" }\n"), [1]);
+        assert_eq!(lines("\"r\\u0065place\" = { \"libm:0.2.16\" = { path = \"x\" } }\n"), [1]);
+        assert_eq!(lines("[workspace]\n\"p\\u0061tch\" = 1\n"), NONE);
+        assert_eq!(lines("[workspace.metadata.\"a\\u0062\"]\n"), NONE);
+        let message_of = |manifest: &str| -> String {
+            let violations = check_workspace_manifest(Path::new("Cargo.toml"), manifest);
+            violations.first().map_or(String::new(), |violation| violation.message.clone())
+        };
+        let escape = message_of("[\"p\\u0061tch\"]\n");
+        assert!(escape.starts_with("cannot read the top-level key `p\\u0061tch`"), "{escape}");
+        assert!(escape.ends_with("(ADR-0001)"), "the message cites the reason");
+        let replace = message_of("[replace]\n");
+        assert!(replace.starts_with("`[replace]` in the workspace manifest swaps"), "{replace}");
+        assert!(replace.ends_with("(ADR-0001)"), "the message cites the reason");
     }
 
     // Goal: headers and keys split at dots outside quotes; sections follow from the segments.
