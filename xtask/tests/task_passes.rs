@@ -10,12 +10,14 @@ use xtask::task::passes::{self, PullHead, PullState, Pulls, Services};
 use xtask::task::plan::Task;
 
 /// GitHub's pull requests: fixed heads and merged branches; each PR's title, description and
-/// auto-merge, which the writes change; and a log of the writes.
+/// auto-merge, which the writes change; the PRs that merged since `open_from` listed them; and
+/// a log of the writes.
 #[derive(Default)]
 struct FakePulls {
     heads: BTreeMap<u32, PullHead>,
     merged: Vec<String>,
     open: Option<u32>,
+    merged_pulls: Vec<u32>,
     states: RefCell<BTreeMap<u32, (String, String, bool)>>,
     log: RefCell<Vec<String>>,
 }
@@ -32,7 +34,8 @@ impl Pulls for FakePulls {
         let head = head.ok_or_else(|| format!("no pull request #{number}"))?;
         let states = self.states.borrow();
         let (title, body, auto_merge) = states.get(&number).cloned().unwrap_or_default();
-        Ok(PullState { head, title, body, auto_merge })
+        let merged = self.merged_pulls.contains(&number);
+        Ok(PullState { head, title, body, auto_merge, open: !merged, merged })
     }
     fn has_merged(&self, branch: &str) -> Result<bool, String> {
         Ok(self.merged.iter().any(|merged| merged == branch))
@@ -152,7 +155,11 @@ fn bots_pull() -> FakePulls {
 }
 
 fn check(clone: &Path, pulls: &FakePulls, tests: &FakeTests, arguments: &[&str]) -> String {
-    let services = Services { pulls, tests };
+    let token = |name: &str| (name == "NAMI_PASSES_TOKEN").then(|| "test-token".to_owned());
+    check_with(clone, Services { pulls, tests, variables: &token }, arguments)
+}
+
+fn check_with(clone: &Path, services: Services<'_>, arguments: &[&str]) -> String {
     match passes::execute(clone, "origin", services, arguments) {
         Ok(output) => format!("ok: {output}"),
         Err(error) => format!("error: {error}"),
@@ -447,6 +454,34 @@ fn open_pr_pushes_only_on_drift_and_always_reconciles() {
     assert!(squat.starts_with(named), "{squat}");
     assert!(squatted.log.borrow().is_empty(), "a squatted PR is neither edited nor closed");
     assert_eq!(tip(&clone), before, "nothing is pushed");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: the open-PR job refuses to start without the token for writes, and names the
+// variable; and a PR that merged while the run worked ends the run cleanly, with no write to
+// it.
+#[test]
+fn open_pr_needs_its_token_and_stops_at_a_merged_pull() {
+    let (root, clone) = setup("token");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let tests = FakeTests::default();
+    let github = FakePulls { open: Some(70), merged_pulls: vec![70], ..bots_pull() };
+    let arguments = ["passes", "--open-pr", file_text.as_str()];
+    for missing in [None, Some(" ".to_owned())] {
+        let variables = |_: &str| missing.clone();
+        let services = Services { pulls: &github, tests: &tests, variables: &variables };
+        let refused = check_with(&clone, services, &arguments);
+        let named = "error: `NAMI_PASSES_TOKEN` holds no token, so `bot/passes` cannot be pushed";
+        assert_eq!(refused, named, "{missing:?}");
+    }
+    let listed = git(&clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
+    assert!(listed.is_empty() && github.log.borrow().is_empty(), "nothing is done without it");
+
+    let merged = check(&clone, &github, &tests, &arguments);
+    assert_eq!(merged, "ok: #70 sets `passes` on a: pushed, merged, nothing to reconcile\n");
+    assert!(github.log.borrow().is_empty(), "a merged PR is neither edited nor re-queued");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

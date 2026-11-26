@@ -249,8 +249,9 @@ pub fn head_from_json(pull: &Value) -> Result<PullHead, String> {
     Ok(PullHead::from_event(&branch, &head, &base, &author))
 }
 
-/// Reads a pull request's head, title, description and auto-merge from GitHub's pulls API.
-/// Auto-merge is on when `auto_merge` is an object; GitHub sends `null` when it is off.
+/// Reads a pull request's head, title, description, auto-merge, and whether it is open or
+/// merged, from GitHub's pulls API. Auto-merge is on when `auto_merge` is an object; GitHub
+/// sends `null` when it is off.
 ///
 /// # Errors
 ///
@@ -261,11 +262,22 @@ pub fn pull_from_json(pull: &Value) -> Result<PullState, String> {
         None | Some(Value::Null) => false,
         Some(other) => return Err(format!("GitHub sent {} as `auto_merge`", other.kind())),
     };
+    let open = match string_at(pull, &["state"])?.as_str() {
+        "open" => true,
+        "closed" => false,
+        other => return Err(format!("GitHub sent the state `{other}`")),
+    };
+    let merged = pull.get("merged_at").and_then(Value::as_str).is_some();
+    if open && merged {
+        return Err("GitHub sent an open PR that has merged".to_owned());
+    }
     let state = PullState {
         head: head_from_json(pull)?,
         title: string_at(pull, &["title"])?,
         body: optional_string(pull, "body")?,
         auto_merge,
+        open,
+        merged,
     };
     Ok(state)
 }
@@ -320,7 +332,8 @@ mod tests {
         value.as_array().expect("an array").to_vec()
     }
 
-    const PULL: &str = r#"{"number": 9, "title": "Set passes: a", "body": null,
+    const PULL: &str = r#"{"number": 9, "state": "open", "merged_at": null,
+        "title": "Set passes: a", "body": null,
         "auto_merge": null, "user": {"login": "nami-ci[bot]"}, "base": {"repo":
         {"full_name": "o/n"}}, "head": {"ref": "bot/passes", "repo": {"full_name": "o/n"}}}"#;
 
@@ -452,6 +465,17 @@ mod tests {
         assert!(error.contains("`auto_merge`"), "{error}");
         let untitled = PULL.replace(r#""title": "Set passes: a","#, "");
         assert!(state(&untitled).is_err(), "no title");
+        assert_eq!((off.open, off.merged), (true, false), "open");
+        let merged = PULL.replace(r#""state": "open""#, r#""state": "closed""#);
+        let merged = merged.replace(r#""merged_at": null"#, r#""merged_at": "2026-11-26T09:00Z""#);
+        let merged = state(&merged).expect("valid");
+        assert_eq!((merged.open, merged.merged), (false, true), "merged");
+        let closed = state(&PULL.replace(r#""state": "open""#, r#""state": "closed""#));
+        assert_eq!(closed.map(|pull| (pull.open, pull.merged)), Ok((false, false)), "closed");
+        let draft = state(&PULL.replace(r#""state": "open""#, r#""state": "draft""#));
+        assert!(draft.expect_err("unknown").contains("`draft`"), "an unknown state");
+        let both = PULL.replace(r#""merged_at": null"#, r#""merged_at": "2026-11-26T09:00Z""#);
+        assert!(state(&both).is_err(), "open and merged at once");
     }
 
     // Goal: gh's output is returned only when it succeeded; a failure names the command and

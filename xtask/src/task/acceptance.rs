@@ -44,6 +44,7 @@ pub struct Listed {
 ///
 /// Names the field that is missing or has the wrong type.
 pub fn listed_from_json(workspace: &str, value: &Value) -> Result<Vec<Listed>, String> {
+    assert!(WORKSPACES.contains(&workspace), "tests are listed in a known workspace: {workspace}");
     let suites = value.get("rust-suites").and_then(Value::as_object);
     let suites = suites.ok_or("nextest sent no `rust-suites` object")?;
     let mut listed = Vec::new();
@@ -74,7 +75,6 @@ pub fn listed_from_json(workspace: &str, value: &Value) -> Result<Vec<Listed>, S
             }
         }
     }
-    assert!(listed.iter().all(|test| test.name.contains("::")), "every name has a crate");
     Ok(listed)
 }
 
@@ -101,7 +101,8 @@ pub fn resolve<'listed>(
     {
         return Err(format!("`{}` holds characters that a nextest filter could misread", odd.name));
     }
-    assert!(found.iter().all(|test| test.name == name), "only exact matches");
+    let known = |test: &&Listed| WORKSPACES.contains(&test.workspace.as_str());
+    assert!(found.iter().all(known), "each match was listed in a known workspace");
     Ok(found)
 }
 
@@ -116,13 +117,16 @@ fn is_plain(text: &str) -> bool {
 #[must_use]
 pub fn filterset(tests: &[&Listed]) -> String {
     assert!(!tests.is_empty(), "an empty filterset would select nothing");
+    let plain = |test: &&Listed| is_plain(&test.binary_id) && is_plain(&test.test);
+    assert!(
+        tests.iter().all(plain),
+        "resolve lets only names that a filter cannot misread through"
+    );
     let terms: Vec<String> = tests
         .iter()
         .map(|test| format!("(binary_id(={}) & test(={}))", test.binary_id, test.test))
         .collect();
-    let expression = terms.join(" | ");
-    assert!(expression.contains("binary_id(="), "every term is exact");
-    expression
+    terms.join(" | ")
 }
 
 /// What setting `passes` needs from a test runner.
@@ -185,6 +189,7 @@ impl Nextest {
     /// The tests that `tasks` may name. The root workspace comes first; `lints/` builds the
     /// dylint library on its own nightly, so it is listed only when the root lacks a name.
     fn list(&self, tasks: &[&Task]) -> Result<Vec<Listed>, String> {
+        assert!(!tasks.is_empty(), "check lists nothing for no task");
         let [first, rest @ ..] = WORKSPACES;
         let mut listed = self.list_in(first)?;
         let lacks = |known: &[Listed]| {
@@ -196,7 +201,6 @@ impl Nextest {
                 listed.extend(self.list_in(workspace)?);
             }
         }
-        assert!(listed.iter().all(|test| !test.name.is_empty()), "every test has a name");
         Ok(listed)
     }
 
@@ -240,7 +244,6 @@ impl Acceptance for Nextest {
         let listed = self.list(tasks)?;
         let verdicts: Vec<Result<(), String>> =
             tasks.iter().map(|task| self.run(task, &listed)).collect();
-        assert_eq!(verdicts.len(), tasks.len(), "one verdict per task");
         Ok(verdicts)
     }
 }

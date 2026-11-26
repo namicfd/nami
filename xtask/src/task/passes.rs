@@ -98,6 +98,10 @@ pub struct PullState {
     pub body: String,
     /// True if auto-merge is on, so that it enters the merge queue once its checks pass.
     pub auto_merge: bool,
+    /// True while it is open.
+    pub open: bool,
+    /// True once it has merged.
+    pub merged: bool,
 }
 
 /// What setting `passes` needs from GitHub's pull requests. Every error says what failed.
@@ -160,6 +164,8 @@ pub struct Services<'services> {
     pub pulls: &'services dyn Pulls,
     /// The test runner.
     pub tests: &'services dyn Acceptance,
+    /// The environment's variables, such as [`WRITE_TOKEN`].
+    pub variables: &'services dyn Fn(&str) -> Option<String>,
 }
 
 /// The change that `check-pr` checks.
@@ -195,7 +201,9 @@ pub fn execute(
     match arguments {
         ["passes"] => found(root, services.tests, None),
         ["passes", "--output", file] => found(root, services.tests, Some(Path::new(file))),
-        ["passes", "--open-pr", file] => open_pr(root, remote, services.pulls, Path::new(file)),
+        ["passes", "--open-pr", file] => {
+            open_pr((root, remote), services.pulls, services.variables, Path::new(file))
+        }
         ["check-pr", base] => super::check_pr(root, &change(base, "", None), services),
         ["check-pr", base, branch] => super::check_pr(root, &change(base, branch, None), services),
         ["check-pr", base, branch, pull] => {
@@ -337,7 +345,6 @@ pub fn passing_from_json(text: &str) -> Result<BTreeSet<String>, String> {
             return Err(format!("{shape}; `{id}` is listed twice"));
         }
     }
-    assert_eq!(ids.len(), entries.len(), "every entry is one distinct ID");
     Ok(ids)
 }
 
@@ -466,6 +473,7 @@ fn shape_problems(root: &Path, base: &str) -> Result<Vec<String>, String> {
 ///
 /// When git cannot read `HEAD` or its parent.
 pub fn own_base(root: &Path, base: &str, branch: &str) -> Result<String, String> {
+    assert!(!base.is_empty() && !base.starts_with('-'), "a base is a revision: {base}");
     let Some(entry) = queue_entry(branch) else {
         return Ok(base.to_owned());
     };
@@ -477,7 +485,8 @@ pub fn own_base(root: &Path, base: &str, branch: &str) -> Result<String, String>
         return Ok(base.to_owned());
     }
     let parent = run(&["rev-parse", "--verify", "HEAD^1"])?.trim().to_owned();
-    assert!(!parent.is_empty(), "rev-parse names the parent");
+    let is_object_name = parent.len() >= 40 && parent.bytes().all(|byte| byte.is_ascii_hexdigit());
+    assert!(is_object_name, "rev-parse --verify names one commit: {parent}");
     Ok(parent)
 }
 
@@ -535,6 +544,15 @@ pub fn flip_problems(
 
 /// Why `change` is not [`CI_LOGIN`]'s PR from [`BOT_BRANCH`].
 fn pull_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
+    assert!(change.pull.is_none_or(|number| number > 0), "pull requests are numbered from 1");
+    let problems = bot_pull_problems(change, pulls);
+    let named = |problem: &String| problem.contains('#') || problem.contains(change.branch);
+    assert!(problems.iter().all(named), "each problem names the PR it is about: {problems:?}");
+    problems
+}
+
+/// [`pull_problems`], without its checks.
+fn bot_pull_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
     let queued = queue_entry(change.branch).map(|entry| entry.pull);
     let Some(number) = change.pull.or(queued) else {
         return vec![format!(
@@ -571,6 +589,18 @@ fn pull_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
 /// problem, so the check never passes unseen.
 #[must_use]
 pub fn no_flip_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
+    assert!(change.head.is_none() || change.pull.is_some(), "an event's head comes with its PR");
+    let problems = flipless_problems(change, pulls);
+    assert!(problems.len() <= 1, "one reason at most: {problems:?}");
+    let refused = |problem: &String| {
+        problem.contains("sets no `passes`") || problem.starts_with("cannot read pull request")
+    };
+    assert!(problems.iter().all(refused), "a flip-less PR is refused for one reason only");
+    problems
+}
+
+/// [`no_flip_problems`], without its checks.
+fn flipless_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
     let refusal = |head: &PullHead, what: &str| {
         format!(
             "{what} comes from `{}` by `{}`, and it sets no `passes`; that branch and that bot \
@@ -623,8 +653,18 @@ fn adoptable(pulls: &dyn Pulls) -> Result<Option<u32>, String> {
     Ok(Some(number))
 }
 
-/// `passes --open-pr <file>`.
-fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<String, String> {
+/// `passes --open-pr <file>`. It refuses to start without the token for writes in
+/// [`WRITE_TOKEN`], as gh's writes do, so that nothing is half done for want of it.
+fn open_pr(
+    (root, remote): (&Path, &str),
+    pulls: &dyn Pulls,
+    variables: &dyn Fn(&str) -> Option<String>,
+    file: &Path,
+) -> Result<String, String> {
+    let token = variables(WRITE_TOKEN).filter(|token| !token.trim().is_empty());
+    let token = token.ok_or_else(|| {
+        format!("`{WRITE_TOKEN}` holds no token, so `bot/passes` cannot be pushed")
+    })?;
     let text = std::fs::read_to_string(file)
         .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
     let reported = passing_from_json(&text)?;
@@ -669,7 +709,7 @@ fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<
     assert_eq!(newly, wanted, "the working tree sets `passes` on exactly the wanted tasks");
     let flipped: Vec<String> =
         after.iter().filter(|task| wanted.contains(&task.id)).map(|task| task.id.clone()).collect();
-    lines.push(publish(root, remote, pulls, (&after, &flipped), open)?);
+    lines.push(publish((root, remote, &token), pulls, (&after, &flipped), open)?);
     Ok(lines.concat())
 }
 
@@ -679,8 +719,7 @@ fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<
 /// alone, and any drift rebuilds the branch. Then it opens the PR if `open` is none, and
 /// reconciles it ([`reconcile`]).
 fn publish(
-    root: &Path,
-    remote: &str,
+    (root, remote, token): (&Path, &str, &str),
     pulls: &dyn Pulls,
     (tasks, flipped): (&[Task], &[String]),
     open: Option<u32>,
@@ -691,7 +730,7 @@ fn publish(
     let commit = commit_working_tree(root, &title)?;
     let mut done = Vec::new();
     if !branch_holds(root, remote, &commit)? {
-        push(root, remote, &commit)?;
+        push(root, remote, &commit, token)?;
         done.push("pushed");
     }
     let number = if let Some(number) = open {
@@ -705,13 +744,13 @@ fn publish(
     Ok(format!("#{number} sets `passes` on {}: {changes}\n", flipped.join(", ")))
 }
 
-/// Force-pushes `commit` as `remote`'s [`BOT_BRANCH`]. This is the one git command that gets
-/// [`WRITE_TOKEN`], through a credential helper that only it is configured with.
-fn push(root: &Path, remote: &str, commit: &str) -> Result<(), String> {
-    let token = std::env::var(WRITE_TOKEN).unwrap_or_default();
+/// Force-pushes `commit` as `remote`'s [`BOT_BRANCH`], as `token`. This is the one git command
+/// that gets [`WRITE_TOKEN`], through a credential helper that only it is configured with.
+fn push(root: &Path, remote: &str, commit: &str, token: &str) -> Result<(), String> {
+    assert!(!token.trim().is_empty(), "open_pr refuses a run without the token for writes");
     assert!(PUSH_CREDENTIALS.contains(WRITE_TOKEN), "the helper answers with the write token");
     let credentials = [
-        (WRITE_TOKEN, token.as_str()),
+        (WRITE_TOKEN, token),
         ("GIT_CONFIG_COUNT", "2"),
         ("GIT_CONFIG_KEY_0", "credential.helper"),
         ("GIT_CONFIG_VALUE_0", ""),
@@ -768,6 +807,12 @@ fn reconcile(
              looks at it",
             state.head.branch, state.head.author
         ));
+    }
+    if !state.open {
+        // It merged, or a human closed it, while this run worked: nothing is left to fix, and
+        // the next run starts from the new `main`.
+        let how = if state.merged { "merged" } else { "closed" };
+        return Ok(vec![how, "nothing to reconcile"]);
     }
     let mut done = Vec::new();
     if state.title != title || state.body != body {
@@ -834,7 +879,8 @@ pub fn pull_text(tasks: &[Task], flipped: &[String], head: &str) -> (String, Str
          again in this PR's own CI, and in the merge queue.\n\n## Rule changes\n\nNone\n\n## \
          Protected files\n\nNone\n\n## Follow-up issues\n\nNone\n"
     );
-    assert!(title.len() < body.len(), "the description says more than the title");
+    let listed = |id: &String| list.contains(&format!("- `{id}`: "));
+    assert!(flipped.iter().all(listed), "the description lists every flipped task: {flipped:?}");
     (title, body)
 }
 

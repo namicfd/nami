@@ -50,7 +50,9 @@ pub fn run(arguments: &[&str]) -> ExitCode {
         Some(&("passes" | "check-pr")) => {
             let process = pulls::GhProcess::new(&root);
             let pulls = pulls::GitHubPulls::new(&process);
-            let services = Services { pulls: &pulls, tests: &Nextest::new(&root) };
+            let variables = |name: &str| std::env::var(name).ok();
+            let tests = Nextest::new(&root);
+            let services = Services { pulls: &pulls, tests: &tests, variables: &variables };
             passes::execute(&root, &remote, services, arguments)
         }
         _ => execute(&root, &remote, &github, arguments),

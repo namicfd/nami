@@ -117,7 +117,7 @@ impl Acceptance for Unasked {
 }
 
 fn check_pr(clone: &Path, arguments: &[&str]) -> Result<String, String> {
-    let services = Services { pulls: &Unasked, tests: &Unasked };
+    let services = Services { pulls: &Unasked, tests: &Unasked, variables: &|_| None };
     let mut all = vec!["check-pr"];
     all.extend(arguments);
     passes::execute(clone, "origin", services, &all)
