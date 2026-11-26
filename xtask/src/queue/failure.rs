@@ -290,6 +290,23 @@ mod tests {
         assert_eq!(error_lines(short), Vec::<String>::new(), "not a timestamp, not an error");
     }
 
+    // Goal: a timestamp needs all four marks: length, a leading digit, `T` after the date and a
+    // final `Z`; a word that misses any one of them is text.
+    #[test]
+    fn timestamps_need_every_mark() {
+        assert!(super::is_timestamp("2026-11-26T10:00:00Z"), "the shortest form");
+        assert!(super::is_timestamp("2026-11-26T10:00:00.1234567Z"));
+        for word in [
+            "2026-11-26T10:00Z",
+            "x026-11-26T10:00:00.0Z",
+            "2026-11-26 10:00:00.00Z",
+            "2026-11-26T10:00:00.00",
+            "xxxxxxxxxxxxxxxxxxxxxxxx",
+        ] {
+            assert!(!super::is_timestamp(word), "{word}");
+        }
+    }
+
     // Goal: the finding parses as `issue file` input, names the PR, the PRs ahead, each failed
     // job with its steps and error lines, and says to rebase or renumber, then re-queue.
     #[test]

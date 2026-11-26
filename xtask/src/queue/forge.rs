@@ -411,6 +411,16 @@ mod tests {
         assert_eq!(job_from_json(&no_steps.unwrap()).unwrap().failed_steps, Vec::<String>::new());
     }
 
+    // Goal: a comment's request body is a JSON object whose `body` is the text, quotes and line
+    // breaks included.
+    #[test]
+    fn comment_requests_carry_the_text() {
+        let request = parse(&super::body_request("say \"hi\"\nthen go")).expect("valid JSON");
+        let body = request.get("body").and_then(crate::json::Value::as_str);
+        assert_eq!(body, Some("say \"hi\"\nthen go"));
+        assert_eq!(request.as_object().map(<[_]>::len), Some(1), "only the body");
+    }
+
     // Goal: commit messages arrive as a JSON array of strings; anything else is an error.
     #[test]
     fn strings_are_read() {
