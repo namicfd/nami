@@ -405,6 +405,11 @@ impl Gh {
         Ok(command)
     }
 
+    /// The checkout that `gh` runs in.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Runs `gh api` with `arguments`, and `input` on stdin; returns what gh printed.
     pub(crate) fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
         let mut command = self.command(arguments, &|name| std::env::var(name).ok())?;

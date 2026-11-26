@@ -7,27 +7,35 @@
 //! - `claim <id>` and `release <id>`: take or give back a task or an issue through the `claims`
 //!   branch.
 //! - `validate`: the plan checks that `cargo xtask tidy` also runs.
-//! - `check-pr <base> [<branch>]`: CI's check that a change never sets `passes`, plus an
-//!   advisory list of files outside the task's `owner_paths` when the branch is `task/<id>`.
+//! - `passes [--output <file> | --open-pr <file>]`: the post-merge workflow that sets `passes`
+//!   through a PR from `bot/passes` (`passes`, ADR-0017).
+//! - `check-pr <base> [<branch> [<pull request>]]`: CI's check that a change sets `passes`
+//!   only as the `nami-ci` bot's PR from `bot/passes`, plus an advisory list of files outside
+//!   the task's `owner_paths` when the branch is `task/<id>`.
 //!
 //! The remote is `origin`, or `$NAMI_TASK_REMOTE`. A claim records `$NAMI_AGENT_ID` (default:
 //! git's `user.name`) and `$NAMI_SESSION_ID`. Issues come from GitHub through `gh`
 //! (`crate::issue`).
 
+pub mod acceptance;
 pub mod claims;
+pub mod passes;
 pub mod plan;
 
 use crate::issue::github::{Gh, GitHub, Issue};
 use crate::issue::{self, trust};
 use crate::queue;
+use acceptance::Nextest;
 use claims::Claim;
+use passes::{Change, Services};
 use plan::Task;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: cargo xtask task status | ready | claim <id> | release <id> | \
-                     validate | check-pr <base> [<branch>]";
+                     validate | passes [--output <file> | --open-pr <file>] | check-pr <base> \
+                     [<branch> [<pull request>]]";
 
 /// Branches named `task/<id>` belong to that task.
 const TASK_BRANCH_PREFIX: &str = "task/";
@@ -36,7 +44,15 @@ const TASK_BRANCH_PREFIX: &str = "task/";
 pub fn run(arguments: &[&str]) -> ExitCode {
     let root = crate::workspace_root();
     let remote = std::env::var("NAMI_TASK_REMOTE").unwrap_or_else(|_| "origin".to_owned());
-    match execute(&root, &remote, &Gh::new(&root), arguments) {
+    let github = Gh::new(&root);
+    let result = match arguments.first() {
+        Some(&("passes" | "check-pr")) => {
+            let services = Services { pulls: &github, tests: &Nextest::new(&root) };
+            passes::execute(&root, &remote, services, arguments)
+        }
+        _ => execute(&root, &remote, &github, arguments),
+    };
+    match result {
         Ok(output) => {
             print!("{output}");
             ExitCode::SUCCESS
@@ -49,12 +65,13 @@ pub fn run(arguments: &[&str]) -> ExitCode {
 }
 
 /// Runs one command against the checkout at `root`, the claims on `remote` and the issues on
-/// `github`. Returns what the command prints on success, or the error to report.
+/// `github`. Returns what the command prints on success, or the error to report. `passes`
+/// and `check-pr` are [`passes::execute`]'s.
 ///
 /// # Errors
 ///
 /// Returns the reason the command failed: invalid plans, a task or issue that cannot be
-/// claimed, a git or GitHub failure, or a change that sets `passes`.
+/// claimed, or a git or GitHub failure.
 pub fn execute(
     root: &Path,
     remote: &str,
@@ -72,8 +89,6 @@ pub fn execute(
             .map(|()| format!("released {id}\n"))
             .map_err(|error| format!("cannot release `{id}`: {error}")),
         ["validate"] => valid_tasks(root).map(|_| "tasks are valid\n".to_owned()),
-        ["check-pr", base] => check_pr(root, base, ""),
-        ["check-pr", base, branch] => check_pr(root, base, branch),
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -422,21 +437,24 @@ fn holder(root: &Path) -> String {
     format!("agent: {}\nsession: {session}", agent.unwrap_or_else(|| "unknown".to_owned()))
 }
 
-/// CI: fail if the change sets `passes` on any task, and list the files outside the task's
-/// `owner_paths` when the branch is `task/<id>` (advisory). The task's definition comes from
-/// `base`, so a branch cannot widen its own `owner_paths`.
-fn check_pr(root: &Path, base: &str, branch: &str) -> Result<String, String> {
+/// CI: fail if the change sets `passes` on any task, unless it is the `nami-ci` bot's PR that
+/// [`passes::flip_problems`] accepts, and list the files outside the task's `owner_paths` when
+/// the branch is `task/<id>` (advisory). The task's definition comes from the base, so a
+/// branch cannot widen its own `owner_paths`. In the merge queue, the base is the parent of
+/// the PR's own commit ([`passes::own_base`]).
+fn check_pr(root: &Path, change: &Change<'_>, services: Services<'_>) -> Result<String, String> {
     let (head_tasks, _) =
         plan::load(root).map_err(|error| format!("cannot read the plans: {error}"))?;
-    let base_tasks = tasks_at(root, base)?;
+    let base = passes::own_base(root, change.base, change.branch)?;
+    let base_tasks = tasks_at(root, &base)?;
     let base_passing: BTreeSet<String> =
         base_tasks.iter().filter(|task| task.passes).map(|task| task.id.clone()).collect();
     let flipped = passes_flips(&head_tasks, &base_passing);
     let mut output = String::new();
     // An issue has no owner paths: its PR is one small change (ADR-0021).
-    let task_id = branch.strip_prefix(TASK_BRANCH_PREFIX);
+    let task_id = change.branch.strip_prefix(TASK_BRANCH_PREFIX);
     if let Some(id) = task_id.filter(|id| !id.starts_with(issue::ID_PREFIX)) {
-        let changed = claims::git(root, &["diff", "--name-only", base, "HEAD"], &[], None)
+        let changed = claims::git(root, &["diff", "--name-only", &base, "HEAD"], &[], None)
             .map_err(|error| error.to_string())?;
         let changed: Vec<&str> = changed.lines().collect();
         let warnings = outside_owner_paths(&base_tasks, id, &changed);
@@ -447,13 +465,24 @@ fn check_pr(root: &Path, base: &str, branch: &str) -> Result<String, String> {
     if flipped.is_empty() {
         return Ok(output);
     }
-    let errors: Vec<String> = flipped
-        .iter()
-        .map(|id| {
-            format!("error: this change sets `passes` on `{id}`; agents never set it (ADR-0011)")
-        })
-        .collect();
-    Err(format!("{output}{}\n{} task(s) had `passes` set", errors.join("\n"), flipped.len()))
+    let own = Change { base: &base, ..*change };
+    let problems = passes::flip_problems(root, &own, &head_tasks, &flipped, services);
+    if problems.is_empty() {
+        return Ok(format!(
+            "{output}the bot's PR from `{}` sets `passes` on {}: their acceptance tests passed \
+             in this run\n",
+            passes::BOT_BRANCH,
+            flipped.join(", ")
+        ));
+    }
+    let errors: Vec<String> = problems.iter().map(|problem| format!("error: {problem}")).collect();
+    Err(format!(
+        "{output}{}\nthis change sets `passes` on {}; only the bot's PR from `{}` may, and agents \
+         never do (ADR-0011, ADR-0017)",
+        errors.join("\n"),
+        flipped.join(", "),
+        passes::BOT_BRANCH
+    ))
 }
 
 /// Every task in the plans at commit `base`.
