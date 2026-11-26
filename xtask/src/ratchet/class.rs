@@ -23,10 +23,13 @@
 //!   trait, module or `macro_rules!` nested inside; and in an existing file its name is no
 //!   identifier of the base's file, so that it shadows nothing the existing code names (a
 //!   prelude item such as `drop`, an import, a glob). A new `impl` is additive only for a type
-//!   new in the same file, named by one plain segment, with no generics on the `impl`, and of a
-//!   trait new in the same file or one of [`ALLOWED_TRAITS`]. Any other `impl` (of an existing
-//!   type, in another file, generic or blanket, of a visitor trait) can override a trait method
-//!   or change which method an existing call resolves to, so it is an edit;
+//!   new in the same file, named by one plain segment, with no type or const parameters and no
+//!   `where` clause, and with lifetime parameters only where they appear in the trait path and
+//!   the method signatures alone (`impl<'tcx> LateLintPass<'tcx> for NewPass`). Its trait may be
+//!   any trait: an `impl` for a plain new type cannot change which method a call on an existing
+//!   type resolves to. Any other `impl` (of an existing type, in another file, generic or
+//!   blanket) can override a trait method or change which method an existing call resolves to,
+//!   so it is an edit;
 //! - (b) a dispatch call ([`dispatch`]): a statement inserted at the top level of an existing
 //!   function's body that calls a new function with shared references and literals only, hands
 //!   such a call's result to `extend`, or registers a new lint or lint pass; each new item is
@@ -447,42 +450,92 @@ impl<'ast> syn::visit::Visit<'ast> for Nested {
     }
 }
 
-/// The std traits that a new type may implement: none of them can change which method a call
-/// on an existing type resolves to. A visitor trait is not among them, and neither is any
-/// trait with methods an existing call could resolve to.
-pub const ALLOWED_TRAITS: [&str; 7] =
-    ["Debug", "Clone", "Copy", "PartialEq", "Eq", "Default", "Display"];
-
 /// What makes a new `impl` in the file `path` an edit, if anything. It is additive only for a
-/// type new in the same file, named by a single segment without arguments, with no generics
-/// on the `impl`, and of a trait new in the same file or one of [`ALLOWED_TRAITS`]. An `impl`
-/// of an existing type, one elsewhere, a generic or blanket one (`impl<T> Quiet for T`, even
-/// when `T` shadows the new type's name) can override a trait method or change which method an
-/// existing call resolves to (review of #57, round 5).
+/// type new in the same file, named by a single plain segment, with no type or const
+/// parameters and no `where` clause; of any trait, since an `impl` for a plain new type
+/// cannot change which method a call on an existing type resolves to. Lifetime parameters are
+/// allowed, without bounds, when they appear only in the trait path and in method signatures,
+/// as in `impl<'tcx> LateLintPass<'tcx> for NewPass`. An `impl` of an existing type, one in
+/// another file, or a generic or blanket one (`impl<T> Quiet for T`, even when `T` shadows the
+/// new type's name) can override a trait method or change which method an existing call
+/// resolves to (review of #57, round 5).
 fn impl_problem(block: &syn::ItemImpl, path: &str, new: &NewNames) -> Option<String> {
-    let is_new = |name: &str| new.types.contains(&(path.to_owned(), name.to_owned()));
-    let own = plain_self_type(&block.self_ty).is_some_and(|name| is_new(&name));
-    let generic = !block.generics.params.is_empty() || block.generics.where_clause.is_some();
-    if !own || generic {
+    let own = plain_self_type(&block.self_ty)
+        .is_some_and(|name| new.types.contains(&(path.to_owned(), name)));
+    let mut lifetimes = Vec::new();
+    let mut parameters = true;
+    for parameter in &block.generics.params {
+        if let syn::GenericParam::Lifetime(lifetime) = parameter
+            && lifetime.attrs.is_empty()
+            && lifetime.bounds.is_empty()
+        {
+            lifetimes.push(lifetime.lifetime.ident.to_string());
+        } else {
+            parameters = false;
+        }
+    }
+    if !own || !parameters || block.generics.where_clause.is_some() {
         return Some(
             "is an `impl` that is not of a type new in this file, written plainly and without \
-             generics; such an `impl` can override a trait method or change which method an \
-             existing call resolves to"
+             type or const parameters or a `where` clause; such an `impl` can override a trait \
+             method or change which method an existing call resolves to"
                 .to_owned(),
         );
     }
-    let (trait_path, _) = block.trait_.as_ref()?;
-    let plain = trait_path.leading_colon.is_none()
-        && trait_path.segments.iter().all(|segment| segment.arguments.is_none());
-    let name = trait_path.segments.last().map_or_else(String::new, |last| last.ident.to_string());
-    let own_trait = trait_path.segments.len() == 1 && is_new(&name);
-    let allowed = ALLOWED_TRAITS.contains(&name.as_str());
-    (!(plain && (own_trait || allowed))).then(|| {
-        format!(
-            "implements `{name}`, a trait that is neither new in this file nor one of \
-             {ALLOWED_TRAITS:?}; a visitor trait's default methods are rule code"
-        )
+    let mut finder = Lifetimes { names: &lifetimes, found: None };
+    for member in &block.items {
+        if let syn::ImplItem::Fn(method) = member {
+            syn::visit::Visit::visit_block(&mut finder, &method.block);
+        } else {
+            syn::visit::Visit::visit_impl_item(&mut finder, member);
+        }
+    }
+    finder.found.map(|lifetime| {
+        format!("uses its lifetime `'{lifetime}` outside the trait path and the method signatures")
     })
+}
+
+/// The first of `names` that `sequence` writes as a lifetime, `'name`, at its top level.
+fn quoted_lifetime(sequence: &[TokenTree], names: &[String]) -> Option<String> {
+    sequence.windows(2).find_map(|pair| {
+        let [TokenTree::Punct(quote), TokenTree::Ident(name)] = pair else {
+            return None;
+        };
+        let named = quote.as_char() == '\'' && names.iter().any(|lifetime| name == lifetime);
+        named.then(|| name.to_string())
+    })
+}
+
+/// Finds a use of one of `names` as a lifetime, macro bodies included.
+struct Lifetimes<'n> {
+    names: &'n [String],
+    found: Option<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Lifetimes<'_> {
+    fn visit_lifetime(&mut self, node: &'ast syn::Lifetime) {
+        let name = node.ident.to_string();
+        if self.found.is_none() && self.names.contains(&name) {
+            self.found = Some(name);
+        }
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let mut pending: Vec<Vec<TokenTree>> = vec![node.tokens.clone().into_iter().collect()];
+        for _ in 0..TOKENS_MAX {
+            let Some(sequence) = pending.pop() else {
+                return;
+            };
+            if self.found.is_none() {
+                self.found = quoted_lifetime(&sequence, self.names);
+            }
+            pending.extend(sequence.into_iter().filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(group.stream().into_iter().collect()),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            }));
+        }
+        panic!("a macro has more than {TOKENS_MAX} token sequences");
+    }
 }
 
 /// The name of the type an `impl` is for, if it is a single plain segment.
@@ -1248,32 +1301,49 @@ mod tests {
 
     // Goal: round 5, thread 2: a blanket `impl<Quieted> Quiet for Quieted`, whose parameter
     // shadows the new struct of that name, is an edit; and so is any `impl` of a new type that
-    // has generics, a path or arguments, or a trait that is neither new in its file nor allowed.
-    // A plain `impl` of a new type of the same file, of a new trait or an allowed one, is
+    // has type or const parameters, a `where` clause, a path or arguments on its type, or a
+    // lifetime with bounds or used outside the trait path and the method signatures. A plain
+    // `impl` of a new type of the same file, of any trait, with lifetimes only there, is
     // additive.
     #[test]
     fn only_plain_impls_of_new_types_are_additive() {
         let base = real(RULES);
         let new = "\ntrait Quiet {\n    fn quiet(&self) {}\n}\n\nstruct Quieted;\n";
         let refused = [
-            "impl<Quieted> Quiet for Quieted {}",
-            "impl<T> Quiet for Quieted where T: Copy {}",
-            "impl Quiet for self::Quieted {}",
-            "impl Quiet for Quieted<u8> {}",
-            "impl<'a> Quiet for Quieted {}",
-            "impl<'ast> Visit<'ast> for Quieted {}",
-            "impl Iterator for Quieted { type Item = u8; fn next(&mut self) -> Option<u8> { \
-             None } }",
-            "impl std::fmt::Debug for Quieted where Self: Sized {}",
-            "impl From<u8> for Quieted { fn from(_: u8) -> Self { Self } }",
+            ("impl<Quieted> Quiet for Quieted {}", "`impl` that is not"),
+            ("impl<T> Quiet for Quieted where T: Copy {}", "`impl` that is not"),
+            ("impl<const N: usize> Quiet for Quieted {}", "`impl` that is not"),
+            ("impl<'a: 'static> Quiet for Quieted {}", "`impl` that is not"),
+            ("impl Quiet for self::Quieted {}", "`impl` that is not"),
+            ("impl Quiet for Quieted<u8> {}", "`impl` that is not"),
+            ("impl std::fmt::Debug for Quieted where Self: Sized {}", "`impl` that is not"),
+            (
+                "impl<'a> Iterator for Quieted { type Item = &'a u8; fn next(&mut self) -> \
+                 Option<&'a u8> { None } }",
+                "lifetime `'a` outside",
+            ),
+            (
+                "impl<'a> Quiet for Quieted { fn quiet(&self) { let _: Option<&'a u8> = None; } }",
+                "lifetime `'a` outside",
+            ),
+            (
+                "impl<'a> Quiet for Quieted { fn quiet(&self) { let _ = vec![None::<&'a u8>]; } }",
+                "lifetime `'a` outside",
+            ),
         ];
-        for (index, block) in refused.iter().enumerate() {
+        for (index, (block, expected)) in refused.iter().enumerate() {
             let head = format!("{base}{new}\n{block}\n");
             let class = edited(&format!("class-impl-{index}"), RULES, &head);
-            assert!(class.edits.iter().any(|edit| edit.contains("`impl")), "{block}: {class:?}");
+            assert!(class.edits.iter().any(|edit| edit.contains(expected)), "{block}: {class:?}");
         }
         let allowed = [
             "impl Quiet for Quieted {}",
+            "impl<'a> Quiet for Quieted {}",
+            "impl<'ast> Visit<'ast> for Quieted {\n    fn visit_file(&mut self, node: &'ast \
+             syn::File) {\n        visit::visit_file(self, node);\n    }\n}",
+            "impl Iterator for Quieted {\n    type Item = u8;\n    fn next(&mut self) -> \
+             Option<u8> {\n        None\n    }\n}",
+            "impl From<u8> for Quieted {\n    fn from(_: u8) -> Self {\n        Self\n    }\n}",
             "impl Quieted {\n    fn new() -> Self {\n        Self\n    }\n}",
             "impl Clone for Quieted {\n    fn clone(&self) -> Self {\n        Self\n    }\n}",
             "impl std::fmt::Display for Quieted {\n    fn fmt(&self, f: &mut \
@@ -1427,7 +1497,8 @@ mod tests {
 
     // Goal: an additive tidy rule is additive: a new function in a rule module, dispatched once
     // with shared references, beside a changed doc comment and a new unit test; the dispatch
-    // call's lines are recorded. And a new function that nothing calls is additive too.
+    // call's lines are recorded. A new function that nothing calls is additive too, and so is a
+    // new rule's own visitor, `impl<'ast> Visit<'ast> for ExtraVisitor`.
     #[test]
     fn a_new_rule_with_its_dispatch_call_is_additive() {
         let base = real(RULES);
@@ -1449,6 +1520,13 @@ mod tests {
         assert_eq!(class.dispatch.get(RULES), Some(&vec![(line + 2, line + 2)]));
         let unused = format!("{base}\nfn spare() -> usize {{ PATH_BANS.len() }}\n");
         assert!(!edited("class-unused", RULES, &unused).is_edit(), "nothing calls it");
+        let own_visitor = "\nstruct ExtraVisitor {\n    found: u32,\n}\n\nimpl<'ast> Visit<'ast> \
+                           for ExtraVisitor {\n    fn visit_expr_loop(&mut self, node: &'ast \
+                           syn::ExprLoop) {\n        self.found += 1;\n        \
+                           visit::visit_expr_loop(self, node);\n    }\n}\n";
+        let with_visitor = format!("{head}{own_visitor}");
+        let visiting = edited("class-own-visitor", RULES, &with_visitor);
+        assert_eq!(visiting.edits, Vec::<String>::new(), "a new rule with its own visitor");
     }
 
     // Goal: a dispatch call that could reach existing state, or names nothing new, is an edit:
@@ -1477,14 +1555,12 @@ mod tests {
         }
     }
 
-    // Goal: the parts of a new lint are additive: its own file, its declaration and pass in
-    // `lib.rs`, the registration appended, and the pass registered; the module list in
-    // `lib.rs`'s docs may change. Its `impl LateLintPass` is an edit: a visitor trait is not one
-    // that a new type may implement on the ratchet alone (review of #57, round 5). Registering
-    // it twice, another wrapping of the pass, or a new file that reads the environment, is an
-    // edit.
+    // Goal: a new lint is additive: its own file, its declaration, pass and `impl<'tcx>
+    // LateLintPass<'tcx>` in `lib.rs`, the registration appended, and the pass registered; the
+    // module list in `lib.rs`'s docs may change. Registering it twice, another wrapping of the
+    // pass, or a new file that reads the environment, is an edit.
     #[test]
-    fn a_new_lint_is_additive_but_for_its_pass_impl() {
+    fn a_new_lint_is_additive() {
         let lib = "lints/src/lib.rs";
         let base = real(lib);
         let lints = "lint_store.register_lints(&[NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);";
@@ -1503,7 +1579,7 @@ mod tests {
         );
         let appended = lints.replace("NAMI_FLOAT_REDUCTION]", "NAMI_FLOAT_REDUCTION, NAMI_EXTRA]");
         let head = replaced(&head, &format!("    {lints}\n"), &format!("    {appended}\n{pass}"));
-        let head = format!("{head}{declared}");
+        let head = format!("{head}{declared}{pass_impl}");
         let extra = "lints/src/extra.rs";
         let module = "use rustc_hir::Expr;\n\npub fn check_expr(_: &LateContext<'_>, _: &Lint, _: \
                       &Expr<'_>) {}\n";
@@ -1511,12 +1587,6 @@ mod tests {
             class_of("class-lint", &[(lib, Some(&base), Some(&head)), (extra, None, Some(module))]);
         assert_eq!(class.edits, Vec::<String>::new());
         assert_eq!(class.dispatch.get(lib).map(Vec::len), Some(2), "{:?}", class.dispatch);
-        let implemented = format!("{head}{pass_impl}");
-        let implemented_files =
-            [(lib, Some(base.as_str()), Some(implemented.as_str())), (extra, None, Some(module))];
-        let with_impl = class_of("class-lint-impl", &implemented_files);
-        assert_edit(&with_impl, "LateLintPass < ' tcx > for NamiExtra` is an `impl` that is not");
-        assert_eq!(with_impl.edits.len(), 1, "{:?}", with_impl.edits);
         let twice = replaced(&head, pass, &format!("{pass}{pass}"));
         let doubled = class_of(
             "class-lint-twice",
