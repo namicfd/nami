@@ -1339,6 +1339,8 @@ mod tests {
         let allowed = [
             "impl Quiet for Quieted {}",
             "impl<'a> Quiet for Quieted {}",
+            "impl<'a> Quiet for Quieted {\n    fn quiet(&self) {\n        let _: &'static str = \
+             \"q\";\n    }\n}",
             "impl<'ast> Visit<'ast> for Quieted {\n    fn visit_file(&mut self, node: &'ast \
              syn::File) {\n        visit::visit_file(self, node);\n    }\n}",
             "impl Iterator for Quieted {\n    type Item = u8;\n    fn next(&mut self) -> \
