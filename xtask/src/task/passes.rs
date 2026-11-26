@@ -727,8 +727,8 @@ fn number_of(pull: &Value) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PullHead, head_from_json, is_active_tasks_file, only_passes_set, passing_from_json,
-        passing_json, pull_number, pull_text, set_passes, unblocked,
+        PullHead, head_from_json, is_active_tasks_file, number_of, only_passes_set,
+        passing_from_json, passing_json, pull_number, pull_text, set_passes, unblocked,
     };
     use crate::json;
     use crate::task::plan::Task;
@@ -883,6 +883,17 @@ mod tests {
         assert!(!body.contains("`a`"), "{body}");
         for heading in ["## Summary", "## Rule changes", "## Protected files", "## Follow-up"] {
             assert!(body.contains(heading), "{heading}");
+        }
+    }
+
+    // Goal: a pull request's number is read from GitHub's JSON, and a missing, zero or
+    // non-integer number is an error.
+    #[test]
+    fn pull_numbers_come_from_github() {
+        let pull = |text: &str| json::parse(text).expect("the fixture is JSON");
+        assert_eq!(number_of(&pull(r#"{"number": 64}"#)), Ok(64));
+        for bad in [r#"{"number": 0}"#, r#"{"number": "7"}"#, r#"{"number": 1.5}"#, "{}"] {
+            assert!(number_of(&pull(bad)).is_err(), "{bad}");
         }
     }
 }
