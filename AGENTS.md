@@ -25,8 +25,8 @@ The toolchain is pinned in `rust-toolchain.toml`. Always pass `--locked`.
 Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0019):
 
 - **At session start,** `$HOME/.cargo/bin` is put on `PATH`, and `cargo xtask doctor` reports any
-  tool whose version is wrong. A session in which gh can reach a person's GitHub login is
-  stopped.
+  tool whose version is wrong. Any person's GitHub login that gh can still reach is reported
+  as an `error[gh-login]` finding. If you get one, run no gh command, and tell the human.
 - **After every edit,** a `.rs` file is formatted, and the edited file is checked against the tidy
   rules that need only that file. Manifests, ADRs and `TIGER_STYLE.md` are checked too. Fix what is reported straight away.
 - **Before you stop,** `just check` and `just dylint` run, unless your tree equals `main` or the
