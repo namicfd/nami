@@ -801,6 +801,25 @@ mod tests {
         every
     }
 
+    // Goal: a finding is well formed only if both texts are one line, the message opens with
+    // its severity's tag, and there is a remedy.
+    #[test]
+    fn findings_are_well_formed() {
+        let finding = |severity, message: &str, remedy: &str| Finding {
+            severity,
+            topic: super::Topic::GhLogin,
+            message: message.to_owned(),
+            remedy: remedy.to_owned(),
+        };
+        assert!(finding(Severity::Error, "error[x]: y", "z").is_well_formed());
+        assert!(finding(Severity::Warning, "warning[x]: y", "z").is_well_formed());
+        assert!(!finding(Severity::Error, "warning[x]: y", "z").is_well_formed(), "wrong tag");
+        assert!(!finding(Severity::Warning, "error[x]: y", "z").is_well_formed(), "wrong tag");
+        assert!(!finding(Severity::Error, "error[x]: y\nz", "z").is_well_formed(), "two lines");
+        assert!(!finding(Severity::Error, "error[x]: y", "z\nz").is_well_formed(), "two lines");
+        assert!(!finding(Severity::Error, "error[x]: y", "").is_well_formed(), "no remedy");
+    }
+
     /// `text` without the parts in double quotes: what gh printed, quoted as its words.
     fn unquoted(text: &str) -> String {
         text.split('"').step_by(2).collect()
