@@ -1,0 +1,93 @@
+# The ratchet's judge again after a review (ADR-0022): the review check reads the reviews, which
+# arrive after the push. Only the judge runs. It reuses the observations of the latest
+# `guardrails` run for the same head commit, waiting for that run if it is still going, so a
+# review never starts or cancels the slow `ratchet (head)` job. If the base moved since, the
+# head tree differs from the one observed and the judge gives no verdict; the next push decides.
+name: ratchet review
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+
+# A newer review replaces the judging of an older one for the same pull request; this cancels
+# only runs of this workflow.
+concurrency:
+  group: ratchet-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The same job as `ratchet` in guardrails.yml, and under the same name, so that the latest
+  # verdict for the head commit is the one shown. It is never skipped, for the same reason.
+  ratchet:
+    name: ratchet
+    runs-on: ubuntu-latest
+    # It may wait for the observing job, which takes up to 120 minutes.
+    timeout-minutes: 180
+    # Reading the reviews is the review check; reading runs finds the observations.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the base next to the PR
+        run: git worktree add --detach "${RUNNER_TEMP}/base" "$(git rev-parse HEAD^1)"
+      - name: Toolchains and the pinned dylint, installed in this job
+        working-directory: ${{ runner.temp }}/base
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            exit 0
+          fi
+          rustup toolchain install
+          (cd lints && rustup toolchain install)
+          # The versions are those of .github/actions/setup/action.yml.
+          cargo install --locked --root "${RUNNER_TEMP}/tools" cargo-dylint@6.4.0 dylint-link@6.4.0
+          echo "${RUNNER_TEMP}/tools/bin" >> "${GITHUB_PATH}"
+      - name: The observations of the latest run for this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=$(gh run list --workflow guardrails.yml --event pull_request --commit "${PR_HEAD}" \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "${run}" ]; then
+            echo "No guardrails run for ${PR_HEAD}; the judge will give no verdict."
+            exit 0
+          fi
+          gh run watch "${run}" --interval 60 > /dev/null || true
+          gh run download "${run}" --name ratchet-observations \
+            --dir "${RUNNER_TEMP}/observations" || true
+      - name: The base's ratchet judges
+        working-directory: ${{ runner.temp }}/base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          # The reviewer app's login, once the maintainer has set it up.
+          REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          commits="$(git rev-parse HEAD)..$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
+          set +e
+          cargo xtask ratchet judge --base . --head "${GITHUB_WORKSPACE}" \
+            --observations "${RUNNER_TEMP}/observations/observations.json" \
+            --pr "${PR_NUMBER}" --pr-head "${PR_HEAD}" --commits "${commits}" \
+            --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" > "${RUNNER_TEMP}/ratchet.md"
+          status=$?
+          cat "${RUNNER_TEMP}/ratchet.md" >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"

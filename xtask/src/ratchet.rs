@@ -19,7 +19,13 @@
 //! **Threat model.** The ratchet is sound against honest mistakes, and against any loosening
 //! that shows without running head code: rule tables, scopes, allowed lists and `check_*` call
 //! sites are read from the head's source by the base. Against head code written to deceive, it
-//! is defence in depth only; the reviewer app, sampled audits and the trusted core back it.
+//! is defence in depth only; the reviewer app, sampled audits and the trusted core back it. The
+//! reviewer app is the bot that `NAMI_REVIEWER_LOGIN` names, and the review it posts runs in CI
+//! (pending #59), where no authoring session holds its key.
+//!
+//! **One tree.** The observer and the judge read the same head: both refuse a head with a
+//! symbolic link, so the observer's scratch copy, which holds regular files only, has every
+//! file of the head; and the observer records the head's fingerprint, which the judge checks.
 //!
 //! **Output.** Each finding is one line on stderr, `place: error[ratchet-<check>]: what; fix`.
 //! A Markdown summary goes to stdout; its last line is the verdict.
@@ -31,6 +37,7 @@
 
 pub mod cli;
 mod corpus;
+mod form;
 mod lint;
 mod mutants;
 pub mod observations;
@@ -124,6 +131,9 @@ pub struct ReviewSource<'a> {
     pub reviews: &'a dyn review::Reviews,
     /// The pull request.
     pub pull: u32,
+    /// The pull request's head commit that was judged. Reviews count only on it, and it must
+    /// still be the head when they are read.
+    pub head: String,
     /// The reviewer app's login; `None` until the app exists.
     pub reviewer: Option<String>,
 }
@@ -140,8 +150,11 @@ pub struct Tools<'a> {
     pub mutants: bool,
     /// The review check's inputs; `None` skips the review check.
     pub review: Option<ReviewSource<'a>>,
-    /// The seed of the placements; `None` draws one from the operating system.
+    /// The seed of the placements; `None` derives it from the head's content
+    /// ([`plant::seed_of`]).
     pub seed: Option<u64>,
+    /// The commits judged, as `base..head`, for the summary; `None` when only trees are given.
+    pub commits: Option<String>,
 }
 
 /// What the ratchet found.
@@ -153,6 +166,9 @@ pub struct Verdict {
     pub outside: Vec<String>,
     /// True if the base's CODEOWNERS owns a changed path, so the owner reviews the PR anyway.
     pub owner_reviews: bool,
+    /// True if the base's CODEOWNERS would still own a changed path once the rule paths are
+    /// unowned (ADR-0022): the owner reviews the PR after the policy flip too.
+    pub owner_reviews_after: bool,
     /// True if a code owner approved the head commit of the pull request.
     pub owner_approved: bool,
     /// The checks that ran.
@@ -161,21 +177,36 @@ pub struct Verdict {
     pub findings: Vec<Finding>,
     /// What the ratchet could not vouch for, with no owner to stand in: no verdict.
     pub unproven: Vec<String>,
+    /// What would be unproven after the policy flip, when the rule paths have no owner.
+    pub unproven_after: Vec<String>,
+    /// The commits judged, as `base..head`, for the summary.
+    pub range: String,
     /// What the summary should say besides the findings: counts, skipped checks and why.
     pub notes: Vec<String>,
 }
 
 impl Verdict {
-    /// The verdict line: the last line of the summary.
+    /// The verdict line: the last line of the summary. It is the verdict under today's
+    /// CODEOWNERS, which decides the exit code.
     #[must_use]
     pub fn line(&self) -> String {
+        self.line_with(&self.unproven)
+    }
+
+    /// The verdict the PR would get after the policy flip of ADR-0022, when the rule paths have
+    /// no owner, so that shadow mode shows the evidence the flip asks for.
+    #[must_use]
+    pub fn line_after(&self) -> String {
+        self.line_with(&self.unproven_after)
+    }
+
+    fn line_with(&self, unproven: &[String]) -> String {
         if !self.findings.is_empty() {
             format!("ratchet: fail, {} finding(s)", self.findings.len())
-        } else if !self.unproven.is_empty() {
+        } else if !unproven.is_empty() {
             format!(
-                "ratchet: no verdict, {} thing(s) unproven; the code owner \
-                     decides",
-                self.unproven.len()
+                "ratchet: no verdict, {} thing(s) unproven; the code owner decides",
+                unproven.len()
             )
         } else if self.outside.is_empty() {
             "ratchet: pass".to_owned()
@@ -196,11 +227,18 @@ impl Verdict {
         let ran = if names.is_empty() { "none".to_owned() } else { names.join(", ") };
         lines.push(format!("- Rule paths changed: {}", self.rule_paths.len()));
         lines.push(format!("- Changed outside the rule paths: {}", self.outside.len()));
+        lines.push(format!("- Judged: {}", self.range));
+        lines.push(format!("- Verdict today (every guardrail path owned): `{}`", self.line()));
+        lines.push(format!(
+            "- Verdict after ADR-0022 (rule paths unowned): `{}`",
+            self.line_after()
+        ));
         lines.push(format!("- The code owner reviews this PR anyway: {}", self.owner_reviews));
+        lines.push(format!("- ... and would after ADR-0022: {}", self.owner_reviews_after));
         lines.push(format!("- A code owner approved the head commit: {}", self.owner_approved));
         lines.push(format!("- Checks run: {ran}"));
         lines.extend(self.notes.iter().map(|note| format!("- {note}")));
-        lines.extend(self.unproven.iter().map(|what| format!("- **Unproven:** {what}")));
+        lines.extend(self.unproven_after.iter().map(|what| format!("- **Unproven:** {what}")));
         if !self.outside.is_empty() {
             lines.extend([String::new(), "Outside the rule paths:".to_owned(), String::new()]);
             lines.extend(self.outside.iter().map(|path| format!("- `{path}`")));
@@ -223,6 +261,9 @@ impl Verdict {
     /// Something the ratchet cannot vouch for: no verdict, unless a code owner approved the
     /// head or reviews the PR anyway.
     fn unprovable(&mut self, what: String) {
+        if !self.owner_approved && !self.owner_reviews_after {
+            self.unproven_after.push(what.clone());
+        }
         if self.owner_approved {
             self.notes.push(format!("{what}; a code owner's approval of the head stands in."));
         } else if self.owner_reviews {
@@ -233,9 +274,10 @@ impl Verdict {
     }
 }
 
-/// The changed paths, split into rule paths and the rest, and whether the base's CODEOWNERS
-/// owns any of them.
-fn scope_of(base: &Path, head: &Path) -> Result<(Vec<String>, Verdict), String> {
+/// The changed paths, split into rule paths and the rest, whether the base's CODEOWNERS owns
+/// any of them, and the fingerprint of the head tree. A head with a symbolic link is no
+/// verdict.
+fn scope_of(base: &Path, head: &Path) -> Result<(Vec<String>, Verdict, String), String> {
     let changed = tree::changed_paths(base, head)
         .map_err(|error| format!("cannot compare the trees: {error}"))?;
     let (rule_paths, outside): (Vec<String>, Vec<String>) =
@@ -244,7 +286,19 @@ fn scope_of(base: &Path, head: &Path) -> Result<(Vec<String>, Verdict), String> 
         .map_err(|error| format!("cannot read the base's {CODEOWNERS}: {error}"))?;
     let lines = crate::pr::parse_codeowners(&codeowners)?;
     let owner_reviews = !crate::pr::protected_paths(&lines, &changed).is_empty();
-    Ok((changed, Verdict { rule_paths, outside, owner_reviews, ..Verdict::default() }))
+    let owner_reviews_after = !crate::pr::protected_paths(&lines, &outside).is_empty();
+    let (head_tree, links) =
+        tree::fingerprint(head).map_err(|error| format!("cannot read the head tree: {error}"))?;
+    if let Some(link) = links.first() {
+        return Err(format!(
+            "the head holds {} symbolic link(s), such as `{link}`; the ratchet never follows \
+             links, so that observe's copy and the judge read the same regular files",
+            links.len()
+        ));
+    }
+    let verdict =
+        Verdict { rule_paths, outside, owner_reviews, owner_reviews_after, ..Verdict::default() };
+    Ok((changed, verdict, head_tree))
 }
 
 /// Runs the head's tools on the base's cases and records what they printed. Runs head code.
@@ -255,14 +309,11 @@ fn scope_of(base: &Path, head: &Path) -> Result<(Vec<String>, Verdict), String> 
 /// cannot be started.
 pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Observations, String> {
     assert!(base.is_absolute() && head.is_absolute(), "the trees have absolute paths");
-    let (changed, verdict) = scope_of(base, head)?;
-    let seed = match tools.seed {
-        Some(seed) => seed,
-        None => plant::os_seed()?,
-    };
+    let (changed, verdict, head_tree) = scope_of(base, head)?;
+    let seed = tools.seed.unwrap_or_else(|| plant::seed_of(&head_tree));
     let corpus = observations::corpus_fingerprint(base)?.0;
     if !changed.iter().any(|path| scope::is_tooling(path)) {
-        return Ok(Observations { skipped: true, seed, corpus, runs: Vec::new() });
+        return Ok(Observations { skipped: true, seed, corpus, head: head_tree, runs: Vec::new() });
     }
     let head_xtask = match &tools.head_xtask {
         Some(binary) => binary.clone(),
@@ -280,7 +331,7 @@ pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Observatio
     if tools.mutants {
         runs.extend(mutants::observe(base, head, &verdict.rule_paths, tools)?);
     }
-    Ok(Observations { skipped: false, seed, corpus, runs })
+    Ok(Observations { skipped: false, seed, corpus, head: head_tree, runs })
 }
 
 /// Judges the observations against the base's corpus and the head's source. Runs no head
@@ -297,14 +348,20 @@ pub fn judge(
     tools: &Tools<'_>,
 ) -> Result<Verdict, String> {
     assert!(base.is_absolute() && head.is_absolute(), "the trees have absolute paths");
-    let (changed, mut verdict) = scope_of(base, head)?;
+    let (changed, mut verdict, head_tree) = scope_of(base, head)?;
+    verdict.range = tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned());
     if !changed.iter().any(|path| scope::is_tooling(path)) {
-        verdict.notes.push(
-            "No change to `xtask/`, `lints/` or a rule path: nothing to \
-                            prove."
-                .to_owned(),
-        );
+        verdict
+            .notes
+            .push("No change to `xtask/`, `lints/` or a rule path: nothing to prove.".to_owned());
         return Ok(verdict);
+    }
+    if observed.head != head_tree {
+        return Err(format!(
+            "the observations are of another head tree (fingerprint {}, here {head_tree}); the \
+             head moved, or the base it merges with did, between the two jobs",
+            observed.head
+        ));
     }
     let (corpus, files) = observations::corpus_fingerprint(base)?;
     if observed.skipped || observed.corpus != corpus || files == 0 {
@@ -316,8 +373,7 @@ pub fn judge(
         ));
     }
     verdict.notes.push(format!(
-        "Base corpus: {files} files, fingerprint {corpus}, placement seed \
-                                {}.",
+        "Base corpus: {files} files, fingerprint {corpus}, placement seed {}.",
         observed.seed
     ));
     let mut rule_set = source::check(base, head)?;
@@ -356,13 +412,12 @@ fn judge_proof(
     if let Some(source) = &tools.review {
         let codeowners = fs::read_to_string(base.join(CODEOWNERS))
             .map_err(|error| format!("cannot read the base's {CODEOWNERS}: {error}"))?;
-        verdict.owner_approved = review::owner_approved(source.reviews, source.pull, &codeowners)?;
+        verdict.owner_approved =
+            review::owner_approved(source.reviews, source.pull, &source.head, &codeowners)?;
     }
     if verdict.rule_paths.is_empty() {
         verdict.notes.push(
-            "Mutation testing and the review check skipped: no rule path \
-                            changed."
-                .to_owned(),
+            "Mutation testing and the review check skipped: no rule path changed.".to_owned(),
         );
         return Ok(());
     }
@@ -379,11 +434,12 @@ fn judge_proof(
     match &tools.review {
         Some(source) => match &source.reviewer {
             Some(reviewer) => {
-                verdict.add(Check::Review, review::check(source.reviews, source.pull, reviewer)?);
+                let findings = review::check(source.reviews, source.pull, &source.head, reviewer)?;
+                verdict.add(Check::Review, findings);
             }
             None => verdict.unprovable(format!(
-                "no reviewer app is set up, so no review independent of the author is shown \
-                 (docs/operations/github-setup.md, step 5b; {})",
+                "no reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}), so no review \
+                 independent of the author is shown; the reviewer runs in CI (pending #59)",
                 review::REVIEWER_APP
             )),
         },
@@ -415,7 +471,13 @@ fn build_xtask(cargo: &OsStr, head: &Path) -> Result<PathBuf, String> {
         ));
     }
     let binary = head.join("target/debug/xtask");
-    assert!(binary.is_file(), "cargo build leaves the binary in the head's target directory");
+    if !binary.is_file() {
+        return Err(format!(
+            "the head's xtask built, but not to {}; the head's cargo configuration moves the \
+             target directory, so pass the binary with `--head-xtask`",
+            binary.display()
+        ));
+    }
     Ok(binary)
 }
 
@@ -472,6 +534,17 @@ mod tests {
         owned.unprovable("no mutant".to_owned());
         assert_eq!((owned.unproven.len(), owned.notes.len()), (0, 1));
         assert_eq!(owned.line(), "ratchet: pass");
+        assert!(owned.line_after().starts_with("ratchet: no verdict, 1"), "unowned after the flip");
+        let shown = owned.summary();
+        assert!(shown.contains("- Verdict today (every guardrail path owned): `ratchet: pass`"));
+        assert!(shown.contains("after ADR-0022 (rule paths unowned): `ratchet: no verdict"));
+        assert!(shown.ends_with("\nratchet: pass\n"), "the exit code follows today's verdict");
+        let mut still = Verdict { owner_reviews: true, owner_reviews_after: true, ..owned };
+        still.unprovable("no reviewer".to_owned());
+        assert_eq!(still.unproven_after.len(), 1, "only the earlier item; the owner still reviews");
+        let mut approved = Verdict { owner_approved: true, ..Verdict::default() };
+        approved.unprovable("no mutant".to_owned());
+        assert!(approved.unproven.is_empty() && approved.unproven_after.is_empty());
     }
 
     // Goal: the tail keeps the last non-blank lines on one line.

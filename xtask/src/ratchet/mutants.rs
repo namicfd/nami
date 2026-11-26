@@ -49,6 +49,12 @@ const TEST_SECONDS_MAX: &str = "300";
 const LISTED: &str = "listed";
 const OUTCOMES: &str = "outcomes.json";
 const MISSED: &str = "missed.txt";
+const TIMEOUT: &str = "timeout.txt";
+
+/// The number of non-blank lines of `text`.
+fn line_count(text: &str) -> u64 {
+    u64::try_from(text.lines().filter(|line| !line.trim().is_empty()).count()).expect("counts fit")
+}
 
 /// The changed rule-path Rust sources of the head that belong to `workspace`.
 fn sources<'a>(head: &Path, rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
@@ -119,11 +125,9 @@ pub fn judge(
         })?;
         let (count, missed) = read_run(run)?;
         let missed_count = missed.lines().filter(|line| !line.trim().is_empty()).count();
-        judged.notes.push(format!(
-            "Mutants in {}: {count}, missed: \
-                                   {missed_count}.",
-            workspace.name
-        ));
+        judged
+            .notes
+            .push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
         if count == 0 {
             judged.unproven.push(format!(
                 "the rule-path change in {} yields no mutant, so mutation testing proves \
@@ -137,44 +141,34 @@ pub fn judge(
 }
 
 /// Reads one mutation run: the number of mutants, and `missed.txt`. Everything must agree:
-/// the listing, the outcomes, the exit code and the missed list.
+/// the listing, the outcomes, the exit code and the missed list. A mutant that timed out is
+/// neither caught nor missed, so any timeout is no verdict, naming the mutants from
+/// `timeout.txt`.
 fn read_run(run: &Run) -> Result<(u64, String), String> {
     let file = |name: &str| -> Result<String, String> {
-        run.files.get(name).cloned().flatten().ok_or_else(|| {
-            format!(
-                "cargo-mutants left no \
-                                                                      {name} for {}",
-                run.subject
-            )
-        })
+        run.files
+            .get(name)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| format!("cargo-mutants left no {name} for {}", run.subject))
     };
     let listed: u64 =
         file(LISTED)?.trim().parse().map_err(|_| "the mutant count is not a number")?;
     if listed == 0 {
         return Ok((0, String::new()));
     }
-    let outcomes = json::parse(&file(OUTCOMES)?).map_err(|error| {
-        format!(
-            "{OUTCOMES} is not JSON: \
-                                                                          {}",
-            error.message
-        )
-    })?;
+    let outcomes = json::parse(&file(OUTCOMES)?)
+        .map_err(|error| format!("{OUTCOMES} is not JSON: {}", error.message))?;
     let count = |key: &str| -> Result<u64, String> {
         match outcomes.get(key) {
-            Some(Value::Number(digits)) => digits.parse().map_err(|_| {
-                format!(
-                    "`{key}` is not a \
-                                                                               count"
-                )
-            }),
+            Some(Value::Number(digits)) => {
+                digits.parse().map_err(|_| format!("`{key}` is not a count"))
+            }
             _ => Err(format!("{OUTCOMES} has no `{key}`")),
         }
     };
     let missed_text = file(MISSED)?;
-    let missed_lines =
-        u64::try_from(missed_text.lines().filter(|line| !line.trim().is_empty()).count())
-            .expect("counts fit");
+    let missed_lines = line_count(&missed_text);
     let (total, missed, timeouts) = (count("total_mutants")?, count("missed")?, count("timeout")?);
     let tested = count("caught")? + missed + timeouts + count("unviable")?;
     let exit_agrees = match run.exit {
@@ -188,6 +182,22 @@ fn read_run(run: &Run) -> Result<(u64, String), String> {
             "cargo-mutants in {} does not add up: listed {listed}, total {total}, tested {tested}, \
              missed {missed} with {missed_lines} in {MISSED}, exit {:?}",
             run.subject, run.exit
+        ));
+    }
+    if timeouts > 0 {
+        let timed_out = file(TIMEOUT)?;
+        if line_count(&timed_out) != timeouts {
+            return Err(format!(
+                "cargo-mutants in {} counts {timeouts} timeouts and lists {} in {TIMEOUT}",
+                run.subject,
+                line_count(&timed_out)
+            ));
+        }
+        return Err(format!(
+            "{timeouts} mutant(s) in {} timed out, so the head's tests neither catch nor miss \
+             them; make the tests that cover them finish: {}",
+            run.subject,
+            super::tail(&timed_out, 20)
         ));
     }
     Ok((total, missed_text))
@@ -286,6 +296,7 @@ fn run_mutants(
         (LISTED.to_owned(), listed),
         (OUTCOMES.to_owned(), read(OUTCOMES)),
         (MISSED.to_owned(), read(MISSED)),
+        (TIMEOUT.to_owned(), read(TIMEOUT)),
     ]);
     Ok(Run {
         subject: workspace.name.to_owned(),
@@ -318,13 +329,16 @@ pub fn missed_findings(missed: &str, directory: &str) -> Vec<Finding> {
             Finding::new(&place, Check::Mutants, message)
         })
         .collect();
-    assert!(findings.len() <= missed.lines().count(), "one finding per missed mutant");
+    assert!(
+        u64::try_from(findings.len()) == Ok(line_count(missed)),
+        "one finding per missed mutant"
+    );
     findings
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LISTED, MISSED, OUTCOMES, missed_findings, read_run, with_headers};
+    use super::{LISTED, MISSED, OUTCOMES, TIMEOUT, missed_findings, read_run, with_headers};
     use crate::ratchet::observations::Run;
     use std::collections::BTreeMap;
 
@@ -367,6 +381,10 @@ mod tests {
             (LISTED.to_owned(), Some(listed.to_owned())),
             (OUTCOMES.to_owned(), Some(outcomes)),
             (MISSED.to_owned(), Some(missed.to_owned())),
+            (
+                TIMEOUT.to_owned(),
+                Some("src/a.rs:2:1: replace b\n".repeat(usize::try_from(timeouts).unwrap())),
+            ),
         ]);
         Run {
             subject: "lints".to_owned(),
@@ -381,13 +399,19 @@ mod tests {
 
     // Goal: a mutation run is read only if the listing, the outcomes, `missed.txt` and the
     // exit code agree: 0 for none missed and none timed out, 2 for some missed, 3 for only
-    // timeouts. Zero mutants listed is read as zero, for the judge to call unproven.
+    // timeouts. Any timeout is no verdict that names the mutants. Zero mutants listed is read
+    // as zero, for the judge to call unproven.
     #[test]
     fn mutation_runs_are_read_strictly() {
         let missed = "src/a.rs:1:1: replace a\n";
         assert_eq!(read_run(&run(Some(0), "2", [2, 2, 0, 0, 0], "")), Ok((2, String::new())));
         assert_eq!(read_run(&run(Some(2), "2", [2, 1, 1, 0, 0], missed)).unwrap().0, 2);
-        assert_eq!(read_run(&run(Some(3), "2", [2, 1, 0, 1, 0], "")).unwrap().0, 2);
+        let timed_out = read_run(&run(Some(3), "2", [2, 1, 0, 1, 0], "")).unwrap_err();
+        assert!(timed_out.contains("1 mutant(s) in lints timed out"), "{timed_out}");
+        assert!(timed_out.contains("src/a.rs:2:1: replace b"), "{timed_out}");
+        let mut unlisted = run(Some(3), "2", [2, 1, 0, 1, 0], "");
+        let _emptied = unlisted.files.insert(TIMEOUT.to_owned(), Some(String::new()));
+        assert!(read_run(&unlisted).unwrap_err().contains("lists 0 in timeout.txt"));
         assert_eq!(read_run(&run(Some(0), "0", [0, 0, 0, 0, 0], "")), Ok((0, String::new())));
         let inconsistent = [
             run(Some(0), "2", [2, 1, 1, 0, 0], missed),

@@ -35,6 +35,9 @@ pub const RULE_MODULES: [&str; 7] = [
 /// The scope of a ban that applies everywhere; any other scope is narrower.
 const SCOPE_EVERYWHERE: &str = "Everywhere";
 
+/// The scopes the judge knows. A ban in any other scope gives no verdict.
+const SCOPES: [&str; 2] = [SCOPE_EVERYWHERE, "NamiCrates"];
+
 /// One row of `PATH_BANS` or `MACRO_BANS`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ban {
@@ -44,8 +47,10 @@ pub struct Ban {
     pub banned: Vec<String>,
     /// Where it is allowed.
     pub allowed: Vec<String>,
-    /// The variant of `BanScope`; macro bans have none and apply everywhere.
+    /// The variant of `BanScope`.
     pub scope: String,
+    /// The table it is a row of: `PATH_BANS` or `MACRO_BANS`.
+    pub table: String,
 }
 
 /// The tables of the registry, as written.
@@ -171,14 +176,16 @@ fn ban_row(row: &Expr, table: &str) -> Result<Ban, String> {
     let fields = fields(row)?;
     let id = string(field(&fields, "id")?)?;
     let allowed = strings(field(&fields, "allowed")?)?;
-    if table == "PATH_BANS" {
-        let banned = vec![string(field(&fields, "segment")?)?];
-        let scope = variant(field(&fields, "scope")?)?;
-        Ok(Ban { id, banned, allowed, scope })
-    } else {
-        let banned = strings(field(&fields, "names")?)?;
-        Ok(Ban { id, banned, allowed, scope: SCOPE_EVERYWHERE.to_owned() })
+    let scope = variant(field(&fields, "scope")?)?;
+    if !SCOPES.contains(&scope.as_str()) {
+        return Err(format!("ban `{id}` has the scope `{scope}`, which the ratchet does not know"));
     }
+    let banned = if table == "PATH_BANS" {
+        vec![string(field(&fields, "segment")?)?]
+    } else {
+        strings(field(&fields, "names")?)?
+    };
+    Ok(Ban { id, banned, allowed, scope, table: table.to_owned() })
 }
 
 /// One finding for each base row that the head loosens: a rule that is gone or changed kind, a
@@ -223,12 +230,18 @@ pub fn loosened_rows(base: &Registry, head: &Registry) -> Vec<Finding> {
 
 /// What makes `head` looser than `base`, if anything.
 fn ban_problem(base: &Ban, head: &Ban) -> Option<String> {
+    if head.table != base.table {
+        return Some(format!(
+            "moved from {} to {}, which bans something else",
+            base.table, head.table
+        ));
+    }
     let dropped: Vec<&String> =
         base.banned.iter().filter(|name| !head.banned.contains(name)).collect();
     if !dropped.is_empty() {
         return Some(format!("no longer bans {dropped:?}"));
     }
-    if base.scope == SCOPE_EVERYWHERE && head.scope != SCOPE_EVERYWHERE {
+    if head.scope != base.scope && head.scope != SCOPE_EVERYWHERE {
         return Some(format!("narrows its scope from {} to {}", base.scope, head.scope));
     }
     let covered =
@@ -274,13 +287,32 @@ impl CallFinder {
     }
 }
 
+/// True for test code: `#[test]` or `#[cfg(test)]`. Calls there are compiled out of the rule.
+fn is_test_item(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        let is_cfg_test = attribute.path().is_ident("cfg")
+            && attribute.parse_args::<syn::Path>().is_ok_and(|path| path.is_ident("test"));
+        attribute.path().is_ident("test") || is_cfg_test
+    })
+}
+
 impl<'ast> Visit<'ast> for CallFinder {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !is_test_item(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.within(&node.sig.ident, |finder| visit::visit_item_fn(finder, node));
+        if !is_test_item(&node.attrs) {
+            self.within(&node.sig.ident, |finder| visit::visit_item_fn(finder, node));
+        }
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.within(&node.sig.ident, |finder| visit::visit_impl_item_fn(finder, node));
+        if !is_test_item(&node.attrs) {
+            self.within(&node.sig.ident, |finder| visit::visit_impl_item_fn(finder, node));
+        }
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -342,23 +374,22 @@ fn lint_name(element: &Expr) -> Option<String> {
 ///
 /// Returns what is unreadable: no verdict.
 pub fn check(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
+    super::form::check_head(head)?;
     let read = |root: &Path, relative: &str| -> Result<String, String> {
-        fs::read_to_string(root.join(relative))
-            .map_err(|error| format!("cannot read {relative}: {error}"))
+        read_optional(root, relative)?.ok_or_else(|| format!("{relative} is missing"))
     };
     let mut findings = loosened_rows(
         &parse_registry(&read(base, REGISTRY)?)?,
         &parse_registry(&read(head, REGISTRY)?)?,
     );
     for module in RULE_MODULES {
-        if !base.join(module).is_file() {
+        let Some(base_text) = read_optional(base, module)? else {
             continue;
-        }
-        let before = check_calls(module, &read(base, module)?)?;
-        let after = if head.join(module).is_file() {
-            check_calls(module, &read(head, module)?)?
-        } else {
-            BTreeSet::new()
+        };
+        let before = check_calls(module, &base_text)?;
+        let after = match read_optional(head, module)? {
+            Some(text) => check_calls(module, &text)?,
+            None => BTreeSet::new(),
         };
         for (function, callee) in before.difference(&after) {
             let message = format!(
@@ -380,10 +411,12 @@ fn lint_findings(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
             .map_err(|error| format!("cannot read the {side}'s lint declarations: {error}"))
     };
     let mut findings = weakened_lints(&read(base, "base")?, &read(head, "head")?);
-    if base.join(LINT_LIBRARY).is_file() {
-        let text = |root: &Path| fs::read_to_string(root.join(LINT_LIBRARY)).unwrap_or_default();
-        let before = registered_lints(&text(base))?;
-        let after = registered_lints(&text(head)).unwrap_or_default();
+    if let Some(base_text) = read_optional(base, LINT_LIBRARY)? {
+        let before = registered_lints(&base_text)?;
+        let after = match read_optional(head, LINT_LIBRARY)? {
+            Some(text) => registered_lints(&text)?,
+            None => BTreeSet::new(),
+        };
         for lint in before.difference(&after) {
             let message = format!(
                 "dylint lint `{lint}` is registered in the base and not in the head; a lint that \
@@ -421,6 +454,35 @@ pub fn weakened_lints(base: &[DylintLint], head: &[DylintLint]) -> Vec<Finding> 
     findings
 }
 
+/// The file at `relative` below `root`, or `None` if there is none. It must be a regular file
+/// reached through no symbolic link, so that the judge reads what the compiler compiles (review
+/// of #57, thread 3).
+///
+/// # Errors
+///
+/// No verdict: a link anywhere on the path, something that is not a regular file, or a read
+/// error.
+pub fn read_optional(root: &Path, relative: &str) -> Result<Option<String>, String> {
+    let mut path = root.to_path_buf();
+    for part in Path::new(relative).components() {
+        path.push(part);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot read {relative}: {error}")),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "{relative} goes through a symbolic link, which the judge never follows"
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(format!("{relative} is not a regular file"));
+    }
+    fs::read_to_string(&path).map(Some).map_err(|error| format!("cannot read {relative}: {error}"))
+}
+
 /// The base's rules whose code sits in a rule path (their id is a string literal there) and
 /// that have no firing fixture in the base. Each needs a case before the ratchet can vouch for
 /// a change to it (ADR-0022).
@@ -429,13 +491,11 @@ pub fn weakened_lints(base: &[DylintLint], head: &[DylintLint]) -> Vec<Finding> 
 ///
 /// Returns what is unreadable.
 pub fn rules_without_cases(base: &Path, tree: &Path) -> Result<Vec<String>, String> {
-    let registry = parse_registry(
-        &fs::read_to_string(base.join(REGISTRY))
-            .map_err(|error| format!("cannot read the base's {REGISTRY}: {error}"))?,
-    )?;
+    let registry_text = read_optional(base, REGISTRY)?.ok_or("the base has no rule registry")?;
+    let registry = parse_registry(&registry_text)?;
     let mut uncovered = Vec::new();
     for module in RULE_MODULES {
-        let Ok(text) = fs::read_to_string(tree.join(module)) else {
+        let Some(text) = read_optional(tree, module)? else {
             continue;
         };
         for id in registry.ids() {
@@ -452,11 +512,31 @@ pub fn rules_without_cases(base: &Path, tree: &Path) -> Result<Vec<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        Ban, check_calls, loosened_rows, parse_registry, registered_lints, rules_without_cases,
-        weakened_lints,
+        Ban, check_calls, loosened_rows, parse_registry, read_optional, registered_lints,
+        rules_without_cases, weakened_lints,
     };
     use crate::tidy::lints::DylintLint;
     use std::collections::BTreeSet;
+
+    // Goal: the judge reads a regular file, `None` for a missing one, and no verdict for a path
+    // through a symbolic link, to a file or a directory, or for something that is not a file.
+    #[test]
+    fn the_judge_never_follows_a_link() {
+        let scratch = crate::tidy::scratch::Scratch::new("ratchet-read-optional");
+        scratch.write("lints/src/lib.rs", "a");
+        let root = scratch.root();
+        assert_eq!(read_optional(root, "lints/src/lib.rs"), Ok(Some("a".to_owned())));
+        assert_eq!(read_optional(root, "lints/src/gone.rs"), Ok(None));
+        assert_eq!(read_optional(root, "gone/src/lib.rs"), Ok(None));
+        std::os::unix::fs::symlink(root.join("lints/src/lib.rs"), root.join("lints/src/a.rs"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("lints"), root.join("linked")).unwrap();
+        for linked in ["lints/src/a.rs", "linked/src/lib.rs"] {
+            let error = read_optional(root, linked).unwrap_err();
+            assert!(error.contains("symbolic link"), "{error}");
+        }
+        assert!(read_optional(root, "lints/src").unwrap_err().contains("not a regular file"));
+    }
 
     fn real_registry() -> String {
         std::fs::read_to_string(crate::workspace_root().join(super::REGISTRY)).unwrap()
@@ -482,8 +562,11 @@ mod tests {
             banned: vec!["libm".to_owned()],
             allowed: vec!["crates/kernels/src/math.rs".to_owned()],
             scope: "Everywhere".to_owned(),
+            table: "PATH_BANS".to_owned(),
         };
         assert_eq!(*libm, ban);
+        let debug = registry.bans.iter().find(|row| row.id == "debug-assert-placement").unwrap();
+        assert_eq!((debug.table.as_str(), debug.scope.as_str()), ("MACRO_BANS", "Everywhere"));
         assert!(
             registry
                 .rules
@@ -499,6 +582,33 @@ mod tests {
     fn loosened_rows_are_found() {
         let base = real_registry();
         assert_eq!(messages(&base, &base), Vec::<String>::new());
+        let path_ban = "PathBan {\n    id: \"direct-libm\",\n    segment: \"libm\",";
+        let as_macro = "MacroBan {\n    id: \"direct-libm\",\n    names: &[\"libm\"],";
+        let moved = base.replacen(
+            "pub const PATH_BANS: &[PathBan] = &[",
+            "pub const PATH_BANS: &[PathBan] = &[];\nconst UNUSED: &[PathBan] = &[",
+            1,
+        );
+        let row = format!(
+            "{as_macro}\n    allowed: &[\"crates/kernels/src/math.rs\"],\n    \
+             scope: BanScope::Everywhere,\n    message: \"m\",\n}}, "
+        );
+        let table = "pub const MACRO_BANS: &[MacroBan] = &[";
+        let moved = moved.replace(table, &format!("{table}{row}"));
+        assert!(base.contains(path_ban), "the fixture text of the probe");
+        let found = messages(&base, &moved);
+        assert!(
+            found.iter().any(|message| message.contains("moved from PATH_BANS to MACRO_BANS")),
+            "{found:?}"
+        );
+        let unknown = base.replacen("scope: BanScope::Everywhere", "scope: BanScope::Somewhere", 1);
+        assert!(parse_registry(&unknown).unwrap_err().contains("does not know"));
+        let wider = base.replacen("scope: BanScope::Everywhere", "scope: BanScope::NamiCrates", 1);
+        assert_eq!(
+            messages(&wider, &base),
+            Vec::<String>::new(),
+            "NamiCrates to Everywhere widens"
+        );
         let narrowed = base.replace("scope: BanScope::Everywhere", "scope: BanScope::NamiCrates");
         assert!(
             messages(&base, &narrowed)[0]
@@ -560,6 +670,16 @@ mod tests {
                 .unwrap();
         let calls = check_calls("rust_source.rs", &real).unwrap();
         assert!(calls.contains(&("check_body".to_owned(), "check_float_equality".to_owned())));
+        let in_tests = format!(
+            "{real}\n#[cfg(test)]\nmod decoy {{ fn check_body() {{ check_float_equality(); }} }}"
+        );
+        let decoy =
+            real.replace("self.check_float_equality(function);", "") + &in_tests[real.len()..];
+        let pair = ("check_body".to_owned(), "check_float_equality".to_owned());
+        assert!(
+            !check_calls("rust_source.rs", &decoy).unwrap().contains(&pair),
+            "test code does not count"
+        );
         let deleted = real.replace("self.check_float_equality(function);", "");
         assert!(
             !check_calls("rust_source.rs", &deleted)

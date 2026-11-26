@@ -8,17 +8,17 @@ name: guardrails
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-  # The ratchet reads the AI review, which arrives after the push, so a review runs it again.
-  pull_request_review:
-    types: [submitted, dismissed]
+  # A review runs only the judge again, in ratchet-review.yml, so that no review can cancel the
+  # observing job.
   # The merge queue waits for every required check on the rebased result (ADR-0009).
   merge_group:
 
 permissions:
   contents: read
 
-# A review or an edit replaces the run for the same pull request, every job included, so that no
-# job of an older run is left skipped or stale beside the new one.
+# A push or an edit replaces the run for the same pull request, every job included, so that no
+# job of an older run is left skipped or stale beside the new one. Reviews do not run this
+# workflow.
 concurrency:
   group: guardrails-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -96,8 +96,10 @@ jobs:
   # The ratchet (ADR-0022) in two jobs, so that the job that judges never runs the PR's code.
   #
   # `ratchet (head)` builds and runs the PR's tools on the base's cases, with the base's
-  # `cargo xtask ratchet observe`, and uploads only what they printed, as JSON. Its steps get no
-  # token: checkout uses a read-only one and does not keep it.
+  # `cargo xtask ratchet observe`, and uploads only what they printed, as JSON, with the
+  # fingerprint of the head tree it copied. Its steps get no token: checkout uses a read-only one
+  # and does not keep it. The placements are drawn from a seed of the head's content, so a
+  # re-run draws the same ones.
   ratchet-head:
     name: ratchet (head)
     runs-on: ubuntu-latest
@@ -144,7 +146,9 @@ jobs:
   # base's corpus from that checkout, the PR's source as data, and the observations. It runs no
   # PR code, and its tools come from a pinned install here, never from a cache the PR's code
   # could have written. It is meant to become the required check, so it already runs on every
-  # event and is never skipped: a skipped job counts as passed for a required check.
+  # event and is never skipped: a skipped job counts as passed for a required check. The summary
+  # names the commits judged: in a merge group, the group's parent commit, which is the entry
+  # ahead in the queue or the target branch, and the group's head.
   ratchet:
     name: ratchet
     needs: ratchet-head
@@ -188,8 +192,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
-          # The reviewer app's login, once the maintainer has set it up (github-setup.md, 5b).
+          # The reviewer app's login, once the maintainer has set it up; it reviews in CI (#59).
           REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
         run: |
@@ -197,13 +202,15 @@ jobs:
             echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
-          # A merge group's ref is gh-readonly-queue/<base>/pr-<number>-<sha>.
+          # A merge group's ref is gh-readonly-queue/<base>/pr-<number>-<PR head commit>.
           number="${PR_NUMBER:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')}"
+          pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
+          commits="$(git rev-parse HEAD)..$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
           set +e
           cargo xtask ratchet judge --base . --head "${GITHUB_WORKSPACE}" \
             --observations "${RUNNER_TEMP}/observations/observations.json" \
-            --pr "${number}" --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" \
-            > "${RUNNER_TEMP}/ratchet.md"
+            --pr "${number}" --pr-head "${pr_head}" --commits "${commits}" \
+            --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" > "${RUNNER_TEMP}/ratchet.md"
           status=$?
           cat "${RUNNER_TEMP}/ratchet.md" >> "${GITHUB_STEP_SUMMARY}"
           exit "${status}"

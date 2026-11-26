@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 /// The version of this format. A judge refuses any other.
-const FORMAT: &str = "1";
+const FORMAT: &str = "2";
 
 /// One run of a head tool on one base case.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +41,8 @@ pub struct Observations {
     pub seed: u64,
     /// The fingerprint of the base corpus the observer planted.
     pub corpus: String,
+    /// The fingerprint of the head tree the observer copied ([`super::tree::fingerprint`]).
+    pub head: String,
     /// Every run, in the order they ran.
     pub runs: Vec<Run>,
 }
@@ -56,11 +58,13 @@ impl Observations {
     pub fn to_json(&self) -> String {
         let runs: Vec<String> = self.runs.iter().map(run_json).collect();
         format!(
-            "{{\"format\":{},\"skipped\":{},\"seed\":{},\"corpus\":{},\"runs\":[\n{}\n]}}\n",
+            "{{\"format\":{},\"skipped\":{},\"seed\":{},\"corpus\":{},\"head\":{},\
+             \"runs\":[\n{}\n]}}\n",
             json::quote(FORMAT),
             self.skipped,
             json::quote(&self.seed.to_string()),
             json::quote(&self.corpus),
+            json::quote(&self.head),
             runs.join(",\n")
         )
     }
@@ -87,7 +91,8 @@ impl Observations {
         let runs =
             value.get("runs").and_then(Value::as_array).ok_or("the observations have no `runs`")?;
         let runs = runs.iter().map(run_from).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { skipped, seed, corpus: text_of(&value, "corpus")?, runs })
+        let (corpus, head) = (text_of(&value, "corpus")?, text_of(&value, "head")?);
+        Ok(Self { skipped, seed, corpus, head, runs })
     }
 
     /// Reads observations from a file.
@@ -176,11 +181,14 @@ pub fn corpus_fingerprint(base: &Path) -> Result<(String, u32), String> {
     let mut hash = crate::dylint::FNV_OFFSET;
     let mut files: u32 = 0;
     for directory in [super::corpus::FIXTURE_DIRECTORY, super::lint::UI_DIRECTORY] {
-        let mut names: Vec<String> = fs::read_dir(base.join(directory))
+        let mut names: Vec<String> = Vec::new();
+        for entry in fs::read_dir(base.join(directory))
             .map_err(|error| format!("cannot read the base's {directory}: {error}"))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
+        {
+            let entry =
+                entry.map_err(|error| format!("cannot read the base's {directory}: {error}"))?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
         names.sort();
         for name in names {
             let relative = format!("{directory}/{name}");
@@ -223,6 +231,7 @@ mod tests {
             skipped: false,
             seed: u64::MAX,
             corpus: "ab".to_owned(),
+            head: "cd".to_owned(),
             runs: vec![run(Some(2)), run(None)],
         };
         assert_eq!(Observations::from_json(&observations.to_json()), Ok(observations.clone()));
@@ -230,7 +239,7 @@ mod tests {
         assert!(Observations::from_json("{}").is_err());
         assert!(
             Observations::from_json(
-                &observations.to_json().replace("\"format\":\"1\"", "\"format\":\"2\"")
+                &observations.to_json().replace("\"format\":\"2\"", "\"format\":\"1\"")
             )
             .is_err()
         );

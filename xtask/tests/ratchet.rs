@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use xtask::ratchet::review::{AUTHOR_APP, Pull, REVIEWER_APP, Review, Reviews, Thread};
+use xtask::ratchet::review::{AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread};
 use xtask::ratchet::{Check, ReviewSource, Tools, Verdict, check, judge, observe};
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
@@ -53,6 +53,8 @@ exit "$code"
 ///   reporting each `line:column` of `<tree>/lints/src/fake-lint.txt` as JSON.
 /// - `cargo dylint --all -- --workspace ...`, which the head's `xtask dylint` runs, reports
 ///   them in human form on the examples of the crates of the workspace it runs in.
+/// - Both exit 101 if they reported something and 0 if not, or 0 whatever they reported while
+///   `lints/src/exit-zero` exists.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 if [ "$1" = build ]; then
     if [ -e broken-build ]; then
@@ -106,7 +108,9 @@ if [ "$2" = --path ]; then
             echo "{$message,\"spans\":[{$span}]}}"
         done < "$3/src/fake-lint.txt"
     done
-    exit 101
+    [ -e "$3/src/exit-zero" ] && exit 0
+    [ -s "$3/src/fake-lint.txt" ] && exit 101
+    exit 0
 fi
 for file in crates/*/examples/*.rs; do
     [ -e "$file" ] || continue
@@ -114,7 +118,9 @@ for file in crates/*/examples/*.rs; do
         printf 'error: a fake lint\n  --> %s:%s:%s\n\n' "$file" "$line" "$column" >&2
     done < lints/src/fake-lint.txt
 done
-exit 101
+[ -e lints/src/exit-zero ] && exit 0
+[ -s lints/src/fake-lint.txt ] && exit 101
+exit 0
 "#;
 
 /// A temporary directory, removed when the test ends.
@@ -224,21 +230,23 @@ const REVIEWED: FakeReviews = FakeReviews {
     approval: None,
 };
 
+/// An app for a login with `[bot]`, a user for any other.
+fn actor(login: &str) -> Actor {
+    if login.ends_with("[bot]") { Actor::app(login) } else { Actor::user(login) }
+}
+
 impl Reviews for FakeReviews {
     fn pull(&self, _pull: u32) -> Result<Pull, String> {
-        Ok(Pull { head: "head".to_owned(), author: AUTHOR_APP.to_owned() })
+        Ok(Pull { head: "head".to_owned(), author: Actor::app(AUTHOR_APP) })
     }
     fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
         let state = "COMMENTED".to_owned();
-        let mut reviews = vec![Review {
-            author: self.reviewer.to_owned(),
-            commit: self.commit.to_owned(),
-            state,
-        }];
+        let mut reviews =
+            vec![Review { author: actor(self.reviewer), commit: self.commit.to_owned(), state }];
         if let Some((author, commit)) = self.approval {
             let approved = "APPROVED".to_owned();
             reviews.push(Review {
-                author: author.to_owned(),
+                author: actor(author),
                 commit: commit.to_owned(),
                 state: approved,
             });
@@ -246,9 +254,10 @@ impl Reviews for FakeReviews {
         Ok(reviews)
     }
     fn threads(&self, _pull: u32) -> Result<Vec<Thread>, String> {
-        let resolved_by = self.resolved_by.map(str::to_owned);
+        let resolved_by = self.resolved_by.map(actor);
         let path = "lints/src/lib.rs".to_owned();
-        Ok(vec![Thread { path, author: REVIEWER_APP.to_owned(), resolved_by }])
+        let author = Some(Actor::app(REVIEWER_APP));
+        Ok(vec![Thread { path, author, resolved: resolved_by.is_some(), resolved_by }])
     }
 }
 
@@ -288,9 +297,11 @@ impl Case {
             review: Some(ReviewSource {
                 reviews,
                 pull: 7,
+                head: "head".to_owned(),
                 reviewer: Some(REVIEWER_APP.to_owned()),
             }),
             seed: Some(11),
+            commits: None,
         }
     }
 
@@ -396,7 +407,7 @@ fn loosened_rule_tables_fail_the_rule_set() {
     let case = Case::new("tables");
     let registry = real("xtask/src/tidy/registry.rs");
     let narrowed =
-        replaced(&registry, "scope: BanScope::Everywhere", "scope: BanScope::NamiCrates");
+        registry.replacen("scope: BanScope::Everywhere", "scope: BanScope::NamiCrates", 1);
     let excepted = replaced(
         &narrowed,
         "allowed: &[\"crates/kernels\"]",
@@ -451,12 +462,35 @@ fn a_dropped_lint_diagnostic_fails() {
         (Check::EndToEnd, "lints/ui/main.rs:4:1".to_owned()),
     ];
     assert_eq!(found(&verdict), expected, "{}", verdict.summary());
-    let decoy = "declare_lint! { pub NAMI_FAKE, Deny, \"a\" }\n#[cfg(any())]\n\
+    let decoy = "declare_lint! { pub NAMI_FAKE, Deny, \"a\" }\n\
                  declare_lint! { pub NAMI_FAKE, Warn, \"b\" }\n";
     write(&case.head(), "lints/src/lib.rs", decoy);
     write(&case.head(), "lints/src/fake-lint.txt", "2:5\n4:1\n");
     let twice = case.run(NOTHING, "any");
     assert!(twice.findings.iter().any(|finding| finding.message.contains("declared 2 times")));
+    let hidden = format!("#[cfg(any())]\nfn gone() {{}}\n{decoy}");
+    write(&case.head(), "lints/src/lib.rs", &hidden);
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let error = check(&case.base(), &case.head(), &tools).expect_err("a cfg in the lint library");
+    assert!(error.contains("`cfg`"), "{error}");
+}
+
+// Goal: a dylint run whose exit code disagrees with what it printed is no verdict: an error
+// diagnostic beside a clean exit, for the library and end to end alike.
+#[test]
+fn a_dylint_exit_that_disagrees_is_no_verdict() {
+    let case = Case::new("lint-exit");
+    write(&case.head(), "lints/src/exit-zero", "");
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let error = check(&case.base(), &case.head(), &tools).expect_err("a clean exit beside errors");
+    assert!(error.contains("lint library exited 0 and printed 2 error"), "{error}");
+    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let mut library_agrees = observed.clone();
+    for run in library_agrees.runs.iter_mut().filter(|run| run.mode == "library") {
+        run.exit = Some(101);
+    }
+    let end_to_end = judge(&case.base(), &case.head(), &library_agrees, &tools).unwrap_err();
+    assert!(end_to_end.contains("`xtask dylint` on lints/ui/main.rs exited 0"), "{end_to_end}");
 }
 
 // Goal: a change outside the rule paths is reported, not failed: with no tooling change nothing
@@ -553,9 +587,29 @@ fn only_the_reviewer_app_counts() {
         check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &resolved)).unwrap();
     assert!(by_other.findings[0].message.contains("resolved by nami-agent[bot]"));
     let mut tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
-    tools.review = Some(ReviewSource { reviews: &REVIEWED, pull: 7, reviewer: None });
+    tools.review =
+        Some(ReviewSource { reviews: &REVIEWED, pull: 7, head: "head".to_owned(), reviewer: None });
     let unset = check(&case.base(), &case.head(), &tools).unwrap();
-    assert!(unset.unproven[0].contains("no reviewer app is set up"), "{}", unset.summary());
+    assert!(unset.unproven[0].contains("no reviewer app is configured"), "{}", unset.summary());
+}
+
+// Goal: the observer and the judge read one head: a head with a symbolic link is no verdict,
+// and so are observations of a head whose files changed before the judge read it.
+#[test]
+fn the_judge_reads_the_head_that_was_observed() {
+    let case = Case::new("one-head");
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    write(
+        &case.head(),
+        "xtask/src/tidy/registry.rs",
+        &format!("{}\n", real("xtask/src/tidy/registry.rs")),
+    );
+    let error = judge(&case.base(), &case.head(), &observed, &tools).unwrap_err();
+    assert!(error.contains("another head tree"), "{error}");
+    std::os::unix::fs::symlink("/etc/hostname", case.head().join("lints/src/linked.rs")).unwrap();
+    let linked = check(&case.base(), &case.head(), &tools).unwrap_err();
+    assert!(linked.contains("1 symbolic link(s), such as `lints/src/linked.rs`"), "{linked}");
 }
 
 // Goal: the judge reads the base's corpus from its own checkout: observations made against a
@@ -672,7 +726,12 @@ fn a_code_owner_approval_stands_in_for_what_is_unproven() {
     let verdict = |approval: Option<(&'static str, &'static str)>| {
         let reviews = FakeReviews { approval, ..REVIEWED };
         let mut tools = case.tools(NOTHING, "any", NOTHING, &reviews);
-        tools.review = Some(ReviewSource { reviews: &reviews, pull: 7, reviewer: None });
+        tools.review = Some(ReviewSource {
+            reviews: &reviews,
+            pull: 7,
+            head: "head".to_owned(),
+            reviewer: None,
+        });
         check(&case.base(), &case.head(), &tools).unwrap()
     };
     let unapproved = verdict(None);

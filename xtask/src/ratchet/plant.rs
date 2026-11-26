@@ -9,14 +9,13 @@
 use super::tree::is_plain_relative;
 use crate::tidy::Scope;
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Candidate paths tried per kind of placement before giving up on that kind.
 const TRIES_MAX: u32 = 48;
 
-/// A small deterministic generator (splitmix64). The seed comes from the operating system in
-/// CI and is fixed in tests (ADR-0009).
+/// A small deterministic generator (splitmix64). The seed comes from the head's content in CI
+/// ([`seed_of`]) and is fixed in tests (ADR-0009).
 #[derive(Clone, Debug)]
 pub struct Rng {
     state: u64,
@@ -65,17 +64,18 @@ impl Rng {
     }
 }
 
-/// A seed from the operating system, which the head's code cannot know before it runs.
-///
-/// # Errors
-///
-/// Returns what failed if `/dev/urandom` cannot be read.
-pub fn os_seed() -> Result<u64, String> {
-    let mut bytes = [0_u8; 8];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|error| format!("cannot read a seed from /dev/urandom: {error}"))?;
-    Ok(u64::from_le_bytes(bytes))
+/// Mixed into every seed, so that placements differ from other uses of the fingerprint. It is
+/// no secret: the observing job runs the head's code and holds none.
+const SALT: &str = "nami-ratchet-placements-1";
+
+/// The seed for a head whose tree has the fingerprint `head_tree`. The same head always gets
+/// the same placements: re-running the check cannot draw new ones until the placements miss,
+/// and only a change to the head's content draws again.
+#[must_use]
+pub fn seed_of(head_tree: &str) -> u64 {
+    assert!(!head_tree.is_empty(), "a fingerprint to seed from");
+    let salted = crate::dylint::fnv1a(crate::dylint::FNV_OFFSET, SALT.as_bytes());
+    crate::dylint::fnv1a(crate::dylint::fnv1a(salted, &[0]), head_tree.as_bytes())
 }
 
 /// The suffix of a file name that decides its kind: everything from the first `.`, or the
@@ -123,7 +123,10 @@ pub fn placements(
             chosen.push(found);
         }
     }
-    assert!(chosen.len() <= 3, "at most three placements");
+    assert!(
+        chosen.iter().all(|path| is_plain_relative(path) && Scope::of(path) == scope),
+        "every placement stays inside the tree, in the case's scope"
+    );
     chosen
 }
 
@@ -175,8 +178,8 @@ mod tests {
         let draws: Vec<usize> = (0..100).map(|_| rng.below(3)).collect();
         assert!(draws.iter().all(|value| *value < 3), "in range");
         assert!((0..3).all(|value| draws.contains(&value)), "every value is drawn");
-        let seeds = [super::os_seed().unwrap(), super::os_seed().unwrap()];
-        assert_ne!(seeds[0], seeds[1], "the operating system's seeds differ");
+        assert_eq!(super::seed_of("00ff"), super::seed_of("00ff"), "a head has one seed");
+        assert_ne!(super::seed_of("00ff"), super::seed_of("00fe"), "another head, another seed");
         assert_eq!(rng.stem().len(), 9);
     }
 

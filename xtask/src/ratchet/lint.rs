@@ -108,8 +108,8 @@ pub fn cases(base: &Path) -> Result<Vec<UiCase>, String> {
         }
         let text = fs::read_to_string(directory.join(format!("{stem}.rs")))
             .map_err(|error| format!("cannot read {UI_DIRECTORY}/{stem}.rs: {error}"))?;
-        let stderr =
-            fs::read_to_string(directory.join(format!("{stem}.stderr"))).unwrap_or_default();
+        let expected = format!("{UI_DIRECTORY}/{stem}.stderr");
+        let stderr = super::source::read_optional(base, &expected)?.unwrap_or_default();
         let is_test = is_test_case(&text).map_err(|flags| {
             format!(
                 "{UI_DIRECTORY}/{stem}.rs passes `{flags}`; the ratchet knows only `{TEST_FLAG}`"
@@ -117,7 +117,10 @@ pub fn cases(base: &Path) -> Result<Vec<UiCase>, String> {
         })?;
         found.push(UiCase { stem: stem.to_owned(), is_test, text, stderr });
     }
-    assert!(found.len() <= names.len(), "one case per source file");
+    assert!(
+        found.windows(2).all(|pair| matches!(pair, [first, second] if first.stem < second.stem)),
+        "the cases are sorted by name, each once"
+    );
     Ok(found)
 }
 
@@ -155,7 +158,6 @@ pub fn parse_json(text: &str) -> Vec<Diagnostic> {
             found.push(diagnostic);
         }
     }
-    assert!(found.len() <= text.lines().count(), "at most one diagnostic per line");
     found
 }
 
@@ -196,7 +198,10 @@ pub fn parse_located(text: &str) -> Vec<Located> {
             found.push(Located { level: current.to_owned(), path, line: line_number, column });
         }
     }
-    assert!(found.len() <= text.lines().count(), "at most one location per line");
+    assert!(
+        found.iter().all(|located| located.level == "error" || located.level == "warning"),
+        "a location belongs to an error or a warning"
+    );
     found
 }
 
@@ -317,11 +322,10 @@ pub fn judge(
         .runs_of(UI_DIRECTORY, "library")
         .next()
         .ok_or("the observations hold no run of the head's lint library")?;
-    if library.exit.is_none() {
-        return Err("the head's lint library run was killed".to_owned());
-    }
-    let mut findings =
-        missing_diagnostics(&expected, &parse_json(&library.stdout), &library.stderr);
+    let reported = parse_json(&library.stdout);
+    let errors = reported.iter().filter(|diagnostic| diagnostic.level == "error").count();
+    exits_agree("the head's lint library", library.exit, errors)?;
+    let mut findings = missing_diagnostics(&expected, &reported, &library.stderr);
     for case in &cases {
         let file = format!("{}.rs", case.stem);
         let of_case: Vec<&Diagnostic> =
@@ -359,6 +363,22 @@ fn base_expectations(
     Ok(expected)
 }
 
+/// Fails, for no verdict, unless the exit code of a dylint run agrees with the errors it
+/// printed: 0 with none, an error code with some. An error exit without an error diagnostic is
+/// a run that broke, and a clean exit beside an error diagnostic is output that cannot be
+/// trusted; neither shows what the lints report.
+fn exits_agree(what: &str, exit: Option<i32>, errors: usize) -> Result<(), String> {
+    match exit {
+        Some(0) if errors == 0 => Ok(()),
+        Some(code) if code != 0 && errors > 0 => Ok(()),
+        Some(0) => Err(format!("{what} exited 0 and printed {errors} error diagnostic(s)")),
+        Some(code) => Err(format!(
+            "{what} exited {code} without an error diagnostic, so it did not run the lints"
+        )),
+        None => Err(format!("{what} was killed")),
+    }
+}
+
 /// Judges one end-to-end run against the base's diagnostics of its case.
 fn judge_dylint(run: &Run, expected: &[&Diagnostic]) -> Result<Vec<Finding>, String> {
     let placement = &run.placement;
@@ -366,11 +386,11 @@ fn judge_dylint(run: &Run, expected: &[&Diagnostic]) -> Result<Vec<Finding>, Str
     if !in_a_crate || !is_plain_relative(Path::new(placement)) {
         return Err(format!("{} was planted at {placement}, not as an example", run.subject));
     }
-    if run.exit.is_none() {
-        return Err(format!("the head's `xtask dylint` on {} was killed", run.subject));
-    }
     let printed = format!("{}\n{}", run.stdout, run.stderr);
-    let found: BTreeSet<(String, u32, u32)> = parse_located(&printed)
+    let located = parse_located(&printed);
+    let errors = located.iter().filter(|diagnostic| diagnostic.level == "error").count();
+    exits_agree(&format!("the head's `xtask dylint` on {}", run.subject), run.exit, errors)?;
+    let found: BTreeSet<(String, u32, u32)> = located
         .into_iter()
         .filter(|located| located.path == *placement)
         .map(|located| (located.level, located.line, located.column))
@@ -693,8 +713,10 @@ mod tests {
         assert!(missing_diagnostics(&[], &[], "").is_empty(), "nothing expected");
     }
 
-    // Goal: an end-to-end run counts only as an example of a crate at a plain path, and not
-    // when it was killed; there, each expected diagnostic must be at the planted path.
+    // Goal: an end-to-end run counts only as an example of a crate at a plain path, and only
+    // when its exit code agrees with the errors it printed: not when it was killed, exited 0
+    // beside an error, or failed without one. There, each expected diagnostic must be at the
+    // planted path.
     #[test]
     fn end_to_end_runs_are_read_strictly() {
         let run =
@@ -713,6 +735,10 @@ mod tests {
         assert_eq!(judge_dylint(&run(at, Some(101), printed), &[&expected]), Ok(Vec::new()));
         assert_eq!(judge_dylint(&run(at, Some(0), ""), &[&expected]).unwrap().len(), 1);
         assert!(judge_dylint(&run(at, None, printed), &[&expected]).is_err(), "killed");
+        let clean_exit = judge_dylint(&run(at, Some(0), printed), &[&expected]).unwrap_err();
+        assert!(clean_exit.contains("exited 0 and printed 1 error"), "{clean_exit}");
+        let broke = judge_dylint(&run(at, Some(101), "error: could not compile"), &[&expected]);
+        assert!(broke.unwrap_err().contains("exited 101 without an error diagnostic"));
         assert!(judge_dylint(&run("crates/a/src/r1.rs", Some(101), printed), &[]).is_err());
         assert!(judge_dylint(&run("docs/examples/r1.rs", Some(101), printed), &[]).is_err());
         assert!(judge_dylint(&run("crates/../examples/r1.rs", Some(101), printed), &[]).is_err());

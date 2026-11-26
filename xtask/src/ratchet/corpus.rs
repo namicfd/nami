@@ -123,7 +123,10 @@ pub fn parse_reports(text: &str) -> Vec<Report> {
             reports.push(Report { path: path.to_owned(), line: number, rule: rule.to_owned() });
         }
     }
-    assert!(reports.len() <= text.lines().count(), "at most one report per line");
+    assert!(
+        reports.iter().all(|report| !report.rule.contains("]: ")),
+        "a rule ends at the first `]: ` of its line"
+    );
     reports
 }
 
@@ -171,7 +174,10 @@ pub fn observe(
                 .map_err(|error| format!("cannot restore the scratch tree: {error}"))?;
         }
     }
-    assert!(runs.iter().all(|run| run.mode == "file" || run.mode == "tree"), "tidy runs only");
+    assert!(
+        runs.iter().all(|run| is_plain_relative(Path::new(&run.placement))),
+        "every case is planted inside the scratch tree"
+    );
     Ok(runs)
 }
 
@@ -269,11 +275,7 @@ fn judge_run(
         ));
     }
     let expected = plant::reports_at(base, placement, &fixture.text).ok_or_else(|| {
-        format!(
-            "the base's tidy cannot check {} at \
-                                {}",
-            fixture.file, run.placement
-        )
+        format!("the base's tidy cannot check {} at {}", fixture.file, run.placement)
     })?;
     if fixture.fires && !expected.iter().any(|(rule, _)| *rule == fixture.id) {
         return Err(format!(

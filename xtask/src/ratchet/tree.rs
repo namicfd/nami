@@ -73,8 +73,39 @@ pub fn changed_paths(base: &Path, head: &Path) -> io::Result<Vec<String>> {
     let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
     let changed: Vec<String> =
         paths.into_iter().filter(|path| before.get(*path) != after.get(*path)).cloned().collect();
-    assert!(changed.len() <= before.len() + after.len(), "a path changes at most once");
+    assert!(
+        changed.windows(2).all(|pair| matches!(pair, [first, second] if first < second)),
+        "the changed paths are sorted and unique"
+    );
     Ok(changed)
+}
+
+/// A fingerprint of the tree below `root` (FNV-1a over every path and its content, in order),
+/// and its symbolic links, sorted. The observer records the fingerprint of the head it ran on,
+/// and the judge compares it with that of the head it reads, so that both saw the same files.
+///
+/// # Errors
+///
+/// Returns an error if the tree cannot be read.
+pub fn fingerprint(root: &Path) -> io::Result<(String, Vec<String>)> {
+    let mut hash = crate::dylint::FNV_OFFSET;
+    let mut links = Vec::new();
+    for (path, entry) in entries(root)? {
+        hash = crate::dylint::fnv1a(hash, path.as_bytes());
+        match entry {
+            Entry::File(bytes) => {
+                hash = crate::dylint::fnv1a(hash, &[0]);
+                hash = crate::dylint::fnv1a(hash, &bytes);
+            }
+            Entry::Link(target) => {
+                hash = crate::dylint::fnv1a(hash, &[1]);
+                hash = crate::dylint::fnv1a(hash, target.as_os_str().as_encoded_bytes());
+                links.push(path);
+            }
+        }
+        hash = crate::dylint::fnv1a(hash, &[0xff]);
+    }
+    Ok((format!("{hash:016x}"), links))
 }
 
 /// A path relative to the root, spelled with `/` whatever the platform.

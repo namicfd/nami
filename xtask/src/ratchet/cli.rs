@@ -7,12 +7,18 @@
 //!   judge:    --observations <file>             judge what they printed
 //!   neither:  observe and judge in one process
 //!
-//!   (--pr <number> [--reviewer <app login>] | --no-review)    judge and neither
+//!   (--pr <number> --pr-head <sha> [--reviewer <app login>]
+//!    | --no-review)                                           judge and neither
+//!   [--commits <base>..<head>]                                judge and neither
 //!   [--no-mutants] [--work <dir>]                             all
 //!   [--head-xtask <file>] [--seed <number>]                   observe and neither
 //! ```
 //!
 //! `--base` must be the checkout whose ratchet runs, because the base's tidy judges in-process.
+//! `--pr-head` is the pull request's head commit that was judged: reviews count only on it,
+//! and the judge gives no verdict if the pull request has moved on. `--commits` names the
+//! commits whose trees are judged, for the summary. Without `--seed`, the placements are drawn
+//! from a seed of the head's content, so that a re-run draws the same ones.
 
 use super::observations::Observations;
 use super::review::GhReviews;
@@ -26,9 +32,14 @@ use std::process::ExitCode;
 const EXIT_NO_VERDICT: u8 = 2;
 
 const USAGE: &str = "usage: cargo xtask ratchet [observe --out <file> | judge --observations \
-                     <file>] --base <dir> --head <dir> [(--pr <number> [--reviewer <login>]) | \
-                     --no-review] [--no-mutants] [--head-xtask <file>] [--seed <number>] \
-                     [--work <dir>]";
+                     <file>] --base <dir> --head <dir> [(--pr <number> --pr-head <sha> \
+                     [--reviewer <login>]) | --no-review] [--commits <base>..<head>] \
+                     [--no-mutants] [--head-xtask <file>] [--seed <number>] [--work <dir>]";
+
+/// True for a full commit hash.
+fn is_commit(text: &str) -> bool {
+    text.len() == 40 && text.chars().all(|character| character.is_ascii_hexdigit())
+}
 
 /// What to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +56,9 @@ struct Arguments {
     base: PathBuf,
     head: PathBuf,
     pull: Option<u32>,
+    pull_head: Option<String>,
     reviewer: Option<String>,
+    commits: Option<String>,
     mutants: bool,
     head_xtask: Option<PathBuf>,
     seed: Option<u64>,
@@ -65,6 +78,7 @@ fn parse(options: &[&str]) -> Result<Arguments, String> {
     let mut rest = options.iter();
     let (mut base, mut head, mut pull, mut reviewer, mut no_review) =
         (None, None, None, None, false);
+    let (mut pull_head, mut commits) = (None, None);
     let (mut mutants, mut head_xtask, mut seed, mut work, mut file) =
         (true, None, None, None, None);
     for _ in 0..options.len() {
@@ -76,6 +90,8 @@ fn parse(options: &[&str]) -> Result<Arguments, String> {
             "--base" => base = Some(PathBuf::from(value()?)),
             "--head" => head = Some(PathBuf::from(value()?)),
             "--pr" => pull = Some(number::<u32>("--pr", value()?)?).filter(|number| *number > 0),
+            "--pr-head" => pull_head = Some(value()?.to_owned()),
+            "--commits" => commits = Some(value()?.to_owned()),
             "--reviewer" => reviewer = Some(value()?.to_owned()).filter(|login| !login.is_empty()),
             "--no-review" => no_review = true,
             "--no-mutants" => mutants = false,
@@ -87,22 +103,65 @@ fn parse(options: &[&str]) -> Result<Arguments, String> {
             other => return Err(format!("unknown option `{other}`; {USAGE}")),
         }
     }
+    let mode = mode_of(subcommand, file, pull.is_some(), no_review)?;
+    check_commits(pull.is_some(), pull_head.as_deref(), commits.as_deref())?;
+    let (Some(base), Some(head)) = (base, head) else {
+        return Err(format!("`--base` and `--head` are required; {USAGE}"));
+    };
+    Ok(Arguments {
+        mode,
+        base,
+        head,
+        pull,
+        pull_head,
+        reviewer,
+        commits,
+        mutants,
+        head_xtask,
+        seed,
+        work,
+    })
+}
+
+/// The mode, from the subcommand and its file, checked against the review options.
+fn mode_of(
+    subcommand: &str,
+    file: Option<PathBuf>,
+    has_pull: bool,
+    no_review: bool,
+) -> Result<Mode, String> {
     let mode = match (subcommand, file) {
         ("observe", Some(file)) => Mode::Observe(file),
         ("judge", Some(file)) => Mode::Judge(file),
         ("", None) => Mode::Both,
         _ => return Err(format!("`observe` needs `--out` and `judge` `--observations`; {USAGE}")),
     };
-    if matches!(mode, Mode::Observe(_)) && (pull.is_some() || no_review) {
+    if matches!(mode, Mode::Observe(_)) && (has_pull || no_review) {
         return Err(format!("`observe` reads no reviews; {USAGE}"));
     }
-    if !matches!(mode, Mode::Observe(_)) && pull.is_some() == no_review {
+    if !matches!(mode, Mode::Observe(_)) && has_pull == no_review {
         return Err(format!("pass exactly one of `--pr <number>` and `--no-review`; {USAGE}"));
     }
-    let (Some(base), Some(head)) = (base, head) else {
-        return Err(format!("`--base` and `--head` are required; {USAGE}"));
+    Ok(mode)
+}
+
+/// Checks the commits given: `--pr-head` exactly with `--pr`, a full commit, and `--commits`
+/// two full commits.
+fn check_commits(
+    has_pull: bool,
+    pull_head: Option<&str>,
+    commits: Option<&str>,
+) -> Result<(), String> {
+    if has_pull != pull_head.is_some() || !pull_head.is_none_or(is_commit) {
+        return Err(format!("`--pr` needs `--pr-head` with the full head commit; {USAGE}"));
+    }
+    let is_range = |range: &str| {
+        range.split_once("..").is_some_and(|(from, to)| is_commit(from) && is_commit(to))
     };
-    Ok(Arguments { mode, base, head, pull, reviewer, mutants, head_xtask, seed, work })
+    if !commits.is_none_or(is_range) {
+        return Err(format!("`--commits` takes `<base>..<head>`, two full commits; {USAGE}"));
+    }
+    Ok(())
 }
 
 /// Resolves a directory argument to an absolute, canonical path.
@@ -163,12 +222,16 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
         cargo: OsString::from("cargo"),
         work: std::path::absolute(&work).map_err(|error| format!("`--work`: {error}"))?,
         mutants: arguments.mutants,
-        review: arguments.pull.map(|pull| ReviewSource {
-            reviews: &github,
-            pull,
-            reviewer: arguments.reviewer.clone(),
+        review: arguments.pull.zip(arguments.pull_head.clone()).map(|(pull, pull_head)| {
+            ReviewSource {
+                reviews: &github,
+                pull,
+                head: pull_head,
+                reviewer: arguments.reviewer.clone(),
+            }
         }),
         seed: arguments.seed,
+        commits: arguments.commits.clone(),
     };
     match &arguments.mode {
         Mode::Observe(out) => {
@@ -188,11 +251,12 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
 mod tests {
     use super::{Mode, parse};
 
-    // Goal: the options parse into the arguments for each mode, and a missing value, an unknown
-    // option, a bad number, a mode without its file, or neither or both of `--pr` and
-    // `--no-review` where reviews are judged, are errors.
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    // Goal: the options parse into the arguments for each mode.
     #[test]
     fn options_are_parsed() {
+        let range = format!("{SHA}..{SHA}");
         let both = parse(&[
             "--base",
             "b",
@@ -200,6 +264,10 @@ mod tests {
             "h",
             "--pr",
             "12",
+            "--pr-head",
+            SHA,
+            "--commits",
+            &range,
             "--reviewer",
             "r[bot]",
             "--no-mutants",
@@ -212,6 +280,7 @@ mod tests {
             (Some(12), Some("r[bot]"), false, Some(5))
         );
         assert_eq!(both.mode, Mode::Both);
+        assert_eq!((both.pull_head.as_deref(), both.commits), (Some(SHA), Some(range.clone())));
         let observe = parse(&["observe", "--base", "b", "--head", "h", "--out", "o.json"]).unwrap();
         assert_eq!(observe.mode, Mode::Observe("o.json".into()));
         let judge = parse(&[
@@ -224,12 +293,22 @@ mod tests {
             "o.json",
             "--pr",
             "3",
+            "--pr-head",
+            SHA,
         ])
         .unwrap();
         assert_eq!((judge.mode, judge.reviewer), (Mode::Judge("o.json".into()), None));
         let empty_reviewer =
-            parse(&["--base", "b", "--head", "h", "--pr", "3", "--reviewer", ""]).unwrap();
+            parse(&["--base", "b", "--head", "h", "--pr", "3", "--pr-head", SHA, "--reviewer", ""])
+                .unwrap();
         assert_eq!(empty_reviewer.reviewer, None, "an unset repository variable is no reviewer");
+    }
+
+    // Goal: a missing value, an unknown option, a bad number, a mode without its file, neither
+    // or both of `--pr` and `--no-review` where reviews are judged, `--pr` without a full
+    // `--pr-head`, and a `--commits` that is not two full commits, are errors.
+    #[test]
+    fn bad_options_are_errors() {
         let errors = [
             vec!["--base", "b", "--head", "h"],
             vec!["--base", "b", "--head", "h", "--pr", "1", "--no-review"],
@@ -241,6 +320,10 @@ mod tests {
             vec!["observe", "--base", "b", "--head", "h", "--out", "o", "--pr", "1"],
             vec!["judge", "--base", "b", "--head", "h", "--out", "o", "--no-review"],
             vec!["--base", "b", "--head", "h", "--no-review", "--seed", "-1"],
+            vec!["--base", "b", "--head", "h", "--pr", "1"],
+            vec!["--base", "b", "--head", "h", "--pr", "1", "--pr-head", "abc"],
+            vec!["--base", "b", "--head", "h", "--no-review", "--pr-head", SHA],
+            vec!["--base", "b", "--head", "h", "--no-review", "--commits", SHA],
         ];
         for options in errors {
             assert!(parse(&options).is_err(), "{options:?}");
