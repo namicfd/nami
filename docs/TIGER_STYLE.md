@@ -349,7 +349,8 @@ finite-volume codes, and especially in agent-written ones.
   - `mul_add` is allowed where written explicitly. Never rewrite an expression into `mul_add`
     without a reason, because doing so changes results. `[review]`
   - **Sums use `sum_fixed`** (or `sum_compensated` for conservation totals), never a naive fold.
-    The lint sees `Iterator::sum` and `fold`; a sum written as a `for` loop is for review.
+    The lint sees `sum`, `product`, `reduce` and the `fold` family; a sum written as a `for`
+    loop is for review.
     `[dylint:nami_float_reduction]` `[review]`
   - No iteration over `HashMap` or `HashSet`. `[clippy:iter_over_hash_type]`
     `[clippy:disallowed_types]`

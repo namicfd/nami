@@ -45,8 +45,13 @@ dylint_linting::declare_lint! {
 dylint_linting::declare_lint! {
     /// ### What it does
     ///
-    /// Reports `Iterator::sum` with a float result, and `Iterator::fold` with a float
-    /// accumulator whose closure adds to the accumulator with `+` or `+=`. Test code is exempt.
+    /// Reports `sum` and `product` with a float result, also inside `Option` or `Result`, and
+    /// `fold`, `rfold`, `try_fold`, `try_rfold` and `reduce` with a float accumulator whose
+    /// function adds to or subtracts from it: a path to `Add::add` or `Sub::sub` such as
+    /// `f64::add`, or a closure in which the accumulator is an operand of `+`, `-`, `+=`, `-=`,
+    /// `add`, `sub`, `add_assign`, `sub_assign`, or the addend of a `mul_add`. An argmin or
+    /// argmax closure, which only compares differences with the accumulator and returns its
+    /// parameters unchanged, is exempt; an addition never is. Test code is exempt.
     ///
     /// ### Why is this bad?
     ///
