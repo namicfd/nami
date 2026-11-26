@@ -217,7 +217,7 @@ gh api "repos/$REPO/environments/nami-agent/deployment-branch-policies" --jq '.b
 gh secret list --repo "$REPO" --env nami-agent
 ```
 
-The first failed merge-queue run after that should leave an issue `PR #<n> failed in the merge queue` by `nami-agent[bot]`, labelled `bug`. To rotate the CI key, generate a new one in the app's settings, replace the secret, then delete the old key there.
+The first failed merge-queue run after that should leave an issue `PR #<n> failed in the merge queue (run <id>)` by `nami-agent[bot]`, labelled `bug`. To rotate the CI key, generate a new one in the app's settings, replace the secret, then delete the old key there.
 
 ## 9. Check that it works
 
