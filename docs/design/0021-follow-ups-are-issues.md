@@ -86,11 +86,29 @@ The workflow `queue` files an issue `PR #<n> failed in the merge queue (run <id>
 - **If anyone else opened #n,** agents do not push to it. The issue says that a human rebases it, and it carries `needs-decision`, so `cargo xtask task ready` does not list it.
 - **The issue quotes only checked text.** The queue ran the PRs' own code and workflow files, so the run's logs and its job and step names are untrusted (point 2). The issue names jobs and steps only by names that `main`'s `.github/workflows/ci.yml` defines, reports codes only as tidy's rule IDs and the dylint lints' names, and builds its links from the repository name and IDs. The fixer reads the log through the link.
 
+### 7. Amendment (Proposed, 2026-11-26): the bot removes `needs-decision` after it records a code owner's decision
+
+The maintainer makes most decisions in a conversation with a session, not on GitHub, so a decided issue waited for a click (issue #65). Points 1 and 3 change: the bot may also remove `needs-decision`, right after it posts a decision record.
+
+- **The record** is a comment by the bot of exactly these four lines:
+
+  ```text
+  <!-- nami:decision -->
+  Decision: <one paragraph, on one line>
+  Decided by: @<login>, <YYYY-MM-DD>
+  Source: <the session or PR where it was decided>
+  ```
+
+- **When the bot's removal counts.** The bot's latest comment posted no later than the removal is a record in this form, it was not edited after the removal, its date is a calendar day, and its decider is a code owner in `.github/CODEOWNERS` on `main`. GitHub's times have whole seconds, so a record from the same second as the removal counts. Any other removal by the bot, and any removal by someone who is not a code owner, still does not count. A code owner's removal counts as before, and adding the label again reopens the question.
+- **`cargo xtask issue decide <n> --by <login> --date <YYYY-MM-DD> --source <text> <decision.md>`** posts the record, then removes the label. It refuses unless the issue is trusted and has `needs-decision`, and `--by` is a code owner. The date is an option because xtask reads no clock (`SystemTime::now` is banned, ADR-0005), and because a decision may be recorded on a later day. `issue show` marks the record.
+- **This rests on agent honesty.** Every agent holds the bot's key, so an agent could record a decision that nobody made. The threat model already assumes honest agents: the bot can file an issue without `needs-decision` in the first place, and nothing checks that it should have. The record makes the claim checkable: it names who decided, when and where, and the maintainer reopens the question by adding the label again.
+
 ## Enforcement
 
 - `cargo xtask issue file`: the body's sections, one kind label, and the duplicate search.
 - `cargo xtask issue show`: the trust filter on the issue and its comments.
-- `cargo xtask task ready` and `claim`: trusted, open, labelled, no `needs-decision` unless a human removed it, unclaimed; then the claims branch.
+- `cargo xtask task ready` and `claim`: trusted, open, labelled, no `needs-decision` unless a code owner removed it, or the bot removed it right after a decision record by a code owner (point 7), unclaimed; then the claims branch.
+- `cargo xtask issue decide` (point 7): it posts the record only on a trusted issue with `needs-decision`, for a code owner, and then removes the label. The record's form is parsed strictly, and tests cover each near miss.
 - The plan rules in tidy: a plan task ID never starts with `issue-`.
 - `cargo xtask pr-body`: the `Follow-up issues` section, and `Fixes #<number>` on an issue's branch.
 - `.claude/settings.json`: deny rules for reading issues with `gh` directly. A speed bump, not a guarantee.
@@ -101,6 +119,7 @@ The workflow `queue` files an issue `PR #<n> failed in the merge queue (run <id>
   - the staleness of a claim on a queue-failure issue. No command releases stale claims; whoever releases one by hand reads #n first (point 6);
   - whether an agent files an issue when it should. As before, the PR description forces an explicit `None`, and the sampled audits (ADR-0008) look for a `None` that is wrong;
   - whether a filing agent copied untrusted text into an issue;
+  - whether a decision record states a decision that the code owner made (point 7). It rests on agent honesty;
   - two sessions that file the same finding within the same minute. The worker closes the duplicate.
 
 ## Consequences
