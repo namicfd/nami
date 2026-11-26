@@ -155,11 +155,17 @@ The only thing a machine provides is the private key (step 5). The settings appl
 
 A gh command without the prefix would otherwise use whatever login gh finds on the machine, which is the maintainer's. A forgotten prefix, a token script that printed nothing, or text that bash ran as commands is enough. On 2026-11-26 a heredoc ended early, and `gh variable set` wrote a repository variable as the maintainer (issue #69). The maintainer keeps their login, and uses it outside Claude Code: in a terminal of their own, not in a session in this repository.
 
-gh looks for a token for github.com in this order: `GH_TOKEN`, `GITHUB_TOKEN`, `hosts.yml` in its configuration directory, and last the system keyring, where `gh auth login` keeps a token for the host even when `hosts.yml` names no one. What enforces it:
+gh looks for a token for github.com in this order: `GH_TOKEN`, `GITHUB_TOKEN`, `hosts.yml` in its configuration directory, and last the system keyring, where `gh auth login` keeps a token for the host even when `hosts.yml` names no one. The first two variables below keep a stored login out of reach; the hook after them reports anything they miss:
 
 - **`GH_CONFIG_DIR=/nonexistent/nami-agents-have-no-gh-login`.** gh finds no `hosts.yml` and so no stored login. The path is absolute, so it is the same in every worktree and directory. It lies below a directory that does not exist and that only root could create, so nothing can log in there. gh with `GH_TOKEN` works as before, and git does not read this directory.
 - **`DBUS_SESSION_BUS_ADDRESS=disabled:`.** On Linux the keyring is the Secret Service on the session bus. An address with no known transport makes gh's keyring lookup fail. The side effect: nothing inside a session can reach the session bus. Desktop notifications (`notify-send`), `secret-tool`, GPG's graphical pinentry and other keyring helpers do not work in a session. No agent needs them, and Claude Code's own notifications use terminal escapes, not the bus.
-- **The session-start hook** (`cargo xtask hook session-start`, `xtask/src/hook/github_login.rs`) runs gh without `GH_TOKEN` and `GITHUB_TOKEN`. `gh auth status` must report no login, and `gh auth token` must find no token. The second also sees the keyring, which `gh auth status` does not list. If `GH_TOKEN` or `GITHUB_TOKEN` is set, it must be an installation token (`ghs_`). If gh can still reach a login, the hook **stops the session** and tells the human and the agent which source it found. If the check cannot tell, it warns and the session goes on. That happens when gh is missing, answers in an unknown way, or takes longer than the check's 30 seconds. The one exception is a `gh auth token` that runs out of time while `DBUS_SESSION_BUS_ADDRESS` is not `disabled:`: then a keyring is in reach, and the session stops. The hook fails closed. Whatever fails inside it is reported as a stop with exit code 0, because Claude Code reads a hook's JSON only after exit 0. That covers an unreadable input, an env file it cannot extend, and a panic in the doctor or the check.
+- **The session-start hook** (`cargo xtask hook session-start`, `xtask/src/hook/github_login.rs`) runs gh without `GH_TOKEN` and `GITHUB_TOKEN`. `gh auth status` must report no login, and `gh auth token` must find no token. The second also sees the keyring, which `gh auth status` does not list. If `GH_TOKEN` or `GITHUB_TOKEN` is set, it must be an installation token (`ghs_`). If gh can still reach a login, the hook reports it with the source it found, as an `error[gh-login]` finding. The agent gets it through `additionalContext` and the human through `systemMessage`. **The hook does not stop the session.**
+  - It also prints `continue:false`, but Claude Code ignores that field at SessionStart. The [hooks reference](https://code.claude.com/docs/en/hooks) says SessionStart is "Context only ... No blocking or decision control".
+  - A live check with Claude Code 2.1.332 confirmed it (PR #72). With a fake personal token in `GH_TOKEN`, the hook printed the stop, and the session still ran its prompt.
+  - Enforcing the verdict is issue #75.
+  - If the check cannot tell, it reports a warning. That happens when gh is missing, answers in an unknown way, or takes longer than the check's 30 seconds.
+  - A `gh auth token` that runs out of time while `DBUS_SESSION_BUS_ADDRESS` is not `disabled:` counts as an error: a keyring is then in reach.
+  - Whatever fails inside the hook is reported as an error, with exit code 0, because Claude Code reads a hook's JSON only after exit 0. That covers an unreadable input, an env file it cannot extend, and a panic in the doctor or the check.
 
 A gh command without the prefix then fails:
 
@@ -168,15 +174,17 @@ $ gh api user
 To get started with GitHub CLI, please run:  gh auth login
 ```
 
-**macOS.** gh reads the keychain through `/usr/bin/security`, and no variable can hide it. If the session-start hook stops a session for a token in the keyring, move the login out of the keychain: run `gh auth logout`, then `gh auth login --insecure-storage`. The login is then kept only in `~/.config/gh/hosts.yml`, which sessions do not see. The other way is to run agents as a separate macOS user that has no gh login.
+**macOS.** gh reads the keychain through `/usr/bin/security`, and no variable can hide it. If the session-start hook reports a token in the keyring, move the login out of the keychain: run `gh auth logout`, then `gh auth login --insecure-storage`. The login is then kept only in `~/.config/gh/hosts.yml`, which sessions do not see. The other way is to run agents as a separate macOS user that has no gh login.
 
-**If the hook stops a session for a stored login,** the session did not get the `env` block: it was started outside this repository's Claude Code settings, or by a launcher that sets its own environment. Start it as described here, or give the launcher the same variables (below).
+**If the hook reports a stored login,** end that session: its gh can act as you. The session did not get the `env` block: it was started outside this repository's Claude Code settings, or by a launcher that sets its own environment. Start it as described here, or give the launcher the same variables (below).
 
 **What this does not cover:**
 
+- **Stopping a session.** A session whose hook reports a login keeps running, and only the agent's instructions keep it from using that login. This applies on macOS, where the keychain cannot be hidden, and to a launcher that exports a personal token. Until issue #75 enforces the verdict, end such a session yourself.
+
 - **Tools and launchers that skip `.claude/settings.json`.** These include a terminal of your own, scripts run outside Claude Code, and agent launchers that set their own environment. They get neither the variables nor the session-start check. `xtask/agent-token.sh env` does not export the two variables yet (issue #71), so set them by hand (below).
 - **`~/.netrc` for git.** git's HTTPS transport reads `~/.netrc` through curl, before it asks a credential helper. A `machine github.com` entry there would make git push as its owner in spite of the settings. Keep GitHub credentials out of `~/.netrc` on a machine that runs agents.
-- **A hook that Claude Code cancels at its timeout.** Claude Code then discards the hook's output, and the session starts unchecked. The doctor and the login check stop at 30 seconds each, well inside the 120-second timeout. The build of xtask that `cargo xtask` runs first has no such limit, and in a fresh worktree a cold build can take longer. Build xtask once (`cargo xtask doctor`) before starting agents in a new worktree.
+- **A hook that Claude Code cancels at its timeout.** Claude Code then discards the hook's output, and the session starts without a report. The doctor and the login check stop at 30 seconds each, well inside the 120-second timeout. The build of xtask that `cargo xtask` runs first has no such limit, and in a fresh worktree a cold build can take longer. Build xtask once (`cargo xtask doctor`) before starting agents in a new worktree.
 
 ### Other launchers
 
