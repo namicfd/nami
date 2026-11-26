@@ -194,8 +194,8 @@ The other job in that workflow, `adr clashes (advisory)`, comments with the work
 
 Unlike the steps above, these have not been run against `namicfd/nami` yet. When you run them, remove this sentence.
 
-1. Go to Settings → Environments → **New environment**, and name it `nami-agent`.
-2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the rule `main`. Add no required reviewers: the job runs unattended.
+1. Go to Settings → Environments. Open `nami-agent` if it is there, or create it with **New environment**. GitHub creates an environment by itself, with no rules, the first time a workflow job names it, so it may exist already.
+2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the rule `main`. Check this rule even if the environment existed already: an environment that GitHub created by itself lets every branch use its secrets. Add no required reviewers: the job runs unattended.
 3. Under **Environment secrets**, add `NAMI_AGENT_PRIVATE_KEY` with the full contents of a private key of the app (step 5), from `-----BEGIN` to the last line. Generate a separate key for CI, so that it can be revoked without touching the agents' machines.
 
 With `gh`, from a machine that holds the CI key:
