@@ -123,16 +123,64 @@ pub fn parse_reports(text: &str) -> Vec<Report> {
             reports.push(Report { path: path.to_owned(), line: number, rule: rule.to_owned() });
         }
     }
-    assert!(
-        reports.iter().all(|report| !report.rule.contains("]: ")),
-        "a rule ends at the first `]: ` of its line"
-    );
     reports
 }
 
-/// Plants every base fixture in the scratch copy of the head tree, at its virtual path and at
-/// paths drawn from the tree, and records what the head's `tidy --file` and, for a firing
-/// fixture, `tidy --root` print. Runs head code; judges nothing.
+/// One case to plant: a base fixture, the path it goes to, and its text there, whose
+/// `// path:` header is disguised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Planting {
+    /// The fixture's index in [`fixtures`].
+    pub fixture: usize,
+    /// Where it goes, relative to the tree.
+    pub placement: PathBuf,
+    /// Its text there.
+    pub text: String,
+}
+
+/// Where every base fixture goes in the head tree at `tree`, whose files are `files`: its
+/// virtual path and paths drawn from `rng`, each with a disguised header. The observer plants
+/// these; the judge draws them again from the same seed and requires a run of each.
+///
+/// # Errors
+///
+/// Returns what failed if a base fixture is broken.
+pub fn plan(
+    base: &Path,
+    fixtures: &[Fixture],
+    tree: &Path,
+    files: &[String],
+    rng: &mut Rng,
+) -> Result<Vec<Planting>, String> {
+    let mut plantings = Vec::new();
+    for (index, fixture) in fixtures.iter().enumerate() {
+        let text = plant::disguise(&fixture.text, rng);
+        let expected = base_reports(base, fixture, &text)?;
+        let placements =
+            plant::placements(base, tree, &fixture.virtual_path, &text, &expected, files, rng);
+        plantings.extend(placements.into_iter().map(|placement| Planting {
+            fixture: index,
+            placement,
+            text: text.clone(),
+        }));
+    }
+    assert!(
+        plantings.iter().all(|planting| is_plain_relative(&planting.placement)),
+        "every case is planted inside the tree"
+    );
+    Ok(plantings)
+}
+
+/// The files of the tree at `root`, relative to it, which placements are drawn from.
+fn files_of(root: &Path) -> Result<Vec<String>, String> {
+    let entries = super::tree::entries(root)
+        .map_err(|error| format!("cannot list the tree {}: {error}", root.display()))?;
+    Ok(entries.into_keys().collect())
+}
+
+/// Plants every base fixture in the scratch copy of the head tree as [`plan`] says, and runs
+/// the head's `tidy --file` on it, and for a firing fixture `tidy --root` on the whole tree.
+/// Runs head code; judges nothing.
 ///
 /// # Errors
 ///
@@ -143,41 +191,23 @@ pub fn observe(
     head_xtask: &Path,
     rng: &mut Rng,
 ) -> Result<Vec<Run>, String> {
-    let files: Vec<String> = super::tree::entries(scratch.root())
-        .map_err(|error| format!("cannot list the scratch tree: {error}"))?
-        .into_keys()
-        .collect();
+    let fixtures = fixtures(base)?;
+    let plantings = plan(base, &fixtures, scratch.root(), &files_of(scratch.root())?, rng)?;
     let mut runs = Vec::new();
-    for fixture in &fixtures(base)? {
-        let expected = base_reports(base, fixture)?;
-        let placements = plant::placements(
-            base,
-            scratch.root(),
-            &fixture.virtual_path,
-            &fixture.text,
-            &expected,
-            &files,
-            rng,
-        );
-        for placement in placements {
-            let planted = scratch
-                .plant(&placement, &fixture.text)
-                .map_err(|error| format!("cannot plant {}: {error}", fixture.file))?;
-            let file = scratch.root().join(&placement);
-            runs.push(run_tidy(head_xtask, scratch.root(), fixture, &placement, "--file", &file));
-            if fixture.fires {
-                let root = scratch.root().to_path_buf();
-                runs.push(run_tidy(head_xtask, &root, fixture, &placement, "--root", &root));
-            }
-            planted
-                .remove()
-                .map_err(|error| format!("cannot restore the scratch tree: {error}"))?;
+    for planting in &plantings {
+        let fixture = fixtures.get(planting.fixture).expect("a planting names a fixture");
+        let planted = scratch
+            .plant(&planting.placement, &planting.text)
+            .map_err(|error| format!("cannot plant {}: {error}", fixture.file))?;
+        let file = scratch.root().join(&planting.placement);
+        let at = &planting.placement;
+        runs.push(run_tidy(head_xtask, scratch.root(), fixture, at, "--file", &file));
+        if fixture.fires {
+            let root = scratch.root().to_path_buf();
+            runs.push(run_tidy(head_xtask, &root, fixture, at, "--root", &root));
         }
+        planted.remove().map_err(|error| format!("cannot restore the scratch tree: {error}"))?;
     }
-    assert!(
-        runs.iter().all(|run| is_plain_relative(Path::new(&run.placement))),
-        "every case is planted inside the scratch tree"
-    );
     Ok(runs)
 }
 
@@ -209,9 +239,14 @@ fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// What the base's tidy reports on a fixture at its virtual path, as `(rule, line)` pairs.
-fn base_reports(base: &Path, fixture: &Fixture) -> Result<BTreeSet<(String, u32)>, String> {
-    let reports = plant::reports_at(base, &fixture.virtual_path, &fixture.text)
+/// What the base's tidy reports on a fixture, with the text `text`, at its virtual path, as
+/// `(rule, line)` pairs.
+fn base_reports(
+    base: &Path,
+    fixture: &Fixture,
+    text: &str,
+) -> Result<BTreeSet<(String, u32)>, String> {
+    let reports = plant::reports_at(base, &fixture.virtual_path, text)
         .ok_or_else(|| format!("the base's tidy cannot check {}", fixture.file))?;
     if fixture.fires && !reports.iter().any(|(rule, _)| *rule == fixture.id) {
         return Err(format!(
@@ -224,46 +259,61 @@ fn base_reports(base: &Path, fixture: &Fixture) -> Result<BTreeSet<(String, u32)
 }
 
 /// Judges the recorded tidy runs against the base's fixtures, read from the base's own
-/// checkout. Returns the corpus and end-to-end findings.
+/// checkout, at the placements drawn again from `rng`, which starts at the observed seed.
+/// Returns the corpus and end-to-end findings.
 ///
 /// # Errors
 ///
-/// No verdict: a base without fixtures, a fixture without its runs, a placement where the base
-/// does not report what the case is for, or a run whose output cannot be read.
+/// No verdict: a base without fixtures, a planting without its runs, a run at a placement that
+/// was not drawn, a placement where the base does not report what the case is for, or a run
+/// whose output cannot be read.
 pub fn judge(
     base: &Path,
     head: &Path,
     observations: &Observations,
+    rng: &mut Rng,
 ) -> Result<Vec<Finding>, String> {
     let fixtures = fixtures(base)?;
     if fixtures.is_empty() {
         return Err(format!("the base has no fixtures in {FIXTURE_DIRECTORY}"));
     }
+    let plantings = plan(base, &fixtures, head, &files_of(head)?, rng)?;
     let mut findings = Vec::new();
-    for fixture in &fixtures {
-        let at_home = fixture.virtual_path.to_string_lossy().into_owned();
-        let mut modes = vec!["file"];
-        if fixture.fires {
-            modes.push("tree");
-        }
+    let mut judged = 0_usize;
+    for planting in &plantings {
+        let fixture = fixtures.get(planting.fixture).expect("a planting names a fixture");
+        let at = planting.placement.to_string_lossy().into_owned();
+        let modes: &[&str] = if fixture.fires { &["file", "tree"] } else { &["file"] };
         for mode in modes {
-            let runs: Vec<&Run> = observations.runs_of(&fixture.file, mode).collect();
-            if !runs.iter().any(|run| run.placement == at_home) {
-                return Err(format!("no `tidy` {mode} run of {} at {at_home}", fixture.file));
-            }
-            for run in runs {
-                findings.extend(judge_run(base, head, fixture, run)?);
-            }
+            let run = observations
+                .runs_of(&fixture.file, mode)
+                .find(|run| run.placement == at)
+                .ok_or_else(|| {
+                    format!(
+                        "no `tidy` {mode} run of {} at {at}, which the seed draws",
+                        fixture.file
+                    )
+                })?;
+            findings.extend(judge_run(base, head, fixture, &planting.text, run)?);
+            judged += 1;
         }
+    }
+    let recorded = observations.runs.iter().filter(|run| run.mode == "file" || run.mode == "tree");
+    if recorded.count() != judged {
+        return Err(format!(
+            "the observations hold tidy runs that the seed does not draw ({judged} drawn)"
+        ));
     }
     Ok(findings)
 }
 
-/// Judges one run: the base's reports at the placement, against what the head printed.
+/// Judges one run of a case with the text `text`: the base's reports at the placement, against
+/// what the head printed.
 fn judge_run(
     base: &Path,
     head: &Path,
     fixture: &Fixture,
+    text: &str,
     run: &Run,
 ) -> Result<Vec<Finding>, String> {
     let placement = Path::new(&run.placement);
@@ -274,7 +324,7 @@ fn judge_run(
             fixture.file, run.placement
         ));
     }
-    let expected = plant::reports_at(base, placement, &fixture.text).ok_or_else(|| {
+    let expected = plant::reports_at(base, placement, text).ok_or_else(|| {
         format!("the base's tidy cannot check {} at {}", fixture.file, run.placement)
     })?;
     if fixture.fires && !expected.iter().any(|(rule, _)| *rule == fixture.id) {

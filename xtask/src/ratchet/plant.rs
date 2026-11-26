@@ -68,14 +68,34 @@ impl Rng {
 /// no secret: the observing job runs the head's code and holds none.
 const SALT: &str = "nami-ratchet-placements-1";
 
-/// The seed for a head whose tree has the fingerprint `head_tree`. The same head always gets
-/// the same placements: re-running the check cannot draw new ones until the placements miss,
-/// and only a change to the head's content draws again.
+/// The seed for the base corpus with the fingerprint `base` and the head `head`: its commit,
+/// or the fingerprint of its tree when no commit is given. The same pair always gets the same
+/// placements, so re-running the check cannot draw new ones, and the judge can draw them again
+/// to check that every one was run.
 #[must_use]
-pub fn seed_of(head_tree: &str) -> u64 {
-    assert!(!head_tree.is_empty(), "a fingerprint to seed from");
+pub fn seed_of(base: &str, head: &str) -> u64 {
+    assert!(!base.is_empty() && !head.is_empty(), "a base and a head to seed from");
     let salted = crate::dylint::fnv1a(crate::dylint::FNV_OFFSET, SALT.as_bytes());
-    crate::dylint::fnv1a(crate::dylint::fnv1a(salted, &[0]), head_tree.as_bytes())
+    let with_base = crate::dylint::fnv1a(crate::dylint::fnv1a(salted, &[0]), base.as_bytes());
+    crate::dylint::fnv1a(crate::dylint::fnv1a(with_base, &[0]), head.as_bytes())
+}
+
+/// The prefix of the header that names a fixture's virtual path.
+const PATH_HEADER: &str = "// path:";
+
+/// `text` with its `// path:` header, which would let rule code recognise a planted case,
+/// replaced by a comment with a random name, so that no line moves.
+#[must_use]
+pub fn disguise(text: &str, rng: &mut Rng) -> String {
+    let Some((first, rest)) = text.split_once('\n') else {
+        return text.to_owned();
+    };
+    if !first.starts_with(PATH_HEADER) {
+        return text.to_owned();
+    }
+    let disguised = format!("// {}\n{rest}", rng.stem());
+    assert_eq!(disguised.lines().count(), text.lines().count(), "no line moves");
+    disguised
 }
 
 /// The suffix of a file name that decides its kind: everything from the first `.`, or the
@@ -161,7 +181,7 @@ pub fn reports_at(base: &Path, relative: &Path, text: &str) -> Option<BTreeSet<(
 
 #[cfg(test)]
 mod tests {
-    use super::{Rng, placements, reports_at, suffix};
+    use super::{Rng, disguise, placements, reports_at, suffix};
     use std::path::Path;
 
     // Goal: the generator is deterministic for a seed, differs between seeds, and stays in range.
@@ -178,9 +198,26 @@ mod tests {
         let draws: Vec<usize> = (0..100).map(|_| rng.below(3)).collect();
         assert!(draws.iter().all(|value| *value < 3), "in range");
         assert!((0..3).all(|value| draws.contains(&value)), "every value is drawn");
-        assert_eq!(super::seed_of("00ff"), super::seed_of("00ff"), "a head has one seed");
-        assert_ne!(super::seed_of("00ff"), super::seed_of("00fe"), "another head, another seed");
+        assert_eq!(super::seed_of("ab", "00ff"), super::seed_of("ab", "00ff"), "one seed a pair");
+        assert_ne!(super::seed_of("ab", "00ff"), super::seed_of("ab", "00fe"), "another head");
+        assert_ne!(super::seed_of("ab", "00ff"), super::seed_of("ac", "00ff"), "another base");
         assert_eq!(rng.stem().len(), 9);
+    }
+
+    // Goal: the `// path:` header is replaced by a random comment on the same line, and a text
+    // without one is kept.
+    #[test]
+    fn the_header_is_disguised() {
+        let mut rng = Rng::new(5);
+        let text = "// path: crates/a/src/x.rs\nfn a() {}\n";
+        let disguised = disguise(text, &mut rng);
+        assert!(
+            !disguised.contains("path:") && disguised.ends_with("\nfn a() {}\n"),
+            "{disguised}"
+        );
+        assert_ne!(disguised, disguise(text, &mut rng), "each placement draws its own");
+        assert_eq!(disguise("fn a() {}\n", &mut rng), "fn a() {}\n");
+        assert_eq!(disguise("// path: x", &mut rng), "// path: x", "no line after the header");
     }
 
     // Goal: a kind is the name from its first dot, or the whole name.

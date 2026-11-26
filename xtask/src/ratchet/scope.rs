@@ -38,6 +38,22 @@ const LINT_DIRECTORY: &str = "lints/";
 /// The xtask module that runs dylint over the workspace.
 const DYLINT_WRAPPER: &str = "xtask/src/dylint.rs";
 
+/// The CODEOWNERS that the policy flip of ADR-0022 gives: `today`'s file with a line without an
+/// owner for each rule path appended, so that on GitHub, where the last matching line wins, the
+/// rule paths lose their owner and every other path keeps it. The "after ADR-0022" verdict is
+/// computed with it, and the flipped file in the policy PR must equal it.
+#[must_use]
+pub fn flipped_codeowners(today: &str) -> String {
+    let mut flipped = today.trim_end().to_owned();
+    flipped.push_str("\n\n# Rule paths: they merge on the ratchet's proof (ADR-0022).\n");
+    for path in RULE_PATHS {
+        flipped.push_str(path);
+        flipped.push('\n');
+    }
+    assert!(flipped.starts_with(today.trim_end()), "the flip only appends");
+    flipped
+}
+
 /// The rule paths as patterns.
 #[must_use]
 pub fn rule_patterns() -> Vec<Pattern> {
@@ -45,7 +61,12 @@ pub fn rule_patterns() -> Vec<Pattern> {
         .iter()
         .map(|path| crate::pr::parse_pattern(path).expect("rule paths are in CODEOWNERS form"))
         .collect();
-    assert_eq!(patterns.len(), RULE_PATHS.len(), "every rule path is a pattern");
+    assert!(
+        patterns
+            .iter()
+            .all(|pattern| patterns.iter().filter(|other| *other == pattern).count() == 1),
+        "no rule path is listed twice"
+    );
     patterns
 }
 

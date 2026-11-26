@@ -126,14 +126,20 @@ jobs:
         env:
           # The base's binary is built outside every cached path.
           CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
         run: |
           mkdir -p "${RUNNER_TEMP}/observations"
           if ! grep --quiet '"observe"' xtask/src/ratchet/cli.rs 2> /dev/null; then
             echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
+          # The observations record the commit observed and the PR head, so that a judge run
+          # after a review judges exactly this commit (ratchet-review.yml).
+          pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
           cargo xtask ratchet observe --base . --head "${GITHUB_WORKSPACE}" \
-            --out "${RUNNER_TEMP}/observations/observations.json" --work "${RUNNER_TEMP}/work"
+            --out "${RUNNER_TEMP}/observations/observations.json" --work "${RUNNER_TEMP}/work" \
+            --pr-head "${pr_head}" --commit "$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -29,6 +29,7 @@
 use super::{Check, Finding};
 use crate::issue::github::parse_lines;
 use crate::json::{self, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -50,6 +51,9 @@ const CHANGES_REQUESTED: &str = "CHANGES_REQUESTED";
 
 /// The state of a review that leaves the reviewer's decision as it was.
 const COMMENTED: &str = "COMMENTED";
+
+/// The state of an approving review.
+const APPROVED: &str = "APPROVED";
 
 /// A GitHub account: its login, with `[bot]` for an app, and whether it is an app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +120,8 @@ pub struct Pull {
 /// One submitted review.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Review {
+    /// GitHub's id of the review.
+    pub id: u64,
     /// The reviewer.
     pub author: Actor,
     /// The commit the review was submitted on.
@@ -159,6 +165,14 @@ pub trait Reviews {
     ///
     /// When GitHub cannot be asked, or the pull request has more threads than one query reads.
     fn threads(&self, pull: u32) -> Result<Vec<Thread>, String>;
+
+    /// The state each dismissed review had before it was dismissed, by review id, in upper
+    /// case as reviews give it.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked.
+    fn dismissed(&self, pull: u32) -> Result<BTreeMap<u64, String>, String>;
 }
 
 /// The latest review by `who` that decided something: not a comment, which leaves the
@@ -179,6 +193,78 @@ fn same_head(request: &Pull, judged: &str, pull: u32) -> Result<(), String> {
     ))
 }
 
+/// What the review gate showed: findings, and what it could not show, which a code owner's
+/// approval of the head stands in for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Gate {
+    /// A request for changes that stands, an open thread, a thread resolved by someone else, or
+    /// a pull request that the reviewer opened.
+    pub findings: Vec<Finding>,
+    /// No review of the head by the reviewer.
+    pub unproven: Vec<String>,
+}
+
+/// Whether the reviewer's requests for changes stand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Objection {
+    /// None, or the reviewer withdrew it with a later review.
+    Withdrawn,
+    /// The reviewer asked for changes, and nothing since withdraws it.
+    Standing,
+    /// Someone dismissed the reviewer's request for changes. Any writer can, the authoring
+    /// app included, so only a later approval by the reviewer withdraws it.
+    Dismissed,
+}
+
+/// Whether the reviewer's requests for changes stand, from its reviews in order. A review
+/// that was dismissed counts by the state it had, from `dismissed`; one whose state is not
+/// known counts as a dismissed request for changes.
+fn objection(reviews: &[&Review], dismissed: &BTreeMap<u64, String>) -> Objection {
+    let mut objection = Objection::Withdrawn;
+    for review in reviews {
+        let was = dismissed.get(&review.id).map(String::as_str);
+        objection = match (review.state.as_str(), objection) {
+            (CHANGES_REQUESTED, _) => Objection::Standing,
+            (DISMISSED, _) if was.is_none_or(|state| state == CHANGES_REQUESTED) => {
+                Objection::Dismissed
+            }
+            (APPROVED, _) | (COMMENTED, Objection::Standing) => Objection::Withdrawn,
+            (_, unchanged) => unchanged,
+        };
+    }
+    objection
+}
+
+/// What is wrong with the threads that the reviewer opened: one that is open, or that someone
+/// else resolved. Everyone else's threads are left to the ruleset.
+fn thread_problems(threads: &[Thread], reviewer: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for thread in threads {
+        let opened_by_reviewer =
+            thread.author.as_ref().is_some_and(|author| author.is_app(reviewer));
+        let resolver = thread.resolved_by.as_ref().map(ToString::to_string);
+        if !opened_by_reviewer {
+            continue;
+        }
+        if !thread.resolved {
+            problems.push(format!(
+                "a review thread by {reviewer} on {} is not resolved; fix it, or answer why the \
+                 finding is wrong, and have the reviewer resolve it (ADR-0008)",
+                thread.path
+            ));
+        } else if !thread.resolved_by.as_ref().is_some_and(|by| by.is_app(reviewer)) {
+            problems.push(format!(
+                "a review thread on {} was resolved by {}, not by {reviewer}; only the reviewer \
+                 resolves its threads for the ratchet (ADR-0022)",
+                thread.path,
+                resolver.unwrap_or_else(|| "a deleted account".to_owned())
+            ));
+        }
+    }
+    assert!(problems.len() <= threads.len(), "at most one problem per thread");
+    problems
+}
+
 /// Applies the review rule to pull request `pull`, whose head must still be `judged`, for the
 /// reviewer app `reviewer`.
 ///
@@ -191,7 +277,7 @@ pub fn check(
     pull: u32,
     judged: &str,
     reviewer: &str,
-) -> Result<Vec<Finding>, String> {
+) -> Result<Gate, String> {
     assert!(pull > 0, "pull requests are numbered from 1");
     if !reviewer.ends_with("[bot]") || reviewer == AUTHOR_APP {
         return Err(format!(
@@ -203,52 +289,39 @@ pub fn check(
     let place = format!("pull request #{pull}");
     let request = reviews.pull(pull)?;
     same_head(&request, judged, pull)?;
-    let mut findings = Vec::new();
-    let mut report = |message: String| findings.push(Finding::new(&place, Check::Review, message));
+    let mut gate = Gate::default();
+    let mut report =
+        |message: String| gate.findings.push(Finding::new(&place, Check::Review, message));
     if request.author == app {
         report(format!("{reviewer} opened this pull request, so it cannot review it (ADR-0022)"));
     }
     let all = reviews.reviews(pull)?;
-    let on_head = all.iter().rev().find(|review| review.author == app && review.commit == judged);
-    let blocked = latest_decision(&all, &app).map(|review| review.state.as_str());
-    match on_head.map(|review| review.state.as_str()) {
-        None | Some(DISMISSED) => report(format!(
-            "{reviewer} has not reviewed the head commit {judged} of #{pull}; have the reviewer \
-             review the head, which also resolves the threads that are fixed (ADR-0008)"
+    let own: Vec<&Review> = all.iter().filter(|review| review.author == app).collect();
+    let reviewed_head = own.iter().any(|review| {
+        review.commit == judged && (review.state == COMMENTED || review.state == APPROVED)
+    });
+    match objection(&own, &reviews.dismissed(pull)?) {
+        Objection::Standing => report(format!(
+            "{reviewer} requests changes on this pull request; fix them, and have it review the \
+             head again (ADR-0008)"
         )),
-        Some(_) if blocked == Some(CHANGES_REQUESTED) => report(format!(
-            "{reviewer}'s latest decision on this pull request requests changes; fix them, and \
-             have it review the head again (ADR-0008)"
+        Objection::Dismissed => report(format!(
+            "{reviewer}'s request for changes was dismissed, which does not withdraw it; only a \
+             later approval by {reviewer} does (ADR-0022)"
         )),
-        Some(_) => {}
+        Objection::Withdrawn => {}
     }
-    for thread in reviews.threads(pull)? {
-        let opened_by_reviewer =
-            thread.author.as_ref().is_some_and(|author| author.is_app(reviewer));
-        if !opened_by_reviewer {
-            continue;
-        }
-        let resolver = thread.resolved_by.as_ref().map(ToString::to_string);
-        if !thread.resolved {
-            report(format!(
-                "a review thread by {reviewer} on {} is not resolved; fix it, or answer why the \
-                 finding is wrong, and have the reviewer resolve it (ADR-0008)",
-                thread.path
-            ));
-        } else if !thread.resolved_by.as_ref().is_some_and(|by| by.is_app(reviewer)) {
-            report(format!(
-                "a review thread on {} was resolved by {}, not by {reviewer}; only the reviewer \
-                 resolves its threads for the ratchet (ADR-0022)",
-                thread.path,
-                resolver.unwrap_or_else(|| "a deleted account".to_owned())
-            ));
-        }
+    for problem in thread_problems(&reviews.threads(pull)?, reviewer) {
+        report(problem);
     }
-    Ok(findings)
+    if !reviewed_head {
+        gate.unproven.push(format!(
+            "{reviewer} has not reviewed the head commit {judged} of #{pull}, so no review \
+             independent of the author is shown; have the reviewer review the head"
+        ));
+    }
+    Ok(gate)
 }
-
-/// The state of an approving review.
-const APPROVED: &str = "APPROVED";
 
 /// True if a user that the base's CODEOWNERS (`codeowners`) names approved the commit judged,
 /// which must still be the pull request's head, and no code owner's latest decision requests
@@ -307,11 +380,34 @@ pub fn reviews_from(text: &str) -> Result<Vec<Review>, String> {
         }
         let field =
             |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let id = match value.get("id") {
+            Some(Value::Number(digits)) => digits.parse::<u64>().ok(),
+            _ => None,
+        };
         found.push(Review {
+            id: id.ok_or("GitHub sent a review without an id")?,
             author: Actor { login: login.to_owned(), bot },
             commit: field("commit_id"),
             state: field("state"),
         });
+    }
+    Ok(found)
+}
+
+/// Reads the earlier states of dismissed reviews from `gh api .../events --jq` output: one
+/// `<review id> <state>` line per `review_dismissed` event.
+///
+/// # Errors
+///
+/// Returns what is wrong if a line has another form.
+pub fn dismissed_from(text: &str) -> Result<BTreeMap<u64, String>, String> {
+    let mut found = BTreeMap::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let parsed = line
+            .split_once(' ')
+            .and_then(|(id, state)| Some((id.parse::<u64>().ok()?, state.trim().to_uppercase())));
+        let (id, state) = parsed.ok_or_else(|| format!("GitHub sent `{line}` as a dismissal"))?;
+        let _replaced = found.insert(id, state);
     }
     Ok(found)
 }
@@ -430,6 +526,13 @@ impl Reviews for GhReviews {
         reviews_from(&self.api(&["--paginate", &path, "--jq", ".[]"])?)
     }
 
+    fn dismissed(&self, pull: u32) -> Result<BTreeMap<u64, String>, String> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{pull}/events?per_page=100");
+        let jq = ".[] | select(.event == \"review_dismissed\") | \
+                  \"\\(.dismissed_review.review_id) \\(.dismissed_review.state)\"";
+        dismissed_from(&self.api(&["--paginate", &path, "--jq", jq])?)
+    }
+
     fn threads(&self, pull: u32) -> Result<Vec<Thread>, String> {
         let query = format!("query={THREADS_QUERY}");
         let number = format!("n={pull}");
@@ -445,13 +548,15 @@ impl Reviews for GhReviews {
 #[cfg(test)]
 mod tests {
     use super::{AUTHOR_APP, Actor, GhReviews, Pull, REVIEWER_APP, Review, Reviews, Thread};
-    use super::{check, owner_approved, reviews_from, threads_from};
+    use super::{check, dismissed_from, owner_approved, reviews_from, threads_from};
     use crate::json;
+    use std::collections::BTreeMap;
 
     struct Fixed {
         author: Actor,
         reviews: Vec<Review>,
         threads: Vec<Thread>,
+        dismissed: BTreeMap<u64, String>,
     }
 
     impl Reviews for Fixed {
@@ -464,14 +569,21 @@ mod tests {
         fn threads(&self, _pull: u32) -> Result<Vec<Thread>, String> {
             Ok(self.threads.clone())
         }
+        fn dismissed(&self, _pull: u32) -> Result<BTreeMap<u64, String>, String> {
+            Ok(self.dismissed.clone())
+        }
     }
 
     fn fixed(reviews: Vec<Review>, threads: Vec<Thread>) -> Fixed {
-        Fixed { author: Actor::app(AUTHOR_APP), reviews, threads }
+        Fixed { author: Actor::app(AUTHOR_APP), reviews, threads, dismissed: BTreeMap::new() }
     }
 
     fn review(author: Actor, commit: &str, state: &str) -> Review {
-        Review { author, commit: commit.to_owned(), state: state.to_owned() }
+        Review { id: 0, author, commit: commit.to_owned(), state: state.to_owned() }
+    }
+
+    fn numbered(id: u64, state: &str) -> Review {
+        Review { id, ..review(reviewer(), "b", state) }
     }
 
     fn reviewer() -> Actor {
@@ -491,24 +603,28 @@ mod tests {
         Thread { author: Some(Actor::user("maintainer")), ..thread(resolved_by) }
     }
 
+    /// The findings' messages, then what is unproven.
     fn messages(fixed: &Fixed) -> Vec<String> {
-        let found = check(fixed, 7, "b", REVIEWER_APP).unwrap();
-        found.into_iter().map(|finding| finding.message).collect()
+        let gate = check(fixed, 7, "b", REVIEWER_APP).unwrap();
+        let findings = gate.findings.into_iter().map(|finding| finding.message);
+        findings.chain(gate.unproven).collect()
     }
 
     // Goal: the reviewer app's review on the head, with every thread resolved by it, passes.
-    // The author's own review, a dismissed or earlier review, a later request for changes, an
-    // open thread, a thread resolved by someone else, and a PR opened by the reviewer are
-    // findings; a head that moved on from the commit judged is no verdict.
+    // A later request for changes, an open thread, a thread resolved by someone else, and a PR
+    // opened by the reviewer are findings; no review of the head by the app (the author's own,
+    // a dismissed or an earlier one) is unproven; a head that moved on is no verdict.
     #[test]
     fn review_rule_holds_on_the_head() {
         let good =
             fixed(vec![review(reviewer(), "b", "COMMENTED")], vec![thread(Some(reviewer()))]);
         assert_eq!(messages(&good), Vec::<String>::new());
         let own = fixed(vec![review(Actor::app(AUTHOR_APP), "b", "COMMENTED")], vec![]);
-        assert!(messages(&own)[0].contains("has not reviewed the head commit b"));
-        let dismissed = fixed(vec![review(reviewer(), "b", "DISMISSED")], vec![]);
-        assert_eq!(messages(&dismissed).len(), 1);
+        let gate = check(&own, 7, "b", REVIEWER_APP).unwrap();
+        assert!(gate.findings.is_empty(), "a missing review is unproven, not a finding");
+        assert!(gate.unproven[0].contains("has not reviewed the head commit b"));
+        let dismissed = messages(&fixed(vec![review(reviewer(), "b", "DISMISSED")], vec![]));
+        assert!(dismissed[0].contains("was dismissed") && dismissed.len() == 2, "{dismissed:?}");
         let earlier = fixed(vec![review(reviewer(), "a", "APPROVED")], vec![]);
         assert_eq!(messages(&earlier).len(), 1);
         let changes = vec![
@@ -563,20 +679,55 @@ mod tests {
         assert!(reviewer().is_app(REVIEWER_APP), "the app by type and login");
     }
 
-    // Goal: reviews are read from the REST answer with their state and account type, skipping
-    // deleted accounts; a login whose type disagrees with its `[bot]` is an error.
+    // Goal: the reviewer's request for changes stands until it withdraws it: a later review of
+    // its own withdraws a standing one, but a dismissed one, which any writer can dismiss,
+    // stands until the reviewer approves. A dismissed review of unknown state counts as a
+    // dismissed request for changes; a dismissed approval is just not a review.
+    #[test]
+    fn requests_for_changes_stand_until_the_reviewer_withdraws_them() {
+        let with = |reviews: Vec<Review>, states: &[(u64, &str)]| {
+            let dismissed = states.iter().map(|(id, state)| (*id, (*state).to_owned())).collect();
+            messages(&Fixed { dismissed, ..fixed(reviews, vec![]) })
+        };
+        let withdrawn = with(vec![numbered(1, "CHANGES_REQUESTED"), numbered(2, "COMMENTED")], &[]);
+        assert_eq!(withdrawn, Vec::<String>::new());
+        let dismissed = [(1, "CHANGES_REQUESTED")];
+        let stands = with(vec![numbered(1, "DISMISSED"), numbered(2, "COMMENTED")], &dismissed);
+        assert!(stands.len() == 1 && stands[0].contains("was dismissed"), "{stands:?}");
+        let approved = with(vec![numbered(1, "DISMISSED"), numbered(2, "APPROVED")], &dismissed);
+        assert_eq!(approved, Vec::<String>::new(), "a later approval withdraws it");
+        let unknown = with(vec![numbered(1, "DISMISSED"), numbered(2, "COMMENTED")], &[]);
+        assert!(unknown[0].contains("was dismissed"), "an unknown state fails closed");
+        let stale = [(1, "APPROVED")];
+        let after = with(vec![numbered(1, "DISMISSED"), numbered(2, "COMMENTED")], &stale);
+        assert_eq!(after, Vec::<String>::new(), "a dismissed approval is no objection");
+        let standing = with(vec![numbered(1, "COMMENTED"), numbered(2, "CHANGES_REQUESTED")], &[]);
+        assert!(standing[0].contains("requests changes"), "{standing:?}");
+    }
+
+    // Goal: dismissals are read as `<review id> <state>` lines, in upper case.
+    #[test]
+    fn dismissals_are_read() {
+        let found = dismissed_from("5 changes_requested\n\n6 approved\n").unwrap();
+        assert_eq!(found.get(&5).map(String::as_str), Some("CHANGES_REQUESTED"));
+        assert_eq!(found.get(&6).map(String::as_str), Some("APPROVED"));
+        assert!(dismissed_from("x approved\n").is_err());
+    }
+
+    // Goal: reviews are read from the REST answer with their id, state and account type,
+    // skipping deleted accounts; a login whose type disagrees with its `[bot]` is an error.
     #[test]
     fn reviews_are_read() {
-        let text = "{\"user\":{\"login\":\"nami-reviewer[bot]\",\"type\":\"Bot\"},\
+        let text = "{\"id\":1,\"user\":{\"login\":\"nami-reviewer[bot]\",\"type\":\"Bot\"},\
                     \"commit_id\":\"abc\",\"state\":\"COMMENTED\"}\n\
-                    {\"user\":{\"login\":\"nami-reviewer\",\"type\":\"User\"},\
+                    {\"id\":2,\"user\":{\"login\":\"nami-reviewer\",\"type\":\"User\"},\
                     \"commit_id\":\"abc\",\"state\":\"APPROVED\"}\n\
                     {\"user\":null,\"commit_id\":\"def\"}\n";
         assert_eq!(
             reviews_from(text).unwrap(),
             [
-                review(reviewer(), "abc", "COMMENTED"),
-                review(Actor::user("nami-reviewer"), "abc", "APPROVED")
+                Review { id: 1, ..review(reviewer(), "abc", "COMMENTED") },
+                Review { id: 2, ..review(Actor::user("nami-reviewer"), "abc", "APPROVED") }
             ]
         );
         assert!(reviews_from("{\"user\":{\"login\":3}}\n").is_err(), "a login is a string");
@@ -625,7 +776,8 @@ case "$*" in
     *pulls/7\ --jq*) echo "0123456789abcdef0123456789abcdef01234567 nami-agent[bot] Bot" ;;
     *pulls/7/reviews*)
         user='"user":{"login":"nami-reviewer[bot]","type":"Bot"}'
-        echo "{$user,\"commit_id\":\"abc\",\"state\":\"COMMENTED\"}" ;;
+        echo "{\"id\":3,$user,\"commit_id\":\"abc\",\"state\":\"COMMENTED\"}" ;;
+    *issues/7/events*) echo "3 changes_requested" ;;
     *n=7*)
         thread='{"isResolved":false,"path":"a.rs","resolvedBy":null,"comments":{"nodes":[]}}'
         threads="{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[$thread]}"
@@ -649,7 +801,12 @@ esac
         let github = GhReviews::using(scratch.root(), &program);
         let pull = github.pull(7).unwrap();
         assert_eq!((pull.head.len(), pull.author), (40, Actor::app(AUTHOR_APP)));
-        assert_eq!(github.reviews(7).unwrap(), [review(reviewer(), "abc", "COMMENTED")]);
+        let comment = Review { id: 3, ..review(reviewer(), "abc", "COMMENTED") };
+        assert_eq!(github.reviews(7).unwrap(), [comment]);
+        assert_eq!(
+            github.dismissed(7).unwrap().get(&3).map(String::as_str),
+            Some("CHANGES_REQUESTED")
+        );
         let threads = github.threads(7).unwrap();
         let open =
             Thread { path: "a.rs".to_owned(), author: None, resolved: false, resolved_by: None };

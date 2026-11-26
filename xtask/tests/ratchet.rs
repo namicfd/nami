@@ -8,6 +8,7 @@
 //! `lints/src/fake-lint.txt`, and whose mutation testing reads `fake-mutants.txt`.
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,13 @@ impl Drop for Temporary {
     }
 }
 
+/// Declares the file module `name` in the lint library of `root`, so that rustc compiles it.
+fn declare_module(root: &Path, name: &str) {
+    let library = root.join("lints/src/lib.rs");
+    let text = fs::read_to_string(&library).expect("the lint library exists");
+    fs::write(library, format!("mod {name};\n{text}")).expect("writable");
+}
+
 fn write(root: &Path, relative: &str, text: &str) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().expect("files have a parent")).expect("writable");
@@ -241,13 +249,14 @@ impl Reviews for FakeReviews {
     }
     fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
         let state = "COMMENTED".to_owned();
-        let mut reviews =
-            vec![Review { author: actor(self.reviewer), commit: self.commit.to_owned(), state }];
-        if let Some((author, commit)) = self.approval {
+        let commit = self.commit.to_owned();
+        let mut reviews = vec![Review { id: 1, author: actor(self.reviewer), commit, state }];
+        if let Some((author, approved_commit)) = self.approval {
             let approved = "APPROVED".to_owned();
             reviews.push(Review {
+                id: 2,
                 author: actor(author),
-                commit: commit.to_owned(),
+                commit: approved_commit.to_owned(),
                 state: approved,
             });
         }
@@ -258,6 +267,9 @@ impl Reviews for FakeReviews {
         let path = "lints/src/lib.rs".to_owned();
         let author = Some(Actor::app(REVIEWER_APP));
         Ok(vec![Thread { path, author, resolved: resolved_by.is_some(), resolved_by }])
+    }
+    fn dismissed(&self, _pull: u32) -> Result<BTreeMap<u64, String>, String> {
+        Ok(BTreeMap::new())
     }
 }
 
@@ -302,6 +314,8 @@ impl Case {
             }),
             seed: Some(11),
             commits: None,
+            pr_head: None,
+            commit: None,
         }
     }
 
@@ -440,7 +454,8 @@ fn a_deleted_check_call_fails_the_rule_set() {
     write(&case.head(), module, &replaced(&text, "self.check_float_equality(function);", ""));
     let verdict = case.run(NOTHING, "any");
     let call = verdict.findings.iter().find(|finding| finding.place == module).expect("a finding");
-    assert!(call.message.contains("`check_body` no longer calls `check_float_equality`"));
+    let expected = "`Visitor::check_body` no longer calls `self.check_float_equality(..)`";
+    assert!(call.message.contains(expected), "{}", call.message);
 }
 
 // Goal: a head whose lint drops a base diagnostic fails in the lint corpus and end to end; a
@@ -472,7 +487,7 @@ fn a_dropped_lint_diagnostic_fails() {
     write(&case.head(), "lints/src/lib.rs", &hidden);
     let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     let error = check(&case.base(), &case.head(), &tools).expect_err("a cfg in the lint library");
-    assert!(error.contains("`cfg`"), "{error}");
+    assert!(error.contains("`#[cfg]`"), "{error}");
 }
 
 // Goal: a dylint run whose exit code disagrees with what it printed is no verdict: an error
@@ -491,6 +506,36 @@ fn a_dylint_exit_that_disagrees_is_no_verdict() {
     }
     let end_to_end = judge(&case.base(), &case.head(), &library_agrees, &tools).unwrap_err();
     assert!(end_to_end.contains("`xtask dylint` on lints/ui/main.rs exited 0"), "{end_to_end}");
+}
+
+// Goal: on a rule-path-only diff, the "after ADR-0022" verdict under today's CODEOWNERS, which
+// owns every guardrail path, is exactly the verdict under the flipped CODEOWNERS, for an
+// unproven change (no mutant) and for a proven one; and today's verdict differs where the
+// owner's review stands in.
+#[test]
+fn the_after_line_is_the_verdict_after_the_flip() {
+    let case = Case::new("flip");
+    let today = "/xtask/ @owner\n/lints/ @owner\n/docs/ @owner\n/.github/ @owner\n";
+    let flipped = xtask::ratchet::scope::flipped_codeowners(today);
+    let run = |codeowners: &str| {
+        for tree in [case.base(), case.head()] {
+            write(&tree, ".github/CODEOWNERS", codeowners);
+        }
+        let reviews = FakeReviews { approval: None, ..REVIEWED };
+        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &reviews)).unwrap()
+    };
+    write(&case.head(), "xtask/src/tidy/text.rs", "fn rule() -> bool { true }\n");
+    for mutants in ["src/a.rs:1:1: fake\n", ""] {
+        write(&case.head(), "src/fake-mutants.txt", mutants);
+        write(&case.base(), "src/fake-mutants.txt", mutants);
+        let shadow = run(today);
+        let after = run(&flipped);
+        assert!(shadow.owner_reviews && !after.owner_reviews, "{}", after.summary());
+        assert_eq!(shadow.line_after(), after.line(), "{}", after.summary());
+        assert_eq!(after.line_after(), after.line(), "the flip is idempotent");
+    }
+    assert!(run(today).line().starts_with("ratchet: pass"), "the owner reviews today");
+    assert!(run(&flipped).line().starts_with("ratchet: no verdict"), "no mutant, no owner");
 }
 
 // Goal: a change outside the rule paths is reported, not failed: with no tooling change nothing
@@ -519,6 +564,7 @@ fn changes_outside_the_rule_paths_are_neutral() {
 fn mutants_see_the_rule_path_diff_per_workspace() {
     let case = Case::new("diff");
     write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    declare_module(&case.head(), "extra");
     write(&case.head(), "lints/src/notes.md", "Not Rust.\n");
     let declaration = fs::read_to_string(case.head().join("lints/src/lib.rs")).unwrap();
     write(&case.head(), "lints/src/lib.rs", &format!("{declaration}// A comment.\n"));
@@ -549,6 +595,7 @@ fn mutants_see_the_rule_path_diff_per_workspace() {
 fn mutation_results_are_read_strictly() {
     let case = Case::new("strict-mutants");
     write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    declare_module(&case.head(), "extra");
     write(&case.head(), "lints/src/no-missed-file", "");
     let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     let error = check(&case.base(), &case.head(), &tools).expect_err("no missed.txt");
@@ -576,7 +623,12 @@ fn only_the_reviewer_app_counts() {
     };
     let verdict =
         check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &own)).unwrap();
-    assert_eq!(found(&verdict), vec![(Check::Review, "pull request #7".to_owned())]);
+    assert_eq!(found(&verdict), vec![], "no review by the app is unproven, not a finding");
+    assert!(verdict.unproven.iter().any(|what| what.contains("has not reviewed the head")));
+    let approved = FakeReviews { approval: Some(("owner", "head")), ..own };
+    let approving = case.tools(NOTHING, "any", NOTHING, &approved);
+    let cleared = check(&case.base(), &case.head(), &approving).unwrap();
+    assert!(cleared.unproven.is_empty(), "an owner's approval clears it: {}", cleared.summary());
     let resolved = FakeReviews {
         approval: None,
         reviewer: REVIEWER_APP,
@@ -610,6 +662,47 @@ fn the_judge_reads_the_head_that_was_observed() {
     std::os::unix::fs::symlink("/etc/hostname", case.head().join("lints/src/linked.rs")).unwrap();
     let linked = check(&case.base(), &case.head(), &tools).unwrap_err();
     assert!(linked.contains("1 symbolic link(s), such as `lints/src/linked.rs`"), "{linked}");
+}
+
+// Goal: the judge draws the placements again from the seed: observations without a drawn run,
+// with a run nobody drew, drawn from another seed, or of another commit are no verdict; and no
+// planted case keeps the `// path:` header that would let rule code recognise it.
+#[test]
+fn the_judge_draws_the_placements_again() {
+    let case = Case::new("drawn");
+    let mut tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    tools.seed = None;
+    tools.commit = Some("a".repeat(40));
+    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    assert!(judge(&case.base(), &case.head(), &observed, &tools).is_ok());
+    let homes = ["crates/solver/src/example.rs", "xtask/src/example.rs"];
+    let drawn = observed
+        .runs
+        .iter()
+        .position(|run| run.mode == "file" && !homes.iter().any(|home| run.placement == *home))
+        .expect("a drawn placement");
+    let mut missing = observed.clone();
+    let _gone = missing.runs.remove(drawn);
+    let error = judge(&case.base(), &case.head(), &missing, &tools).unwrap_err();
+    assert!(error.contains("which the seed draws"), "{error}");
+    let mut extra = observed.clone();
+    let mut stray = observed.runs[drawn].clone();
+    stray.placement = "crates/solver/src/elsewhere.rs".to_owned();
+    extra.runs.push(stray);
+    assert!(
+        judge(&case.base(), &case.head(), &extra, &tools).unwrap_err().contains("does not draw")
+    );
+    let reseeded =
+        xtask::ratchet::observations::Observations { seed: observed.seed ^ 1, ..observed.clone() };
+    assert!(judge(&case.base(), &case.head(), &reseeded, &tools).unwrap_err().contains("seed"));
+    tools.commits = Some(format!("{}..{}", "b".repeat(40), "c".repeat(40)));
+    let other = judge(&case.base(), &case.head(), &observed, &tools).unwrap_err();
+    assert!(other.contains("judge the commit that was observed"), "{other}");
+    let headers = observed
+        .runs
+        .iter()
+        .filter(|run| run.stdout.contains("// path:") || run.stderr.contains("// path:"));
+    assert_eq!(headers.count(), 0);
 }
 
 // Goal: the judge reads the base's corpus from its own checkout: observations made against a
@@ -722,6 +815,7 @@ fn the_command_line_reports_the_verdict_in_its_exit_code() {
 fn a_code_owner_approval_stands_in_for_what_is_unproven() {
     let case = Case::new("approval");
     write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    declare_module(&case.head(), "extra");
     write(&case.head(), "lints/src/fake-mutants.txt", "");
     let verdict = |approval: Option<(&'static str, &'static str)>| {
         let reviews = FakeReviews { approval, ..REVIEWED };

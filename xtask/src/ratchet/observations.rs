@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 /// The version of this format. A judge refuses any other.
-const FORMAT: &str = "2";
+const FORMAT: &str = "3";
 
 /// One run of a head tool on one base case.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +43,10 @@ pub struct Observations {
     pub corpus: String,
     /// The fingerprint of the head tree the observer copied ([`super::tree::fingerprint`]).
     pub head: String,
+    /// The commit whose tree was observed, such as GitHub's test merge; empty if not given.
+    pub commit: String,
+    /// The pull request's head commit; empty if not given.
+    pub pr_head: String,
     /// Every run, in the order they ran.
     pub runs: Vec<Run>,
 }
@@ -59,12 +63,14 @@ impl Observations {
         let runs: Vec<String> = self.runs.iter().map(run_json).collect();
         format!(
             "{{\"format\":{},\"skipped\":{},\"seed\":{},\"corpus\":{},\"head\":{},\
-             \"runs\":[\n{}\n]}}\n",
+             \"commit\":{},\"pr_head\":{},\"runs\":[\n{}\n]}}\n",
             json::quote(FORMAT),
             self.skipped,
             json::quote(&self.seed.to_string()),
             json::quote(&self.corpus),
             json::quote(&self.head),
+            json::quote(&self.commit),
+            json::quote(&self.pr_head),
             runs.join(",\n")
         )
     }
@@ -92,7 +98,8 @@ impl Observations {
             value.get("runs").and_then(Value::as_array).ok_or("the observations have no `runs`")?;
         let runs = runs.iter().map(run_from).collect::<Result<Vec<_>, _>>()?;
         let (corpus, head) = (text_of(&value, "corpus")?, text_of(&value, "head")?);
-        Ok(Self { skipped, seed, corpus, head, runs })
+        let (commit, pr_head) = (text_of(&value, "commit")?, text_of(&value, "pr_head")?);
+        Ok(Self { skipped, seed, corpus, head, commit, pr_head, runs })
     }
 
     /// Reads observations from a file.
@@ -232,6 +239,8 @@ mod tests {
             seed: u64::MAX,
             corpus: "ab".to_owned(),
             head: "cd".to_owned(),
+            commit: "ef".to_owned(),
+            pr_head: String::new(),
             runs: vec![run(Some(2)), run(None)],
         };
         assert_eq!(Observations::from_json(&observations.to_json()), Ok(observations.clone()));
@@ -239,7 +248,7 @@ mod tests {
         assert!(Observations::from_json("{}").is_err());
         assert!(
             Observations::from_json(
-                &observations.to_json().replace("\"format\":\"2\"", "\"format\":\"1\"")
+                &observations.to_json().replace("\"format\":\"3\"", "\"format\":\"2\"")
             )
             .is_err()
         );

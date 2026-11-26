@@ -1,18 +1,19 @@
 //! What the base reads from the head's source as data, with `syn`, without running any head
 //! code (ADR-0022): the rule tables, the `check_*` calls of the rule modules, and the lint
-//! declarations and registrations.
+//! declarations and registrations. Each file is first held to the dialect of [`super::dialect`],
+//! in which these readings are what the compiler builds.
 //!
 //! Mutation testing makes no mutant for a changed constant or a deleted line, and the corpus
 //! pins a ban at one or two paths. These checks close that gap for data: every base row must be
 //! in the head unchanged or narrowed in what it permits, and every base `check_*` call site must
 //! still be there. A table in a form this module does not read is no verdict, never a pass.
 
+use super::dialect;
 use super::{Check, Finding};
-use crate::tidy::lints::{self, DylintLint};
+use crate::tidy::lints::DylintLint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use syn::visit::{self, Visit};
 use syn::{Expr, ExprArray, Lit};
 
 /// The rule registry, relative to the root.
@@ -158,28 +159,33 @@ fn strings(expr: &Expr) -> Result<Vec<String>, String> {
     rows(expr)?.into_iter().map(string).collect()
 }
 
-/// The last segment of a path such as `RuleKind::Source`.
-fn variant(expr: &Expr) -> Result<String, String> {
-    let Expr::Path(path) = expr else {
-        return Err(format!("a field in {REGISTRY} is not an enum variant"));
+/// The variant of `expected` that a field names, written as `Enum::Variant` in full.
+fn variant(expr: &Expr, expected: &str) -> Result<String, String> {
+    let named = if let Expr::Path(path) = expr
+        && path.qself.is_none()
+    {
+        dialect::registry::variant_of(&path.path)
+    } else {
+        None
     };
-    let last = path.path.segments.last().ok_or("an empty path")?;
-    Ok(last.ident.to_string())
+    match named {
+        Some((name, variant)) if name == expected => Ok(variant),
+        _ => Err(format!("a field in {REGISTRY} is not written as `{expected}::<variant>`")),
+    }
 }
 
 fn rule_row(row: &Expr) -> Result<(String, String), String> {
     let fields = fields(row)?;
-    Ok((string(field(&fields, "id")?)?, variant(field(&fields, "kind")?)?))
+    Ok((string(field(&fields, "id")?)?, variant(field(&fields, "kind")?, "RuleKind")?))
 }
 
 fn ban_row(row: &Expr, table: &str) -> Result<Ban, String> {
     let fields = fields(row)?;
     let id = string(field(&fields, "id")?)?;
     let allowed = strings(field(&fields, "allowed")?)?;
-    let scope = variant(field(&fields, "scope")?)?;
-    if !SCOPES.contains(&scope.as_str()) {
-        return Err(format!("ban `{id}` has the scope `{scope}`, which the ratchet does not know"));
-    }
+    let scope = variant(field(&fields, "scope")?, "BanScope")
+        .map_err(|problem| format!("ban `{id}`: {problem}, with a scope the ratchet knows"))?;
+    assert!(SCOPES.contains(&scope.as_str()), "the dialect knows only these scopes");
     let banned = if table == "PATH_BANS" {
         vec![string(field(&fields, "segment")?)?]
     } else {
@@ -253,118 +259,13 @@ fn ban_problem(base: &Ban, head: &Ban) -> Option<String> {
     None
 }
 
-/// The `check_*` calls of one module: `(enclosing function, callee)` pairs, method calls
-/// included.
+/// The `check_*` call sites of one module, keyed as in [`dialect::rules`].
 ///
 /// # Errors
 ///
-/// Returns what is wrong if the module does not parse.
+/// No verdict: the module does not parse, or is outside the dialect.
 pub fn check_calls(relative: &str, text: &str) -> Result<BTreeSet<(String, String)>, String> {
-    let file =
-        syn::parse_file(text).map_err(|error| format!("{relative} does not parse: {error}"))?;
-    let mut finder = CallFinder { function: String::new(), found: BTreeSet::new() };
-    finder.visit_file(&file);
-    Ok(finder.found)
-}
-
-struct CallFinder {
-    function: String,
-    found: BTreeSet<(String, String)>,
-}
-
-impl CallFinder {
-    fn record(&mut self, callee: &syn::Ident) {
-        let name = callee.to_string();
-        if name.starts_with("check_") {
-            let _new = self.found.insert((self.function.clone(), name));
-        }
-    }
-
-    fn within(&mut self, name: &syn::Ident, visit_body: impl FnOnce(&mut Self)) {
-        let outer = std::mem::replace(&mut self.function, name.to_string());
-        visit_body(self);
-        self.function = outer;
-    }
-}
-
-/// True for test code: `#[test]` or `#[cfg(test)]`. Calls there are compiled out of the rule.
-fn is_test_item(attributes: &[syn::Attribute]) -> bool {
-    attributes.iter().any(|attribute| {
-        let is_cfg_test = attribute.path().is_ident("cfg")
-            && attribute.parse_args::<syn::Path>().is_ok_and(|path| path.is_ident("test"));
-        attribute.path().is_ident("test") || is_cfg_test
-    })
-}
-
-impl<'ast> Visit<'ast> for CallFinder {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if !is_test_item(&node.attrs) {
-            visit::visit_item_mod(self, node);
-        }
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !is_test_item(&node.attrs) {
-            self.within(&node.sig.ident, |finder| visit::visit_item_fn(finder, node));
-        }
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !is_test_item(&node.attrs) {
-            self.within(&node.sig.ident, |finder| visit::visit_impl_item_fn(finder, node));
-        }
-    }
-
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let Expr::Path(path) = &*node.func
-            && let Some(last) = path.path.segments.last()
-        {
-            self.record(&last.ident);
-        }
-        visit::visit_expr_call(self, node);
-    }
-
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        self.record(&node.method);
-        visit::visit_expr_method_call(self, node);
-    }
-}
-
-/// The lint names in every `register_lints(&[..])` call of the lint library's root module.
-///
-/// # Errors
-///
-/// Returns what is wrong if the module does not parse.
-pub fn registered_lints(text: &str) -> Result<BTreeSet<String>, String> {
-    let file =
-        syn::parse_file(text).map_err(|error| format!("{LINT_LIBRARY} does not parse: {error}"))?;
-    let mut finder = Registrations { found: BTreeSet::new() };
-    finder.visit_file(&file);
-    Ok(finder.found)
-}
-
-struct Registrations {
-    found: BTreeSet<String>,
-}
-
-impl<'ast> Visit<'ast> for Registrations {
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.method == "register_lints"
-            && let Some(Expr::Reference(reference)) = node.args.first()
-            && let Expr::Array(array) = &*reference.expr
-        {
-            self.found.extend(array.elems.iter().filter_map(lint_name));
-        }
-        visit::visit_expr_method_call(self, node);
-    }
-}
-
-/// The lint named by an element of `register_lints(&[..])`, in lower case.
-fn lint_name(element: &Expr) -> Option<String> {
-    let Expr::Path(path) = element else {
-        return None;
-    };
-    path.path.segments.last().map(|last| last.ident.to_string().to_lowercase())
+    dialect::rules::call_sites(relative, text)
 }
 
 /// Compares what the base reads from both trees: the registry, the `check_*` calls of the rule
@@ -374,7 +275,7 @@ fn lint_name(element: &Expr) -> Option<String> {
 ///
 /// Returns what is unreadable: no verdict.
 pub fn check(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
-    super::form::check_head(head)?;
+    dialect::check_head(base, head)?;
     let read = |root: &Path, relative: &str| -> Result<String, String> {
         read_optional(root, relative)?.ok_or_else(|| format!("{relative} is missing"))
     };
@@ -391,10 +292,10 @@ pub fn check(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
             Some(text) => check_calls(module, &text)?,
             None => BTreeSet::new(),
         };
-        for (function, callee) in before.difference(&after) {
+        for (function, call) in before.difference(&after) {
             let message = format!(
-                "`{function}` no longer calls `{callee}`; a rule's check is never removed without \
-                 the code owner (ADR-0022)"
+                "`{function}` no longer calls `{call}(..)`; a rule's check is never removed \
+                 without the code owner (ADR-0022)"
             );
             findings.push(Finding::new(module, Check::RuleSet, message));
         }
@@ -406,24 +307,15 @@ pub fn check(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
 /// Lints: every lint the base enforces is declared exactly once in the head, still enforced,
 /// and still registered.
 fn lint_findings(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
-    let read = |root: &Path, side: &str| {
-        lints::declared(root)
-            .map_err(|error| format!("cannot read the {side}'s lint declarations: {error}"))
-    };
-    let mut findings = weakened_lints(&read(base, "base")?, &read(head, "head")?);
-    if let Some(base_text) = read_optional(base, LINT_LIBRARY)? {
-        let before = registered_lints(&base_text)?;
-        let after = match read_optional(head, LINT_LIBRARY)? {
-            Some(text) => registered_lints(&text)?,
-            None => BTreeSet::new(),
-        };
-        for lint in before.difference(&after) {
-            let message = format!(
-                "dylint lint `{lint}` is registered in the base and not in the head; a lint that \
-                 is not registered never runs (ADR-0022)"
-            );
-            findings.push(Finding::new(LINT_LIBRARY, Check::RuleSet, message));
-        }
+    let before = dialect::lints::library(base).map_err(|problem| format!("the base: {problem}"))?;
+    let after = dialect::lints::library(head)?;
+    let mut findings = weakened_lints(&before.declarations, &after.declarations);
+    for lint in before.registered.difference(&after.registered) {
+        let message = format!(
+            "dylint lint `{lint}` is registered in the base and not in the head; a lint that is \
+             not registered never runs (ADR-0022)"
+        );
+        findings.push(Finding::new(LINT_LIBRARY, Check::RuleSet, message));
     }
     Ok(findings)
 }
@@ -483,9 +375,9 @@ pub fn read_optional(root: &Path, relative: &str) -> Result<Option<String>, Stri
     fs::read_to_string(&path).map(Some).map_err(|error| format!("cannot read {relative}: {error}"))
 }
 
-/// The base's rules whose code sits in a rule path (their id is a string literal there) and
-/// that have no firing fixture in the base. Each needs a case before the ratchet can vouch for
-/// a change to it (ADR-0022).
+/// The base's rules whose code sits in a rule path (their id is a string literal there, read
+/// from the module's tokens outside its tests) and that have no firing fixture in the base.
+/// Each needs a case before the ratchet can vouch for a change to it (ADR-0022).
 ///
 /// # Errors
 ///
@@ -498,10 +390,11 @@ pub fn rules_without_cases(base: &Path, tree: &Path) -> Result<Vec<String>, Stri
         let Some(text) = read_optional(tree, module)? else {
             continue;
         };
+        let literals = dialect::rules::literals(module, &text)?;
         for id in registry.ids() {
             let fixture =
                 base.join(super::corpus::FIXTURE_DIRECTORY).join(format!("{id}.fires.fixture"));
-            if text.contains(&format!("\"{id}\"")) && !fixture.is_file() {
+            if literals.contains(&id) && !fixture.is_file() {
                 uncovered.push(format!("{id} ({module})"));
             }
         }
@@ -512,8 +405,8 @@ pub fn rules_without_cases(base: &Path, tree: &Path) -> Result<Vec<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        Ban, check_calls, loosened_rows, parse_registry, read_optional, registered_lints,
-        rules_without_cases, weakened_lints,
+        Ban, check_calls, loosened_rows, parse_registry, read_optional, rules_without_cases,
+        weakened_lints,
     };
     use crate::tidy::lints::DylintLint;
     use std::collections::BTreeSet;
@@ -604,7 +497,7 @@ mod tests {
             "{found:?}"
         );
         let unknown = base.replacen("scope: BanScope::Everywhere", "scope: BanScope::Somewhere", 1);
-        assert!(parse_registry(&unknown).unwrap_err().contains("does not know"));
+        assert!(parse_registry(&unknown).unwrap_err().contains("a scope the ratchet knows"));
         let wider = base.replacen("scope: BanScope::Everywhere", "scope: BanScope::NamiCrates", 1);
         assert_eq!(
             messages(&wider, &base),
@@ -639,6 +532,24 @@ mod tests {
         assert_eq!(messages(&gone, &base).len(), 1, "an exception added back is a loosening");
     }
 
+    // Goal: a field names a variant of its own enum, and the rule-set check holds the head's
+    // registry to the dialect: a change outside the tables is no verdict, though the tables
+    // read the same.
+    #[test]
+    fn the_registry_is_read_in_the_dialect() {
+        let base = real_registry();
+        let wrong_enum = base.replacen("kind: RuleKind::Source", "kind: BanScope::Everywhere", 1);
+        assert!(parse_registry(&wrong_enum).unwrap_err().contains("`RuleKind::<variant>`"));
+        let trees = crate::tidy::scratch::Scratch::new("ratchet-source-dialect");
+        trees.write(&format!("base/{}", super::REGISTRY), &base);
+        let narrowed =
+            base.replace("self == Self::Everywhere || scope.is_nami()", "scope.is_nami()");
+        trees.write(&format!("head/{}", super::REGISTRY), &narrowed);
+        let error =
+            super::check(&trees.root().join("base"), &trees.root().join("head")).unwrap_err();
+        assert!(error.contains("outside the dialect"), "{error}");
+    }
+
     // Goal: a registry in another form is unreadable, never an empty table.
     #[test]
     fn unreadable_registries_are_errors() {
@@ -657,52 +568,24 @@ mod tests {
         assert!(parse_registry(vector).unwrap_err().contains("not written as `&[..]`"));
     }
 
-    // Goal: `check_*` calls are found with their enclosing function, as calls and as method
-    // calls, so that a deleted call is seen.
+    // Goal: `check_*` calls are found keyed by their enclosing function and their form, so
+    // that a deleted call is seen, and a call redirected to a look-alike is not the same call.
     #[test]
     fn check_calls_are_found() {
-        let text = "fn a() { check_x(); helper(); }\nimpl V { fn b(&mut self) { self.check_y(1); \
-                    super::check_z(); } }\nmod inner { fn c() { check_w(); } }";
+        let text = "fn check_x() {}\nfn a() { check_x(); helper(); }\nstruct V;\nimpl V { fn \
+                    check_y(&self, _: u8) {}\n fn b(&mut self) { self.check_y(1); } }";
         let found = check_calls("m.rs", text).unwrap();
         let pairs: Vec<(&str, &str)> =
             found.iter().map(|(f, c)| (f.as_str(), c.as_str())).collect();
-        let expected = [("a", "check_x"), ("b", "check_y"), ("b", "check_z"), ("c", "check_w")];
-        assert_eq!(pairs, expected, "a module that is not test code counts");
+        assert_eq!(pairs, [("V::b", "self.check_y"), ("a", "check_x")]);
         let real =
             std::fs::read_to_string(crate::workspace_root().join("xtask/src/tidy/rust_source.rs"))
                 .unwrap();
         let calls = check_calls("rust_source.rs", &real).unwrap();
-        assert!(calls.contains(&("check_body".to_owned(), "check_float_equality".to_owned())));
-        let in_tests = format!(
-            "{real}\n#[cfg(test)]\nmod decoy {{ fn check_body() {{ check_float_equality(); }} }}"
-        );
-        let decoy =
-            real.replace("self.check_float_equality(function);", "") + &in_tests[real.len()..];
-        let pair = ("check_body".to_owned(), "check_float_equality".to_owned());
-        assert!(
-            !check_calls("rust_source.rs", &decoy).unwrap().contains(&pair),
-            "test code does not count"
-        );
+        let pair = ("Visitor::check_body".to_owned(), "self.check_float_equality".to_owned());
+        assert!(calls.contains(&pair), "{calls:?}");
         let deleted = real.replace("self.check_float_equality(function);", "");
-        assert!(
-            !check_calls("rust_source.rs", &deleted)
-                .unwrap()
-                .contains(&("check_body".to_owned(), "check_float_equality".to_owned()))
-        );
-    }
-
-    // Goal: registered lints are read from `register_lints(&[..])`, and the real library
-    // registers both of its lints.
-    #[test]
-    fn registered_lints_are_read() {
-        let real =
-            std::fs::read_to_string(crate::workspace_root().join("lints/src/lib.rs")).unwrap();
-        let found = registered_lints(&real).unwrap();
-        assert_eq!(
-            found,
-            BTreeSet::from(["nami_float_reduction".to_owned(), "nami_recursion".to_owned()])
-        );
-        assert!(registered_lints("fn f( {").is_err());
+        assert!(!check_calls("rust_source.rs", &deleted).unwrap().contains(&pair));
     }
 
     fn lint(name: &str, level: &str) -> DylintLint {

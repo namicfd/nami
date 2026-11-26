@@ -198,10 +198,6 @@ pub fn parse_located(text: &str) -> Vec<Located> {
             found.push(Located { level: current.to_owned(), path, line: line_number, column });
         }
     }
-    assert!(
-        found.iter().all(|located| located.level == "error" || located.level == "warning"),
-        "a location belongs to an error or a warning"
-    );
     found
 }
 
@@ -231,8 +227,9 @@ pub fn observe(
     if cases.is_empty() {
         return Ok(Vec::new());
     }
+    let (name, placements) = plan(&cases, &plant_crates(scratch.root())?, rng);
     let package = tools.work.join("ui-head");
-    write_package(&package, &rng.stem(), &cases)
+    write_package(&package, &name, &cases)
         .map_err(|error| format!("cannot write {}: {error}", package.display()))?;
     let (output, other) = run_library(tools, head, "head", &package)?;
     let library = Run {
@@ -244,21 +241,33 @@ pub fn observe(
         stderr: other,
         files: BTreeMap::new(),
     };
-    let crates = plant_crates(scratch)?;
     let mut runs = vec![library];
-    for case in &cases {
-        let crate_directory = rng.pick(&crates);
-        let placement = format!("{crate_directory}/examples/{}.rs", rng.stem());
-        runs.push(run_dylint(case, &placement, scratch, head_xtask, tools)?);
+    for (case, placement) in cases.iter().zip(&placements) {
+        runs.push(run_dylint(case, placement, scratch, head_xtask, tools)?);
     }
     Ok(runs)
 }
 
-/// The crates of the scratch tree that a case can be planted in: `crates/<name>` with a
+/// The head package's random name, and where each case is planted as an example: a crate of
+/// `crates` and a random file name, drawn from `rng`. The judge draws them again.
+fn plan(cases: &[UiCase], crates: &[String], rng: &mut Rng) -> (String, Vec<String>) {
+    let name = rng.stem();
+    let placements: Vec<String> = cases
+        .iter()
+        .map(|_| {
+            let crate_directory = rng.pick(crates);
+            format!("{crate_directory}/examples/{}.rs", rng.stem())
+        })
+        .collect();
+    assert_eq!(placements.len(), cases.len(), "one placement per case");
+    (name, placements)
+}
+
+/// The crates of the tree at `root` that a case can be planted in: `crates/<name>` with a
 /// manifest.
-fn plant_crates(scratch: &Scratch) -> Result<Vec<String>, String> {
-    let entries = super::tree::entries(scratch.root())
-        .map_err(|error| format!("cannot list the scratch tree: {error}"))?;
+fn plant_crates(root: &Path) -> Result<Vec<String>, String> {
+    let entries =
+        super::tree::entries(root).map_err(|error| format!("cannot list the tree: {error}"))?;
     let crates: Vec<String> = entries
         .keys()
         .filter_map(|path| path.strip_suffix("/Cargo.toml"))
@@ -310,13 +319,16 @@ fn run_dylint(
 /// `.stderr`, or a missing or unreadable run.
 pub fn judge(
     base: &Path,
+    head: &Path,
     observations: &Observations,
     tools: &Tools<'_>,
+    rng: &mut Rng,
 ) -> Result<Vec<Finding>, String> {
     let cases = cases(base)?;
     if cases.is_empty() {
         return Err(format!("the base has no UI cases in {UI_DIRECTORY}"));
     }
+    let (_name, placements) = plan(&cases, &plant_crates(head)?, rng);
     let expected = base_expectations(base, &cases, tools)?;
     let library = observations
         .runs_of(UI_DIRECTORY, "library")
@@ -326,15 +338,17 @@ pub fn judge(
     let errors = reported.iter().filter(|diagnostic| diagnostic.level == "error").count();
     exits_agree("the head's lint library", library.exit, errors)?;
     let mut findings = missing_diagnostics(&expected, &reported, &library.stderr);
-    for case in &cases {
+    for (case, placement) in cases.iter().zip(&placements) {
         let file = format!("{}.rs", case.stem);
         let of_case: Vec<&Diagnostic> =
             expected.iter().filter(|diagnostic| diagnostic.file == file).collect();
         let subject = format!("{UI_DIRECTORY}/{file}");
         let run = observations
             .runs_of(&subject, "dylint")
-            .next()
-            .ok_or_else(|| format!("the observations hold no `xtask dylint` run of {subject}"))?;
+            .find(|run| run.placement == *placement)
+            .ok_or_else(|| {
+                format!("no `xtask dylint` run of {subject} at {placement}, which the seed draws")
+            })?;
         findings.extend(judge_dylint(run, &of_case)?);
     }
     Ok(findings)

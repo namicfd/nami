@@ -16,12 +16,14 @@
 //! Without a subcommand, both run in one process, for local use and the tests. See [`cli`] for
 //! the options.
 //!
-//! **Threat model.** The ratchet is sound against honest mistakes, and against any loosening
-//! that shows without running head code: rule tables, scopes, allowed lists and `check_*` call
-//! sites are read from the head's source by the base. Against head code written to deceive, it
-//! is defence in depth only; the reviewer app, sampled audits and the trusted core back it. The
-//! reviewer app is the bot that `NAMI_REVIEWER_LOGIN` names, and the review it posts runs in CI
-//! (pending #59), where no authoring session holds its key.
+//! **Threat model.** The ratchet is sound against honest mistakes. Its `syn` checks are sound
+//! for files in the dialect of [`dialect`], and a rule-path file outside it gives no verdict:
+//! for those files, the rule tables, scopes, allowed lists, the presence of each `check_*` call
+//! site, and the lints' levels and registrations are what the compiler builds. Whether a call
+//! that is present also runs is for the corpus and mutation testing to show. Against head code
+//! written to deceive, the rest is defence in depth only; the reviewer app, sampled audits and
+//! the trusted core back it. The reviewer app is the bot that `NAMI_REVIEWER_LOGIN` names, and
+//! the review it posts runs in CI (pending #59), where no authoring session holds its key.
 //!
 //! **One tree.** The observer and the judge read the same head: both refuse a head with a
 //! symbolic link, so the observer's scratch copy, which holds regular files only, has every
@@ -37,7 +39,7 @@
 
 pub mod cli;
 mod corpus;
-mod form;
+pub mod dialect;
 mod lint;
 mod mutants;
 pub mod observations;
@@ -150,11 +152,25 @@ pub struct Tools<'a> {
     pub mutants: bool,
     /// The review check's inputs; `None` skips the review check.
     pub review: Option<ReviewSource<'a>>,
-    /// The seed of the placements; `None` derives it from the head's content
+    /// The seed of the placements; `None` derives it from the base's corpus and the head
     /// ([`plant::seed_of`]).
     pub seed: Option<u64>,
     /// The commits judged, as `base..head`, for the summary; `None` when only trees are given.
     pub commits: Option<String>,
+    /// The pull request's head commit, which seeds the placements; `None` seeds them from the
+    /// head tree.
+    pub pr_head: Option<String>,
+    /// The commit whose tree `observe` copies, such as GitHub's test merge, recorded so that a
+    /// later judge can check it judges the same commit.
+    pub commit: Option<String>,
+}
+
+impl Tools<'_> {
+    /// The seed of the placements for the base corpus `corpus` and the head tree `head_tree`.
+    fn seed(&self, corpus: &str, head_tree: &str) -> u64 {
+        let head = self.pr_head.as_deref().unwrap_or(head_tree);
+        self.seed.unwrap_or_else(|| plant::seed_of(corpus, head))
+    }
 }
 
 /// What the ratchet found.
@@ -233,6 +249,11 @@ impl Verdict {
             "- Verdict after ADR-0022 (rule paths unowned): `{}`",
             self.line_after()
         ));
+        lines.push(
+            "- Both verdicts count the reviews as they are now; the latest run for this head, \
+             usually the one after the reviewer's review, is the evidence."
+                .to_owned(),
+        );
         lines.push(format!("- The code owner reviews this PR anyway: {}", self.owner_reviews));
         lines.push(format!("- ... and would after ADR-0022: {}", self.owner_reviews_after));
         lines.push(format!("- A code owner approved the head commit: {}", self.owner_approved));
@@ -286,7 +307,8 @@ fn scope_of(base: &Path, head: &Path) -> Result<(Vec<String>, Verdict, String), 
         .map_err(|error| format!("cannot read the base's {CODEOWNERS}: {error}"))?;
     let lines = crate::pr::parse_codeowners(&codeowners)?;
     let owner_reviews = !crate::pr::protected_paths(&lines, &changed).is_empty();
-    let owner_reviews_after = !crate::pr::protected_paths(&lines, &outside).is_empty();
+    let flipped = crate::pr::parse_codeowners(&scope::flipped_codeowners(&codeowners))?;
+    let owner_reviews_after = !crate::pr::protected_paths(&flipped, &changed).is_empty();
     let (head_tree, links) =
         tree::fingerprint(head).map_err(|error| format!("cannot read the head tree: {error}"))?;
     if let Some(link) = links.first() {
@@ -310,10 +332,18 @@ fn scope_of(base: &Path, head: &Path) -> Result<(Vec<String>, Verdict, String), 
 pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Observations, String> {
     assert!(base.is_absolute() && head.is_absolute(), "the trees have absolute paths");
     let (changed, verdict, head_tree) = scope_of(base, head)?;
-    let seed = tools.seed.unwrap_or_else(|| plant::seed_of(&head_tree));
     let corpus = observations::corpus_fingerprint(base)?.0;
+    let mut observed = Observations {
+        skipped: true,
+        seed: tools.seed(&corpus, &head_tree),
+        corpus,
+        head: head_tree,
+        commit: tools.commit.clone().unwrap_or_default(),
+        pr_head: tools.pr_head.clone().unwrap_or_default(),
+        runs: Vec::new(),
+    };
     if !changed.iter().any(|path| scope::is_tooling(path)) {
-        return Ok(Observations { skipped: true, seed, corpus, head: head_tree, runs: Vec::new() });
+        return Ok(observed);
     }
     let head_xtask = match &tools.head_xtask {
         Some(binary) => binary.clone(),
@@ -323,15 +353,16 @@ pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Observatio
         .map_err(|error| format!("cannot create the work directory: {error}"))?;
     let scratch = Scratch::copy_of(head, &tools.work.join("head-tree"))
         .map_err(|error| format!("cannot copy the head tree: {error}"))?;
-    let mut rng = plant::Rng::new(seed);
-    let mut runs = corpus::observe(base, &scratch, &head_xtask, &mut rng)?;
+    let mut rng = plant::Rng::new(observed.seed);
+    observed.runs = corpus::observe(base, &scratch, &head_xtask, &mut rng)?;
     if changed.iter().any(|path| scope::is_lint_tooling(path)) {
-        runs.extend(lint::observe(base, head, &scratch, &head_xtask, tools, &mut rng)?);
+        observed.runs.extend(lint::observe(base, head, &scratch, &head_xtask, tools, &mut rng)?);
     }
     if tools.mutants {
-        runs.extend(mutants::observe(base, head, &verdict.rule_paths, tools)?);
+        observed.runs.extend(mutants::observe(base, head, &verdict.rule_paths, tools)?);
     }
-    Ok(Observations { skipped: false, seed, corpus, head: head_tree, runs })
+    observed.skipped = false;
+    Ok(observed)
 }
 
 /// Judges the observations against the base's corpus and the head's source. Runs no head
@@ -372,6 +403,14 @@ pub fn judge(
             if observed.skipped { ", skipped" } else { "" }
         ));
     }
+    same_commits(observed, tools)?;
+    if observed.seed != tools.seed(&corpus, &head_tree) {
+        return Err(format!(
+            "the observations were drawn with the seed {}, not the one this base and head give; \
+             the placements cannot be checked",
+            observed.seed
+        ));
+    }
     verdict.notes.push(format!(
         "Base corpus: {files} files, fingerprint {corpus}, placement seed {}.",
         observed.seed
@@ -388,9 +427,10 @@ pub fn judge(
     }
     verdict.add(Check::RuleSet, rule_set);
     // Each finding names its own check; corpus and end-to-end findings come from one pass.
-    verdict.add(Check::TidyCorpus, corpus::judge(base, head, observed)?);
+    let mut rng = plant::Rng::new(observed.seed);
+    verdict.add(Check::TidyCorpus, corpus::judge(base, head, observed, &mut rng)?);
     if changed.iter().any(|path| scope::is_lint_tooling(path)) {
-        verdict.add(Check::LintCorpus, lint::judge(base, observed, tools)?);
+        verdict.add(Check::LintCorpus, lint::judge(base, head, observed, tools, &mut rng)?);
     } else {
         verdict.notes.push("Lint checks skipped: nothing below `lints/` changed.".to_owned());
     }
@@ -398,6 +438,35 @@ pub fn judge(
     judge_proof(base, head, observed, tools, &mut verdict)?;
     verdict.findings.sort();
     Ok(verdict)
+}
+
+/// Fails, for no verdict, if the observations name another commit than the one judged, or
+/// another pull request head.
+fn same_commits(observed: &Observations, tools: &Tools<'_>) -> Result<(), String> {
+    let judged =
+        tools.commits.as_deref().and_then(|range| range.split_once("..")).map(|(_, head)| head);
+    if let Some(judged) = judged
+        && !observed.commit.is_empty()
+        && observed.commit != judged
+    {
+        return Err(format!(
+            "the observations are of the commit {}, and this judges {judged}; judge the commit \
+             that was observed",
+            observed.commit
+        ));
+    }
+    let pr_head =
+        tools.review.as_ref().map(|source| source.head.as_str()).or(tools.pr_head.as_deref());
+    if let Some(pr_head) = pr_head
+        && !observed.pr_head.is_empty()
+        && observed.pr_head != pr_head
+    {
+        return Err(format!(
+            "the observations are of the pull request head {}, and this judges {pr_head}",
+            observed.pr_head
+        ));
+    }
+    Ok(())
 }
 
 /// The checks that stand in for the owner's review of rule paths: mutation testing of the
@@ -434,8 +503,11 @@ fn judge_proof(
     match &tools.review {
         Some(source) => match &source.reviewer {
             Some(reviewer) => {
-                let findings = review::check(source.reviews, source.pull, &source.head, reviewer)?;
-                verdict.add(Check::Review, findings);
+                let gate = review::check(source.reviews, source.pull, &source.head, reviewer)?;
+                verdict.add(Check::Review, gate.findings);
+                for what in gate.unproven {
+                    verdict.unprovable(what);
+                }
             }
             None => verdict.unprovable(format!(
                 "no reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}), so no review \
@@ -507,7 +579,52 @@ fn tail(text: &str, lines: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Check, Finding, Verdict, tail};
+    use super::{Check, Finding, Tools, Verdict, same_commits, tail};
+    use crate::ratchet::observations::Observations;
+
+    fn tools(pr_head: Option<&str>, commits: Option<&str>) -> Tools<'static> {
+        Tools {
+            head_xtask: None,
+            cargo: "cargo".into(),
+            work: "/w".into(),
+            mutants: false,
+            review: None,
+            seed: None,
+            commits: commits.map(str::to_owned),
+            pr_head: pr_head.map(str::to_owned),
+            commit: None,
+        }
+    }
+
+    // Goal: the seed comes from the base corpus and the PR head, or the head tree without one,
+    // unless `--seed` gives it.
+    #[test]
+    fn the_seed_follows_the_base_and_the_head() {
+        use crate::ratchet::plant::seed_of;
+        assert_eq!(tools(Some("p"), None).seed("c", "t"), seed_of("c", "p"));
+        assert_eq!(tools(None, None).seed("c", "t"), seed_of("c", "t"));
+        assert_ne!(tools(Some("p"), None).seed("c", "t"), tools(Some("q"), None).seed("c", "t"));
+        let fixed = Tools { seed: Some(3), ..tools(Some("p"), None) };
+        assert_eq!(fixed.seed("c", "t"), 3);
+    }
+
+    // Goal: observations of another commit or another PR head are no verdict; observations
+    // that record neither, or the same ones, are judged.
+    #[test]
+    fn observations_must_be_of_the_commit_judged() {
+        let observed = Observations {
+            commit: "h".to_owned(),
+            pr_head: "p".to_owned(),
+            ..Observations::default()
+        };
+        assert_eq!(same_commits(&observed, &tools(Some("p"), Some("b..h"))), Ok(()));
+        let other_commit = same_commits(&observed, &tools(Some("p"), Some("b..x")));
+        assert!(other_commit.unwrap_err().contains("judge the commit"));
+        let other_head = same_commits(&observed, &tools(Some("q"), Some("b..h")));
+        assert!(other_head.unwrap_err().contains("pull request head"));
+        let unrecorded = Observations::default();
+        assert_eq!(same_commits(&unrecorded, &tools(Some("q"), Some("b..x"))), Ok(()));
+    }
 
     // Goal: the verdict line says pass, pass outside the rule paths, no verdict, or fail with
     // the count; the summary ends with it and lists the findings and what is unproven; an
