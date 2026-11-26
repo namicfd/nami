@@ -13,13 +13,15 @@ check: fmt-check tidy clippy test
 # Full gate: the fast gate plus supply-chain checks, compiler-level lints and release-checked tests.
 check-full: check deny dylint test-checked
 
-# Format all code.
+# Format all code. `lints/` is its own workspace, and its UI tests are no cargo target.
 fmt:
     cargo fmt --all
+    cd lints && cargo fmt && rustfmt --edition 2024 ui/*.rs
 
-# Fail if any file is not formatted.
+# Fail if any file is not formatted, in the root workspace and in `lints/` with its UI tests.
 fmt-check:
     cargo fmt --all --check
+    cd lints && cargo fmt --check && rustfmt --edition 2024 --check ui/*.rs
 
 # Style rules that clippy cannot express (ADR-0006).
 tidy:
