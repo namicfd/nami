@@ -60,11 +60,18 @@ use std::time::Duration;
 /// Exit code that makes Claude Code show stderr to the agent.
 const EXIT_FEEDBACK: u8 = 2;
 
-/// Seconds the worktree's own check of an edited file may take (hook timeout: 120). A first
-/// build of its xtask can take longer; then this process checks the file itself.
-const EDIT_CHECK_SECONDS_MAX: u32 = 60;
+/// Seconds that the worktree's own formatting and check of an edited file may take together,
+/// each run's reap after a kill included (hook timeout: 120). What one run leaves, the next
+/// gets. A first build of its xtask can take longer; then this process checks the file itself.
+const EDIT_BUDGET_SECONDS_MAX: u32 = 80;
 
-/// Seconds the stop gate may take (hook timeout: 600). A cold gate took 114 seconds.
+/// Seconds that each hook keeps, beyond the budget of its checks, for its own work: the fallback
+/// check in this process after an edit, recording the outcome at stop.
+#[cfg(test)]
+const OWN_WORK_SECONDS_MIN: u32 = 30;
+
+/// Seconds the stop gate may take, its reap after a kill included (hook timeout: 600). A cold
+/// gate took 114 seconds.
 const GATE_SECONDS_MAX: u32 = 480;
 
 /// Seconds a killed check may take to end before the hook stops waiting for it.
@@ -238,10 +245,17 @@ enum Outcome {
 }
 
 /// Runs `command` in its own process group, with stdin from `input` (or nothing), stdout and
-/// stderr in files next to `log`, and waits for it for at most `polls_max` polls of
+/// stderr in files next to `log`, and waits for it until its deadline in `budget`, in polls of
 /// [`POLL_INTERVAL_MILLISECONDS`]. The deadline counts polls, not wall-clock time (ADR-0005).
-fn run_bounded(command: &mut Command, input: Option<&Path>, log: &Path, polls_max: u32) -> Outcome {
-    assert!(polls_max > 0, "a check gets at least one poll");
+fn run_bounded(
+    command: &mut Command,
+    input: Option<&Path>,
+    log: &Path,
+    budget: &mut Budget,
+) -> Outcome {
+    if budget.deadline() == 0 {
+        return Outcome::CouldNotRun("was not started: its time budget is spent".to_owned());
+    }
     let (out_log, err_log) = (log.with_extension("out"), log.with_extension("err"));
     let stdin = match input.map(fs::File::open).transpose() {
         Ok(file) => file.map_or_else(Stdio::null, Stdio::from),
@@ -256,7 +270,7 @@ fn run_bounded(command: &mut Command, input: Option<&Path>, log: &Path, polls_ma
     };
     let command = command.stdin(stdin).stdout(stdout).stderr(stderr);
     let spawned = in_own_process_group(command).spawn();
-    let status = spawned.map(|mut child| wait_until(&mut child, polls_max));
+    let status = spawned.map(|mut child| wait_until(&mut child, budget));
     let read = |file: &Path| match fs::read(file) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) => format!("(cannot read the output in {}: {error})", file.display()),
@@ -281,10 +295,39 @@ fn polls_in(seconds: u32) -> u32 {
     polls
 }
 
-/// Waits for `child` for at most `polls_max` polls, then kills it and its process group.
-fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
+/// Polls that a run, or a series of runs that share it, may still take, each run's reap after a
+/// kill included. A run's deadline is what is left minus one reap, so a series of runs can never
+/// take longer than its budget.
+#[derive(Debug)]
+struct Budget {
+    polls_left: u32,
+}
+
+impl Budget {
+    /// A budget of `seconds`.
+    fn of_seconds(seconds: u32) -> Self {
+        Self { polls_left: polls_in(seconds) }
+    }
+
+    /// The polls a run may wait before it is killed: what is left minus one reap, or none.
+    fn deadline(&self) -> u32 {
+        self.polls_left.saturating_sub(polls_in(REAP_SECONDS_MAX))
+    }
+
+    /// Takes one poll from the budget.
+    fn spend(&mut self) {
+        assert!(self.polls_left > 0, "a run never polls beyond its budget");
+        self.polls_left -= 1;
+    }
+}
+
+/// Waits for `child` until its deadline in `budget`, then kills it and its process group and
+/// waits at most one reap for it to end. Every poll is taken from `budget`.
+fn wait_until(child: &mut Child, budget: &mut Budget) -> Result<ExitStatus, String> {
     let interval = Duration::from_millis(u64::from(POLL_INTERVAL_MILLISECONDS));
-    for _ in 0..polls_max {
+    let deadline = budget.deadline();
+    for _ in 0..deadline {
+        budget.spend();
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => std::thread::sleep(interval),
@@ -304,7 +347,8 @@ fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
     let group = kill_process_group(child);
     // The reap is bounded too, so that a child the kill did not reach cannot hang the hook.
     let mut reaped = Err("it did not end after the kill".to_owned());
-    for _ in 0..polls_in(REAP_SECONDS_MAX) {
+    for _ in 0..polls_in(REAP_SECONDS_MAX).min(budget.polls_left) {
+        budget.spend();
         match child.try_wait() {
             Ok(Some(status)) => {
                 reaped = Ok(status);
@@ -322,7 +366,7 @@ fn wait_until(child: &mut Child, polls_max: u32) -> Result<ExitStatus, String> {
         (Ok(status), Err(error)) => format!("{status}; {error}"),
         (Err(error), _) => error,
     };
-    let seconds = polls_max * POLL_INTERVAL_MILLISECONDS / 1000;
+    let seconds = deadline * POLL_INTERVAL_MILLISECONDS / 1000;
     Err(format!("did not finish within {seconds} seconds and was killed ({killed})"))
 }
 
@@ -376,18 +420,20 @@ fn post_edit(root: &Path, payload: &str) -> ExitCode {
         eprintln!("hook post-edit: {} is not in {}", file.display(), root.display());
         return ExitCode::FAILURE;
     };
-    let is_own_check = is_other_worktree(root);
+    // One budget for all of the worktree's own work, so that the fallback below always has
+    // time before the hook's timeout.
+    let mut budget = is_other_worktree(root).then(|| Budget::of_seconds(EDIT_BUDGET_SECONDS_MAX));
     let is_rust = file.extension().is_some_and(|extension| extension == "rs");
     let text = if is_rust {
-        match format_in_place(root, &file, &original, is_own_check) {
+        match format_in_place(root, &file, &original, budget.as_mut()) {
             Ok(formatted) => formatted,
             Err(exit) => return exit,
         }
     } else {
         original
     };
-    if is_own_check {
-        match own_file_check(root, &file) {
+    if let Some(budget) = budget.as_mut() {
+        match own_file_check(root, &file, budget) {
             Ok(exit) => return exit,
             Err(reason) => eprintln!(
                 "hook post-edit: the check of {} could not run ({reason}); checked with the \
@@ -415,7 +461,7 @@ fn post_edit(root: &Path, payload: &str) -> ExitCode {
 /// Checks `file` with the rules of the worktree at `root`: `cargo xtask tidy --file` in it,
 /// with the toolchain it pins. Returns the exit code to stop with if the check ran: it passed,
 /// or it found violations, which go to the agent. Otherwise returns why it could not run.
-fn own_file_check(root: &Path, file: &Path) -> Result<ExitCode, String> {
+fn own_file_check(root: &Path, file: &Path, budget: &mut Budget) -> Result<ExitCode, String> {
     assert!(file.is_absolute(), "the worktree's check is given an absolute path");
     let mut command = Command::new("cargo");
     let command = command
@@ -426,7 +472,7 @@ fn own_file_check(root: &Path, file: &Path) -> Result<ExitCode, String> {
         .env_remove(TOOLCHAIN_VARIABLES[1]);
     let log = output_log(root, "edit-check");
     let violations = i32::from(crate::tidy::cli::EXIT_VIOLATIONS);
-    match run_bounded(command, None, &log, polls_in(EDIT_CHECK_SECONDS_MAX)) {
+    match run_bounded(command, None, &log, budget) {
         Outcome::Exited(0, _) => Ok(ExitCode::SUCCESS),
         Outcome::Exited(code, printed) if code == violations => {
             eprint!("{}", printed.both());
@@ -440,26 +486,25 @@ fn own_file_check(root: &Path, file: &Path) -> Result<ExitCode, String> {
     }
 }
 
-/// Formats a Rust file and writes it back if the text changed. With `checkout_toolchain`, the
-/// rustfmt of the toolchain that `root` pins formats it, or, if that cannot run, this process's
-/// own. Returns the formatted text, or the exit code to stop with: feedback for a syntax error,
-/// failure if the file cannot be written.
+/// Formats a Rust file and writes it back if the text changed. With `checkout_budget`, the
+/// rustfmt of the toolchain that `root` pins formats it within that budget, or, if that cannot
+/// run, this process's own. Returns the formatted text, or the exit code to stop with: feedback
+/// for a syntax error, failure if the file cannot be written.
 fn format_in_place(
     root: &Path,
     file: &Path,
     original: &str,
-    checkout_toolchain: bool,
+    checkout_budget: Option<&mut Budget>,
 ) -> Result<String, ExitCode> {
-    let formatted = if checkout_toolchain {
-        match format_with_checkout_toolchain(root, original) {
+    let formatted = match checkout_budget {
+        Some(budget) => match format_with_checkout_toolchain(root, original, budget) {
             Err(error) => format_source(root, original).inspect(|_| {
                 let first = error.lines().next().unwrap_or_default();
                 eprintln!("note: the rustfmt that {} pins did not run ({first})", root.display());
             }),
             formatted => formatted,
-        }
-    } else {
-        format_source(root, original)
+        },
+        None => format_source(root, original),
     };
     let text = match formatted {
         Ok(formatted) => formatted,
@@ -517,7 +562,8 @@ fn run_gate(root: &Path) -> Result<(), String> {
         .current_dir(root)
         .env_remove(TOOLCHAIN_VARIABLES[0])
         .env_remove(TOOLCHAIN_VARIABLES[1]);
-    match run_bounded(command, None, &output_log(root, "gate"), polls_in(GATE_SECONDS_MAX)) {
+    let mut budget = Budget::of_seconds(GATE_SECONDS_MAX);
+    match run_bounded(command, None, &output_log(root, "gate"), &mut budget) {
         Outcome::Exited(0, _) => Ok(()),
         Outcome::Exited(_, printed) => Err(printed.both()),
         Outcome::CouldNotRun(reason) => Err(format!("`just check dylint` {reason}")),
@@ -771,10 +817,14 @@ fn format_source(root: &Path, source: &str) -> Result<String, String> {
 }
 
 /// Formats one file's source like [`format_source`], but with the rustfmt of the toolchain that
-/// `root` pins, as a bounded check: within [`EDIT_CHECK_SECONDS_MAX`], its process group killed
+/// `root` pins, as a bounded check: within what is left of `budget`, its process group killed
 /// at the deadline. Returns what went wrong if it did not format the source, so that the caller
 /// can fall back to this process's rustfmt.
-fn format_with_checkout_toolchain(root: &Path, source: &str) -> Result<String, String> {
+fn format_with_checkout_toolchain(
+    root: &Path,
+    source: &str,
+    budget: &mut Budget,
+) -> Result<String, String> {
     let input = output_log(root, "format-input");
     let written = fs::write(&input, source);
     written.map_err(|error| format!("cannot write {}: {error}", input.display()))?;
@@ -785,7 +835,7 @@ fn format_with_checkout_toolchain(root: &Path, source: &str) -> Result<String, S
         .env_remove(TOOLCHAIN_VARIABLES[0])
         .env_remove(TOOLCHAIN_VARIABLES[1]);
     let log = output_log(root, "format");
-    let outcome = run_bounded(command, Some(&input), &log, polls_in(EDIT_CHECK_SECONDS_MAX));
+    let outcome = run_bounded(command, Some(&input), &log, budget);
     discard(Some(&input));
     match outcome {
         Outcome::Exited(0, printed) => Ok(printed.stdout),
@@ -888,6 +938,11 @@ mod tests {
     const UNFORMATTED: &str = "fn a( )->u32{1}\n";
     const FORMATTED: &str = "fn a() -> u32 {\n    1\n}\n";
 
+    /// The budget of the worktree's own work after an edit.
+    fn edit_budget() -> super::Budget {
+        super::Budget::of_seconds(super::EDIT_BUDGET_SECONDS_MAX)
+    }
+
     // Goal: an unformatted Rust file is rewritten in its formatted form, and the formatted text
     // is what the tidy rules then see.
     #[test]
@@ -895,7 +950,7 @@ mod tests {
         let scratch = Scratch::new("hook-format-rewrite");
         scratch.write("lib.rs", UNFORMATTED);
         let file = scratch.root().join("lib.rs");
-        let text = format_in_place(&crate::workspace_root(), &file, UNFORMATTED, false);
+        let text = format_in_place(&crate::workspace_root(), &file, UNFORMATTED, None);
         assert_eq!(text.ok().as_deref(), Some(FORMATTED), "the formatted text is returned");
         let on_disk = std::fs::read_to_string(&file).unwrap();
         assert_eq!(on_disk, FORMATTED, "the file is rewritten");
@@ -907,7 +962,12 @@ mod tests {
     fn format_in_place_leaves_a_formatted_file_alone() {
         let scratch = Scratch::new("hook-format-alone");
         let unwritable = scratch.root();
-        let text = format_in_place(&crate::workspace_root(), unwritable, FORMATTED, true);
+        let text = format_in_place(
+            &crate::workspace_root(),
+            unwritable,
+            FORMATTED,
+            Some(&mut edit_budget()),
+        );
         assert_eq!(text.ok().as_deref(), Some(FORMATTED), "nothing to write, nothing fails");
     }
 
@@ -918,10 +978,15 @@ mod tests {
         let scratch = Scratch::new("hook-format-errors");
         let root = crate::workspace_root();
         scratch.write("broken.rs", "fn a( {\n");
-        let broken = format_in_place(&root, &scratch.root().join("broken.rs"), "fn a( {\n", true);
+        let broken = format_in_place(
+            &root,
+            &scratch.root().join("broken.rs"),
+            "fn a( {\n",
+            Some(&mut edit_budget()),
+        );
         let broken = broken.expect_err("a syntax error cannot be formatted");
         assert!(is(broken, ExitCode::from(EXIT_FEEDBACK)), "feedback, got {broken:?}");
-        let unwritable = format_in_place(&root, scratch.root(), UNFORMATTED, false);
+        let unwritable = format_in_place(&root, scratch.root(), UNFORMATTED, None);
         let unwritable = unwritable.expect_err("a directory cannot be written as a file");
         assert!(is(unwritable, ExitCode::FAILURE), "a failure, got {unwritable:?}");
         assert!(!is(ExitCode::FAILURE, ExitCode::from(EXIT_FEEDBACK)), "the codes differ");
@@ -991,6 +1056,11 @@ mod tests {
         command.stdin(std::process::Stdio::piped()).spawn().unwrap()
     }
 
+    /// A budget whose deadline is `polls`, with one reap on top.
+    fn budget_with_deadline(polls: u32) -> super::Budget {
+        super::Budget { polls_left: polls + super::polls_in(super::REAP_SECONDS_MAX) }
+    }
+
     // Goal: a check that outlives its deadline is killed with its whole process group, and one
     // that ends in time is waited for. Method: event-driven, no clock: two `cat`s in one group
     // block on pipes the test holds open, so only a kill can end them, and the test reaps both.
@@ -1003,15 +1073,17 @@ mod tests {
         let member_command =
             std::os::unix::process::CommandExt::process_group(&mut member_command, group);
         let mut member = blocked_cat(member_command);
-        let error = wait_until(&mut leader, 50).expect_err("only a kill ends the leader");
+        let mut budget = budget_with_deadline(50);
+        let error = wait_until(&mut leader, &mut budget).expect_err("only a kill ends the leader");
         assert!(error.starts_with("did not finish within 1 seconds and was killed"), "{error}");
         assert!(error.ends_with("(signal: 9 (SIGKILL))"), "by SIGKILL, group and all: {error}");
+        assert_eq!(budget.deadline(), 0, "the deadline is spent");
         let member_status = member.wait().unwrap();
         let signal = std::os::unix::process::ExitStatusExt::signal(&member_status);
         assert_eq!(signal, Some(9), "the group kill reached the member: {member_status}");
         let mut quick = std::process::Command::new("true").spawn().unwrap();
-        let status = wait_until(&mut quick, super::polls_in(super::GATE_SECONDS_MAX));
-        let status = status.expect("`true` ends by itself");
+        let mut ample = super::Budget::of_seconds(super::GATE_SECONDS_MAX);
+        let status = wait_until(&mut quick, &mut ample).expect("`true` ends by itself");
         assert!(status.success(), "its status is kept: {status}");
     }
 
@@ -1029,59 +1101,107 @@ mod tests {
     // Goal: a bounded run reads its input from a file, reports the exit code with stdout and
     // stderr apart, and a check that cannot start, is ended by a signal or outlives its deadline
     // as one that could not run, never as an exit code. Method: no case depends on the clock.
-    // A case that ends by itself gets the gate's whole deadline; the one that must be killed
+    // A case that ends by itself gets the gate's whole budget; the one that must be killed
     // blocks on a FIFO that the test made and never writes, so it cannot end by itself.
     #[test]
     fn bounded_runs_tell_an_exit_from_a_check_that_could_not_run() {
-        use super::{GATE_SECONDS_MAX, Outcome, Printed, polls_in, run_bounded};
+        use super::{Budget, GATE_SECONDS_MAX, Outcome, Printed, run_bounded};
         let scratch = Scratch::new("hook-bounded");
         let log = scratch.root().join("run.log");
-        let ample = polls_in(GATE_SECONDS_MAX);
-        let shell = |script: &str, input: Option<&std::path::Path>, polls| {
+        let shell = |script: &str, input: Option<&std::path::Path>, budget: &mut Budget| {
             let mut command = std::process::Command::new("sh");
             let command = command.args(["-c", script]).current_dir(scratch.root());
-            run_bounded(command, input, &log, polls)
+            run_bounded(command, input, &log, budget)
         };
-        let exited = shell("echo out; echo err >&2; exit 7", None, ample);
+        let ample = || Budget::of_seconds(GATE_SECONDS_MAX);
+        let exited = shell("echo out; echo err >&2; exit 7", None, &mut ample());
         let printed = Printed { stdout: "out\n".to_owned(), stderr: "err\n".to_owned() };
         assert_eq!(exited, Outcome::Exited(7, printed), "both streams, apart");
         assert!(!log.with_extension("out").exists(), "the logs are removed after the run");
         assert!(!log.with_extension("err").exists(), "both of them");
         scratch.write("input.txt", "from the file\n");
         let input = scratch.root().join("input.txt");
-        let Outcome::Exited(0, read) = shell("cat", Some(&input), ample) else { panic!() };
+        let read = shell("cat", Some(&input), &mut ample());
+        let Outcome::Exited(0, read) = read else { panic!("`cat` of the input fails: {read:?}") };
         assert_eq!(read.stdout, "from the file\n", "stdin comes from the input file");
-        let Outcome::Exited(0, empty) = shell("cat", None, ample) else { panic!() };
+        let empty = shell("cat", None, &mut ample());
+        let Outcome::Exited(0, empty) = empty else { panic!("`cat` of nothing fails: {empty:?}") };
         assert_eq!(empty.stdout, "", "and without one, stdin is empty");
-        let missing =
-            run_bounded(&mut std::process::Command::new("/nonexistent"), None, &log, ample);
-        let Outcome::CouldNotRun(unstarted) = missing else { panic!("{missing:?}") };
+        let mut nonexistent = std::process::Command::new("/nonexistent");
+        let missing = run_bounded(&mut nonexistent, None, &log, &mut ample());
+        let Outcome::CouldNotRun(unstarted) = missing else { panic!("it ran: {missing:?}") };
         assert!(unstarted.starts_with("cannot start: "), "{unstarted}");
-        let signalled = shell("echo before; kill -TERM $$", None, ample);
-        let Outcome::CouldNotRun(ended) = signalled else { panic!("{signalled:?}") };
+        let signalled = shell("echo before; kill -TERM $$", None, &mut ample());
+        let Outcome::CouldNotRun(ended) = signalled else { panic!("it exited: {signalled:?}") };
         assert!(ended.starts_with("ended by signal: 15"), "{ended}");
         assert!(ended.ends_with("before\n"), "with its output: {ended}");
         let mut fifo = std::process::Command::new("mkfifo");
         let made = fifo.arg(scratch.root().join("f")).status().unwrap();
         assert!(made.success(), "the FIFO is made before the check starts");
-        let Outcome::CouldNotRun(killed) = shell("read x < f", None, 5) else { panic!() };
+        let blocked = shell("read x < f", None, &mut budget_with_deadline(5));
+        let Outcome::CouldNotRun(killed) = blocked else { panic!("it ended: {blocked:?}") };
         assert!(killed.starts_with("did not finish within 0 seconds and was killed"), "{killed}");
     }
 
-    // Goal: each deadline leaves time before Claude Code's timeout in `.claude/settings.json`
-    // (120 seconds after an edit, 600 at stop): the edit for its fallback check, the stop for
-    // recording the outcome.
+    // Goal: runs that share a budget never take longer than it, reaps included: what one run
+    // spends, the next cannot, and a spent budget starts nothing. Method: two runs that only a
+    // kill can end share a small budget; the second, and a third, are not started.
     #[test]
-    fn deadlines_are_within_the_hook_timeouts() {
-        use super::{EDIT_CHECK_SECONDS_MAX, GATE_SECONDS_MAX, POLL_INTERVAL_MILLISECONDS};
-        let seconds = |limit| super::polls_in(limit) * POLL_INTERVAL_MILLISECONDS / 1000;
-        assert_eq!(seconds(EDIT_CHECK_SECONDS_MAX), 60, "half of 120");
-        assert_eq!(seconds(GATE_SECONDS_MAX), 480, "two minutes short of 600");
+    fn runs_share_one_budget_and_a_spent_one_starts_nothing() {
+        use super::{Outcome, run_bounded};
+        let scratch = Scratch::new("hook-budget");
+        let log = scratch.root().join("run.log");
+        let mut fifo = std::process::Command::new("mkfifo");
+        let made = fifo.arg(scratch.root().join("f")).status().unwrap();
+        assert!(made.success(), "the FIFO is made before the checks start");
+        let mut budget = budget_with_deadline(5);
+        let total = budget.polls_left;
+        let mut run = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            let command = command.args(["-c", script]).current_dir(scratch.root());
+            run_bounded(command, None, &log, &mut budget)
+        };
+        let first = run("read x < f");
+        let Outcome::CouldNotRun(killed) = first else { panic!("it ended: {first:?}") };
+        assert!(killed.starts_with("did not finish within 0 seconds"), "{killed}");
+        for _ in 0..2 {
+            let next = run("touch started; read x < f");
+            let Outcome::CouldNotRun(refused) = next else { panic!("it ran: {next:?}") };
+            assert_eq!(refused, "was not started: its time budget is spent", "nothing is left");
+        }
+        assert!(!scratch.root().join("started").exists(), "a spent budget starts nothing");
+        assert!(budget.polls_left < total, "the first run spent its share: {budget:?}");
+        assert_eq!(budget.deadline(), 0, "and left no deadline for another");
+    }
+
+    // Goal: the worst case of each hook, every run's deadline and reap within its budget plus
+    // the time the hook keeps for its own work, ends before Claude Code's timeout for that hook
+    // in `.claude/settings.json`: after an edit, the fallback check still runs.
+    #[test]
+    fn budgets_are_within_the_hook_timeouts() {
+        use super::{EDIT_BUDGET_SECONDS_MAX, GATE_SECONDS_MAX, OWN_WORK_SECONDS_MIN};
         let settings =
             std::fs::read_to_string(crate::workspace_root().join(".claude/settings.json"))
                 .expect("the settings are readable");
-        assert_eq!(settings.matches(r#""timeout": 120"#).count(), 2, "edit and session start");
-        assert_eq!(settings.matches(r#""timeout": 600"#).count(), 2, "stop and subagent stop");
+        let settings = crate::json::parse(&settings).expect("the settings are JSON");
+        let timeout = |event: &str| -> u32 {
+            let hook = settings.get("hooks").and_then(|hooks| hooks.get(event));
+            let hook = hook.and_then(|entries| entries.as_array()?.first()?.get("hooks"));
+            let timeout = hook.and_then(|hooks| hooks.as_array()?.first()?.get("timeout"));
+            let Some(crate::json::Value::Number(seconds)) = timeout else {
+                panic!("the {event} hook has no timeout: {timeout:?}");
+            };
+            seconds.parse().expect("the timeout is a whole number of seconds")
+        };
+        let worst = |budget| super::Budget::of_seconds(budget).polls_left;
+        let seconds = |polls: u32| polls * super::POLL_INTERVAL_MILLISECONDS / 1000;
+        let edit = seconds(worst(EDIT_BUDGET_SECONDS_MAX)) + OWN_WORK_SECONDS_MIN;
+        assert!(edit <= timeout("PostToolUse"), "{edit} s exceed the edit hook's timeout");
+        for event in ["Stop", "SubagentStop"] {
+            let stop = seconds(worst(GATE_SECONDS_MAX)) + OWN_WORK_SECONDS_MIN;
+            assert!(stop <= timeout(event), "{stop} s exceed the {event} hook's timeout");
+        }
+        assert_eq!((timeout("PostToolUse"), timeout("Stop")), (120, 600), "the timeouts read");
     }
 
     // Goal: every event name round-trips, and anything else is not an event.

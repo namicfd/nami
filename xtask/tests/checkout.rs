@@ -58,6 +58,22 @@ shift
 exec "$NAMI_TEST_XTASK" "$@"
 "#;
 
+/// A stand-in for `rustfmt`: it records where it runs, the toolchain overrides it inherits and
+/// its arguments, and "formats" stdin by putting a line in front that names the toolchain it ran
+/// with: the inherited override, or the one the checkout pins if there is none. While
+/// `rustfmt-fails` exists, it fails like rustup without the pinned toolchain, unless an
+/// override names another toolchain.
+const FAKE_RUSTFMT: &str = r#"#!/bin/sh
+mkdir -p target
+echo "$PWD|$RUSTUP_TOOLCHAIN|$RUSTUP_TOOLCHAIN_SOURCE|$*" >> target/rustfmt-calls
+if [ -e rustfmt-fails ] && [ -z "$RUSTUP_TOOLCHAIN" ]; then
+    echo "error: toolchain 'pinned' is not installed" >&2
+    exit 1
+fi
+echo "// formatted by ${RUSTUP_TOOLCHAIN:-the pinned toolchain}"
+cat
+"#;
+
 /// Runs git in `directory` with a fixed identity and without the user's hooks or signing.
 fn git_output(directory: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
@@ -101,7 +117,8 @@ impl Scratch {
         scratch.commit("base");
         fs::create_dir_all(scratch.directory.join("bin"))
             .expect("the scratch directory is writable");
-        for (tool_name, script) in [("just", FAKE_JUST), ("cargo", FAKE_CARGO)] {
+        let tools = [("just", FAKE_JUST), ("cargo", FAKE_CARGO), ("rustfmt", FAKE_RUSTFMT)];
+        for (tool_name, script) in tools {
             let tool = scratch.directory.join("bin").join(tool_name);
             fs::write(&tool, script).expect("the scratch directory is writable");
             fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("it is ours");
@@ -607,6 +624,49 @@ fn a_nami_looking_directory_inside_the_project_is_not_a_worktree() {
     assert!(stderr.contains("a.snap.new:0: error[snapshot-draft]"), "by the project: {stderr}");
     assert!(!stderr.contains("could not run"), "no worktree check was tried: {stderr}");
     assert_eq!(cargo_calls(&inner), Vec::<String>::new(), "none of its code ran");
+}
+
+// Goal: an edited Rust file in a worktree is formatted by the rustfmt of the toolchain that
+// worktree pins, with this process's toolchain override removed; if that rustfmt cannot run,
+// this process's own formats the file and says so. Method: a fake `rustfmt` that puts a line
+// in front naming the toolchain it ran with, and fails while `rustfmt-fails` exists unless an
+// override names another toolchain.
+#[test]
+fn rust_files_in_a_worktree_are_formatted_by_its_toolchain() {
+    let scratch = Scratch::new("edit-rustfmt");
+    let project = fs::canonicalize(scratch.root()).expect("the checkout exists");
+    let worktree = scratch.worktree("work");
+    let source = worktree.join("src/lib.rs");
+    fs::create_dir_all(worktree.join("src")).unwrap();
+    fs::write(&source, "fn a() {}\n").unwrap();
+    let toolchain = [
+        ("RUSTUP_TOOLCHAIN", Path::new("the-project-toolchain")),
+        ("RUSTUP_TOOLCHAIN_SOURCE", Path::new("env")),
+    ];
+    let edited = scratch.hook("post-edit", &edit_payload(&project, &source), &toolchain);
+    let stderr = String::from_utf8_lossy(&edited.stderr);
+    assert_eq!(edited.status.code(), Some(0), "the formatted file is clean: {stderr}");
+    let formatted = fs::read_to_string(&source).unwrap();
+    assert_eq!(formatted, "// formatted by the pinned toolchain\nfn a() {}\n", "the worktree's");
+    let pinned = format!("{}|||--edition 2024 --emit stdout", worktree.display());
+    let calls = lines_of(&worktree, "target/rustfmt-calls");
+    assert_eq!(calls, std::slice::from_ref(&pinned), "with the overrides removed");
+
+    fs::write(worktree.join("rustfmt-fails"), "").unwrap();
+    fs::write(&source, "fn b() {}\n").unwrap();
+    let fell_back = scratch.hook("post-edit", &edit_payload(&project, &source), &toolchain);
+    let fell_back_stderr = String::from_utf8_lossy(&fell_back.stderr);
+    let code = fell_back.status.code();
+    assert_eq!(code, Some(0), "the fallback formats it: {fell_back_stderr}");
+    let note = format!("note: the rustfmt that {} pins did not run (exit 1: ", worktree.display());
+    assert!(fell_back_stderr.contains(&note), "and says so: {fell_back_stderr}");
+    let reformatted = fs::read_to_string(&source).unwrap();
+    let expected = "// formatted by the-project-toolchain\nfn b() {}\n";
+    assert_eq!(reformatted, expected, "by this process's rustfmt");
+    let tail = "the-project-toolchain|env|--edition 2024 --emit stdout";
+    let fallback = format!("{}|{tail}", worktree.display());
+    let all_calls = lines_of(&worktree, "target/rustfmt-calls");
+    assert_eq!(all_calls, [pinned.clone(), pinned, fallback], "the worktree's first, then its own");
 }
 
 // Goal: a worktree check that cannot run, because the toolchain it pins is missing, its xtask
