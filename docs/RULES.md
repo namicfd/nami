@@ -6,44 +6,45 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 
 ## Tidy rules
 
-`cargo xtask tidy`. A source rule is decided from one file, so the edit hook can run it on the file that was just edited. A workspace rule needs the whole tree. Every source rule has a firing and a passing example in `xtask/fixtures/tidy/`.
+`cargo xtask tidy`. A source rule is decided from one file, so the edit hook can run it on the file that was just edited. A workspace rule needs the whole tree. Every source rule has a firing and a passing example in `xtask/fixtures/tidy/`. What a rule sees and misses is here, not in `docs/TIGER_STYLE.md`, which states the rule and its reason (rule `doc-tool-name`).
 
-| Rule | Kind | What it requires | Reference |
-| --- | --- | --- | --- |
-| `adr-index` | source | Every ADR is listed in `docs/design/README.md`. | ADR-0000 |
-| `adr-number` | source | No two ADR files share a number, and an ADR's title repeats the number of its file name. | ADR-0000 |
-| `adr-section` | source | Every ADR has the six required sections. | ADR-0000 |
-| `adr-status` | source | Every ADR has a valid status line. | ADR-0000 |
-| `assertion-density` | workspace | Each nami crate averages at least two assertions per non-trivial function. | ADR-0004 |
-| `async` | source | No `async` functions or blocks: functions run to completion. | TIGER_STYLE.md, Control flow |
-| `debt-marker` | source | No unfinished-work markers in Rust sources; unfinished work is a task. | TIGER_STYLE.md, Zero technical debt |
-| `default` | source | No `Default` derives or impls in nami crates: every field is spelled out. | TIGER_STYLE.md, External events and control flow |
-| `dependency-override` | source | The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped for other source code under its own name. | ADR-0001 |
-| `doc-tag` | source | Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a lint that is switched on, or a planned mechanism that exists. | TIGER_STYLE.md, How rules are enforced |
-| `expect-budget` | workspace | The number of `expect(...)` lint suppressions, counted on tokens so that `cfg_attr` and macro bodies are included, equals `xtask/expect-budget.txt`. | ADR-0006 |
-| `float-eq-in-eq-fn` | source | In nami crates outside tests, no `==` or `!=` with a float operand in a function whose name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. Without types, a float operand is a float literal, an `f32`/`f64` constant such as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter declared `f32`/`f64` or an array or slice of them (or a reference to one), indexed or not, until a `let`, closure, `match` arm or `for` rebinds the name. Stricter than clippy on purpose: an exact `== 0.0` is reported too. Not seen: fields, `Option<f64>`, untyped locals, call results, macro arguments. A float parameter rebound by `if let` or `while let` is a false positive. | ADR-0006 |
-| `function-length` | source | Functions are at most 70 physical lines, closures included. | TIGER_STYLE.md, Scope and size |
-| `ignore-reason` | source | `#[ignore]` carries a reason. | ADR-0006 |
-| `kernel-indirection` | source | No `dyn` trait objects and no function pointers in `crates/kernels`. | ADR-0003 |
-| `line-length` | source | Lines in Rust sources are at most 100 columns. | TIGER_STYLE.md, Style by the numbers |
-| `magic-tolerance` | source | In nami crates outside tests, a float literal in (0, 1e-6] appears only in the initialiser of a `const` item that has a doc comment. | TIGER_STYLE.md, Floating point |
-| `parse` | source | Every Rust source file parses. | ADR-0006 |
-| `plan-files` | workspace | Every plan directory under `docs/exec-plans/` holds both `plan.md` and `tasks.json`. | ADR-0011 |
-| `plan-section` | workspace | Every task has a `### <id>` section in its plan's `plan.md`. | ADR-0011 |
-| `plan-stage` | workspace | A plan under `completed/` has no unfinished task. | ADR-0011 |
-| `planned-task` | workspace | Every planned mechanism has a task with the same id in a `tasks.json` under `docs/exec-plans/active/`. | ADR-0018 |
-| `rules-doc` | workspace | `docs/RULES.md` matches what `cargo xtask rules` generates from the registry. | ADR-0018 |
-| `runtime-dependency` | source | Runtime and build dependencies of nami crates are `libm` and workspace crates only, and none is renamed with `package = "..."`. | ADR-0001 |
-| `snapshot-draft` | source | No unreviewed insta snapshots (`*.snap.new`). | ADR-0006 |
-| `task-graph` | workspace | Task ids are unique, every dependency exists, no task passes before its dependencies, and the dependencies form no cycle. | ADR-0011 |
-| `task-owner-paths` | workspace | Two unfinished tasks that can run at the same time own no common path. | ADR-0011 |
-| `tasks-json` | workspace | Every `tasks.json` is valid JSON with one `tasks` array, and every task has exactly the six fields of the schema. | ADR-0011 |
-| `test-goal` | source | Every test starts with a comment that states its goal. | TIGER_STYLE.md, Comments, docs and commits |
-| `unasserted-function` | source | A function in a nami crate longer than 10 lines contains an assertion. | ADR-0004 |
-| `unbounded-loop` | source | No `loop`, no `while`, and no `for` over a range without an end, over `repeat`, `repeat_with`, `from_fn` or `successors` from `core::iter`, or over `cycle`, unless `take` or `zip` bounds it: every loop has a fixed upper bound. | TIGER_STYLE.md, Put a limit on everything |
-| `unsafe` | source | `unsafe` appears only in `crates/alloc-guard`. | ADR-0014 |
-| `usize` | source | In nami crates, `usize` appears in function signatures, fields, public constants and statics, and type aliases only in `base::index`. Trait impls and const generics are exempt. | ADR-0002 |
-| `vec-field` | source | No `Vec` anywhere inside a field type in nami crates: fixed-size storage is `Box<[T]>`. | ADR-0003 |
+| Rule | Kind | What it requires | What it sees and misses | Reference |
+| --- | --- | --- | --- | --- |
+| `adr-index` | source | Every ADR is listed in `docs/design/README.md`. |  | ADR-0000 |
+| `adr-number` | source | No two ADR files share a number, and an ADR's title repeats the number of its file name. |  | ADR-0000 |
+| `adr-section` | source | Every ADR has the six required sections. |  | ADR-0000 |
+| `adr-status` | source | Every ADR has a valid status line. |  | ADR-0000 |
+| `assertion-density` | workspace | Each nami crate averages at least two assertions per non-trivial function. |  | ADR-0004 |
+| `async` | source | No `async` functions or blocks: functions run to completion. |  | TIGER_STYLE.md, Control flow |
+| `debt-marker` | source | No unfinished-work markers in Rust sources; unfinished work is a task. |  | TIGER_STYLE.md, Zero technical debt |
+| `default` | source | No `Default` derives or impls in nami crates: every field is spelled out. |  | TIGER_STYLE.md, External events and control flow |
+| `dependency-override` | source | The workspace manifest has no `[patch]` or `[replace]`: no dependency is swapped for other source code under its own name. | `cargo deny` rejects a git override but not a path override. | ADR-0001 |
+| `doc-tag` | source | Every mechanism tag in `docs/TIGER_STYLE.md` has a known form and names a tidy rule, a lint that is switched on, or a planned mechanism that exists. |  | TIGER_STYLE.md, How rules are enforced |
+| `doc-tool-name` | source | The rules of `docs/TIGER_STYLE.md` do not name a checking tool in their prose: the tag names the mechanism, and what it sees and misses is in the registry and in this document. | Read from the first `## ` heading on, outside fenced code blocks, line by line and ignoring case. It reports the words `tidy`, `clippy`, `dylint`, `rustfmt`, `rustc`, `lints`, `nextest`, `miri`, `cargo-deny` and `cargo-mutants`, and the phrases `cargo deny`, `cargo mutants` and `the lint`, as whole words in the prose outside code spans. A dash ends a word, so `clippy-clean` is reported. A code span counts when it runs that tool: the name alone or followed by arguments, after any `VAR=value` words, and after a runner (`just`, `cargo` or `cargo xtask`) and the options that precede the tool (`+nightly`, `--locked`), such as `cargo xtask tidy` or `just dylint`; so a tag, `clippy.toml` and `clippy::float_cmp` are not reported. `just` alone is left out because it is an everyday English word. A rule line with an odd number of backticks is reported too, because a code span that runs across lines would swap code and prose. Known false positives, which have to be reworded: tidy as an English adjective, and lints as a verb. Not seen: a phrase broken across two lines, and prose that describes a check without naming its tool, such as a list of the syntax a rule reports. A foreign gate (`--policy`) runs this rule too, because it reads only the style guide's text. | TIGER_STYLE.md, How rules are enforced |
+| `expect-budget` | workspace | The number of `expect(...)` lint suppressions equals `xtask/expect-budget.txt`. | Counted on tokens, so that `cfg_attr` and macro bodies are included. | ADR-0006 |
+| `float-eq-in-eq-fn` | source | In nami crates outside tests, no `==` or `!=` with a float operand in a function whose name contains `eq` or is `ne` or `is_nan`, where clippy's `float_cmp` is silent. | Without types, a float operand is a float literal, an `f32`/`f64` constant such as `f64::NAN`, a cast to `f32`/`f64`, or a parameter, `let` or closure parameter declared `f32`/`f64` or an array or slice of them (or a reference to one), indexed or not, until a `let`, closure, `match` arm or `for` rebinds the name. Stricter than clippy on purpose: an exact `== 0.0` is reported too. Not seen: fields, `Option<f64>`, untyped locals, call results, macro arguments. A float parameter rebound by `if let` or `while let` is a false positive. | ADR-0006 |
+| `function-length` | source | Functions are at most 70 physical lines, closures included. |  | TIGER_STYLE.md, Scope and size |
+| `ignore-reason` | source | `#[ignore]` carries a reason. |  | ADR-0006 |
+| `kernel-indirection` | source | No `dyn` trait objects and no function pointers in `crates/kernels`. |  | ADR-0003 |
+| `line-length` | source | Lines in Rust sources are at most 100 columns. | rustfmt cannot wrap long string literals or comments, so tidy checks the limit. | TIGER_STYLE.md, Style by the numbers |
+| `magic-tolerance` | source | In nami crates outside tests, a float literal in (0, 1e-6] appears only in the initialiser of a `const` item that has a doc comment. |  | TIGER_STYLE.md, Floating point |
+| `parse` | source | Every Rust source file parses. |  | ADR-0006 |
+| `plan-files` | workspace | Every plan directory under `docs/exec-plans/` holds both `plan.md` and `tasks.json`. |  | ADR-0011 |
+| `plan-section` | workspace | Every task has a `### <id>` section in its plan's `plan.md`. |  | ADR-0011 |
+| `plan-stage` | workspace | A plan under `completed/` has no unfinished task. |  | ADR-0011 |
+| `planned-task` | workspace | Every planned mechanism has a task with the same id in a `tasks.json` under `docs/exec-plans/active/`. |  | ADR-0018 |
+| `rules-doc` | workspace | `docs/RULES.md` matches what `cargo xtask rules` generates from the registry. |  | ADR-0018 |
+| `runtime-dependency` | source | Runtime and build dependencies of nami crates are `libm` and workspace crates only, and none is renamed with `package = "..."`. |  | ADR-0001 |
+| `snapshot-draft` | source | No unreviewed insta snapshots (`*.snap.new`). |  | ADR-0006 |
+| `task-graph` | workspace | Task ids are unique, every dependency exists, no task passes before its dependencies, and the dependencies form no cycle. |  | ADR-0011 |
+| `task-owner-paths` | workspace | Two unfinished tasks that can run at the same time own no common path. |  | ADR-0011 |
+| `tasks-json` | workspace | Every `tasks.json` is valid JSON with one `tasks` array, and every task has exactly the six fields of the schema. |  | ADR-0011 |
+| `test-goal` | source | Every test starts with a comment that states its goal. |  | TIGER_STYLE.md, Comments, docs and commits |
+| `unasserted-function` | source | A function in a nami crate longer than 10 lines contains an assertion. |  | ADR-0004 |
+| `unbounded-loop` | source | No `loop`, no `while`, and no `for` over a range without an end or an endless `core::iter` source: every loop has a fixed upper bound. | Every `loop` and `while` is reported. A `for` is reported when its iterable, under parentheses, references and any adaptor, starts from a range without an end (`start..`), from `cycle()` (also as `Iterator::cycle`), or from `repeat`, `repeat_with`, `from_fn` or `successors` called by a bare name or through a path that ends in `iter::`, and no `take` follows that source. A `zip` is endless only if both sides are, a `chain` if either side is. A bare `from_fn` imported from elsewhere, such as `core::array::from_fn`, is reported too: call it by a qualified path. An iterable that takes more than 256 steps to walk, counting each expression and each combine, is reported. Not seen, and for review: any other iterator that never ends, such as a custom one, one held in a variable, or one returned by a function. | TIGER_STYLE.md, Put a limit on everything |
+| `unsafe` | source | `unsafe` appears only in `crates/alloc-guard`. |  | ADR-0014 |
+| `usize` | source | In nami crates, `usize` appears in function signatures, fields, public constants and statics, and type aliases only in `base::index`. | Trait impls and const generics are exempt. | ADR-0002 |
+| `vec-field` | source | No `Vec` anywhere inside a field type in nami crates: fixed-size storage is `Box<[T]>`. |  | ADR-0003 |
 
 ## Tidy bans
 
@@ -56,16 +57,16 @@ Declarative source rules: a ban is one row in `PATH_BANS` or `MACRO_BANS` plus t
 
 ## Dylint lints
 
-`just dylint`, part of `just check-full`. Declared in `lints/src/`, on a pinned nightly. A lint gates only at `Deny`, because the recipe does not deny warnings.
+`just dylint`, part of `just check-full`. Declared in `lints/src/`, on a pinned nightly. A lint gates only at `Deny`, because the recipe does not deny warnings. What it sees and misses is the `### What it does` section of its doc comment.
 
-| Lint | Level | What it reports |
-| --- | --- | --- |
-| `nami_float_reduction` | Deny | naive float sum (ADR-0005) |
-| `nami_recursion` | Deny | function that can call itself (ADR-0006) |
+| Lint | Level | What it reports | What it sees and misses |
+| --- | --- | --- | --- |
+| `nami_float_reduction` | Deny | naive float sum (ADR-0005) | Reports `sum` and `product` with a float result, also inside `Option` or `Result`, and `fold`, `rfold`, `try_fold`, `try_rfold` and `reduce` with a float accumulator whose function adds to or subtracts from it: a path to `Add::add` or `Sub::sub` such as `f64::add`, or a closure in which the accumulator is an operand of `+`, `-`, `+=`, `-=`, `add`, `sub`, `add_assign`, `sub_assign`, or the addend of a `mul_add`. An argmin or argmax closure, which only compares differences with the accumulator and returns its parameters unchanged, is exempt; an addition never is. Test code is exempt. A sum written as a `for` loop is not seen, and is for review. |
+| `nami_recursion` | Deny | function that can call itself (ADR-0006) | Reports functions that call themselves, directly or through other functions, including through closures, through trait methods resolved to a concrete impl, through generic functions that call back into a trait impl, through functions passed as values, and through overloaded operators and derefs. |
 
 ## Clippy and rustc lints
 
-The lint tables are `[workspace.lints.rust]` and `[workspace.lints.clippy]` in the root `Cargo.toml`. The banned methods and types, each with a reason that names the replacement, are in `clippy.toml`. `just clippy` denies warnings. A lint that a tag in `docs/TIGER_STYLE.md` names cannot be removed or set to `allow` without `doc-tag` failing.
+The lint tables are `[workspace.lints.rust]` and `[workspace.lints.clippy]` in the root `Cargo.toml`. The workspace lints are pedantic plus selected restriction lints, and `-D warnings` applies in `just` and CI. The banned methods and types, each with a reason that names the replacement, are in `clippy.toml`. `just clippy` denies warnings. A lint that a tag in `docs/TIGER_STYLE.md` names cannot be removed or set to `allow` without `doc-tag` failing.
 
 ## Planned mechanisms
 
@@ -73,7 +74,7 @@ Promised in the documents and not built yet. The style guide tags the rules they
 
 | Id | Intended mechanism | What it will check | Reference |
 | --- | --- | --- | --- |
-| `alloc-after-init` | test | A counting-allocator test around the time loop proves that nothing allocates after init. | ADR-0003 |
+| `alloc-after-init` | test | A counting-allocator test around the time loop proves that nothing allocates after init. The counting allocator (`crates/alloc-guard`) already fails any test that allocates inside `assert_no_allocations`; wrapping the time loop in it is still to do. | ADR-0003 |
 | `clippy-fixtures` | test | One planted violation per clippy ban and configured lint proves that each still fires after a toolchain bump. | ADR-0006 |
 | `determinism-hash` | ci | CI hashes the output of a canonical problem set and compares Linux, macOS and a same-seed rerun. | ADR-0005 |
 | `doc-example-sync` | test | The code blocks in `docs/TIGER_STYLE.md` are compiled and linted, so the examples cannot drift from the rules. | ADR-0013 |
@@ -87,8 +88,8 @@ Promised in the documents and not built yet. The style guide tags the rules they
 
 ## Rules left to review
 
-`docs/TIGER_STYLE.md` carries 47 `[review]` tags: rules, or parts of rules, that no tool checks and that the AI reviewer and the human reviewer have to hold. A rule that keeps getting broken in review is a candidate for a mechanism.
+`docs/TIGER_STYLE.md` carries 48 `[review]` tags: rules, or parts of rules, that no tool checks and that the AI reviewer and the human reviewer have to hold. A rule that keeps getting broken in review is a candidate for a mechanism.
 
 ## Checking another revision's tree
 
-`cargo xtask tidy --root <dir>` checks another tree with this binary. With `--policy <dir>` it acts as a foreign gate: CI runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by weakening its own gate. In that mode the `#[expect]` budget is read from the policy directory, and the rules that compare the tree's documents with the binary's own registry are skipped, because a tree with a different registry fails them by construction: `doc-tag`, `planned-task`, `rules-doc`.
+`cargo xtask tidy --root <dir>` checks another tree with this binary. With `--policy <dir>` it acts as a foreign gate: CI runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by weakening its own gate. In that mode the `#[expect]` budget is read from the policy directory, and the rules that compare the tree's documents with the binary's own registry are skipped, because a tree with a different registry fails them by construction: `doc-tag`, `planned-task`, `rules-doc`. Every other rule runs, `doc-tool-name` on the style guide included, because it reads only the guide's text.

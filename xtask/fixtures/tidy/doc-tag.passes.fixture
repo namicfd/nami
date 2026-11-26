@@ -6,11 +6,11 @@ The legend above the first section describes the forms with placeholders, such a
 
 ## Rules
 
-- A tidy rule and a ban. `[tidy:line-length]` `[tidy:direct-libm]`
-- A clippy lint that is switched on, and a lint of the pedantic group. `[clippy:unwrap_used]`
+- A rule and a ban of the registry. `[tidy:line-length]` `[tidy:direct-libm]`
+- A lint that is switched on, and one of the pedantic group. `[clippy:unwrap_used]`
   `[clippy:pedantic]`
-- A rustc lint that is switched on. `[rustc:missing_docs]`
-- A dylint lint that is declared. `[dylint:nami_recursion]`
+- A compiler lint that is switched on. `[rustc:missing_docs]`
+- A lint of the project library that is declared. `[dylint:nami_recursion]`
 - A mechanism that is planned, next to judgement. `[planned:glossary]` `[review]`
 - The plain mechanisms. `[compiler]` `[fmt]` `[deny]`
 - Code in backticks is not a tag: `[f64; NVAR]` states and `field[CellIndex]` gathers.

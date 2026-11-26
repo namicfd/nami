@@ -37,20 +37,104 @@ impl DylintLint {
     }
 }
 
+/// The doc section that says what a lint sees and misses, the dylint counterpart of a tidy
+/// rule's `detail` in the registry.
+const WHAT_IT_DOES: &str = "### What it does";
+
 /// Every lint declared below `lints/src/`, sorted by name. A tree without that directory has
 /// no lints.
 pub fn declared(root: &Path) -> io::Result<Vec<DylintLint>> {
-    let mut lints = Vec::new();
+    let mut lints: Vec<DylintLint> =
+        sources(root)?.iter().flat_map(|text| declarations_in(text)).collect();
+    lints.sort();
+    Ok(lints)
+}
+
+/// The `### What it does` section of each lint's doc comment, as one paragraph, by lower-case
+/// lint name and sorted by it. A lint without that section has none here.
+pub fn documented(root: &Path) -> io::Result<Vec<(String, String)>> {
+    let mut found: Vec<(String, String)> =
+        sources(root)?.iter().flat_map(|text| documentation_in(text)).collect();
+    found.sort();
+    Ok(found)
+}
+
+/// The text of every Rust file below `lints/src/`.
+fn sources(root: &Path) -> io::Result<Vec<String>> {
+    let mut texts = Vec::new();
     if !root.join(LINT_SOURCES).is_dir() {
-        return Ok(lints);
+        return Ok(texts);
     }
     for relative in super::files_below(root, Path::new(LINT_SOURCES))? {
         if relative.extension().is_some_and(|extension| extension == "rs") {
-            lints.extend(declarations_in(&fs::read_to_string(root.join(&relative))?));
+            texts.push(fs::read_to_string(root.join(&relative))?);
         }
     }
-    lints.sort();
-    Ok(lints)
+    Ok(texts)
+}
+
+/// The `### What it does` section of each declaration in one file: the doc comment lines
+/// right before `pub NAME, Level, "description"`, from that heading to the next one.
+fn documentation_in(text: &str) -> Vec<(String, String)> {
+    let Ok(stream) = text.parse::<TokenStream>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for sequence in tokens::sequences(stream) {
+        for (start, window) in sequence.windows(6).enumerate() {
+            let Some(lint) = declaration(window) else {
+                continue;
+            };
+            let lines = doc_lines_before(sequence.get(..start).unwrap_or_default());
+            if let Some(section) = what_it_does(&lines) {
+                found.push((lint.name, section));
+            }
+        }
+    }
+    found
+}
+
+/// The doc comment lines that end right before `tokens` end: `///` comments lex as
+/// `# [doc = "..."]`, so the walk goes back over those pairs.
+fn doc_lines_before(tokens: &[TokenTree]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = tokens;
+    for _ in 0..tokens.len() {
+        let [before @ .., hash, TokenTree::Group(attribute)] = rest else {
+            break;
+        };
+        let Some(line) = doc_text(attribute).filter(|_| tokens::is_punct(hash, '#')) else {
+            break;
+        };
+        lines.push(line);
+        rest = before;
+    }
+    let stopped = !matches!(rest, [.., hash, TokenTree::Group(attribute)]
+        if tokens::is_punct(hash, '#') && doc_text(attribute).is_some());
+    assert!(stopped, "the walk takes every doc line before the declaration");
+    lines.reverse();
+    lines
+}
+
+/// The text of a `[doc = "..."]` attribute group.
+fn doc_text(attribute: &proc_macro2::Group) -> Option<String> {
+    let inner: Vec<TokenTree> = attribute.stream().into_iter().collect();
+    let [TokenTree::Ident(name), equals, TokenTree::Literal(literal)] = inner.as_slice() else {
+        return None;
+    };
+    let syn::Lit::Str(text) = syn::Lit::new(literal.clone()) else {
+        return None;
+    };
+    (name == "doc" && tokens::is_punct(equals, '=')).then(|| text.value())
+}
+
+/// The lines after `### What it does` and before the next `###` heading, joined into one
+/// paragraph. `None` without that heading or without text under it.
+fn what_it_does(lines: &[String]) -> Option<String> {
+    let start = lines.iter().position(|line| line.trim() == WHAT_IT_DOES)?;
+    let body = lines.iter().skip(start + 1).take_while(|line| !line.trim().starts_with("###"));
+    let words: Vec<&str> = body.map(|line| line.trim()).filter(|line| !line.is_empty()).collect();
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// The lint declarations in one source file. A declaration is the token run
@@ -94,7 +178,7 @@ fn declaration(window: &[TokenTree]) -> Option<DylintLint> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DylintLint, declarations_in, declared};
+    use super::{DylintLint, declarations_in, declared, documentation_in, documented};
     use crate::tidy::scratch::Scratch;
 
     const DECLARATION: &str = "dylint_linting::declare_late_lint! {\n    /// ### What it does\n    \
@@ -158,5 +242,43 @@ mod tests {
         assert_eq!(names, ["a_first", "nami_recursion"]);
         let real = declared(&crate::workspace_root()).unwrap();
         assert!(real.iter().any(|lint| lint.name == "nami_recursion" && lint.is_enforced()));
+    }
+
+    // Goal: the `### What it does` section of a declaration's doc comment is read as one
+    // paragraph, up to the next heading; other doc text and undocumented lints give nothing.
+    #[test]
+    fn what_it_does_is_read() {
+        let expected = ("nami_recursion".to_owned(), "Reports recursion.".to_owned());
+        assert_eq!(documentation_in(DECLARATION), [expected]);
+        let two = "m! {\n/// Intro.\n/// ### What it does\n///\n/// Reports `a`,\n/// and `b`.\n\
+                   ///\n/// More.\n/// ### Why is this bad?\n/// Reasons.\npub A, Deny, \"x\" }";
+        let section = ("a".to_owned(), "Reports `a`, and `b`. More.".to_owned());
+        assert_eq!(documentation_in(two), [section]);
+        assert_eq!(documentation_in("m! { /// Plain docs.\n pub A, Deny, \"x\" }"), []);
+        assert_eq!(documentation_in("m! { /// ### What it does\n pub A, Deny, \"x\" }"), []);
+        assert_eq!(documentation_in("m! { pub A, Deny, \"x\" }"), [], "no doc comment");
+        let other_attribute = "m! { /// ### What it does\n/// X.\n#[allow(y)] pub A, Deny, \"x\" }";
+        assert_eq!(documentation_in(other_attribute), [], "the docs must end at the declaration");
+        assert_eq!(documentation_in("fn broken( {"), [], "a file that does not lex");
+        let real = documented(&crate::workspace_root()).unwrap();
+        assert!(
+            real.iter().any(|(name, text)| name == "nami_recursion" && text.starts_with("Reports"))
+        );
+        assert_eq!(documented(&crate::workspace_root().join("no-such-dir")).unwrap(), []);
+    }
+
+    // Goal: every lint that gates says what it sees and misses, because docs/RULES.md shows
+    // that section and the style guide no longer does.
+    #[test]
+    fn every_enforced_lint_has_what_it_does() {
+        let root = crate::workspace_root();
+        let documented = documented(&root).unwrap();
+        let enforced: Vec<DylintLint> =
+            declared(&root).unwrap().into_iter().filter(DylintLint::is_enforced).collect();
+        assert!(!enforced.is_empty(), "the project declares lints that gate");
+        for lint in enforced {
+            let found = documented.iter().any(|(name, _)| *name == lint.name);
+            assert!(found, "`{}` needs a `### What it does` section in its doc", lint.name);
+        }
     }
 }
