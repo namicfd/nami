@@ -4,9 +4,12 @@
 //! The rule: the reviewer app (`nami-reviewer[bot]`, a GitHub App separate from the agents'
 //! `nami-agent[bot]`, whose key the authoring sessions never hold) has submitted a review on
 //! the PR's head commit that is not dismissed; the PR was not opened by that app; and every
-//! review thread is resolved, by that app. A review of an earlier commit does not count, not
-//! even when the later commits are fixes: `review-pr` re-reviews the new head and resolves the
-//! threads that are fixed then.
+//! review thread that the app opened is resolved, by that app. The ratchet counts only the
+//! app's own threads: it reports a thread of someone else's that the app resolved, because a
+//! stolen reviewer token could otherwise clear a human's objection. Everyone else's threads
+//! are left to the ruleset, which requires every conversation resolved before merge. A review
+//! of an earlier commit does not count, not even when the later commits are fixes: `review-pr`
+//! re-reviews the new head and resolves the threads that are fixed then.
 //!
 //! [`Reviews`] is what the check needs from GitHub. [`GhReviews`] asks through `gh api`, as
 //! whoever `GH_TOKEN` names; the tests use fixed data.
@@ -123,18 +126,24 @@ pub fn check(reviews: &dyn Reviews, pull: u32, reviewer: &str) -> Result<Vec<Fin
         ));
     }
     for thread in reviews.threads(pull)? {
-        match &thread.resolved_by {
-            None => report(format!(
+        let opened_by_reviewer = bare(&thread.author) == bare(reviewer);
+        match (&thread.resolved_by, opened_by_reviewer) {
+            (None, true) => report(format!(
                 "a review thread by {} on {} is not resolved; fix it, or answer why the finding \
                  is wrong, and have the reviewer resolve it (ADR-0008)",
                 thread.author, thread.path
             )),
-            Some(by) if bare(by) != bare(reviewer) => report(format!(
+            (Some(by), true) if bare(by) != bare(reviewer) => report(format!(
                 "a review thread on {} was resolved by {by}, not by {reviewer}; only the \
-                 reviewer resolves threads for the ratchet (ADR-0022)",
+                 reviewer resolves its threads for the ratchet (ADR-0022)",
                 thread.path
             )),
-            Some(_) => {}
+            (Some(by), false) if bare(by) == bare(reviewer) => report(format!(
+                "{reviewer} resolved a review thread by {} on {}; the reviewer resolves only \
+                 its own threads, so whoever opened it must resolve it (ADR-0022)",
+                thread.author, thread.path
+            )),
+            _ => {}
         }
     }
     Ok(findings)
@@ -343,6 +352,10 @@ mod tests {
         }
     }
 
+    fn human_thread(resolved_by: Option<&str>) -> Thread {
+        Thread { author: "maintainer".to_owned(), ..thread(resolved_by) }
+    }
+
     fn messages(fixed: &Fixed) -> Vec<String> {
         check(fixed, 7, REVIEWER_APP).unwrap().into_iter().map(|finding| finding.message).collect()
     }
@@ -491,5 +504,22 @@ esac
         assert!(!approved(vec![review("owner", "a", "APPROVED")]));
         assert!(!approved(vec![review(REVIEWER_APP, "b", "APPROVED")]));
         assert!(!approved(vec![]));
+    }
+
+    // Goal: only the reviewer app's own threads count: someone else's thread is left to the
+    // ruleset whether resolved or not, unless the reviewer app resolved it, which is a finding.
+    #[test]
+    fn only_the_reviewer_s_own_threads_count() {
+        let with = |threads: Vec<Thread>| Fixed {
+            author: AUTHOR_APP,
+            reviews: vec![review(REVIEWER_APP, "b", "COMMENTED")],
+            threads,
+        };
+        assert_eq!(messages(&with(vec![human_thread(None)])), Vec::<String>::new());
+        assert_eq!(messages(&with(vec![human_thread(Some("maintainer"))])), Vec::<String>::new());
+        let cleared = messages(&with(vec![human_thread(Some("nami-reviewer"))]));
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert!(cleared[0].contains("resolved a review thread by maintainer"), "{cleared:?}");
+        assert_eq!(messages(&with(vec![thread(None)])).len(), 1, "its own open thread");
     }
 }
