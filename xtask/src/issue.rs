@@ -675,6 +675,9 @@ mod tests {
         fn is_queued(&self, number: u32) -> Result<bool, String> {
             Err(format!("the issue commands never ask whether #{number} is queued"))
         }
+        fn head_is_here(&self, number: u32) -> Result<bool, String> {
+            Err(format!("the issue commands never ask where #{number}'s head is"))
+        }
     }
 
     fn trust() -> Trust {

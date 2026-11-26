@@ -917,6 +917,9 @@ impl GitHub for Issues {
     fn is_queued(&self, _number: u32) -> Result<bool, String> {
         Err("not used".to_owned())
     }
+    fn head_is_here(&self, _number: u32) -> Result<bool, String> {
+        Err("not used".to_owned())
+    }
 }
 
 // Goal: `pr-body` checks a description against the real changes, the code owners on the base

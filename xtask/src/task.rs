@@ -350,6 +350,9 @@ fn queue_failure_pull(found: &Issue) -> Option<u32> {
 ///   the PR's merge closes the issue;
 /// - the PR is closed or merged while the issue is open, or the number is no PR: nobody can
 ///   push a fix there, and a human closes the issue;
+/// - the PR was not opened by the bot, or its branch is not in this repository: agents check
+///   out and push only the bot's own branches here, whatever the issue's labels say
+///   (ADR-0023), and a human handles it;
 /// - the PR is in the merge queue: a push would take it out again. If it fails there, the
 ///   new run gets its own issue.
 ///
@@ -372,6 +375,18 @@ fn queue_failure_hold(
         format!("#{pull} was not opened by the bot, so agents never push to it; a human rebases it")
     } else if !fix.is_open {
         format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")
+    } else if fix.author != trust::BOT_LOGIN {
+        format!(
+            "#{pull} was opened by `{}`, not by `{}`, so agents do not push to it; a human \
+             rebases or renumbers it, re-queues it and closes issue #{number}",
+            fix.author,
+            trust::BOT_LOGIN
+        )
+    } else if !github.head_is_here(pull)? {
+        format!(
+            "#{pull}'s branch is not in this repository (a fork's, or deleted), so agents do not \
+             check it out or push to it; a human handles #{pull} and closes issue #{number}"
+        )
     } else if crate::pr::closes(&fix.body, number, repository) {
         format!(
             "#{pull} says `Fixes #{number}`: the fix is in flight and #{pull}'s merge closes the \

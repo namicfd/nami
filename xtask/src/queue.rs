@@ -616,10 +616,14 @@ mod tests {
             self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
         }
+        fn head_is_here(&self, number: u32) -> Result<bool, String> {
+            self.serve(Serves::WorkflowToken);
+            Err(format!("not asked for #{number}: the queue commands check out no PR"))
+        }
     }
 
     fn trust() -> Trust {
-        Trust::from_codeowners("/docs/design/ @owner\n").with_vocabulary(vocabulary())
+        Trust::from_codeowners("/docs/design/ @owner\n").with_ci(vocabulary(), "namicfd/nami")
     }
 
     fn vocabulary() -> Vocabulary {
@@ -943,6 +947,26 @@ mod tests {
             "the CI app's earlier issue: {}",
             filed[0].1
         );
+    }
+
+    // Goal: open issues by the CI app with a queue-failure title for #51 and a hostile body
+    // neither make `queue failed` panic nor count as earlier failures: the new issue is filed
+    // and names none of them.
+    #[test]
+    fn hostile_ci_issues_never_stop_the_filing() {
+        let hostile: String = super::shape::tests::hostile_bodies()
+            .iter()
+            .zip(80..)
+            .map(|(body, number)| {
+                let title = super::failure::title(51, 9);
+                issue_line_with_body(number, &title, CI_LOGIN, "open", body)
+            })
+            .collect();
+        let fake = Fake { issues: issues() + &hostile, ..dropped() };
+        let output = run(&fake, &["failed", "--run", "900"]).expect("filed");
+        assert_eq!(output, "filed #70: PR #51 failed in the merge queue (run 900)\n");
+        let filed = fake.filed.borrow();
+        assert!(!filed[0].1.contains("still open"), "no hostile issue counts: {}", filed[0].1);
     }
 
     // Goal: wired as in production, the clash comment is read and posted with the workflow's

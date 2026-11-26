@@ -16,6 +16,8 @@ struct Fake {
     events: Vec<(u32, LabelEvent)>,
     comments: Vec<(u32, Comment)>,
     queued: Vec<u32>,
+    /// The pull requests whose head branch is in a fork.
+    forks: Vec<u32>,
     is_down: bool,
     is_label_gone: bool,
     asked: RefCell<Vec<u32>>,
@@ -64,6 +66,13 @@ impl GitHub for Fake {
             Err("GitHub is down".to_owned())
         } else {
             Ok(self.queued.contains(&number))
+        }
+    }
+    fn head_is_here(&self, number: u32) -> Result<bool, String> {
+        if self.is_down {
+            Err("GitHub is down".to_owned())
+        } else {
+            Ok(!self.forks.contains(&number))
         }
     }
 }
@@ -427,6 +436,7 @@ fn queue_failures_wait_for_their_fix() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+<<<<<<< HEAD
 // Goal: without the repository's `needs-decision` label, renamed or deleted, nobody can tell
 // which issues wait for a decision: `ready` lists no issue and says why, still naming the plan
 // tasks, and `claim` refuses every issue.
@@ -464,42 +474,67 @@ fn a_humans_failed_pull_request_is_held_without_the_label() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+/// A fixture whose `main` has a `ci.yml` and whose `origin` stands for
+/// `https://github.com/namicfd/nami`, rewritten to the local remote, so that the CI app's
+/// issues can be checked; and the vocabulary of that `main`.
+fn ci_setup(name: &str) -> (PathBuf, PathBuf, xtask::queue::failure::Vocabulary) {
+    let (root, clone) = setup(name);
+    std::fs::create_dir_all(clone.join(".github/workflows")).expect("directory is writable");
+    let workflow = "name: ci\njobs:\n  gate:\n    name: gate\n";
+    std::fs::write(clone.join(".github/workflows/ci.yml"), workflow).expect("file is written");
+    let github = "https://github.com/namicfd/nami";
+    let local = root.join("remote.git");
+    let rewrite = format!("url.{}.insteadOf", local.display());
+    let _ = git(&clone, &["config", "remote.origin.url", github]);
+    let _ = git(&clone, &["config", &rewrite, github]);
+    push_code_owners(&clone);
+    let vocabulary = xtask::queue::failure::Vocabulary::load(&clone, "origin/main")
+        .expect("main's ci.yml is readable");
+    (root, clone, vocabulary)
+}
+
+/// The CI app's issue #`number` with the title and body that `queue failed` writes for run
+/// `run` of PR #45 in `repository`.
+fn ci_failure(
+    vocabulary: &xtask::queue::failure::Vocabulary,
+    number: u32,
+    run: u64,
+    repository: &str,
+) -> Issue {
+    let report = xtask::queue::failure::Failure {
+        pull: 45,
+        author: "nami-agent[bot]".to_owned(),
+        group: std::collections::BTreeSet::new(),
+        repository: repository.to_owned(),
+        run,
+        jobs: Vec::new(),
+        earlier: std::collections::BTreeSet::new(),
+    };
+    let finding = xtask::queue::failure::finding(&report, vocabulary);
+    let draft = xtask::issue::Draft::parse(&finding).expect("the finding parses");
+    Issue { author: "nami-ci[bot]".to_owned(), body: draft.body, ..queue_failure(number, run) }
+}
+
 // Goal: a queue-failure issue that the CI app filed waits for its fix like the bot's, and is
 // claimed for the PR's own branch; any other issue by the CI app, also one with the right
 // title and a body that `queue failed` did not write, is neither listed nor claimable
 // (ADR-0023). Its body is checked against the vocabulary of `main`'s `ci.yml`.
 #[test]
 fn the_ci_apps_queue_failures_wait_like_the_bots() {
-    let (root, clone) = setup("queue-failures-ci");
-    std::fs::create_dir_all(clone.join(".github/workflows")).expect("directory is writable");
-    let workflow = "name: ci\njobs:\n  gate:\n    name: gate\n";
-    std::fs::write(clone.join(".github/workflows/ci.yml"), workflow).expect("file is written");
-    push_code_owners(&clone);
-    let vocabulary = xtask::queue::failure::Vocabulary::load(&clone, "origin/main")
-        .expect("main's ci.yml is readable");
-    let report = xtask::queue::failure::Failure {
-        pull: 45,
-        author: "nami-agent[bot]".to_owned(),
-        group: std::collections::BTreeSet::new(),
-        repository: "namicfd/nami".to_owned(),
-        run: 900,
-        jobs: Vec::new(),
-        earlier: std::collections::BTreeSet::new(),
-    };
-    let finding = xtask::queue::failure::finding(&report, &vocabulary);
-    let draft = xtask::issue::Draft::parse(&finding).expect("the finding parses");
-    let failure =
-        Issue { author: "nami-ci[bot]".to_owned(), body: draft.body, ..queue_failure(3, 900) };
+    let (root, clone, vocabulary) = ci_setup("queue-failures-ci");
+    let failure = ci_failure(&vocabulary, 3, 900, "namicfd/nami");
     let listed = format!("a\tTask a\nissue-3\t{}\n", failure.title);
     let other = issue(5, "nami-ci[bot]", &["bug"]);
     let tampered = Issue { number: 6, body: failure.body.clone() + "More.\n", ..failure.clone() };
+    let foreign = ci_failure(&vocabulary, 7, 901, "attacker/evil");
     let pulls = pull_45("Fixes #3");
-    let mut github = Fake { issues: vec![failure, other, pulls, tampered], ..Fake::default() };
+    let issues = vec![failure, other, pulls, tampered, foreign];
+    let mut github = Fake { issues, ..Fake::default() };
     let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
     assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "#3 waits, #5 is out");
     let refused = task(&github, &["claim", "issue-3"]).expect_err("it waits");
     assert!(refused.contains("#45 says `Fixes #3`: the fix is in flight"), "{refused}");
-    for number in ["5", "6"] {
+    for number in ["5", "6", "7"] {
         let untrusted = task(&github, &["claim", &format!("issue-{number}")])
             .expect_err("not what queue failed writes");
         assert!(untrusted.contains("`nami-ci[bot]`, whom agents trust only"), "{untrusted}");
@@ -508,6 +543,67 @@ fn the_ci_apps_queue_failures_wait_like_the_bots() {
     assert_eq!(task(&github, &["ready"]), Ok(listed), "no fix in flight: work for an agent");
     let claimed = task(&github, &["claim", "issue-3"]).expect("work for an agent");
     assert!(claimed.contains("fix it on #45's own branch"), "{claimed}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a queue-failure issue, by the CI app or the bot, is work for agents only if its PR
+// was opened by the bot and has its branch in this repository; otherwise it is held with a
+// reason a human can act on, whatever its labels say (ADR-0023).
+#[test]
+fn queue_failures_of_other_prs_are_held() {
+    let (root, clone, vocabulary) = ci_setup("queue-failures-scope");
+    let by_ci = ci_failure(&vocabulary, 3, 900, "namicfd/nami");
+    let by_bot = Issue { number: 4, ..queue_failure(4, 950) };
+    let human = Issue { author: "owner".to_owned(), ..pull_45("Summary.") };
+    let mut github = Fake { issues: vec![by_ci, by_bot, human], ..Fake::default() };
+    let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
+    assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "both are held");
+    for id in ["issue-3", "issue-4"] {
+        let held = task(&github, &["claim", id]).expect_err("a human's PR");
+        assert!(held.contains("#45 was opened by `owner`, not by `nami-agent[bot]`"), "{held}");
+        assert!(held.contains("a human rebases or renumbers it"), "{held}");
+    }
+    github.issues[2].author = "nami-agent[bot]".to_owned();
+    github.forks = vec![45];
+    assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "a fork's branch");
+    let held = task(&github, &["claim", "issue-3"]).expect_err("a fork's PR");
+    assert!(held.contains("#45's branch is not in this repository"), "{held}");
+    github.forks.clear();
+    let listed = task(&github, &["ready"]).expect("both are work");
+    assert!(listed.contains("issue-3\t") && listed.contains("issue-4\t"), "{listed}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: hostile bodies under a queue-failure title by the CI app make `task ready`, `claim`
+// and `status` refuse or leave out the issue, and never panic.
+#[test]
+fn hostile_ci_bodies_never_panic() {
+    let (root, clone, vocabulary) = ci_setup("queue-failures-hostile");
+    let real = ci_failure(&vocabulary, 3, 900, "namicfd/nami");
+    let log = "([log](https://github.com/namicfd/nami/actions/runs/900/job/7))";
+    let lines = [
+        format!("- Job `a`b` failed {log}. Read the log for the error."),
+        format!("- Job `gate` failed at `a`b` {log}. Read the log for the error."),
+        format!("- Job `gate` failed {log}. Tidy rules reported: `@x`."),
+    ];
+    let mut issues: Vec<Issue> = lines
+        .iter()
+        .zip(10..)
+        .map(|(line, number)| {
+            let body = real.body.replace("## Proposed fix", &format!("{line}\n\n## Proposed fix"));
+            Issue { number, body, ..real.clone() }
+        })
+        .collect();
+    issues.push(Issue { number: 20, body: "`".repeat(5), ..real });
+    issues.push(pull_45("Summary."));
+    let github = Fake { issues, ..Fake::default() };
+    let task = |arguments: &[&str]| execute(&clone, "origin", &github, arguments);
+    assert_eq!(task(&["ready"]), Ok("a\tTask a\n".to_owned()), "every hostile issue is out");
+    for number in [10, 11, 12, 20] {
+        let refused = task(&["claim", &format!("issue-{number}")]).expect_err("untrusted");
+        assert!(refused.contains("`nami-ci[bot]`, whom agents trust only"), "{refused}");
+    }
+    assert!(task(&["status"]).is_ok(), "status reads them too");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

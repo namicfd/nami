@@ -35,14 +35,23 @@ pub const NEEDS_DECISION: &str = "needs-decision";
 const CODEOWNERS_FILE: &str = ".github/CODEOWNERS";
 
 /// The authors that agents believe: the bot, and the code owners; and the CI app for its
-/// queue-failure issues, when the vocabulary that checks their bodies is known.
+/// queue-failure issues, when what checks their bodies is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trust {
     /// Code owners' logins, in lowercase: GitHub logins ignore case.
     owners: BTreeSet<String>,
-    /// `main`'s vocabulary, against which a CI app's issue body is checked. Without it, no
-    /// issue by the CI app is trusted.
-    vocabulary: Option<Vocabulary>,
+    /// What a CI app's issue body is checked against, or why it cannot be checked here. Without
+    /// it, no issue by the CI app is trusted, and the refusal says why.
+    ci: Result<CiScope, String>,
+}
+
+/// What the body of a CI app's issue is checked against (ADR-0023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiScope {
+    /// The names that a finding may quote.
+    pub vocabulary: Vocabulary,
+    /// This repository's `owner/name`, the only one that a finding may link to.
+    pub repository: String,
 }
 
 impl Trust {
@@ -58,18 +67,25 @@ impl Trust {
                 words.skip(1)
             })
             .filter_map(|word| word.strip_prefix('@'))
-            .filter(|login| !login.is_empty() && !login.contains('/'))
+            .filter(|login| !login.is_empty() && !login.contains(['/', '@']))
             .map(str::to_ascii_lowercase)
             .collect();
-        assert!(owners.iter().all(|owner| !owner.contains('@')), "owners are bare logins");
-        Self { owners, vocabulary: None }
+        let ci = Err("nothing was given to check them against".to_owned());
+        Self { owners, ci }
     }
 
-    /// This trust, with `vocabulary` to check the bodies of the CI app's issues against.
+    /// This trust, with `vocabulary` and this repository's `owner/name` to check the bodies
+    /// of the CI app's issues against.
     #[must_use]
-    pub fn with_vocabulary(self, vocabulary: Vocabulary) -> Self {
+    pub fn with_ci(self, vocabulary: Vocabulary, repository: &str) -> Self {
         assert!(!vocabulary.rules.is_empty(), "a vocabulary has tidy's rules");
-        Self { vocabulary: Some(vocabulary), ..self }
+        Self { ci: Ok(CiScope { vocabulary, repository: repository.to_owned() }), ..self }
+    }
+
+    /// This trust, with the reason why the CI app's issues cannot be checked here.
+    #[must_use]
+    pub fn without_ci(self, reason: String) -> Self {
+        Self { ci: Err(reason), ..self }
     }
 
     /// True for the bot and for a code owner.
@@ -86,9 +102,10 @@ impl Trust {
     }
 }
 
-/// The trust list from `.github/CODEOWNERS` at `reference`, such as `origin/main`, with the
-/// vocabulary of `ci.yml` at `reference`. When that vocabulary cannot be loaded, the CI app's
-/// issues are not trusted: failing closed is safe.
+/// The trust list from `.github/CODEOWNERS` at `reference`, such as `origin/main`, with what
+/// the CI app's issues are checked against: the vocabulary (`ci.yml`'s names at `reference`)
+/// and the repository that `reference`'s remote names. When either cannot be loaded, the CI
+/// app's issues are not trusted, and the refusal says why: failing closed is safe.
 ///
 /// # Errors
 ///
@@ -102,9 +119,15 @@ pub fn load(root: &Path, reference: &str) -> Result<Trust, String> {
         )
     })?;
     let trust = Trust::from_codeowners(&text);
-    Ok(match Vocabulary::load(root, reference) {
-        Ok(vocabulary) => trust.with_vocabulary(vocabulary),
-        Err(_) => trust,
+    let remote = reference.split_once('/').map_or("origin", |(remote, _)| remote);
+    let vocabulary = Vocabulary::load(root, reference)
+        .map_err(|error| format!("the vocabulary could not be loaded: {error}"));
+    let repository = super::github::repository_of(root, remote).ok_or_else(|| {
+        format!("the remote `{remote}` names no GitHub repository to check the links against")
+    });
+    Ok(match (vocabulary, repository) {
+        (Ok(vocabulary), Ok(repository)) => trust.with_ci(vocabulary, &repository),
+        (Err(reason), _) | (_, Err(reason)) => trust.without_ci(reason),
     })
 }
 
@@ -119,14 +142,27 @@ pub fn refused(issue: &Issue, trust: &Trust) -> Option<String> {
         return Some(format!("#{number} is a pull request, not an issue"));
     }
     if issue.author == CI_LOGIN {
-        let is_queue_failure = trust.vocabulary.as_ref().is_some_and(|vocabulary| {
-            crate::queue::shape::is_finding(&issue.title, &issue.body, vocabulary)
-        });
+        let scope = match &trust.ci {
+            Ok(scope) => scope,
+            Err(reason) => {
+                return Some(format!(
+                    "#{number} was opened by `{CI_LOGIN}`, whose issues agents trust only once \
+                     their body is checked, and it cannot be checked here: {reason} (ADR-0023)"
+                ));
+            }
+        };
+        let is_queue_failure = crate::queue::shape::is_finding(
+            &issue.title,
+            &issue.body,
+            &scope.vocabulary,
+            &scope.repository,
+        );
         return (!is_queue_failure).then(|| {
             format!(
                 "#{number} was opened by `{CI_LOGIN}`, whom agents trust only for the issues \
                  that `cargo xtask queue failed` files, with exactly its title and body, \
-                 checked against `main`'s `ci.yml` (ADR-0023)"
+                 linking to `{}` and checked against the vocabulary (ADR-0023)",
+                scope.repository
             )
         });
     }
@@ -708,12 +744,21 @@ mod tests {
     // (ADR-0023).
     #[test]
     fn the_ci_app_is_trusted_for_queue_failures_only() {
-        let trust = trust().with_vocabulary(crate::queue::shape::tests::vocabulary());
+        let vocabulary = crate::queue::shape::tests::vocabulary;
+        let trust = trust().with_ci(vocabulary(), "namicfd/nami");
+        let unchecked = trust.clone().without_ci("the vocabulary could not be loaded: x".into());
+        let elsewhere = super::Trust::from_codeowners("").with_ci(vocabulary(), "fork/nami");
         for (pull, run) in [(1, 1), (51, 9), (u32::MAX, u64::MAX)] {
             let filed = ci_issue(pull, run);
             assert_eq!(refused(&filed, &trust), None, "{}", filed.title);
-            let unknown = refused(&filed, &super::Trust { vocabulary: None, ..trust.clone() });
-            assert!(unknown.is_some(), "without a vocabulary, nothing is checked or trusted");
+            let unknown = refused(&filed, &unchecked).expect("nothing to check it against");
+            assert!(unknown.contains("cannot be checked here: the vocabulary could not"));
+            let foreign = refused(&filed, &elsewhere).expect("it links to another repository");
+            assert!(foreign.contains("linking to `fork/nami`"), "{foreign}");
+        }
+        for hostile in crate::queue::shape::tests::hostile_bodies() {
+            let filed = Issue { body: hostile, ..ci_issue(51, 9) };
+            assert!(refused(&filed, &trust).is_some(), "refused, not a panic: {}", filed.body);
         }
         let failure = ci_issue(51, 9);
         assert_eq!(unworkable(&failure, &[], &trust), None);

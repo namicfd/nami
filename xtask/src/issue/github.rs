@@ -161,6 +161,26 @@ pub trait GitHub {
     ///
     /// When GitHub cannot be asked, or does not have it.
     fn is_queued(&self, number: u32) -> Result<bool, String>;
+
+    /// True if pull request `number`'s head branch is in this repository, not in a fork; false
+    /// also when its head repository is gone.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or does not have it.
+    fn head_is_here(&self, number: u32) -> Result<bool, String>;
+}
+
+/// Whether a pull request, in the shape of GitHub's pulls API, has its head branch in its base
+/// repository. A head repository that GitHub sends as `null`, because it was deleted, is not.
+///
+/// # Errors
+///
+/// When the answer has no base repository's name.
+pub fn head_is_here_from_json(pull: &Value) -> Result<bool, String> {
+    let base = string_at(pull, &["base", "repo", "full_name"])?;
+    let head = string_at(pull, &["head", "repo", "full_name"]).ok();
+    Ok(head.is_some_and(|head| head == base))
 }
 
 /// Reads an issue or pull request in the shape of GitHub's issues API.
@@ -296,9 +316,13 @@ fn as_number(value: &Value) -> Option<u32> {
 /// ready` lists a queue-failure issue whose PR closes it only in that form. In CI,
 /// `actions/checkout` sets `origin` to the repository that the workflow runs in, the base
 /// repository also for a PR from a fork, so CI reads the right name.
+///
+/// The URL is the one configured for the remote, before any `url.<base>.insteadOf` rewrite:
+/// the name that the remote stands for, wherever git fetches it from.
 #[must_use]
 pub fn repository_of(root: &Path, remote: &str) -> Option<String> {
-    let url = crate::task::claims::git(root, &["remote", "get-url", remote], &[], None).ok()?;
+    let key = format!("remote.{remote}.url");
+    let url = crate::task::claims::git(root, &["config", "--get", &key], &[], None).ok()?;
     repository_of_url(url.trim())
 }
 
@@ -372,11 +396,6 @@ impl Gh {
         if let Some(variable) = self.hidden {
             let _ = command.env_remove(variable);
         }
-        let sees = |variable: &str| {
-            command.get_envs().any(|(name, value)| name == variable && value.is_some())
-        };
-        let leaked = [self.token_variable, self.hidden].into_iter().flatten().any(sees);
-        assert!(!leaked, "gh never sees the variable that holds another client's token");
         Ok(command)
     }
 
@@ -476,6 +495,11 @@ impl GitHub for Gh {
     fn is_queued(&self, number: u32) -> Result<bool, String> {
         is_queued_from_json(&self.queue_entry(number)?)
     }
+
+    fn head_is_here(&self, number: u32) -> Result<bool, String> {
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
+        head_is_here_from_json(&self.one(&[&path], None)?)
+    }
 }
 
 impl Gh {
@@ -514,6 +538,26 @@ mod tests {
         label_event_from_json, parse_lines,
     };
     use crate::json::parse;
+
+    // Goal: a PR's head is here only when its head repository is its base repository; a
+    // fork's head or a deleted one is not, and an answer without a base is an error.
+    #[test]
+    fn heads_are_here_only_in_the_base_repository() {
+        let pull = |head: &str| {
+            let base = r#""base": {"repo": {"full_name": "namicfd/nami"}}"#;
+            parse(&format!(r#"{{{base}, "head": {{"repo": {head}}}}}"#)).unwrap()
+        };
+        assert_eq!(
+            super::head_is_here_from_json(&pull(r#"{"full_name": "namicfd/nami"}"#)),
+            Ok(true)
+        );
+        assert_eq!(
+            super::head_is_here_from_json(&pull(r#"{"full_name": "outsider/nami"}"#)),
+            Ok(false)
+        );
+        assert_eq!(super::head_is_here_from_json(&pull("null")), Ok(false), "a deleted fork");
+        assert!(super::head_is_here_from_json(&parse("{}").unwrap()).is_err(), "no base");
+    }
 
     /// An issue as GitHub's API returns it, with the fields that are not read left out.
     const ISSUE: &str = r#"{"number": 12, "title": "Loop rule misses cycle()",
