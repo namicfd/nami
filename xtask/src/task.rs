@@ -21,6 +21,7 @@ pub mod acceptance;
 pub mod claims;
 pub mod passes;
 pub mod plan;
+pub mod pulls;
 
 use crate::issue::github::{Gh, GitHub, Issue};
 use crate::issue::{self, trust};
@@ -47,7 +48,9 @@ pub fn run(arguments: &[&str]) -> ExitCode {
     let github = Gh::new(&root);
     let result = match arguments.first() {
         Some(&("passes" | "check-pr")) => {
-            let services = Services { pulls: &github, tests: &Nextest::new(&root) };
+            let process = pulls::GhProcess::new(&root);
+            let pulls = pulls::GitHubPulls::new(&process);
+            let services = Services { pulls: &pulls, tests: &Nextest::new(&root) };
             passes::execute(&root, &remote, services, arguments)
         }
         _ => execute(&root, &remote, &github, arguments),
@@ -463,7 +466,13 @@ fn check_pr(root: &Path, change: &Change<'_>, services: Services<'_>) -> Result<
         output = lines.concat();
     }
     if flipped.is_empty() {
-        return Ok(output);
+        let problems = passes::no_flip_problems(change, services.pulls);
+        if problems.is_empty() {
+            return Ok(output);
+        }
+        let errors: Vec<String> =
+            problems.iter().map(|problem| format!("error: {problem}")).collect();
+        return Err(format!("{output}{}", errors.join("\n")));
     }
     let own = Change { base: &base, ..*change };
     let problems = passes::flip_problems(root, &own, &head_tasks, &flipped, services);

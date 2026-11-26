@@ -10,22 +10,34 @@
 //!   the tasks that may be set: active, not passing, every dependency passing, and a merged PR
 //!   from `task/<id>`. It sets `passes` on exactly those, commits the change on top of `HEAD`,
 //!   force-pushes the commit as [`BOT_BRANCH`], opens or updates that branch's PR and turns on
-//!   auto-merge. When no task is left, it closes the open PR, if there is one. It runs no
-//!   tests, so the bot's token never meets a test binary.
-//! - `check-pr` lets a change set `passes` only when [`flip_problems`] finds nothing.
+//!   auto-merge. When `bot/passes` already sets `passes` on exactly those tasks, it pushes
+//!   nothing, so the PR stays in the merge queue. When no task is left, it closes the open PR,
+//!   if there is one. An open PR from [`BOT_BRANCH`] that [`CI_LOGIN`] did not open is never
+//!   adopted: the job fails and changes nothing. It runs no tests, so the bot's token never
+//!   meets a test binary. Only the push and the PR writes act as the app's token,
+//!   [`WRITE_TOKEN`]; every read acts as `GH_TOKEN` (`super::pulls`).
+//! - `check-pr` lets a change set `passes` only when [`flip_problems`] finds nothing, and
+//!   rejects a PR from [`BOT_BRANCH`] or by [`CI_LOGIN`] that sets none ([`no_flip_problems`]).
 //!
-//! The merged PR matters because acceptance tests can pass before the work is done: two tasks
-//! may share a test, and a later task's test may already exist.
+//! The merged PR is a weak condition: any agent can merge a trivial PR from `task/<id>`. The
+//! acceptance tests carry the weight; the merged PR only keeps a task from passing on a test
+//! that a later task wrote, or that two tasks share.
 
 use super::acceptance::Acceptance;
 use super::claims::git;
 use super::plan::{self, Task};
-use crate::issue::github::{Gh, string_at};
+use super::pulls::WRITE_TOKEN;
 use crate::json::{self, Value};
 use crate::queue::failure::{pull_of_message, queue_entry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::Command;
+
+/// The git credential helper for the push to [`BOT_BRANCH`]: it answers `get` with the token
+/// in [`WRITE_TOKEN`], which git inherits, and nothing else. It is configured on the push
+/// command only, after the helpers from git's own configuration are cleared.
+const PUSH_CREDENTIALS: &str = "!f() { test \"$1\" = get && printf \
+                                'username=x-access-token\\npassword=%s\\n' \
+                                \"$NAMI_PASSES_TOKEN\"; }; f";
 
 /// The one branch whose PR may set `passes`.
 pub const BOT_BRANCH: &str = "bot/passes";
@@ -495,6 +507,89 @@ fn pull_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
     problems
 }
 
+/// Why `change`, which sets no `passes`, is still refused: [`BOT_BRANCH`] and [`CI_LOGIN`]'s
+/// PRs exist only to set it, so anything else they carry is someone else's change. Empty
+/// when it is neither. A PR that cannot be looked up is a problem, so the check never passes
+/// unseen.
+#[must_use]
+pub fn no_flip_problems(change: &Change<'_>, pulls: &dyn Pulls) -> Vec<String> {
+    let refusal = |what: String| {
+        format!("{what}, and it sets no `passes`; that branch and that bot only ever set it")
+    };
+    if change.branch == BOT_BRANCH {
+        return vec![refusal(format!("the change comes from `{BOT_BRANCH}`"))];
+    }
+    let queued = queue_entry(change.branch).map(|entry| entry.pull);
+    let Some(number) = change.pull.or(queued) else {
+        return Vec::new();
+    };
+    match pulls.head(number) {
+        Ok(head) if head.branch == BOT_BRANCH || head.author == CI_LOGIN => {
+            vec![refusal(format!("#{number} comes from `{}` by `{}`", head.branch, head.author))]
+        }
+        Ok(_) => Vec::new(),
+        Err(error) => vec![format!("cannot read pull request #{number}: {error}")],
+    }
+}
+
+/// The open PR from [`BOT_BRANCH`], if there is one, once it is known to be [`CI_LOGIN`]'s.
+///
+/// # Errors
+///
+/// When someone else opened it: pushing would change their PR, and closing it is a human's
+/// call. Nothing is changed.
+fn adoptable(pulls: &dyn Pulls) -> Result<Option<u32>, String> {
+    let Some(number) = pulls.open_from(BOT_BRANCH)? else {
+        return Ok(None);
+    };
+    let head = pulls.head(number)?;
+    if head.author != CI_LOGIN || head.branch != BOT_BRANCH {
+        return Err(format!(
+            "#{number}, the open PR from `{BOT_BRANCH}`, comes from `{}` by `{}`, not from \
+             {CI_LOGIN}; nothing was changed. A human closes #{number}, and the next run opens \
+             the bot's PR",
+            head.branch, head.author
+        ));
+    }
+    assert!(number > 0, "pull requests are numbered from 1");
+    Ok(Some(number))
+}
+
+/// The tasks on which `remote`'s [`BOT_BRANCH`] sets `passes`: those that pass at its tip and
+/// not at the tip's parent. `None` when the branch does not exist.
+///
+/// # Errors
+///
+/// When git cannot reach the remote or read the plans there.
+fn held_flips(root: &Path, remote: &str) -> Result<Option<BTreeSet<String>>, String> {
+    let run = |arguments: &[&str]| {
+        git(root, arguments, &[], None)
+            .map_err(|error| format!("cannot read `{BOT_BRANCH}`: {error}"))
+    };
+    let reference = format!("refs/heads/{BOT_BRANCH}");
+    if run(&["ls-remote", remote, &reference])?.trim().is_empty() {
+        return Ok(None);
+    }
+    let local = "refs/nami/bot-passes";
+    let _ = run(&[
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--depth=2",
+        remote,
+        &format!("+{reference}:{local}"),
+    ])?;
+    let parent_passing: BTreeSet<String> = super::tasks_at(root, &format!("{local}^1"))?
+        .into_iter()
+        .filter(|task| task.passes)
+        .map(|task| task.id)
+        .collect();
+    let held: BTreeSet<String> =
+        super::passes_flips(&super::tasks_at(root, local)?, &parent_passing).into_iter().collect();
+    assert!(held.is_disjoint(&parent_passing), "a flip did not pass before");
+    Ok(Some(held))
+}
+
 /// `passes --open-pr <file>`.
 fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(file)
@@ -514,7 +609,7 @@ fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<
             )
         })
         .collect();
-    let open = pulls.open_from(BOT_BRANCH)?;
+    let open = adoptable(pulls)?;
     if wanted.is_empty() {
         lines.push(match open {
             Some(number) => {
@@ -523,6 +618,19 @@ fn open_pr(root: &Path, remote: &str, pulls: &dyn Pulls, file: &Path) -> Result<
             }
             None => "no task is newly done\n".to_owned(),
         });
+        return Ok(lines.concat());
+    }
+    let held = match open {
+        Some(_) => held_flips(root, remote)?,
+        None => None,
+    };
+    if let Some(number) = open.filter(|_| held.as_ref() == Some(&wanted)) {
+        let ids: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        lines.push(format!(
+            "#{number} already sets `passes` on {}; nothing pushed, so it keeps its place in \
+             the merge queue\n",
+            ids.join(", ")
+        ));
         return Ok(lines.concat());
     }
     write_passes(root, &tasks, &wanted)?;
@@ -555,7 +663,15 @@ fn publish(
     let (title, body) = pull_text(tasks, flipped, head.trim());
     let commit = commit_working_tree(root, &title)?;
     let target = format!("{commit}:refs/heads/{BOT_BRANCH}");
-    let _ = git(root, &["push", "--quiet", "--force", remote, &target], &[], None)
+    assert!(PUSH_CREDENTIALS.contains(WRITE_TOKEN), "the push acts as the token for writes");
+    let credentials = [
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "credential.helper"),
+        ("GIT_CONFIG_VALUE_0", ""),
+        ("GIT_CONFIG_KEY_1", "credential.helper"),
+        ("GIT_CONFIG_VALUE_1", PUSH_CREDENTIALS),
+    ];
+    let _ = git(root, &["push", "--quiet", "--force", remote, &target], &credentials, None)
         .map_err(|error| error.to_string())?;
     let number = match open {
         Some(number) => {
@@ -626,111 +742,12 @@ pub fn pull_text(tasks: &[Task], flipped: &[String], head: &str) -> (String, Str
     (title, body)
 }
 
-impl Pulls for Gh {
-    fn head(&self, number: u32) -> Result<PullHead, String> {
-        let pull = self.one(&[&format!("repos/{{owner}}/{{repo}}/pulls/{number}")], None)?;
-        head_from_json(&pull)
-    }
-
-    fn has_merged(&self, branch: &str) -> Result<bool, String> {
-        let path = format!(
-            "repos/{{owner}}/{{repo}}/pulls?state=closed&base={BASE_BRANCH}&head={{owner}}:\
-             {branch}&per_page=100"
-        );
-        let pulls = self.list(&path)?;
-        Ok(pulls.iter().any(|pull| pull.get("merged_at").is_some_and(|at| *at != Value::Null)))
-    }
-
-    fn open_from(&self, branch: &str) -> Result<Option<u32>, String> {
-        let path = format!(
-            "repos/{{owner}}/{{repo}}/pulls?state=open&head={{owner}}:{branch}&per_page=100"
-        );
-        let numbers: Result<Vec<u32>, String> = self.list(&path)?.iter().map(number_of).collect();
-        match numbers?.as_slice() {
-            [] => Ok(None),
-            [number] => Ok(Some(*number)),
-            many => Err(format!("GitHub lists {} open PRs from `{branch}`", many.len())),
-        }
-    }
-
-    fn open(&self, branch: &str, title: &str, body: &str) -> Result<u32, String> {
-        let request = format!(
-            "{{\"title\": {}, \"head\": {}, \"base\": {}, \"body\": {}}}",
-            json::quote(title),
-            json::quote(branch),
-            json::quote(BASE_BRANCH),
-            json::quote(body)
-        );
-        let arguments = ["--method", "POST", "repos/{owner}/{repo}/pulls", "--input", "-"];
-        number_of(&self.one(&arguments, Some(&request))?)
-    }
-
-    fn edit(&self, number: u32, title: &str, body: &str) -> Result<(), String> {
-        let request =
-            format!("{{\"title\": {}, \"body\": {}}}", json::quote(title), json::quote(body));
-        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
-        let _ = self.api(&["--method", "PATCH", &path, "--input", "-"], Some(&request))?;
-        Ok(())
-    }
-
-    fn close(&self, number: u32) -> Result<(), String> {
-        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
-        let request = "{\"state\": \"closed\"}";
-        let _ = self.api(&["--method", "PATCH", &path, "--input", "-"], Some(request))?;
-        Ok(())
-    }
-
-    fn auto_merge(&self, number: u32) -> Result<(), String> {
-        let output = Command::new("gh")
-            .args(["pr", "merge", &number.to_string(), "--auto", "--squash"])
-            .current_dir(self.root())
-            .output()
-            .map_err(|error| format!("cannot run gh: {error}; install the GitHub CLI"))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(format!(
-            "`gh pr merge {number} --auto --squash` failed: {}; add #{number} to the merge queue \
-             by hand",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-/// Reads a pull request's head branch and author from GitHub's pulls API. A head in another
-/// repository, or in one that was deleted, is written `<owner>:<branch>`.
-///
-/// # Errors
-///
-/// Names the field that is missing or has the wrong type.
-pub fn head_from_json(pull: &Value) -> Result<PullHead, String> {
-    let branch = string_at(pull, &["head", "ref"])?;
-    let base = string_at(pull, &["base", "repo", "full_name"])?;
-    let head = string_at(pull, &["head", "repo", "full_name"]).ok();
-    let branch = if head.as_deref() == Some(base.as_str()) {
-        branch
-    } else {
-        string_at(pull, &["head", "label"]).unwrap_or_else(|_| format!("(unknown):{branch}"))
-    };
-    Ok(PullHead { branch, author: string_at(pull, &["user", "login"])? })
-}
-
-/// The `number` of a pull request in GitHub's pulls API.
-fn number_of(pull: &Value) -> Result<u32, String> {
-    let Some(Value::Number(digits)) = pull.get("number") else {
-        return Err("a pull request has no `number`".to_owned());
-    };
-    let number = digits.parse::<u32>().ok().filter(|number| *number > 0);
-    number.ok_or_else(|| format!("a pull request has the number `{digits}`"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        PullHead, head_from_json, is_active_tasks_file, number_of, only_passes_set,
-        passing_from_json, passing_json, pull_number, pull_text, set_passes, unblocked,
+        is_active_tasks_file, only_passes_set, passing_from_json, passing_json, pull_number,
+        pull_text, set_passes, unblocked,
     };
-    use crate::json;
     use crate::task::plan::Task;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -789,27 +806,6 @@ mod tests {
         ] {
             assert!(!is_active_tasks_file(other), "{other}");
         }
-    }
-
-    // Goal: a head in this repository gives its branch name, and a fork's gives
-    // `<owner>:<branch>`, so a fork's `bot/passes` is never the bot's.
-    #[test]
-    fn heads_name_their_repository() {
-        let pull = |head: &str| {
-            json::parse(&format!(
-                r#"{{"user": {{"login": "nami-agent[bot]"}}, "base": {{"repo": {{"full_name":
-                "o/n"}}}}, "head": {{"ref": "bot/passes", "label": "x:bot/passes", "repo":
-                {head}}}}}"#
-            ))
-            .expect("the fixture is JSON")
-        };
-        let own = head_from_json(&pull(r#"{"full_name": "o/n"}"#)).expect("valid");
-        let expected =
-            PullHead { branch: "bot/passes".to_owned(), author: "nami-agent[bot]".to_owned() };
-        assert_eq!(own, expected);
-        let fork = head_from_json(&pull(r#"{"full_name": "x/n"}"#)).expect("valid");
-        assert_eq!(fork.branch, "x:bot/passes");
-        assert_eq!(head_from_json(&pull("null")).expect("valid").branch, "x:bot/passes");
     }
 
     fn task(id: &str, depends_on: &[&str], passes: bool, active: bool) -> Task {
@@ -883,17 +879,6 @@ mod tests {
         assert!(!body.contains("`a`"), "{body}");
         for heading in ["## Summary", "## Rule changes", "## Protected files", "## Follow-up"] {
             assert!(body.contains(heading), "{heading}");
-        }
-    }
-
-    // Goal: a pull request's number is read from GitHub's JSON, and a missing, zero or
-    // non-integer number is an error.
-    #[test]
-    fn pull_numbers_come_from_github() {
-        let pull = |text: &str| json::parse(text).expect("the fixture is JSON");
-        assert_eq!(number_of(&pull(r#"{"number": 64}"#)), Ok(64));
-        for bad in [r#"{"number": 0}"#, r#"{"number": "7"}"#, r#"{"number": 1.5}"#, "{}"] {
-            assert!(number_of(&pull(bad)).is_err(), "{bad}");
         }
     }
 }
