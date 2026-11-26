@@ -8,9 +8,10 @@
 //!   failed, through the path of `cargo xtask issue file`, so that `cargo xtask task ready`
 //!   lists it and the next session rebases or renumbers the PR on its own branch (ADR-0021,
 //!   point 6). It files nothing unless the PR really left the queue: it is open, not merged,
-//!   not queued, and no newer merge-queue run tested it. A trusted open issue with the same
-//!   title stops a re-run from filing twice. A PR that the bot did not open gets
-//!   `needs-decision`, because agents do not push to it.
+//!   not queued, and no newer merge-queue run tested it. There is one issue per failed run:
+//!   its title names the run, so a re-run of the run files nothing, while a later failed run
+//!   of the same PR gets its own issue, which names the earlier ones. A PR that the bot did
+//!   not open gets `needs-decision`, because agents do not push to it.
 //!
 //! Both act on the checkout's GitHub repository as whoever `GH_TOKEN` names, and read the code
 //! owners from `.github/CODEOWNERS` on `<remote>/main` (`$NAMI_TASK_REMOTE`, or `origin`). The
@@ -168,7 +169,7 @@ fn publish(
 }
 
 /// Files the issue for failed merge-queue run `run`, unless it is not one, the PR is still in
-/// play, or a trusted open issue already records the PR's failure.
+/// play, or a trusted open issue already records this run's failure.
 fn file_failure(
     forge: &dyn Forge,
     github: &dyn GitHub,
@@ -198,15 +199,21 @@ fn file_failure(
     if let Some(reason) = still_in_play(forge, &details, &entry, &state)? {
         return Ok(format!("{reason}; nothing to file\n"));
     }
-    let title = failure::title(pull);
+    // One issue per failed run: a re-run of this run finds its issue; another run of the same
+    // PR is a new failure, even while the PR says `Fixes` for an earlier one.
+    let title = failure::title(pull, run);
     let open = github.open_issues()?;
-    let recorded = open.iter().find(|issue| {
-        issue.is_open && issue.title == title && trust::refused(issue, trust).is_none()
-    });
-    if let Some(recorded) = recorded {
+    let failures_of_pull: Vec<(u64, u32)> = open
+        .iter()
+        .filter(|issue| issue.is_open && trust::refused(issue, trust).is_none())
+        .filter_map(|issue| {
+            let (of, its_run) = failure::entry_of_title(&issue.title)?;
+            (of == pull).then_some((its_run, issue.number))
+        })
+        .collect();
+    if let Some((_, recorded)) = failures_of_pull.iter().find(|(its_run, _)| *its_run == run) {
         return Ok(format!(
-            "#{} already records that #{pull} failed; not filed again\n",
-            recorded.number
+            "#{recorded} already records that run {run} of #{pull} failed; not filed again\n"
         ));
     }
     let vocabulary = vocabulary()?;
@@ -217,6 +224,7 @@ fn file_failure(
         run,
         jobs: failed_jobs(forge, run, &vocabulary)?,
         author: state.author,
+        earlier: failures_of_pull.iter().map(|(_, number)| *number).collect(),
     };
     let draft = Draft::parse(&failure::finding(&report, &vocabulary))?;
     assert_eq!(draft.title, title, "the issue carries the title that re-runs look for");
@@ -365,8 +373,13 @@ mod tests {
     /// The open issues: an outsider's issue with the title of #51's failure, and the bot's
     /// issue for another PR.
     fn issues() -> String {
-        issue_line(3, "PR #51 failed in the merge queue", "outsider", "open")
-            + &issue_line(4, "PR #52 failed in the merge queue", "nami-agent[bot]", "open")
+        issue_line(3, "PR #51 failed in the merge queue (run 900)", "outsider", "open")
+            + &issue_line(
+                4,
+                "PR #52 failed in the merge queue (run 900)",
+                "nami-agent[bot]",
+                "open",
+            )
     }
 
     /// `gh api repos/o/r/pulls/51` and the GraphQL answer about its queue entry.
@@ -440,8 +453,7 @@ mod tests {
             self.edited.borrow_mut().push((id, body.to_owned()));
             Ok(())
         }
-        fn run(&self, id: u64) -> Result<Run, String> {
-            assert_eq!(id, 900);
+        fn run(&self, _id: u64) -> Result<Run, String> {
             run_from_json(&parse(&self.run).unwrap())
         }
         fn jobs(&self, _id: u64) -> Result<Vec<Job>, String> {
@@ -620,11 +632,14 @@ mod tests {
     fn a_pull_request_that_dropped_out_gets_an_issue() {
         let fake = dropped();
         let output = run(&fake, &["failed", "--run", "900"]).expect("filed");
-        assert_eq!(output, "filed #70: PR #51 failed in the merge queue\n", "no PR to list it in");
+        assert_eq!(
+            output, "filed #70: PR #51 failed in the merge queue (run 900)\n",
+            "no PR to list it in"
+        );
         let filed = fake.filed.borrow();
         assert_eq!(filed.len(), 1);
         let (title, body, labels) = &filed[0];
-        assert_eq!(title, "PR #51 failed in the merge queue");
+        assert_eq!(title, "PR #51 failed in the merge queue (run 900)");
         assert_eq!(labels, &["bug"], "the bot's PR is work for agents");
         for part in [
             "- Found in: merge-queue run https://github.com/namicfd/nami/actions/runs/900\n",
@@ -711,11 +726,11 @@ mod tests {
     // not failed merge-queue runs file nothing; a run on another branch is an error.
     #[test]
     fn re_runs_and_other_runs_file_nothing() {
-        let title = "PR #51 failed in the merge queue";
+        let title = "PR #51 failed in the merge queue (run 900)";
         let recorded = issues() + &issue_line(9, title, "nami-agent[bot]", "open");
         let again = Fake { issues: recorded, ..dropped() };
         let skipped = run(&again, &["failed", "--run", "900"]).unwrap();
-        assert_eq!(skipped, "#9 already records that #51 failed; not filed again\n");
+        assert_eq!(skipped, "#9 already records that run 900 of #51 failed; not filed again\n");
         assert!(again.filed.borrow().is_empty());
         let closed = issues() + &issue_line(9, title, "nami-agent[bot]", "closed");
         let reopened = Fake { issues: closed, ..dropped() };
@@ -733,6 +748,38 @@ mod tests {
             Fake { run: RUN.replace("gh-readonly-queue/main/pr-51-", "task/x-"), ..dropped() };
         let error = run(&odd, &["failed", "--run", "900"]).expect_err("not a queue branch");
         assert!(error.contains("not a merge-queue branch"), "{error}");
+    }
+
+    // Goal: two failed runs of one PR are two issues. While the first issue #60 is open, and
+    // the PR may already say `Fixes #60`, a second failed run files a new issue that names #60
+    // as an earlier failure; a re-run of the second run then files nothing (ADR-0021, point 6).
+    #[test]
+    fn a_second_failure_of_the_same_pull_request_gets_its_own_issue() {
+        let first_title = "PR #51 failed in the merge queue (run 900)";
+        let first = issues() + &issue_line(60, first_title, "nami-agent[bot]", "open");
+        let runs = queue_run(900, 42, "2026-11-26T08:24:28Z", 51)
+            + &queue_run(950, 42, "2026-11-26T08:24:28Z", 51);
+        let second = Fake {
+            run: RUN.replace("\"id\": 900", "\"id\": 950"),
+            issues: first.clone(),
+            queue_runs: runs,
+            ..dropped()
+        };
+        let output = run(&second, &["failed", "--run", "950"]).expect("a new failure");
+        assert_eq!(output, "filed #70: PR #51 failed in the merge queue (run 950)\n");
+        let body = second.filed.borrow()[0].1.clone();
+        assert!(
+            body.contains("the issues about those failures are still open: #60. #51's description"),
+            "{body}"
+        );
+        assert!(body.contains("add `Fixes #<this issue>` to #51's description"), "{body}");
+
+        let second_title = "PR #51 failed in the merge queue (run 950)";
+        let both = first + &issue_line(70, second_title, "nami-agent[bot]", "open");
+        let rerun = Fake { issues: both, ..second };
+        let skipped = run(&rerun, &["failed", "--run", "950"]).unwrap();
+        assert_eq!(skipped, "#70 already records that run 950 of #51 failed; not filed again\n");
+        assert_eq!(rerun.filed.borrow().len(), 1, "only the filing before the re-run");
     }
 
     // Goal: malformed commands and numbers are errors that show the usage.

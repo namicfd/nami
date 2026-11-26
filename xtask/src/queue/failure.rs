@@ -191,26 +191,32 @@ pub struct Failure {
     pub run: u64,
     /// The jobs that failed.
     pub jobs: Vec<FailedJob>,
+    /// Open issues about earlier failed runs of the same PR, whose fix may already be on it.
+    pub earlier: BTreeSet<u32>,
 }
 
-/// The title of the issue for PR `pull`. Re-runs find an open issue by this exact title.
+/// The title of the issue for PR `pull`'s failed run `run`: one issue per failed run. A re-run
+/// of the same run finds the open issue by this exact title.
 #[must_use]
-pub fn title(pull: u32) -> String {
-    format!("{TITLE_PREFIX}{pull}{TITLE_SUFFIX}")
+pub fn title(pull: u32, run: u64) -> String {
+    format!("{TITLE_PREFIX}{pull}{TITLE_MIDDLE}{run})")
 }
 
-/// The PR that a queue-failure issue's title names, or `None` for any other title.
+/// The PR and the run that a queue-failure issue's title names, or `None` for any other title.
 #[must_use]
-pub fn pull_of_title(title: &str) -> Option<u32> {
-    let number = title.strip_prefix(TITLE_PREFIX)?.strip_suffix(TITLE_SUFFIX)?;
-    canonical_number(number)
+pub fn entry_of_title(title: &str) -> Option<(u32, u64)> {
+    let (number, rest) = title.strip_prefix(TITLE_PREFIX)?.split_once(TITLE_MIDDLE)?;
+    let run = rest.strip_suffix(')')?;
+    let is_canonical = !run.starts_with('0') && run.bytes().all(|byte| byte.is_ascii_digit());
+    let run = run.parse::<u64>().ok().filter(|_| is_canonical)?;
+    Some((canonical_number(number)?, run))
 }
 
 /// What a queue-failure issue's title says before the PR's number.
 const TITLE_PREFIX: &str = "PR #";
 
-/// What a queue-failure issue's title says after the PR's number.
-const TITLE_SUFFIX: &str = " failed in the merge queue";
+/// What a queue-failure issue's title says between the PR's number and the run's ID.
+const TITLE_MIDDLE: &str = " failed in the merge queue (run ";
 
 /// The finding for `failure`, in the format of `cargo xtask issue file`. Its text is fixed,
 /// apart from numbers, the repository name and names from `vocabulary`.
@@ -222,8 +228,19 @@ pub fn finding(failure: &Failure, vocabulary: &Vocabulary) -> String {
         "# {}\n\n- Found in: merge-queue run {run_url}\n\n## What happened\n\nThe merge queue \
          tested #{pull}, the required checks failed, and #{pull} left the queue: it is open, \
          not merged and not queued, and no newer merge-queue run exists for it.",
-        title(pull)
+        title(pull, failure.run)
     )];
+    if !failure.earlier.is_empty() {
+        let earlier: Vec<String> =
+            failure.earlier.iter().map(|number| format!("#{number}")).collect();
+        pieces.push(format!(
+            " #{pull} failed in the queue before, and the issues about those failures are still \
+             open: {}. #{pull}'s description may already say `Fixes` for them. This is a new \
+             failure: keep those lines, add `Fixes #<this issue>` to #{pull}'s description, and \
+             fix the new cause.",
+            earlier.join(", ")
+        ));
+    }
     if !failure.group.is_empty() {
         let group: Vec<String> = failure.group.iter().map(|number| format!("#{number}")).collect();
         pieces.push(format!(
@@ -361,6 +378,7 @@ mod tests {
             repository: "namicfd/nami".to_owned(),
             run: 900,
             jobs,
+            earlier: BTreeSet::new(),
         }
     }
 
@@ -391,18 +409,25 @@ mod tests {
         }
     }
 
-    // Goal: a queue-failure title names its PR and round-trips; any other title names none.
+    // Goal: a queue-failure title names its PR and its run, one issue per failed run, and
+    // round-trips; any other title, or a number that is not canonical, names none.
     #[test]
-    fn titles_name_their_pull_request() {
-        assert_eq!(super::pull_of_title(&title(51)), Some(51));
+    fn titles_name_their_pull_request_and_run() {
+        assert_eq!(title(51, 45_782_890_699), "PR #51 failed in the merge queue (run 45782890699)");
+        assert_eq!(super::entry_of_title(&title(51, 900)), Some((51, 900)));
         for other in [
-            "PR #51 failed in the merge queue!",
-            "PR #051 failed in the merge queue",
-            "PR # failed in the merge queue",
-            "Re: PR #51 failed in the merge queue",
-            "PR #51 failed",
+            "PR #51 failed in the merge queue",
+            "PR #51 failed in the merge queue (run 900)!",
+            "PR #51 failed in the merge queue (run 900",
+            "PR #51 failed in the merge queue (run 0900)",
+            "PR #51 failed in the merge queue (run )",
+            "PR #51 failed in the merge queue (run 9x0)",
+            "PR #51 failed in the merge queue (run 99999999999999999999)",
+            "PR #051 failed in the merge queue (run 900)",
+            "PR # failed in the merge queue (run 900)",
+            "Re: PR #51 failed in the merge queue (run 900)",
         ] {
-            assert_eq!(super::pull_of_title(other), None, "{other}");
+            assert_eq!(super::entry_of_title(other), None, "{other}");
         }
     }
 
@@ -481,8 +506,8 @@ mod tests {
         report.group = [45, 47].into();
         let text = finding(&report, &vocabulary());
         let draft = Draft::parse(&text).expect("a finding that `issue file` accepts");
-        assert_eq!(draft.title, title(51));
-        assert_eq!(draft.title, "PR #51 failed in the merge queue");
+        assert_eq!(draft.title, title(51, 900));
+        assert_eq!(draft.title, "PR #51 failed in the merge queue (run 900)");
         for part in [
             "- Found in: merge-queue run https://github.com/namicfd/nami/actions/runs/900\n",
             "and #51 left the queue: it is open, not merged and not queued, and no newer",
@@ -505,8 +530,20 @@ mod tests {
         }
         let alone = finding(&failure(Vec::new()), &vocabulary());
         assert!(!alone.contains("merge group also held"), "{alone}");
+        assert!(!alone.contains("failed in the queue before"), "{alone}");
         assert!(alone.contains("No job of the run reports a failure"), "{alone}");
         assert!(Draft::parse(&alone).is_ok(), "{alone}");
+        let again = Failure { earlier: [40, 44].into(), ..failure(Vec::new()) };
+        let second = finding(&again, &vocabulary());
+        assert!(
+            second.contains(
+                " #51 failed in the queue before, and the issues about those failures are still \
+                 open: #40, #44. #51's description may already say `Fixes` for them. This is a \
+                 new failure: keep those lines, add `Fixes #<this issue>` to #51's description, \
+                 and fix the new cause."
+            ),
+            "{second}"
+        );
     }
 
     // Goal: a PR that the bot did not open is left to a human, and the finding says why.

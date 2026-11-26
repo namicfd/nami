@@ -206,54 +206,105 @@ fn issues_are_claimed_like_tasks() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
+/// The bot's issue about failed run `run` of PR #45.
+fn queue_failure(number: u32, run: u64) -> Issue {
+    Issue {
+        title: format!("PR #45 failed in the merge queue (run {run})"),
+        ..issue(number, "nami-agent[bot]", &["bug"])
+    }
+}
+
+/// PR #45, open, with the description `body`.
+fn pull_45(body: &str) -> Issue {
+    Issue { is_pull_request: true, body: body.to_owned(), ..issue(45, "nami-agent[bot]", &[]) }
+}
+
 // Goal: the bot's queue-failure issue waits while the PR it names is open and its description
 // closes the issue: `ready` leaves it out, `claim` refuses and says why, and `status` shows a
-// held claim as waiting (ADR-0021, point 6). A closing word in a comment, a closed PR, an
-// issue that is not a PR, or a title by someone else than the bot does not make it wait.
+// held claim as waiting (ADR-0021, point 6). A closing word in a comment does not count. A
+// closed PR, or a number that is no PR, makes the issue a human's to close; a title by
+// someone else than the bot is an ordinary issue.
 #[test]
 fn queue_failures_wait_for_their_fix() {
     let (root, clone) = setup("queue-failures");
     push_code_owners(&clone);
-    let title = "PR #45 failed in the merge queue";
-    let failure = Issue { title: title.to_owned(), ..issue(3, "nami-agent[bot]", &["bug"]) };
-    let fix = Issue {
-        is_pull_request: true,
-        body: "Summary.\n\nFixes #3\n".to_owned(),
-        ..issue(45, "nami-agent[bot]", &[])
-    };
-    let mut github = Fake { issues: vec![failure, fix], ..Fake::default() };
+    let failure = queue_failure(3, 900);
+    let listed = format!("a\tTask a\nissue-3\t{}\n", failure.title);
+    let mut github =
+        Fake { issues: vec![failure, pull_45("Summary.\n\nFixes #3\n")], ..Fake::default() };
     let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
-    let waiting = "a\tTask a\n".to_owned();
-    let listed = format!("a\tTask a\nissue-3\t{title}\n");
-    assert_eq!(task(&github, &["ready"]), Ok(waiting.clone()), "the fix is in flight");
+    let left_out = "a\tTask a\n".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok(left_out.clone()), "the fix is in flight");
     let refused = task(&github, &["claim", "issue-3"]).expect_err("it waits");
-    assert!(refused.contains("`issue-3` waits for #45, whose description says `Fixes #3`"));
+    assert!(refused.contains("#45 says `Fixes #3`: the fix is in flight"), "{refused}");
 
     github.issues[1].body = "Summary.\n<!-- Fixes #3 -->\n".to_owned();
     assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "a comment closes nothing");
     let claimed = task(&github, &["claim", "issue-3"]).expect("work for an agent");
     assert!(claimed.contains("fix it on #45's own branch") && claimed.contains("keep the claim"));
-    github.issues[1].body = "Fixes #3".to_owned();
+    github.issues[1].body = "**Fixes #3**".to_owned();
     let status = task(&github, &["status"]).expect("status works");
-    assert!(status.contains("#45 says `Fixes #3` and waits to merge"), "{status}");
+    assert!(status.contains("; #45 says `Fixes #3`: the fix is in flight"), "{status}");
     let popped = github.issues.pop().expect("the fix");
     let unknown = task(&github, &["status"]).expect("status works");
     assert!(unknown.contains("its fix's state is unknown: no issue #45"), "{unknown}");
     assert_eq!(task(&github, &["release", "issue-3"]), Ok("released issue-3\n".to_owned()));
-    assert!(task(&github, &["ready"]).expect_err("incomplete").contains("no issue #45"));
     github.issues.push(popped);
-    assert_eq!(task(&github, &["ready"]), Ok(waiting), "released, and still waiting");
+    assert_eq!(task(&github, &["ready"]), Ok(left_out.clone()), "released, and still waiting");
 
     github.issues[1].is_open = false;
-    assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "a closed PR waits for nothing");
-    github.issues[1] = Issue { is_pull_request: false, ..github.issues[1].clone() };
-    github.issues[1].is_open = true;
-    assert_eq!(task(&github, &["ready"]), Ok(listed.clone()), "#45 is an issue, not a PR");
+    assert_eq!(task(&github, &["ready"]), Ok(left_out.clone()), "a closed PR takes no fix");
+    let closed = task(&github, &["claim", "issue-3"]).expect_err("a human's");
+    assert!(closed.contains("#45 is closed or merged, but issue #3 is still open"), "{closed}");
+    github.issues[1] = Issue { is_pull_request: false, is_open: true, ..github.issues[1].clone() };
+    assert_eq!(task(&github, &["ready"]), Ok(left_out), "#45 is an issue, not a PR");
+    let no_pull = task(&github, &["claim", "issue-3"]).expect_err("a human's");
+    assert!(no_pull.contains("#45, which issue #3 names, is not a pull request"), "{no_pull}");
     github.issues[1].is_pull_request = true;
     github.issues[0].author = "owner".to_owned();
     assert_eq!(task(&github, &["ready"]), Ok(listed), "only the bot files queue failures");
     let plain = task(&github, &["claim", "issue-3"]).expect("an ordinary issue");
     assert!(plain.contains("work on the branch `task/issue-3`"), "{plain}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a second failed run of the same PR is new work. Its issue is ready while the PR says
+// `Fixes` only for the first one, and waits too once the PR closes both (ADR-0021, point 6).
+#[test]
+fn a_second_queue_failure_is_ready_while_the_first_waits() {
+    let (root, clone) = setup("queue-failures-chained");
+    push_code_owners(&clone);
+    let (first, second) = (queue_failure(3, 900), queue_failure(4, 950));
+    let second_line = format!("a\tTask a\nissue-4\t{}\n", second.title);
+    let mut github = Fake { issues: vec![first, second, pull_45("Fixes #3")], ..Fake::default() };
+    let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
+    assert_eq!(task(&github, &["ready"]), Ok(second_line), "the second failure is new work");
+    assert!(task(&github, &["claim", "issue-3"]).expect_err("waits").contains("in flight"));
+    let claimed = task(&github, &["claim", "issue-4"]).expect("the new failure");
+    assert!(claimed.contains("add `Fixes #4` to #45's description"), "{claimed}");
+    assert_eq!(task(&github, &["release", "issue-4"]), Ok("released issue-4\n".to_owned()));
+    github.issues[2].body = "Fixes #3\nFixes #4".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "both wait now");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a lookup that fails for one issue leaves out only that issue: `ready` fails, says how
+// many it left out, and still lists the rest.
+#[test]
+fn a_failed_lookup_leaves_out_only_its_issue() {
+    let (root, clone) = setup("ready-left-out");
+    push_code_owners(&clone);
+    // Issue #3 names PR #45, which GitHub does not have.
+    let github = Fake {
+        issues: vec![queue_failure(3, 900), issue(5, "nami-agent[bot]", &["bug"])],
+        ..Fake::default()
+    };
+    let ready = execute(&clone, "origin", &github, &["ready"]).expect_err("incomplete");
+    assert_eq!(
+        ready,
+        "1 issue(s) left out because their state is unknown, so this list is incomplete; the \
+         rest of the list:\na\tTask a\nissue-5\tIssue 5\n"
+    );
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
