@@ -121,9 +121,12 @@ If it needs more than one small PR, release the claim, comment why, and add `nee
 
 **A merge-queue failure** is the one exception to steps 2 and 3 (ADR-0021, point 6). CI files `PR #<n> failed in the merge queue` when PR #n failed the required checks in the queue and left it. Only #n's branch can take the fix, so:
 
-1. Claim `issue-<m>` as usual. If #n is already back in the queue and its description says `Fixes #<m>`, someone else is on it: release the claim and take other work.
+1. Claim `issue-<m>` as usual. While #n is open and its description says `Fixes #<m>`, its fix is in flight, whether #n is queued or not: `ready` leaves the issue out and `claim` refuses it. Take other work, and push nothing to #n.
 2. Check out #n's branch, not `task/issue-<m>`. Rebase it onto `main` and run `just check-full`. Two ADRs with one number are the usual cause: renumber #n's ADR, meaning its file name, its title, its row in `docs/design/README.md` and every reference (ADR-0000).
-3. Push to #n's branch, add `Fixes #<m>` to #n's description, and add #n to the merge queue again. #n's merge closes the issue. If #n changes protected paths, the push dismisses its approval, and it waits for the code owner again.
+3. Push to #n's branch, add `Fixes #<m>` to #n's description, and add #n to the merge queue again. If #n changes protected paths, the push dismisses its approval, and it waits for the code owner again.
+4. Keep the claim. The issue closes when #n merges, or when a human closes it.
+
+A claim on such an issue is stale only if #n has had no push since the claim and does not say `Fixes #<m>`. A PR from `task/issue-<m>` does not count, because none is expected.
 
 The issue names only jobs, steps, tidy rules and lints that `main` defines. Read the log through its link. If the bot did not open #n, the issue carries `needs-decision` and a human rebases #n.
 
