@@ -170,8 +170,13 @@ mod tests {
         };
         assert_eq!(draw(7), draw(7));
         assert_ne!(draw(7), draw(8));
+        assert_eq!(Rng::new(0).next_u64(), 0xe220_a839_7b1d_cdaf, "splitmix64's first output");
         let mut rng = Rng::new(1);
-        assert!((0..100).all(|_| rng.below(3) < 3));
+        let draws: Vec<usize> = (0..100).map(|_| rng.below(3)).collect();
+        assert!(draws.iter().all(|value| *value < 3), "in range");
+        assert!((0..3).all(|value| draws.contains(&value)), "every value is drawn");
+        let seeds = [super::os_seed().unwrap(), super::os_seed().unwrap()];
+        assert_ne!(seeds[0], seeds[1], "the operating system's seeds differ");
         assert_eq!(rng.stem().len(), 9);
     }
 
