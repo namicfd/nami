@@ -141,13 +141,16 @@ The protected paths are:
   `.cargo/` and `.config/`.
 - **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`, except
   the rule paths (ADR-0022): the files that define what a tidy rule or a dylint lint reports, their
-  fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths merges without the
-  code owner once the required `ratchet` check proves that every case `main` writes down still
-  holds, the rule tables only narrow, mutation testing misses nothing, and the reviewer app
-  (`NAMI_REVIEWER_LOGIN`, not the agents' bot) reviewed its head and resolved its threads. That
-  holds for an **additive** change: new rules, new fixtures and UI cases, new rows. An **edit** to
-  existing rule code (a changed function, constant, test, fixture or UI case) also waits for the
-  reviewer app's approval of its head commit (#59), and until that app exists for a code owner's.
+  fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths is either:
+  - **additive** (new rules beside the old code, new fixtures and UI cases, new rows): it merges
+    on the required `ratchet` check's proof alone, with no review needed. The check proves that
+    every case `main` writes down still holds, the rule tables only narrow, and mutation testing
+    misses nothing; an open request for changes or thread by the reviewer app
+    (`NAMI_REVIEWER_LOGIN`, not the agents' bot) still blocks it;
+  - an **edit** to existing rule code (a changed function, constant, test, fixture or UI case, or
+    an `impl` that is not a plain `impl` of a type new in its file): it also waits for the
+    reviewer app's approval of its head commit (#59), and until that app exists for a code
+    owner's.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
 - **Policy:** `docs/design/`, `docs/TIGER_STYLE.md` and `docs/operations/`.
 - **References:** `crates/reference/` and `tools/`.

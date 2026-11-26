@@ -130,16 +130,20 @@ whatever your branch did to its own copies. Only the reviewer app's review count
 bot. What else the PR needs depends on its class, which the summary names (`pass (additive)`,
 `no verdict (edit)`):
 
-- **Additive** (ADR-0022, point 2): new functions and types, a new lint in its own file, one
-  dispatch call per new item, new registry rows, new fixtures and UI cases, reworded docs. It
-  merges once the reviewer app has reviewed its head commit and resolved its threads. Write a new
-  rule this way when you can: add its code beside the old, and leave existing functions, constants
-  and tests as they are.
-- **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case, or a
-  new member of an existing `impl`. It waits for the reviewer app's approval of its head commit
-  (#59), and until that app exists for a code owner's. Say in the PR description why the edit
-  does not loosen the rule.
+- **Additive** (ADR-0022, point 2): new functions and types, one dispatch call per new item, new
+  registry rows, new fixtures and UI cases, reworded docs. It merges on the ratchet's proof
+  alone, with no review needed; an open request for changes or thread by the reviewer app still
+  blocks it. Write a new rule this way when you can: add its code beside the old, leave existing
+  functions, constants and tests as they are, and give a new type only plain `impl`s in its own
+  file, of a new trait or of `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Default` or `Display`.
+  Don't nest an `impl`, trait, module or `macro_rules!` in a function, and don't use
+  `include_str!`, `file!` or `env!`, not even in a test.
+- **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
+  member of an existing `impl`; an `impl` with generics, in another file than its type, or of a
+  visitor trait such as `Visit` or `LateLintPass` (so a new lint's pass `impl` is an edit). It
+  waits for the reviewer app's approval of its head commit (#59), and until that app exists for a
+  code owner's. Say in the PR description why the edit does not loosen the rule.
 
-Until the reviewer app exists, every rule-path PR still needs a code owner's approval of its head
-commit. Run the check yourself first, inside a checkout of `main`:
-`cargo xtask ratchet --base . --head <your tree> --no-review`.
+Run the check yourself first, inside a checkout of `main`:
+`cargo xtask ratchet --base . --head <your tree> --no-review`. Without a review, it reports the
+skipped review check as unproven.
