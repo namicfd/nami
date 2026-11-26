@@ -160,7 +160,7 @@ The authoritative list is `.github/CODEOWNERS`.
     PR that says `Fixes #<n>` (ADR-0021).
   - Read the task's `### <id>` section in its `plan.md` before you start.
   - Work on a branch named `task/<id>`. Touch only the task's `owner_paths`.
-  - Never set `passes`. CI sets it, or for now the maintainer (ADR-0017).
+  - Never set `passes`. CI sets it, through the `nami-ci` bot's PR (ADR-0017).
   - If you give up on a task, `cargo xtask task release <id>` and say why in the plan.
 - **A reference lands before the feature it tests.** Never write the reference for code you also
   implement.
