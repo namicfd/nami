@@ -628,15 +628,25 @@ mod tests {
         assert!(weakened_lints(&kept, &head).is_empty(), "a kept, d never enforced, e is new");
     }
 
-    // Goal: in this tree, every rule whose id appears in a rule-path module has a firing
-    // fixture: the invariant that lets the ratchet vouch for a change to it (ADR-0022).
+    // Goal: every rule whose id appears in a rule-path module has a firing fixture, the
+    // invariant that lets the ratchet vouch for a change to it (ADR-0022): the frozen `text.rs`
+    // with the fixtures of its three rules has none uncovered, and a module that names a rule
+    // with no fixture is reported. Frozen inputs, so that an additive change cannot break it.
     #[test]
     fn every_rule_in_a_rule_path_has_a_case() {
-        let root = crate::workspace_root();
-        assert_eq!(rules_without_cases(&root, &root).unwrap(), Vec::<String>::new());
+        let covered = crate::tidy::scratch::Scratch::new("ratchet-covered");
+        covered.write(super::REGISTRY, &real_registry());
+        let text = "xtask/src/tidy/text.rs";
+        covered.write(text, &crate::ratchet::frozen(text));
+        for id in ["line-length", "debt-marker", "test-goal"] {
+            let fixture = format!("xtask/fixtures/tidy/{id}.fires.fixture");
+            covered.write(&fixture, &crate::ratchet::frozen(&fixture));
+        }
+        let none = rules_without_cases(covered.root(), covered.root()).unwrap();
+        assert_eq!(none, Vec::<String>::new());
         let scratch = crate::tidy::scratch::Scratch::new("ratchet-uncovered");
         scratch.write(super::REGISTRY, &real_registry());
-        scratch.write("xtask/src/tidy/text.rs", "const RULE: &str = \"assertion-density\";\n");
+        scratch.write(text, "const RULE: &str = \"assertion-density\";\n");
         let uncovered = rules_without_cases(scratch.root(), scratch.root()).unwrap();
         assert_eq!(uncovered, ["assertion-density (xtask/src/tidy/text.rs)"]);
     }

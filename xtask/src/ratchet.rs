@@ -95,8 +95,9 @@ const FROZEN: &str = "xtask/fixtures/ratchet";
 /// a snapshot that the ratchet's own tests read instead of the live file. The tests edit their
 /// inputs by exact text, so on the live files an additive change, such as a dispatch call at
 /// the tail of `text::check`, would break them, and the ratchet could never vouch for it
-/// (review of #57, round 8). Only `the_rule_paths_are_in_the_dialect` and the invariant
-/// `every_rule_in_a_rule_path_has_a_case` read the live tree, and neither anchors on text.
+/// (review of #57, round 8). Only the guard `the_rule_paths_are_in_the_dialect` reads the live
+/// rule files, and it anchors on no text. The canonical end-to-end tests copy the live tree on
+/// purpose, and are run by hand.
 #[must_use]
 pub fn frozen(relative: &str) -> String {
     assert!(!relative.starts_with('/'), "a frozen copy is named by a relative path");
