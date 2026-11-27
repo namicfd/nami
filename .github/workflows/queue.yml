@@ -50,9 +50,13 @@ jobs:
   # Ownership of queue failures: when the required checks fail on a merge-queue branch and the
   # PR has really left the queue, file an issue of kind `bug` for it, as nami-agent[bot], so
   # that `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on
-  # its own branch (ADR-0021, point 6). One issue per failed run: the title names the run, so a
-  # re-run of it finds its open issue and files nothing. No concurrency group: two runs file
-  # two different issues, and a group could cancel a pending job and lose a failure.
+  # its own branch (ADR-0021, point 6). One issue per merge group: the title names the first
+  # failed run, so a re-run of it finds its open issue and files nothing, and a failed run of
+  # the other workflow for the same group (`ci` or `guardrails`) adds its jobs to that issue as
+  # a comment. The group's tested commit keys a concurrency group, so the two runs of one merge
+  # group are filed one after the other and the second finds the first's issue. It never
+  # cancels: GitHub keeps one running and one pending job per group, and one merge group has at
+  # most these two workflows to file.
   #
   # `workflow_run` runs main's version of this file and of xtask, never a PR's, so the bot's
   # key never meets a PR's code. The key lives in the `nami-agent` environment, which only
@@ -66,6 +70,9 @@ jobs:
        github.event.workflow_run.path == '.github/workflows/guardrails.yml') &&
       github.event.workflow_run.event == 'merge_group' &&
       github.event.workflow_run.conclusion == 'failure'
+    concurrency:
+      group: queue-failure-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: nami-agent

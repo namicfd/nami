@@ -480,8 +480,9 @@ fn into_result(verdict: Verdict) -> Result<Verdict, String> {
 
 /// Judges the observations into one accumulator: every step adds its findings, and a step that
 /// cannot reach a result adds its reason to [`Verdict::failed`] and the others go on, so that
-/// no failure drops a finding (review of #57, round 11). Only the checks that the observations
-/// are of these trees, which come before any finding, end the judging early.
+/// no failure drops a finding (review of #57, rounds 11 and 12). Observations that are not of
+/// these trees leave out the steps that read them; the rule set and the review gate, which read
+/// only the trees and the reviews, run all the same.
 #[must_use]
 pub fn judge_all(base: &Path, head: &Path, observed: &Observations, tools: &Tools<'_>) -> Verdict {
     assert!(base.is_absolute() && head.is_absolute(), "the trees have absolute paths");
@@ -496,17 +497,48 @@ pub fn judge_all(base: &Path, head: &Path, observed: &Observations, tools: &Tool
             .push("No change to `xtask/`, `lints/` or a rule path: nothing to prove.".to_owned());
         return verdict;
     }
-    match observed_here(base, observed, tools, &head_tree) {
-        Ok(note) => verdict.notes.push(note),
-        Err(reason) => {
-            verdict.failed.push(reason);
-            return verdict;
-        }
-    }
     match rule_set(base, head) {
         Ok(findings) => verdict.add(Check::RuleSet, findings),
         Err(reason) => verdict.failed.push(reason),
     }
+    match observed_here(base, observed, tools, &head_tree) {
+        Ok(note) => {
+            verdict.notes.push(note);
+            judge_observed(base, head, observed, tools, &changed, &mut verdict);
+        }
+        Err(reason) => {
+            verdict.failed.push(reason);
+            judge_reviews(base, tools, &mut verdict);
+        }
+    }
+    verdict.findings.sort();
+    verdict
+}
+
+/// The review gate and the code owner's approval alone, for observations that cannot be
+/// judged: they read only the reviews.
+fn judge_reviews(base: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
+    if let Some(source) = &tools.review {
+        match owner_approval(base, source) {
+            Ok(approved) => verdict.owner_approved = approved,
+            Err(reason) => verdict.failed.push(reason),
+        }
+    }
+    if !verdict.rule_paths.is_empty() {
+        let _approved = review_gate(tools, verdict);
+    }
+}
+
+/// The steps that read the observations: the tidy corpus, the lint corpus, end to end, and the
+/// proof of [`judge_proof`].
+fn judge_observed(
+    base: &Path,
+    head: &Path,
+    observed: &Observations,
+    tools: &Tools<'_>,
+    changed: &[String],
+    verdict: &mut Verdict,
+) {
     // Each finding names its own check; corpus and end-to-end findings come from one pass.
     let mut rng = plant::Rng::new(observed.seed);
     let drawn = match corpus::judge(base, head, observed, &mut rng) {
@@ -537,10 +569,12 @@ pub fn judge_all(base: &Path, head: &Path, observed: &Observations, tools: &Tool
             Err(reason) => verdict.failed.push(reason),
         }
     }
-    verdict.add(Check::EndToEnd, Vec::new());
-    judge_proof(base, head, observed, tools, &mut verdict);
-    verdict.findings.sort();
-    verdict
+    // End to end is the corpus's pass over the head's whole tree: it ran only if the
+    // corpus's placements were drawn.
+    if drawn {
+        verdict.add(Check::EndToEnd, Vec::new());
+    }
+    judge_proof(base, head, observed, tools, verdict);
 }
 
 /// Checks that `observed` are the observations of these trees: of the head tree `head_tree`,
@@ -664,19 +698,24 @@ fn judge_proof(
         );
         return;
     }
-    let class = match class::classify(base, head, &verdict.rule_paths) {
-        Ok(class) => class,
+    // A diff that cannot be classified is no verdict, but its missed mutants and the review
+    // gate's findings, such as the app's request for changes, still count (review of #57,
+    // round 12): the class is only for the coverage of the hunks and for the edit gate.
+    let classified = class::classify(base, head, &verdict.rule_paths);
+    let class = match classified {
+        Ok(class) => Some(class),
         Err(reason) => {
-            // The review gate's findings, such as the app's request for changes, still count.
             verdict.failed.push(reason);
-            let _approved = review_gate(tools, verdict);
-            return;
+            None
         }
     };
     // What mutation testing could not show. For an edit, the reviewer app's approval stands in
     // for it: a test edited with the code it tests pins the edit, so mutants prove little there.
-    let uncovered = judge_mutants(base, head, observed, tools, &class, verdict);
+    let uncovered = judge_mutants(base, head, observed, tools, class.as_ref(), verdict);
     let approved = review_gate(tools, verdict);
+    let Some(class) = class else {
+        return;
+    };
     if class.is_edit() && approved {
         verdict.notes.push(format!(
             "An edit to existing rule code: the reviewer app approved the head commit, which \
@@ -722,7 +761,7 @@ fn judge_mutants(
     head: &Path,
     observed: &Observations,
     tools: &Tools<'_>,
-    class: &class::Class,
+    class: Option<&class::Class>,
     verdict: &mut Verdict,
 ) -> Vec<String> {
     if !tools.mutants {
@@ -817,13 +856,41 @@ pub fn check(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Verdict, Str
 }
 
 /// [`check`] as one accumulator ([`judge_all`]): an observation that fails is a step that
-/// could not reach a result.
+/// could not reach a result, and the steps that need no observations run all the same
+/// ([`judge_unobserved`]).
 #[must_use]
 pub fn check_all(base: &Path, head: &Path, tools: &Tools<'_>) -> Verdict {
     match observe(base, head, tools) {
         Ok(observed) => judge_all(base, head, &observed, tools),
-        Err(reason) => Verdict::unjudged(reason, tools),
+        Err(reason) => judge_unobserved(base, head, tools, reason),
     }
+}
+
+/// The verdict when there are no observations to judge, for `reason`: the observing job
+/// failed, or its record cannot be read. The rule set and the review gate, which read only the
+/// trees and the reviews, still run, so that their findings fail the PR whatever the owner
+/// approved (review of #57, round 12).
+#[must_use]
+pub fn judge_unobserved(base: &Path, head: &Path, tools: &Tools<'_>, reason: String) -> Verdict {
+    let (changed, mut verdict, _head_tree) = match scope_of(base, head) {
+        Ok(scoped) => scoped,
+        Err(trees) => {
+            let mut unjudged = Verdict::unjudged(reason, tools);
+            unjudged.failed.push(trees);
+            return unjudged;
+        }
+    };
+    verdict.range = tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned());
+    verdict.failed.push(reason);
+    if changed.iter().any(|path| scope::is_tooling(path)) {
+        match rule_set(base, head) {
+            Ok(findings) => verdict.add(Check::RuleSet, findings),
+            Err(problem) => verdict.failed.push(problem),
+        }
+        judge_reviews(base, tools, &mut verdict);
+    }
+    verdict.findings.sort();
+    verdict
 }
 
 /// `verdict`, settled by a code owner if it can be. A code owner's approval of the head commit

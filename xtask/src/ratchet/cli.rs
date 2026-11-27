@@ -290,7 +290,7 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
         Mode::Judge(file) => {
             let judged = match unread.map_or_else(|| Observations::read(file), Err) {
                 Ok(observed) => super::judge_all(&base, &head, &observed, &tools),
-                Err(reason) => Verdict::unjudged(reason, &tools),
+                Err(reason) => super::judge_unobserved(&base, &head, &tools, reason),
             };
             super::settled(&base, &tools, judged).map(Some)
         }

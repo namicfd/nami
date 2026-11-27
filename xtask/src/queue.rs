@@ -217,7 +217,8 @@ fn file_failure(
         ));
     }
     let vocabulary = vocabulary()?;
-    if let Some(noted) = note_on_sibling(forge, &details, &failures_of_pull, &vocabulary)? {
+    let sibling = Sibling { forge, github, details: &details };
+    if let Some(noted) = sibling.note(&failures_of_pull, &vocabulary)? {
         return Ok(noted);
     }
     let report = Failure {
@@ -237,38 +238,60 @@ fn file_failure(
     Ok(format!("filed #{number}: {title}\n"))
 }
 
-/// One issue per merge group: when both `ci` and `guardrails` fail for one merge group, the
-/// second run to finish finds the issue of the first among `failures_of_pull`, the open
-/// trusted issues of the same PR by their run, and adds its failed jobs to it as a comment
-/// instead of filing another (review of #57, round 11). Returns what it did, or `None` if no
-/// issue records a run of the same merge group: the same queue branch and tested commit.
-///
-/// # Errors
-///
-/// When GitHub cannot be asked.
-fn note_on_sibling(
-    forge: &dyn Forge,
-    details: &Run,
-    failures_of_pull: &[(u64, u32)],
-    vocabulary: &Vocabulary,
-) -> Result<Option<String>, String> {
-    for (its_run, number) in failures_of_pull {
-        let sibling = forge.run(*its_run)?;
-        let same_group =
-            sibling.head_sha == details.head_sha && sibling.head_branch == details.head_branch;
-        if sibling.id != *its_run || !same_group || sibling.path == details.path {
-            continue;
+/// A failed run, and where to look for the issue of another run of its merge group.
+struct Sibling<'a> {
+    forge: &'a dyn Forge,
+    github: &'a dyn GitHub,
+    details: &'a Run,
+}
+
+impl Sibling<'_> {
+    /// One issue per merge group: when both `ci` and `guardrails` fail for one merge group, the
+    /// second run to finish finds the issue of the first among `failures_of_pull`, the open
+    /// trusted issues of the same PR by their run, and adds its failed jobs to it as a comment
+    /// instead of filing another (review of #57, round 11). A re-run of the second run finds
+    /// that comment, by the bot and naming the run, and posts nothing (round 12). Returns what
+    /// it did, or `None` if no issue records a run of the same merge group: the same queue
+    /// branch and tested commit.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked.
+    fn note(
+        &self,
+        failures_of_pull: &[(u64, u32)],
+        vocabulary: &Vocabulary,
+    ) -> Result<Option<String>, String> {
+        let details = self.details;
+        for (its_run, number) in failures_of_pull {
+            let sibling = self.forge.run(*its_run)?;
+            let same_group =
+                sibling.head_sha == details.head_sha && sibling.head_branch == details.head_branch;
+            if sibling.id != *its_run || !same_group || sibling.path == details.path {
+                continue;
+            }
+            let repository = self.forge.repository()?;
+            let named = format!("https://github.com/{repository}/actions/runs/{}.", details.id);
+            let comments = self.github.comments(*number)?;
+            if comments
+                .iter()
+                .any(|comment| comment.author == BOT_LOGIN && comment.body.contains(&named))
+            {
+                return Ok(Some(format!(
+                    "#{number} already notes run {} of the same merge group; not noted again\n",
+                    details.id
+                )));
+            }
+            let jobs = failed_jobs(self.forge, details.id, vocabulary)?;
+            let note = failure::sibling_note(details.id, &repository, &jobs, vocabulary);
+            self.forge.post_comment(*number, &note)?;
+            return Ok(Some(format!(
+                "#{number} records run {its_run} of the same merge group; added run {} to it\n",
+                details.id
+            )));
         }
-        let jobs = failed_jobs(forge, details.id, vocabulary)?;
-        let repository = forge.repository()?;
-        let note = failure::sibling_note(details.id, &repository, &jobs, vocabulary);
-        forge.post_comment(*number, &note)?;
-        return Ok(Some(format!(
-            "#{number} records run {its_run} of the same merge group; added run {} to it\n",
-            details.id
-        )));
+        Ok(None)
     }
-    Ok(None)
 }
 
 /// Why PR `entry.pull` has not left the queue for good after run `details`, or `None` if it
@@ -457,6 +480,8 @@ mod tests {
         state: (String, String),
         queue_runs: String,
         issues: String,
+        /// The comments of every issue, as `(author, body)`.
+        issue_comments: Vec<(&'static str, String)>,
         posted: RefCell<Vec<(u32, String)>>,
         edited: RefCell<Vec<(u64, String)>>,
         filed: RefCell<Vec<(String, String, Vec<String>)>>,
@@ -526,8 +551,12 @@ mod tests {
         fn open_issues(&self) -> Result<Vec<Issue>, String> {
             Ok(lines(&self.issues, issue_from_json))
         }
-        fn comments(&self, number: u32) -> Result<Vec<Comment>, String> {
-            Err(format!("not asked for #{number}"))
+        fn comments(&self, _number: u32) -> Result<Vec<Comment>, String> {
+            let comment = |(author, body): &(&str, String)| Comment {
+                author: (*author).to_owned(),
+                body: body.clone(),
+            };
+            Ok(self.issue_comments.iter().map(comment).collect())
         }
         fn label_events(&self, number: u32) -> Result<Vec<LabelEvent>, String> {
             Err(format!("not asked for #{number}"))
@@ -796,6 +825,27 @@ mod tests {
         assert_eq!(*number, 9);
         assert!(note.contains("https://github.com/namicfd/nami/actions/runs/901"), "{note}");
         assert!(note.contains("Job `gate` failed"), "{note}");
+        let again = Fake {
+            run: guardrails.clone(),
+            other_runs: BTreeMap::from([(900, RUN.to_owned())]),
+            issues: recorded.clone(),
+            issue_comments: vec![("nami-agent[bot]", note.clone())],
+            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
+            ..dropped()
+        };
+        let rerun = run(&again, &["failed", "--run", "901"]).unwrap();
+        assert_eq!(rerun, "#9 already notes run 901 of the same merge group; not noted again\n");
+        assert!(again.posted.borrow().is_empty(), "a re-run posts nothing");
+        let forged = Fake {
+            run: guardrails.clone(),
+            other_runs: BTreeMap::from([(900, RUN.to_owned())]),
+            issues: recorded.clone(),
+            issue_comments: vec![("outsider", note.clone())],
+            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
+            ..dropped()
+        };
+        let noted = run(&forged, &["failed", "--run", "901"]).unwrap();
+        assert!(noted.starts_with("#9 records run 900"), "an outsider's copy is not the bot's");
         let other_group = RUN.replace("0123456789abcdef", "fedcba9876543210");
         let separate = Fake {
             run: guardrails,

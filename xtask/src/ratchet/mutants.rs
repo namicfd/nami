@@ -415,12 +415,14 @@ struct Inputs<'a> {
     rule_paths: &'a [String],
     observations: &'a Observations,
     work: &'a Path,
-    class: &'a super::class::Class,
+    class: Option<&'a super::class::Class>,
 }
 
 /// Judges the recorded mutation runs, workspace by workspace. `class` holds, by file, the lines
-/// of the dispatch calls and of the new declarations, whose hunks need no mutant of their own.
-/// What cannot be judged goes into [`Judged::failed`], and the other workspaces are judged on.
+/// of the dispatch calls and of the new declarations, whose hunks need no mutant of their own;
+/// without it (the diff could not be classified), the missed mutants are still read, and only
+/// the coverage of the hunks is left out. What cannot be judged goes into [`Judged::failed`],
+/// and the other workspaces are judged on.
 #[must_use]
 pub fn judge(
     base: &Path,
@@ -428,7 +430,7 @@ pub fn judge(
     rule_paths: &[String],
     observations: &Observations,
     work: &Path,
-    class: &super::class::Class,
+    class: Option<&super::class::Class>,
 ) -> Judged {
     let inputs = Inputs { base, head, rule_paths, observations, work, class };
     let mut judged = Judged::default();
@@ -443,8 +445,9 @@ pub fn judge(
     judged
 }
 
-/// Judges the mutation run of one workspace into `judged`. Its missed mutants are recorded as
-/// soon as the run is read, so that a later failure keeps them.
+/// Judges the mutation run of one workspace into `judged`. Its missed mutants are recorded from
+/// `missed.txt` before anything that can fail, the exit code, the counts and the timeouts
+/// among them, so that no later failure drops them (review of #57, round 12).
 ///
 /// # Errors
 ///
@@ -458,10 +461,12 @@ fn judge_workspace(
         inputs.observations.runs_of(workspace.name, "mutants").next().ok_or_else(|| {
             format!("the observations hold no mutation run of {}", workspace.name)
         })?;
+    if let Some(Some(missed)) = run.files.get(MISSED) {
+        judged.findings.extend(missed_findings(missed, workspace.directory));
+    }
     let (count, missed) = read_run(run)?;
     let missed_count = missed.lines().filter(|line| !line.trim().is_empty()).count();
     judged.notes.push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
-    judged.findings.extend(missed_findings(&missed, workspace.directory));
     // The registry's tables are data, which the rule-set check reads, so a data-only change
     // passes with no mutant. Every other hunk needs one of its own, unless each of its lines is
     // exempt (`hunks::is_exempt`): a comment or blank, test code, a dispatch call, a new
@@ -470,13 +475,17 @@ fn judge_workspace(
         if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
     let mut uncovered = Vec::new();
     for path in changed_sources(inputs.rule_paths, workspace) {
+        // Without a class, no hunk can be told exempt; the diff is no verdict already.
+        let Some(class) = inputs.class else {
+            break;
+        };
         uncovered.extend(uncovered_hunks(
             inputs.base,
             inputs.head,
             path,
             &starts,
             inputs.work,
-            inputs.class,
+            class,
         )?);
     }
     assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
@@ -615,10 +624,12 @@ fn read_run(run: &Run) -> Result<(u64, String), String> {
     let missed_lines = line_count(&missed_text);
     let (total, missed, timeouts) = (count("total_mutants")?, count("missed")?, count("timeout")?);
     let tested = count("caught")? + missed + timeouts + count("unviable")?;
+    // cargo-mutants 27.1.0 (`src/outcome.rs`, `LabOutcome::exit_code`): a timeout wins over a
+    // missed mutant, so misses with a timeout exit 3, and 2 means misses without one.
     let exit_agrees = match run.exit {
         Some(0) => missed == 0 && timeouts == 0,
-        Some(2) => missed > 0,
-        Some(3) => missed == 0 && timeouts > 0,
+        Some(2) => missed > 0 && timeouts == 0,
+        Some(3) => timeouts > 0,
         _ => false,
     };
     if total != listed || tested != total || missed != missed_lines || !exit_agrees {
@@ -943,9 +954,10 @@ mod tests {
     }
 
     // Goal: a mutation run is read only if the listing, the outcomes, `missed.txt` and the
-    // exit code agree: 0 for none missed and none timed out, 2 for some missed, 3 for only
-    // timeouts. Any timeout is no verdict that names the mutants. Zero mutants listed is read
-    // as zero, for the judge to call unproven.
+    // exit code agree, with cargo-mutants 27.1.0's precedence (`LabOutcome::exit_code`): 0 for
+    // none missed and none timed out, 3 for any timeout, missed ones or not, and 2 for missed
+    // ones without a timeout. Any timeout is no verdict that names the mutants. Zero mutants
+    // listed is read as zero, for the judge to call unproven.
     #[test]
     fn mutation_runs_are_read_strictly() {
         let missed = "src/a.rs:1:1: replace a\n";
@@ -957,6 +969,8 @@ mod tests {
         let mut unlisted = run(Some(3), "2", [2, 1, 0, 1, 0], "");
         let _emptied = unlisted.files.insert(TIMEOUT.to_owned(), Some(String::new()));
         assert!(read_run(&unlisted).unwrap_err().contains("lists 0 in timeout.txt"));
+        let both = read_run(&run(Some(3), "2", [2, 0, 1, 1, 0], missed)).unwrap_err();
+        assert!(both.contains("1 mutant(s) in lints timed out"), "a miss and a timeout: {both}");
         assert_eq!(read_run(&run(Some(0), "0", [0, 0, 0, 0, 0], "")), Ok((0, String::new())));
         let inconsistent = [
             run(Some(0), "2", [2, 1, 1, 0, 0], missed),
@@ -964,7 +978,7 @@ mod tests {
             run(Some(2), "2", [2, 2, 0, 0, 0], ""),
             run(Some(2), "2", [2, 1, 1, 0, 0], ""),
             run(Some(3), "2", [2, 2, 0, 0, 0], ""),
-            run(Some(3), "2", [2, 0, 1, 1, 0], missed),
+            run(Some(2), "2", [2, 0, 1, 1, 0], missed),
             run(Some(0), "3", [2, 2, 0, 0, 0], ""),
             run(Some(0), "2", [2, 1, 0, 0, 0], ""),
             run(Some(1), "2", [2, 2, 0, 0, 0], ""),

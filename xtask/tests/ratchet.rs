@@ -57,7 +57,7 @@ exit "$code"
 ///   each mutant's place, and `missed.txt` from `<dir>/src/fake-missed.txt`, and leaves
 ///   `missed.txt` out while `<dir>/src/no-missed-file` exists. The mutants listed in
 ///   `<dir>/src/fake-timeout.txt` time out: they are counted and written to `timeout.txt`, and
-///   with no missed mutant the run exits 3.
+///   the run exits 3, missed mutants or not, as cargo-mutants 27.1.0 does.
 /// - `cargo dylint --path <tree>/lints ...` "lints" every `.rs` file of the package it runs in,
 ///   reporting each `line:column` of `<tree>/lints/src/fake-lint.txt` as JSON.
 /// - `cargo dylint --all -- --workspace ...`, which the head's `xtask dylint` runs, reports
@@ -124,8 +124,9 @@ if [ "$1" = mutants ]; then
         [ -e "$dir/src/fake-missed.txt" ] && cp "$dir/src/fake-missed.txt" "$out/missed.txt"
     fi
     [ -e "$dir/src/fake-timeout.txt" ] && cp "$dir/src/fake-timeout.txt" "$out/timeout.txt"
-    [ "$missed" -gt 0 ] && exit 2
+    # cargo-mutants 27.1.0, `LabOutcome::exit_code` in src/outcome.rs: a timeout wins.
     [ "$timeouts" -gt 0 ] && exit 3
+    [ "$missed" -gt 0 ] && exit 2
     exit 0
 fi
 if [ "$1" = nextest ] || [ "$1" = test ]; then
@@ -1097,6 +1098,114 @@ fn one_workspace_s_timeout_keeps_another_s_misses() {
     assert_eq!(found(&verdict), vec![(Check::Mutants, "xtask/src/tidy/text.rs:1:1".to_owned())]);
     assert!(verdict.failed.iter().any(|why| why.contains("timed out")), "{:?}", verdict.failed);
     assert!(verdict.line().starts_with("ratchet: fail"), "{}", verdict.line());
+}
+
+/// Asserts that `verdict`, settled with the code owner's approval, fails on `finding` and
+/// lists `late` among what it could not judge.
+fn assert_fails_on(verdict: &Verdict, finding: (Check, &str), late: &str) {
+    assert!(verdict.line().starts_with("ratchet: fail"), "{}", verdict.summary());
+    let expected = (finding.0, finding.1.to_owned());
+    assert!(found(verdict).contains(&expected), "{:?} in {}", expected, verdict.summary());
+    assert!(verdict.failed.iter().any(|why| why.contains(late)), "{late}: {:?}", verdict.failed);
+}
+
+// Goal: round 12 of #57's review, the reviewer's probes: with the code owner's approval,
+// each fails and shows what it found. A missed mutant and a timeout in one workspace (exit 3,
+// as cargo-mutants 27.1.0 gives it) keep the miss; a rule-set loosening counts though the head
+// does not build; the app's request for changes counts though the observations are of another
+// head tree; a miss counts though a rule-path file does not parse; and a corpus finding counts
+// though the owner's approval cannot be read.
+#[test]
+fn the_reviewer_s_round_12_probes_fail() {
+    let case = Case::new("round-12-miss-timeout");
+    let two = "fn a() -> bool { true }\nfn b() -> bool { false }\n";
+    write(&case.head(), "lints/src/extra.rs", two);
+    declare_module(&case.head(), "extra");
+    let listing = "src/extra.rs:1:1: fake\nsrc/extra.rs:2:1: fake\n";
+    write(&case.head(), "lints/src/fake-mutants.txt", listing);
+    write(&case.head(), "lints/src/fake-missed.txt", "src/extra.rs:1:1: fake\n");
+    write(&case.head(), "lints/src/fake-timeout.txt", "src/extra.rs:2:1: fake\n");
+    let approved = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+    let settle = |tools: &Tools<'_>| {
+        let verdict = settled(&case.base(), tools, check_all(&case.base(), &case.head(), tools));
+        verdict.expect("a verdict with a finding")
+    };
+    let both = settle(&approved);
+    assert_fails_on(&both, (Check::Mutants, "lints/src/extra.rs:1:1"), "timed out");
+    let undeclared = Case::new("round-12-classify");
+    write(&undeclared.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    declare_module(&undeclared.head(), "extra");
+    write(&undeclared.head(), "lints/src/fake-missed.txt", "src/extra.rs:1:1: fake\n");
+    write(&undeclared.head(), "lints/src/undeclared.rs", "fn broken( {\n");
+    let tools = undeclared.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+    let raw = check_all(&undeclared.base(), &undeclared.head(), &tools);
+    let unclassified = settled(&undeclared.base(), &tools, raw).expect("a verdict");
+    assert_fails_on(&unclassified, (Check::Mutants, "lints/src/extra.rs:1:1"), "does not parse");
+}
+
+// Goal: round 12 of #57's review: the steps that need no observations run when the
+// observations fail. A rule-set loosening fails a head whose xtask does not build, and the
+// reviewer app's request for changes fails observations of another head tree, both with the
+// code owner's approval.
+#[test]
+fn findings_without_observations_still_fail() {
+    let case = Case::new("round-12-unobserved");
+    let registry = real("xtask/src/tidy/registry.rs");
+    let renamed = replaced(&registry, "id: \"line-length\"", "id: \"line-length-v2\"");
+    write(&case.head(), "xtask/src/tidy/registry.rs", &renamed);
+    write(&case.head(), "broken-build", "");
+    let mut tools = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+    tools.head_xtask = None;
+    let unbuilt = settled(&case.base(), &tools, check_all(&case.base(), &case.head(), &tools));
+    let unbuilt = unbuilt.expect("a verdict with a finding");
+    assert!(unbuilt.line().starts_with("ratchet: fail"), "{}", unbuilt.summary());
+    assert!(unbuilt.findings.iter().any(|finding| finding.check == Check::RuleSet));
+    assert!(
+        unbuilt.failed.iter().any(|why| why.contains("does not build")),
+        "{:?}",
+        unbuilt.failed
+    );
+    let other = Case::new("round-12-mismatch");
+    let changes =
+        FakeReviews { state: "CHANGES_REQUESTED", approval: Some(("owner", "head")), ..REVIEWED };
+    let requested = other.tools(NOTHING, "any", NOTHING, &changes);
+    let observed = observe(&other.base(), &other.head(), &requested).unwrap();
+    write(&other.head(), "docs/later.md", "Written after the observation.\n");
+    let raw = xtask::ratchet::judge_all(&other.base(), &other.head(), &observed, &requested);
+    let mismatched = settled(&other.base(), &requested, raw).expect("a verdict with a finding");
+    assert!(mismatched.line().starts_with("ratchet: fail"), "{}", mismatched.summary());
+    assert!(mismatched.findings.iter().any(|finding| finding.check == Check::Review));
+    assert!(mismatched.failed.iter().any(|why| why.contains("another head tree")));
+}
+
+/// GitHub as [`FakeReviews`] answers it, but the reviews cannot be read, so neither can the
+/// code owner's approval.
+struct BrokenReviews(FakeReviews);
+
+impl Reviews for BrokenReviews {
+    fn pull(&self, pull: u32) -> Result<Pull, String> {
+        self.0.pull(pull)
+    }
+    fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
+        Err("GitHub answered 502 for the reviews".to_owned())
+    }
+    fn threads(&self, pull: u32) -> Result<Vec<Thread>, String> {
+        self.0.threads(pull)
+    }
+    fn dismissed(&self, pull: u32) -> Result<BTreeMap<u64, String>, String> {
+        self.0.dismissed(pull)
+    }
+}
+
+// Goal: round 12 of #57's review: corpus findings fail when the code owner's approval itself
+// cannot be read.
+#[test]
+fn findings_fail_when_the_approval_cannot_be_read() {
+    let case = Case::new("round-12-approval");
+    write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    declare_module(&case.head(), "extra");
+    let broken = BrokenReviews(OWNER_APPROVED);
+    assert_fails_with(&settled_with_findings(&case, &broken, None), "502 for the reviews");
 }
 
 // Goal: the judge draws the placements again from the seed: observations without a drawn run,
