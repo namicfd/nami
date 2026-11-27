@@ -78,16 +78,17 @@ The ratchet sorts each rule-path diff into one class (`xtask/src/ratchet/class.r
 **Additive** means that every change in the rule paths is one of these:
 
 - **(a) New items, new files and modules for a new rule.** A new top-level item of a Rust file, new or existing: a function, a struct, enum, union or trait, a lint or lint pass declared with `declare_lint!`, `declare_tool_lint!` or `declare_lint_pass!`, a test module; in a new file also an import without a glob, and in an existing file a file module `mod name;` for a new file. A new item:
-  - carries only the attributes `doc`, `derive`, `must_use`, `inline`, `expect` and `test`;
-  - names nothing that reaches the environment, a process or the file system (`env`, `option_env`, `process`, `Command`, `fs`, `io`, and the `Path` methods that ask the file system, such as `exists` and `metadata`);
-  - uses none of `include!`, `include_str!`, `include_bytes!`, `file!`, `env!` and `option_env!`, a test among them: a test that pins `include_str!(file!())` kills every mutant of the file without testing a rule;
-  - holds no `impl`, trait, module or `macro_rules!` nested inside it;
+  - carries, on itself and on everything inside it (an `impl` member, a nested function), only the attributes `doc`, `derive`, `must_use`, `inline`, `expect` and `test`, so no `export_name`, `link_section`, `no_mangle`, `used` or other `unsafe` attribute;
+  - holds no `unsafe` code at any depth: no `unsafe impl`, `unsafe trait`, `unsafe fn` or `unsafe` block, and no `extern` block;
+  - names nothing, a test or test module among it, that reaches the environment, the clock, a process, a thread, the network or the file system (`env`, `option_env`, `time`, `SystemTime`, `Instant`, `process`, `Command`, `thread`, `net`, `fs`, `io`, `workspace_root`, and the `Path` methods that ask the file system, such as `exists` and `metadata`);
+  - uses none of `include!`, `include_str!`, `include_bytes!`, `file!`, `env!` and `option_env!`, a test among them. A test that pins its file, as it compiles (`include_str!(file!())`) or as it runs (`std::fs::read_to_string`), kills every mutant of the file without testing a rule (#57's review, rounds 5 and 6);
+  - holds no `impl`, trait, module or `macro_rules!` nested inside it, and no constant or static at any depth, associated constants included: like a top-level constant, which is an edit, no mutant tests its value;
   - in an existing file, has a name that is no identifier of the base's file, so that it shadows nothing the existing code names: a prelude item such as `drop`, an import, a glob.
 
   **A new `impl` is additive only** when it is a top-level item of the same file that defines its new self type; the self type is a single-segment path naming that type; the `impl` has no type or const parameters and no `where` clause; and its lifetime parameters, if any, have no bounds and appear only in the trait path and in method signatures, as in `impl<'tcx> LateLintPass<'tcx> for NewPass` and `impl<'ast> Visit<'ast> for NewVisitor`. The trait may be any trait: an `impl` whose self type is a plain new type of the same file cannot change which method a call on an existing type resolves to. Anything else is an edit: an `impl` of an existing type, an inherent `impl` in another file, a blanket or generic `impl` (`impl<T>`, even when its parameter shadows the new type's name, or one with a `where` clause), and a lifetime used in an associated type, a body or a macro (#57's review, round 5). So a new lint, and a new tidy rule with its own visitor, are fully additive.
 - **(b) One dispatch call per new item, at the existing dispatch sites.** A statement inserted at the top level of an existing function's body, in one of these forms:
   - `f(args);`, `module::f(args);` or `Type::f(args);`, calling a function new in the file that the path resolves to, or a function of a type new there;
-  - `place.extend(call);`, where `call` is such a call and `place` a path or a field of one, such as `self.violations`, so that the new rule's reports join the existing ones;
+  - `place.extend(call);`, where `call` calls a new function whose return type is exactly `Vec<Violation>`, and `place` is a report list of the function the call is in, read with `syn` from the base: a parameter of type `&mut Vec<Violation>`, a `self` field declared `Vec<Violation>` in the method's own type, a local declared `Vec<Violation>` (or untyped in a function that returns `Vec<Violation>` and ends in it) that the function returns, or a report field of a returned struct literal, as `rust_source::check` returns `Report { violations: visitor.violations }`. So a dispatch call can only add reports. On any other place, such as an allow-list, an exemption set or a list of enforced lints, it is an edit (#57's review, round 6: `names.extend(vendored(&root))` in `workspace_crates` would have let a nami crate depend on any crate). A place whose type cannot be read so is an edit too;
   - `place.register_lints(&[NEW, ..]);` with new lints only, or the base's registration with new lints appended;
   - `place.register_late_lint_pass(Box::new(|_| Box::new(NewPass)));`, or the early form, for a new lint pass.
 
@@ -102,7 +103,9 @@ The ratchet sorts each rule-path diff into one class (`xtask/src/ratchet/class.r
 - a changed or removed function, method, constant, static, type, `impl`, trait, import, macro or test;
 - a new member of an existing `impl`, or a new item inside an existing inline module other than the test module;
 - an `impl` that is not a plain `impl` of a type new in the same file (above);
-- a new constant or static (mutation testing makes no mutant for its value), a new macro or inline module, an import into an existing module;
+- a new constant or static at any depth, associated constants included (mutation testing makes no mutant for its value), a new macro or inline module, an import into an existing module;
+- `unsafe` code, an `extern` block, or an attribute outside the allowed ones, anywhere in a new item;
+- an `extend` on a place that is not a report list of its function, or with a call that does not return `Vec<Violation>`;
 - a registry row change that no data check proves, such as a new planned row or a changed `mechanism`;
 - a changed or deleted fixture, UI case or other file.
 
@@ -182,8 +185,9 @@ The judge draws the placements again from the recorded seed, after checking that
 - **Sound against honest mistakes by agents,** which is what #31 and the reviews of #57 showed, within what each class rests on.
 - **The `syn` checks are sound for files in the dialect** (point 3): for those, the rule ids, ban rows, scopes, allowed lists, the presence of each `check_*` call site, and the lints' levels and registrations that the base reads from the head's source are what the compiler builds, and no output of the head's code is involved. A rule-path file outside the dialect gives no verdict.
 - **An additive diff rests on the corpus, end to end and the data checks.** The existing rule code is the base's, token for token, and the new code can neither shadow it nor reach the state it reads (point 2). So the base's rules report what they reported, and the corpus and end to end show it at every placement; the data checks show that the tables only tighten; and that the new rules fire as their cases say, the new cases (which land in the base first) and mutation testing of the new code show. **Residual risk:**
-  - new code that reaches existing state through a path the class does not model, such as interior mutability behind a shared reference, a panic, or a loop that does not end; the corpus, end to end and the reviewer's review are what stand against these;
-  - a new rule that fires on too little, or a new case that is weak. That makes the guardrails less strict than they could be, never less strict than the base.
+  - new code that reaches existing state through a path the class does not model, such as interior mutability behind a shared reference, a panic, or a loop that does not end; the corpus, end to end and the sampled audits after merge (ADR-0008) are what stand against these, since an additive diff needs no review;
+  - a new rule that fires on too little, or a new case that is weak. That makes the guardrails less strict than they could be, never less strict than the base;
+  - a new test that pins its file through an existing helper that reads the tree without naming any of the names above, which would make mutants of the new code look caught. A null-mutant check (apply a change that alters no behaviour, such as an appended comment, and require the suite to pass) would close this; it is not built.
 - **An edit rests on the independent reviewer.** The checks still catch what they can: a removed row or call, a lowered lint, a case that no longer fires at a placement, a missed mutant. But how existing rule code applies its rules is code, which the `syn` checks do not read, and the corpus shows it only at the paths where it plants a case. A narrowing that no placement reaches, written with its tests edited along, passes every check; that was each exploit of #57's reviews. The reviewer app's approval of the head commit is what vouches for it. **Residual risk:** a narrowing that the reviewer also misses. The sampled audits after merge (ADR-0008) and the corpus, which only grows, stand against it.
 - **The review gate** counts only the bot that `NAMI_REVIEWER_LOGIN` names, matched by account type and exact login, never the authoring app and never a user account with a look-alike name. The review runs in CI (#59), where no authoring session holds the reviewer app's key (point 6).
 - **Defence in depth only** against head code written to deceive. Such code can recognise inputs, behave differently when observed, or lie in the records it prints, which the judge reads as data. The placements (point 3) are hardening against code that special-cases the planted cases, not proof. The reviewer app (point 6), sampled audits after merge (ADR-0008) and the trusted core, which deceptive code would have to get past, back the ratchet here.
@@ -350,6 +354,15 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 |---|---|---|
 | a new `struct Visitor` with its rule in `text.rs`, and in `rust_source.rs` an inherent `impl Visitor<'_> { fn visit_file(..) }` that skips a file starting with `#!`, which turned every rule off there (honest-plausible) | additive | edit: the new `impl Visitor<'_>` is not an `impl` of a type new in its file |
 | `trait Quiet { fn visit_file(..) {} } struct Quieted; impl<Quieted> Quiet for Quieted {}`, a blanket `impl` whose parameter shadows the new struct (deliberate) | additive | edit: an `impl` with generics |
+
+**#57's exploits of round 6** went at the dispatch calls and the tests. Each passed as additive; each is an edit now, with a test in `class.rs` (`extend_adds_only_reports`, `new_tests_may_not_read_the_file_at_run_time`):
+
+| Exploit | Then | Now |
+|---|---|---|
+| `names.extend(vendored(&root));` in `manifest::workspace_crates`, with a new `fn vendored` naming `rayon`, so `runtime-dependency` let a nami crate depend on it (honest-plausible) | additive | edit: `names` is no report list |
+| `bindings.names.extend(rebound(&pattern, &self));` in `FloatEqualityFinder::unbind`, which turned `float-eq-in-eq-fn` off after any untyped `let` (deliberate) | additive | edit: `bindings.names` is no report list |
+| `lints.extend(..)` in `manifest::enforced_lints` (`doc-tag`), and `parameters.extend(..)` in `float_reduction::is_selection` (the argmin exemption) | additive | edit: neither is a report list |
+| a new test in `rust_source.rs` that asserts the length of `std::fs::read_to_string` of the file itself, so every mutant of the file fails it (deliberate) | additive | edit: the new test names `fs` |
 
 **#34 replayed with mutation testing** (first version): pass, 35 mutants, 33 caught and 2 unviable.
 
