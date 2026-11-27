@@ -21,6 +21,7 @@
 //! queued merge, so how the rules apply is shown there; the mutants only ever show that the
 //! head's tests pin its own rule code.
 
+use super::Reason;
 use super::observations::Observations;
 use super::source::read_optional;
 use std::path::{Path, PathBuf};
@@ -84,52 +85,57 @@ pub fn rule_diff(base: &Path, head: &Path) -> Result<Vec<Change>, String> {
 ///
 /// # Errors
 ///
-/// No verdict: an observation of another pull request head, one that skipped the head, one of
-/// another tree than the carried head (by fingerprint), or one whose rule-path diff is not the
+/// No verdict, with its kind. Missing evidence ([`Reason::Evidence`]): an observation of
+/// another pull request head, one that skipped the head, or one of another tree than the
+/// carried head (by fingerprint). [`Reason::CarriedDiff`]: one whose rule-path diff is not the
 /// queued merge's, path for path and text for text.
 pub fn check(
     base: &Path,
     head: &Path,
     carried: &Carried,
     pr_head: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, (Reason, String)> {
+    let missing = |reason: String| (Reason::Evidence, reason);
     let observed = &carried.observations;
     if let Some(expected) = pr_head
         && observed.pr_head != expected
     {
-        return Err(format!(
+        return Err(missing(format!(
             "the carried mutation evidence observed the pull request head `{}`, not `{expected}`",
             observed.pr_head
-        ));
+        )));
     }
     if observed.skipped {
-        return Err(
-            "the carried observation skipped the head, so it holds no mutation evidence".to_owned()
-        );
+        return Err(missing(
+            "the carried observation skipped the head, so it holds no mutation evidence".to_owned(),
+        ));
     }
     let (observed_tree, links) = super::tree::fingerprint(&carried.head)
-        .map_err(|error| format!("cannot read the carried head tree: {error}"))?;
+        .map_err(|error| missing(format!("cannot read the carried head tree: {error}")))?;
     if observed.head != observed_tree || !links.is_empty() {
-        return Err(format!(
+        return Err(missing(format!(
             "the carried observation is of another head tree (fingerprint {}, the carried tree's \
              {observed_tree}), so its runs say nothing about these trees",
             observed.head
-        ));
+        )));
     }
-    let queued = rule_diff(base, head)?;
-    let earlier = rule_diff(&carried.base, &carried.head)?;
+    let queued = rule_diff(base, head).map_err(missing)?;
+    let earlier = rule_diff(&carried.base, &carried.head).map_err(missing)?;
     if queued != earlier {
         let paths = |diff: &[Change]| -> Vec<String> {
             diff.iter().map(|(path, _, _)| path.clone()).collect()
         };
-        return Err(format!(
-            "the carried mutation evidence observed another rule-path diff than the queued \
+        return Err((
+            Reason::CarriedDiff,
+            format!(
+                "the carried mutation evidence observed another rule-path diff than the queued \
              merge's (observed {:?}, queued {:?}, or the same paths with other text), as when \
              another rule PR that touches these files merged first. Push again, rebased onto \
              the new main, so that the ratchet observes this PR on its new base, then queue it \
              again; re-running the workflow does not help, because it observes the same merge",
-            paths(&earlier),
-            paths(&queued)
+                paths(&earlier),
+                paths(&queued)
+            ),
         ));
     }
     Ok(format!(
@@ -143,7 +149,7 @@ pub fn check(
 
 #[cfg(test)]
 mod tests {
-    use super::{Carried, check, rule_diff};
+    use super::{Carried, Reason, check, rule_diff};
     use crate::ratchet::observations::Observations;
 
     /// Writes `files` into `root`, relative paths and texts.
@@ -182,24 +188,29 @@ mod tests {
         let (queue_base, queue_head) = (root.join("queue/base"), root.join("queue/head"));
         let note = check(&queue_base, &queue_head, &carried, Some("abc")).unwrap();
         assert!(note.contains("rule-path diff of 1 path(s) is the queued merge's"), "{note}");
-        let other = check(&queue_base, &queue_head, &carried, Some("def")).unwrap_err();
+        let refused = |evidence: &Carried, pr_head: Option<&str>, why: Reason| {
+            let (kind, text) = check(&queue_base, &queue_head, evidence, pr_head).unwrap_err();
+            assert_eq!(kind, why, "{text}");
+            text
+        };
+        let other = refused(&carried, Some("def"), Reason::Evidence);
         assert!(other.contains("observed the pull request head `abc`, not `def`"), "{other}");
         carried.observations.skipped = true;
-        let skipped = check(&queue_base, &queue_head, &carried, None).unwrap_err();
+        let skipped = refused(&carried, None, Reason::Evidence);
         assert!(skipped.contains("skipped the head"), "{skipped}");
         carried.observations.skipped = false;
         scratch.write("carried/head/docs/later.md", "x\n");
-        let moved = check(&queue_base, &queue_head, &carried, None).unwrap_err();
+        let moved = refused(&carried, None, Reason::Evidence);
         assert!(moved.contains("is of another head tree"), "{moved}");
         std::fs::remove_file(root.join("carried/head/docs/later.md")).unwrap();
         scratch.write(&format!("queue/head/{rule}"), "fn a() {}\nfn c() {}\n");
-        let text = check(&queue_base, &queue_head, &carried, None).unwrap_err();
+        let text = refused(&carried, None, Reason::CarriedDiff);
         assert!(text.contains("another rule-path diff"), "{text}");
         assert!(text.contains("Push again, rebased onto the new main"), "{text}");
         assert!(text.contains("re-running the workflow does not help"), "{text}");
         scratch.write(&format!("queue/head/{rule}"), "fn a() {}\nfn b() {}\n");
         scratch.write("queue/head/lints/ui/new.rs", "fn main() {}\n");
-        let paths = check(&queue_base, &queue_head, &carried, None).unwrap_err();
+        let paths = refused(&carried, None, Reason::CarriedDiff);
         assert!(paths.contains("\"lints/ui/new.rs\""), "{paths}");
         assert_eq!(rule_diff(&queue_base, &queue_base).unwrap(), Vec::new(), "no change");
     }

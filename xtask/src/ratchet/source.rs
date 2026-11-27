@@ -14,7 +14,7 @@
 //! does not read is no verdict, never a pass.
 
 use super::dialect;
-use super::{Check, Finding, Step, Verdict};
+use super::{Check, Finding, Reason, Step, Tools, Verdict};
 use crate::tidy::lints::DylintLint;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -278,18 +278,39 @@ pub fn check_calls(relative: &str, text: &str) -> Result<BTreeSet<(String, Strin
 /// declared and registered. Each reading holds its own files of the head to the dialect, as
 /// [`dialect::check_head`] does for all of them, and fails alone: a file that cannot be read,
 /// or that is outside the dialect, leaves out only the readings of that file, and the others'
-/// findings are recorded (review of #57, round 13).
-pub fn check(base: &Path, head: &Path, verdict: &mut Verdict) {
+/// findings are recorded (review of #57, round 13). A head file that cannot be read so is a
+/// form the ratchet refuses ([`Reason::Refused`]); a base file that cannot be read is missing
+/// evidence ([`Reason::Evidence`]).
+pub fn check(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
     let readings = [registry_findings(base, head)]
         .into_iter()
         .chain(RULE_MODULES.iter().map(|module| call_findings(base, head, module)))
         .chain([lint_findings(base, head)]);
     for reading in readings {
-        match reading {
-            Ok(findings) => findings.into_iter().for_each(|finding| verdict.record(finding)),
-            Err(reason) => verdict.fail(Step::RuleSet, reason),
+        let injected = verdict.inject(Step::RuleSet, tools, Ok::<_, String>(()));
+        match (injected, reading) {
+            (Err(reason), _) => verdict.fail(Step::RuleSet, reason),
+            (Ok(()), Ok(findings)) => {
+                for finding in findings {
+                    verdict.record(finding);
+                }
+            }
+            (Ok(()), Err((why, reason))) => verdict.fail_for(Step::RuleSet, why, reason),
         }
     }
+}
+
+/// What one reading of [`check`] found, or why it could not read: the kind and the reason.
+type Reading = Result<Vec<Finding>, (Reason, String)>;
+
+/// A failure to read the head as the dialect allows.
+fn refused(reason: String) -> (Reason, String) {
+    (Reason::Refused, reason)
+}
+
+/// A failure to read the base.
+fn unread(reason: String) -> (Reason, String) {
+    (Reason::Evidence, reason)
 }
 
 /// The registry's rows that the head loosens.
@@ -298,13 +319,15 @@ pub fn check(base: &Path, head: &Path, verdict: &mut Verdict) {
 ///
 /// No verdict: either registry is missing or does not parse, or the head's is outside the
 /// dialect.
-fn registry_findings(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
+fn registry_findings(base: &Path, head: &Path) -> Reading {
     let read = |root: &Path| -> Result<String, String> {
         read_optional(root, REGISTRY)?.ok_or_else(|| format!("{REGISTRY} is missing"))
     };
-    let head_text = read(head)?;
-    dialect::registry::check(&head_text)?;
-    Ok(loosened_rows(&parse_registry(&read(base)?)?, &parse_registry(&head_text)?))
+    let head_text = read(head).map_err(refused)?;
+    dialect::registry::check(&head_text).map_err(refused)?;
+    let after = parse_registry(&head_text).map_err(refused)?;
+    let before = read(base).and_then(|text| parse_registry(&text)).map_err(unread)?;
+    Ok(loosened_rows(&before, &after))
 }
 
 /// The `check_*` calls of the rule module `module` that the base makes and the head does not.
@@ -312,15 +335,15 @@ fn registry_findings(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
 /// # Errors
 ///
 /// No verdict: the module cannot be read, or either side is outside the dialect.
-fn call_findings(base: &Path, head: &Path, module: &str) -> Result<Vec<Finding>, String> {
-    let after = match read_optional(head, module)? {
-        Some(text) => check_calls(module, &text)?,
+fn call_findings(base: &Path, head: &Path, module: &str) -> Reading {
+    let after = match read_optional(head, module).map_err(refused)? {
+        Some(text) => check_calls(module, &text).map_err(refused)?,
         None => BTreeSet::new(),
     };
-    let Some(base_text) = read_optional(base, module)? else {
+    let Some(base_text) = read_optional(base, module).map_err(unread)? else {
         return Ok(Vec::new());
     };
-    let before = check_calls(module, &base_text)?;
+    let before = check_calls(module, &base_text).map_err(unread)?;
     let findings: Vec<Finding> = before
         .difference(&after)
         .map(|(function, call)| {
@@ -337,9 +360,10 @@ fn call_findings(base: &Path, head: &Path, module: &str) -> Result<Vec<Finding>,
 
 /// Lints: every lint the base enforces is declared exactly once in the head, still enforced,
 /// and still registered.
-fn lint_findings(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
-    let before = dialect::lints::library(base).map_err(|problem| format!("the base: {problem}"))?;
-    let after = dialect::lints::library(head)?;
+fn lint_findings(base: &Path, head: &Path) -> Reading {
+    let before =
+        dialect::lints::library(base).map_err(|problem| unread(format!("the base: {problem}")))?;
+    let after = dialect::lints::library(head).map_err(refused)?;
     let mut findings = weakened_lints(&before.declarations, &after.declarations);
     for lint in before.registered.difference(&after.registered) {
         let message = format!(
@@ -618,16 +642,18 @@ mod tests {
         trees.write(&format!("head/{}", super::REGISTRY), &hidden);
         let checked = || {
             let mut verdict = crate::ratchet::Verdict::default();
-            super::check(&base_root, &head_root, &mut verdict);
-            (verdict.findings, verdict.failed)
+            super::check(&base_root, &head_root, &crate::ratchet::plain_tools(), &mut verdict);
+            let settleable = verdict.is_settleable();
+            (verdict.findings, verdict.failed, settleable)
         };
-        let (found, failed) = checked();
+        let (found, failed, settleable) = checked();
         assert!(found.is_empty(), "{found:?}");
         assert!(failed.len() == 1 && failed[0].contains("outside the dialect"), "{failed:?}");
+        assert!(settleable, "a head outside the dialect is a form the ratchet refuses");
         let narrowed =
             base.replace("self == Self::Everywhere || scope.is_nami()", "scope.is_nami()");
         trees.write(&format!("head/{}", super::REGISTRY), &narrowed);
-        assert_eq!(checked(), (Vec::new(), Vec::new()));
+        assert_eq!(checked(), (Vec::new(), Vec::new(), true));
         let paths = [super::REGISTRY.to_owned()];
         let class = crate::ratchet::class::classify(&base_root, &head_root, &paths).unwrap();
         assert!(class.edits[0].contains("`BanScope::includes` changed"), "{:?}", class.edits);

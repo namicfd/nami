@@ -19,8 +19,8 @@ use xtask::ratchet::review::{
 };
 use xtask::ratchet::tree::Scratch;
 use xtask::ratchet::{
-    Check, Faults, ReviewSource, STEPS, Tools, Verdict, canonical, carry, check, check_all, judge,
-    judge_all, judge_unobserved, observe, settled,
+    Check, Faults, ReviewSource, STEPS, Step, Tools, Verdict, canonical, carry, check, check_all,
+    judge, judge_all, judge_unobserved, observe, settled,
 };
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
@@ -698,7 +698,7 @@ fn a_dylint_exit_that_disagrees_is_no_verdict() {
     let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     let error = check(&case.base(), &case.head(), &tools).expect_err("a clean exit beside errors");
     assert!(error.contains("lint library exited 0 and printed 2 error"), "{error}");
-    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let observed = observed_cleanly(&case.base(), &case.head(), &tools);
     let mut library_agrees = observed.clone();
     for run in library_agrees.runs.iter_mut().filter(|run| run.mode == "library") {
         run.exit = Some(101);
@@ -820,7 +820,7 @@ fn a_merge_group_carries_the_pr_s_mutation_evidence() {
     let text = "xtask/src/tidy/text.rs";
     write(&case.head(), text, "fn rule() -> bool {\n    true\n}\n");
     let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
-    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let observed = observed_cleanly(&case.base(), &case.head(), &tools);
     let carried = case.place.path("carried");
     for (tree, from) in [("base", case.base()), ("head", case.head())] {
         let _copy = Scratch::copy_of(&from, &carried.join(tree)).expect("copied");
@@ -831,7 +831,7 @@ fn a_merge_group_carries_the_pr_s_mutation_evidence() {
     keep(&observed);
     let mut queue = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     queue.mutants = false;
-    let queued = observe(&case.base(), &case.head(), &queue).unwrap();
+    let queued = observed_cleanly(&case.base(), &case.head(), &queue);
     assert!(queued.runs.iter().all(|run| run.mode != "mutants"), "the queue observes no mutants");
     let judged = || {
         let mut with = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
@@ -870,7 +870,8 @@ fn a_merge_group_carries_the_pr_s_mutation_evidence() {
 // Goal: round 7 of #57's review: a new test that pins its file through an existing helper
 // (`read_optional`), which names nothing the class refuses, is additive, but the null mutant
 // shows that a test depends on the file's source text, so the mutant evidence proves nothing
-// and the diff gets no verdict. Without the pin, the same diff passes.
+// and the diff gets no verdict, which no approval settles (round 14). Without the pin, the same
+// diff passes.
 #[test]
 fn a_test_that_pins_its_file_gives_no_verdict() {
     let case = Case::new("null-mutant");
@@ -885,25 +886,24 @@ fn a_test_that_pins_its_file_gives_no_verdict() {
     let unpinned = check(&case.base(), &case.head(), &tools).unwrap();
     assert!(unpinned.unproven.is_empty(), "{}", unpinned.summary());
     write(&case.head(), "fake-pins.txt", &format!("{text} {}\n", source.len()));
-    let pinned = check(&case.base(), &case.head(), &tools).unwrap();
-    let expected = "a test depends on the source text of xtask/src/tidy/text.rs";
-    assert!(pinned.unproven.iter().any(|what| what.contains(expected)), "{}", pinned.summary());
-    assert!(pinned.line().starts_with("ratchet: no verdict (additive)"), "{}", pinned.line());
-    // Review of #55, thread 2: for an edit, the reviewer app's approval does not stand in for a
-    // failed null run; a code owner's does.
+    let pinned = check(&case.base(), &case.head(), &tools).unwrap_err();
+    let expected = "null mutant: the mutant evidence of xtask proves nothing: a test depends on \
+                    the source text of xtask/src/tidy/text.rs";
+    assert!(pinned.contains(expected), "{pinned}");
+    // Review of #55, thread 2, and of #57, round 14: neither the reviewer app's approval of an
+    // edit nor a code owner's stands in for a failed null run; the test is fixed instead.
     let fixture = "xtask/fixtures/tidy/line-length.fires.fixture";
     write(&case.head(), fixture, &format!("{}\n", real(fixture)));
     let approved =
         check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &APPROVED));
-    let approved = approved.unwrap();
-    assert!(approved.unproven.iter().any(|what| what.contains(expected)), "{}", approved.summary());
-    assert!(approved.line().starts_with("ratchet: no verdict (edit)"), "{}", approved.line());
+    assert!(approved.unwrap_err().contains(expected), "the app's approval");
     let owner = FakeReviews { approval: Some(("owner", "head")), ..APPROVED };
-    let owned = check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &owner));
-    let owned = owned.unwrap().line();
-    assert!(owned.starts_with("ratchet: pass (edit)"), "a code owner's approval: {owned}");
+    let owned = case.tools(NOTHING, "any", NOTHING, &owner);
+    let settling = settled(&case.base(), &owned, check_all(&case.base(), &case.head(), &owned));
+    let refused = settling.unwrap_err();
+    assert!(refused.contains(expected) && refused.contains("No approval settles"), "{refused}");
     write(&case.head(), fixture, &real(fixture));
-    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let observed = observed_cleanly(&case.base(), &case.head(), &tools);
     let mut dropped = observed.clone();
     dropped.runs.retain(|run| run.mode != "null");
     let error = judge(&case.base(), &case.head(), &dropped, &tools).unwrap_err();
@@ -955,7 +955,7 @@ fn an_additive_diff_needs_no_review_and_an_edit_the_app_s_approval() {
 fn the_judge_reads_the_head_that_was_observed() {
     let case = Case::new("one-head");
     let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
-    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let observed = observed_cleanly(&case.base(), &case.head(), &tools);
     write(
         &case.head(),
         "xtask/src/tidy/registry.rs",
@@ -1184,7 +1184,7 @@ fn findings_without_observations_still_fail() {
     let changes =
         FakeReviews { state: "CHANGES_REQUESTED", approval: Some(("owner", "head")), ..REVIEWED };
     let requested = other.tools(NOTHING, "any", NOTHING, &changes);
-    let observed = observe(&other.base(), &other.head(), &requested).unwrap();
+    let observed = observed_cleanly(&other.base(), &other.head(), &requested);
     write(&other.head(), "docs/later.md", "Written after the observation.\n");
     let raw = xtask::ratchet::judge_all(&other.base(), &other.head(), &observed, &requested);
     let mismatched = settled(&other.base(), &requested, raw).expect("a verdict with a finding");
@@ -1274,41 +1274,136 @@ fn a_symlinked_head_keeps_its_findings() {
     assert!(verdict.failed.iter().any(|why| why.starts_with("scope: the head holds 1 symbolic")));
 }
 
-// Goal: round 13 of #57's review: no failed step drops another step's finding, by
-// construction. The judge enters every step of `STEPS`, in that order, with observations,
-// without them and with carried evidence that cannot be read. And for every step S and every
-// other step T, a judge in which T finds something as it starts and S fails as it starts fails
-// with T's finding and lists S's failure, though the code owner approved the head. A step added
+// Goal: round 14 of #57's review, the reviewer's probes: a failure that the head chooses in a
+// late phase of `observe` drops nothing observed before it. With a tidy loosening and the code
+// owner's approval, a rule file that holds the null mutant's comment, and a deleted
+// `lints/Cargo.lock`, each still fail on the corpus's findings, with the failed phase listed.
+#[test]
+fn the_reviewer_s_round_14_probes_fail() {
+    let probe = |name: &str, extra: &str, lock: bool| {
+        let case = Case::new(name);
+        write(&case.head(), "lints/src/extra.rs", extra);
+        declare_module(&case.head(), "extra");
+        if !lock {
+            fs::remove_file(case.head().join("lints/Cargo.lock")).expect("the lock exists");
+        }
+        let tools = case.tools("unbounded-loop", "any", NOTHING, &OWNER_APPROVED);
+        let observed = observe(&case.base(), &case.head(), &tools);
+        let raw = judge_all(&case.base(), &case.head(), &observed, &tools);
+        let verdict = settled(&case.base(), &tools, raw).expect("a verdict with findings");
+        (observed.failures, verdict)
+    };
+    let null = "fn extra() -> bool { true }\n\
+                // The ratchet's null mutant: a change that alters no behaviour.\n";
+    let (failures, commented) = probe("round-14-null", null, true);
+    assert!(failures.iter().any(|(step, _)| *step == Step::NullRun), "{failures:?}");
+    assert!(commented.line().starts_with("ratchet: fail"), "{}", commented.summary());
+    assert!(commented.findings.iter().any(|finding| finding.check == Check::TidyCorpus));
+    assert!(commented.failed.iter().any(|why| why.contains("already holds the null mutant")));
+    let (unread, unlocked) = probe("round-14-lock", "fn extra() -> bool { true }\n", false);
+    assert!(unread.iter().any(|(step, _)| *step == Step::LintLibrary), "{unread:?}");
+    assert!(unlocked.line().starts_with("ratchet: fail"), "{}", unlocked.summary());
+    assert!(unlocked.findings.iter().any(|finding| finding.check == Check::TidyCorpus));
+    assert!(unlocked.has_failed(Step::LintLibrary), "{:?}", unlocked.failed);
+}
+
+/// Observes the head with `tools`, and asserts that no phase failed.
+fn observed_cleanly(base: &Path, head: &Path, tools: &Tools<'_>) -> Observations {
+    let observed = observe(base, head, tools);
+    assert!(observed.failures.is_empty(), "{:?}", observed.failures);
+    observed
+}
+
+/// Asserts that each step of `raw` reached its body, or recorded why it did not: it skipped, or
+/// it failed before its body.
+fn assert_accounted(raw: &Verdict, what: &str) {
+    assert_eq!(raw.visited, STEPS, "{what}: the judge enters every step, in order");
+    for step in STEPS {
+        let skipped = raw.skipped.iter().any(|(skip, _)| *skip == step);
+        let accounted = raw.reached.contains(&step) || skipped || raw.has_failed(step);
+        assert!(accounted, "{what}: {} neither reached its body nor said why", step.name());
+    }
+}
+
+/// Asserts what a planted finding of `find` gives in `raw`, with the code owner's approval: the
+/// step kept it if it reached its body, and settling never passes. With the finding the verdict
+/// fails; without it, the step that dropped it says why, and a planted failure, missing
+/// evidence, stays no verdict.
+fn assert_never_passes(base: &Path, tools: &Tools<'_>, raw: Verdict, find: Step, what: &str) {
+    let place = format!("injected/{}", find.name());
+    let kept = raw.findings.iter().any(|finding| finding.place == place);
+    assert_eq!(kept, raw.reached.contains(&find), "{what}: {}", raw.summary());
+    match settled(base, tools, raw) {
+        Ok(verdict) => {
+            assert!(verdict.line().starts_with("ratchet: fail"), "{what}: {}", verdict.summary());
+            assert!(kept, "{what}: a fail with the finding listed: {}", verdict.summary());
+        }
+        Err(reason) => assert!(!kept, "{what}: the finding was dropped: {reason}"),
+    }
+}
+
+// Goal: rounds 13 and 14 of #57's review: no failure drops a finding, and the owner's approval
+// never turns a dropped one into a pass. The faults act at the steps' real read and record
+// points. Every step reaches its body or says why, with observations, without them and with
+// carried evidence that cannot be read. For every pair of a step S that fails and a step T that
+// finds, S itself included (it finds, then fails), S's failure is listed, T's finding is kept
+// whenever T reached its body, and with the owner's approval the verdict fails or stays no
+// verdict, never a pass. The same holds when a phase of `observe` fails instead. A step added
 // to the judge is in `STEPS`, or the first check fails; once there, the matrix covers it.
 #[test]
 fn no_failed_step_drops_another_step_s_finding() {
     let case = Case::new("faults");
     write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    write(&case.head(), "lints/src/fake-mutants.txt", "src/extra.rs:1:1: fake\n");
     declare_module(&case.head(), "extra");
     let mut tools = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
     let (base, head) = (case.base(), case.head());
-    let observed = observe(&base, &head, &tools).expect("the head is observed");
+    let observed = observed_cleanly(&base, &head, &tools);
+    let carried = case.place.path("carried");
+    for (tree, from) in [("base", &base), ("head", &head)] {
+        let _copy = Scratch::copy_of(from, &carried.join(tree)).expect("copied");
+    }
+    fs::write(carried.join(carry::OBSERVATIONS), observed.to_json()).expect("writable");
+    tools.carried = Some(carry::Carried::read(&carried));
     let clean = judge_all(&base, &head, &observed, &tools);
-    assert_eq!(clean.visited, STEPS, "the judge enters every step, in order");
     assert!(clean.findings.is_empty() && clean.failed.is_empty(), "{}", clean.summary());
-    let unobserved = judge_unobserved(&base, &head, &tools, "the observing job failed");
-    assert_eq!(unobserved.visited, STEPS, "without observations");
+    assert_eq!(clean.reached, STEPS, "with everything to read, every step reaches its body");
+    assert_accounted(&judge_unobserved(&base, &head, &tools, "lost"), "without observations");
     tools.carried = Some(Err("the carried evidence cannot be read".to_owned()));
-    assert_eq!(judge_all(&base, &head, &observed, &tools).visited, STEPS, "carried evidence");
-    tools.carried = None;
+    assert_accounted(&judge_all(&base, &head, &observed, &tools), "unreadable carried evidence");
+    tools.carried = Some(carry::Carried::read(&carried));
     for fail in STEPS {
-        for find in STEPS.into_iter().filter(|step| *step != fail) {
-            tools.faults = Faults { fail: Some(fail), find: Some(find) };
+        for find in STEPS {
+            tools.faults = Faults { fail: Some(fail), find: Some(find), fail_observing: None };
             let pair = format!("{} fails, {} finds", fail.name(), find.name());
             let raw = judge_all(&base, &head, &observed, &tools);
-            assert_eq!(raw.visited, STEPS, "{pair}: every step is entered");
-            let verdict = settled(&base, &tools, raw).expect("a verdict with a finding");
-            assert!(verdict.line().starts_with("ratchet: fail"), "{pair}: {}", verdict.summary());
-            let place = format!("injected/{}", find.name());
-            let kept = verdict.findings.iter().any(|finding| finding.place == place);
-            assert!(kept, "{pair}: the finding is kept: {}", verdict.summary());
-            let failure = format!("{}: an injected failure", fail.name());
-            assert!(verdict.failed.contains(&failure), "{pair}: {:?}", verdict.failed);
+            assert_accounted(&raw, &pair);
+            // The step handles the planted failure as a real one, in its own words.
+            let step = format!("{}: ", fail.name());
+            let listed = |why: &String| why.starts_with(&step) && why.ends_with("injected failure");
+            assert!(raw.failed.iter().any(listed), "{pair}: {:?}", raw.failed);
+            assert_never_passes(&base, &tools, raw, find, &pair);
+        }
+    }
+    tools.carried = None;
+    let phases = [Step::Observations, Step::TidyCorpus, Step::LintLibrary, Step::LintCases];
+    for phase in phases.into_iter().chain([Step::Mutants, Step::NullRun]) {
+        tools.faults = Faults { fail_observing: Some(phase), ..Faults::default() };
+        let partial = observe(&base, &head, &tools);
+        assert_eq!(
+            partial.failures_of(phase).count(),
+            1,
+            "{}: {:?}",
+            phase.name(),
+            partial.failures
+        );
+        for find in STEPS {
+            tools.faults = Faults { find: Some(find), ..Faults::default() };
+            let what = format!("observing {} fails, {} finds", phase.name(), find.name());
+            let raw = judge_all(&base, &head, &partial, &tools);
+            assert_accounted(&raw, &what);
+            assert!(raw.has_failed(phase), "{what}: the phase's step fails: {:?}", raw.failed);
+            assert_never_passes(&base, &tools, raw, find, &what);
         }
     }
 }
@@ -1322,7 +1417,7 @@ fn the_judge_draws_the_placements_again() {
     let mut tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     tools.seed = None;
     tools.commit = Some("a".repeat(40));
-    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let observed = observed_cleanly(&case.base(), &case.head(), &tools);
     assert!(judge(&case.base(), &case.head(), &observed, &tools).is_ok());
     let homes = ["crates/solver/src/example.rs", "xtask/src/example.rs"];
     let drawn = observed
@@ -1365,10 +1460,10 @@ fn a_corpus_changed_in_the_head_job_gets_no_verdict() {
         fs::remove_file(entry.unwrap().path()).unwrap();
     }
     let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
-    let observed = observe(&tampered, &case.head(), &tools).unwrap();
+    let observed = observed_cleanly(&tampered, &case.head(), &tools);
     let error = judge(&case.base(), &case.head(), &observed, &tools).expect_err("another corpus");
     assert!(error.contains("do not cover the base's corpus"), "{error}");
-    let honest = observe(&case.base(), &case.head(), &tools).unwrap();
+    let honest = observed_cleanly(&case.base(), &case.head(), &tools);
     let mut away = honest.clone();
     let at_home = "crates/solver/src/example.rs";
     away.runs.retain(|run| {
@@ -1402,8 +1497,9 @@ fn the_head_xtask_is_built_from_the_head() {
 }
 
 // Goal: the command line refuses a base other than its own checkout and bad options (exit 2),
-// exits 1 for a loosening and 0 for a pass that the code owner reviews anyway, and `observe`
-// then `judge` give the same verdict as one run, with the verdict as the last line of stdout.
+// exits 1 for a loosening, 2 for skipped checks even where the code owner reviews anyway, and
+// 0 for a pass, and `observe` then `judge` give the same verdict as one run, with the verdict
+// as the last line of stdout.
 #[test]
 fn the_command_line_reports_the_verdict_in_its_exit_code() {
     let case = Case::new("command-line");
@@ -1434,9 +1530,11 @@ fn the_command_line_reports_the_verdict_in_its_exit_code() {
     let loose_path = loose.display().to_string();
     let honest_args = ["--no-review", "--head-xtask", honest_path.as_str()];
     let loose_args = ["--no-review", "--head-xtask", loose_path.as_str()];
+    // Skipped checks are missing evidence, which no review by the owner stands in for (review
+    // of #57, round 14): a local run that skips them gives no verdict.
     let (code, line) = run(&base, &honest_args);
-    assert_eq!(code, Some(0), "{line}");
-    assert!(line.starts_with("ratchet: pass (additive), outside the rule paths: 1"), "{line}");
+    assert_eq!(code, Some(2), "{line}");
+    assert!(line.starts_with("ratchet: no verdict (additive), 2 thing(s) unproven"), "{line}");
     let (loose_code, loose_line) = run(&base, &loose_args);
     assert_eq!(loose_code, Some(1), "{loose_line}");
     let observations = case.place.path("observations.json");
@@ -1455,6 +1553,13 @@ fn the_command_line_reports_the_verdict_in_its_exit_code() {
     assert!(why.contains("`--base` must be the checkout whose ratchet runs"), "{why}");
     let bad = Command::new(&real).args(["ratchet", "--base", "."]).current_dir(&base).output();
     assert_eq!(bad.expect("xtask runs").status.code(), Some(2), "no `--head`");
+    fs::remove_file(case.head().join("docs/RULES.md")).expect("the head's new rule list");
+    let budget = "xtask/expect-budget.txt";
+    let _bytes = fs::copy(base.join(budget), case.head().join(budget)).expect("the base's budget");
+    write(&case.head(), "docs/notes.md", "No tooling.\n");
+    let (passed, passed_line) = run(&base, &honest_args);
+    assert_eq!(passed, Some(0), "{passed_line}");
+    assert!(passed_line.starts_with("ratchet: pass, outside the rule paths: 1"), "{passed_line}");
 }
 
 // Goal: an approval of the head commit by a code owner turns what the ratchet cannot prove (a
@@ -1578,7 +1683,7 @@ fn run_canonical(diff: &canonical::Diff) -> Canonical {
         .expect("cargo runs");
     assert!(rules.success(), "the head's xtask writes docs/RULES.md");
     let tools = real_tools(place.path("work-pr"), true, None);
-    let observed = observe(&base, &head, &tools).expect("the pull request is observed");
+    let observed = observed_cleanly(&base, &head, &tools);
     let pull_request = judge(&base, &head, &observed, &tools).expect("a verdict on the PR");
     println!("{}", pull_request.summary());
     let carried = place.path("carried");
@@ -1597,7 +1702,7 @@ fn run_canonical(diff: &canonical::Diff) -> Canonical {
     // these two lines of the output.
     println!("canonical {}: the merge group starts", diff.name);
     let queue_observe = real_tools(place.path("work-queue"), false, None);
-    let queued = observe(&queue_base, &queue_head, &queue_observe).expect("the merge is observed");
+    let queued = observed_cleanly(&queue_base, &queue_head, &queue_observe);
     let carried = carry::Carried::read(&carried).expect("the carried evidence reads");
     let queue_judge = real_tools(place.path("work-queue-judge"), true, Some(carried));
     let merge_group = judge(&queue_base, &queue_head, &queued, &queue_judge).expect("a verdict");

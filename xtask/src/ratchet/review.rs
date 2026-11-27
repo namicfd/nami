@@ -30,7 +30,7 @@
 //! [`Reviews`] is what the check needs from GitHub. [`GhReviews`] asks through `gh api`, as
 //! whoever `GH_TOKEN` names; the tests use fixed data.
 
-use super::{Check, Finding, Step, Verdict};
+use super::{Check, Finding, Step, Tools, Verdict};
 use crate::issue::github::parse_lines;
 use crate::json::{self, Value};
 use std::collections::BTreeMap;
@@ -293,6 +293,7 @@ pub fn check(
     pull: u32,
     judged: &str,
     reviewer: &str,
+    tools: &Tools<'_>,
     verdict: &mut Verdict,
 ) {
     assert!(pull > 0, "pull requests are numbered from 1");
@@ -306,10 +307,11 @@ pub fn check(
         );
     }
     let (found, failed) = (verdict.findings.len(), verdict.failed.len());
+    verdict.reach(Step::ReviewGate, tools);
     let app = Actor::app(reviewer);
     let place = format!("pull request #{pull}");
     verdict.ran(Check::Review);
-    match reviews.pull(pull) {
+    match verdict.inject(Step::ReviewGate, tools, reviews.pull(pull)) {
         Ok(request) => {
             if request.author == app {
                 let message = format!(
@@ -324,7 +326,7 @@ pub fn check(
         Err(reason) => verdict.fail(Step::ReviewGate, reason),
     }
     let decided = decisions(reviews, pull, judged, &app, verdict);
-    thread_findings(reviews, pull, reviewer, verdict);
+    thread_findings(reviews, pull, reviewer, tools, verdict);
     let Some((reviewed, approved)) = decided else {
         return;
     };
@@ -397,11 +399,18 @@ fn decisions(
 /// The findings of the reviewer's threads on pull request `pull`, into `verdict`, page by page,
 /// each page's as soon as it is read. A page that cannot be read, or more than
 /// [`THREAD_PAGES_MAX`] pages, fails [`Step::ReviewGate`].
-fn thread_findings(reviews: &dyn Reviews, pull: u32, reviewer: &str, verdict: &mut Verdict) {
+fn thread_findings(
+    reviews: &dyn Reviews,
+    pull: u32,
+    reviewer: &str,
+    tools: &Tools<'_>,
+    verdict: &mut Verdict,
+) {
     let place = format!("pull request #{pull}");
     let mut after: Option<String> = None;
     for _page in 0..THREAD_PAGES_MAX {
-        let page = match reviews.threads(pull, after.as_deref()) {
+        let read = reviews.threads(pull, after.as_deref());
+        let page = match verdict.inject(Step::ReviewGate, tools, read) {
             Ok(page) => page,
             Err(reason) => return verdict.fail(Step::ReviewGate, reason),
         };
@@ -699,7 +708,7 @@ mod tests {
     /// The review gate on pull request 7 at `judged`, for `reviewer`, into a verdict of its own.
     fn gate(fixed: &dyn Reviews, judged: &str, reviewer: &str) -> Verdict {
         let mut verdict = Verdict::default();
-        check(fixed, 7, judged, reviewer, &mut verdict);
+        check(fixed, 7, judged, reviewer, &crate::ratchet::plain_tools(), &mut verdict);
         verdict
     }
 

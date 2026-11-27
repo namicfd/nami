@@ -44,9 +44,15 @@
 //! `NAMI_REVIEWER_LOGIN` names, and the review it posts runs in CI (pending #59), where no
 //! authoring session holds its key.
 //!
-//! **One tree.** The observer and the judge read the same head: both refuse a head with a
-//! symbolic link, so the observer's scratch copy, which holds regular files only, has every
-//! file of the head; and the observer records the head's fingerprint, which the judge checks.
+//! **One tree.** The observer and the judge read the same head: the observer records the head's
+//! fingerprint, which the judge checks, and both leave symbolic links out of what they plant and
+//! mutate, since the observer's scratch copy holds regular files only. The judge refuses a head
+//! with a link, a form it cannot vouch for, and still judges what was observed of it.
+//!
+//! **Settling.** A code owner's approval of the head settles a no verdict only when each reason
+//! is unprovable though the evidence is complete ([`Reason::settleable`]); missing or broken
+//! evidence is fixed by fixing the PR or re-running the job, never settled (review of #57,
+//! round 14).
 //!
 //! **Output.** Each finding is one line on stderr, `place: error[ratchet-<check>]: what; fix`.
 //! A Markdown summary goes to stdout; its last line is the verdict.
@@ -89,6 +95,9 @@ const WITHHELD_VARIABLES: [&str; 5] =
 
 /// The base's CODEOWNERS, which decides whether the owner reviews a pull request anyway.
 const CODEOWNERS: &str = ".github/CODEOWNERS";
+
+/// Why a step that reads the observations skips: there are none of these trees.
+const NO_OBSERVATIONS: &str = "no observations of these trees; the observations step says why";
 
 /// Where the frozen copies of rule-path files live, for the ratchet's own tests.
 const FROZEN: &str = "xtask/fixtures/ratchet";
@@ -143,11 +152,13 @@ impl Check {
     }
 }
 
-/// A step of the judge. Every step has the form `fn step(.., verdict: &mut Verdict)` and
-/// returns nothing: it records each finding into the verdict the moment it is known, and a
-/// failure as [`Verdict::fail`], so that no `?` can cross a step and drop what another step
-/// found (review of #57, round 13). The fault-injection test makes each step fail beside a
-/// finding of each other one.
+/// A step of the judge, and the phase of `observe` that gathers its evidence. Every step has
+/// the form `fn step(.., verdict: &mut Verdict)` and returns nothing: it records each finding
+/// into the verdict the moment it is known, and a failure as [`Verdict::fail`], so that no `?`
+/// can cross a step and drop what another step found (review of #57, round 13). Each phase of
+/// `observe` records its failure in the observations and the others go on, and the judge's
+/// step fails on it (round 14). The fault-injection test plants failures and findings at the
+/// steps' real read and record points ([`Faults`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
     /// The changed paths, CODEOWNERS and the head tree's fingerprint.
@@ -215,17 +226,65 @@ impl Step {
             Self::ReviewGate => "review gate",
         }
     }
+
+    /// The step named `name`, as [`Step::name`] gives it.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        STEPS.into_iter().find(|step| step.name() == name)
+    }
 }
 
-/// Faults that the fault-injection test plants in the judge; the command line never sets any.
-/// `fail` makes that step fail as it starts, and `find` makes that step report a finding as it
-/// starts.
+/// Faults that the fault-injection test plants; the command line never sets any. They act at
+/// the steps' real points: `find` records a finding where its step reaches its body
+/// ([`Verdict::reach`]); `fail` makes a read of its step fail where the step reads its input
+/// ([`Verdict::inject`]), the first read after that finding if the step also finds, so that the
+/// step finds and then fails; and `fail_observing` makes that phase of `observe` fail.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Faults {
-    /// The step that fails.
+    /// The step whose read fails.
     pub fail: Option<Step>,
     /// The step that finds something.
     pub find: Option<Step>,
+    /// The phase of `observe` that fails.
+    pub fail_observing: Option<Step>,
+}
+
+/// Why the ratchet could not reach a verdict on something, and whether a code owner's approval
+/// of the head settles it. Only what is unprovable though the evidence is complete is settled;
+/// evidence that is missing, unreadable or mismatched, or a tool that failed, never is: the PR
+/// is fixed or the job re-run (review of #57, round 14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// Evidence that is missing, unreadable or mismatched, a check that was skipped, or a tool
+    /// that failed or was killed. What [`Verdict::fail`] records.
+    Evidence,
+    /// An edit to existing rule code without the reviewer app's approval of the head.
+    UnapprovedEdit,
+    /// A changed hunk, or a workspace's change, without a mutant of its own.
+    NoMutant,
+    /// A manifest or build file in the rule paths.
+    BuildFile,
+    /// A form the ratchet refuses to read: a file outside the dialect, a symbolic link, a diff
+    /// the class does not read.
+    Refused,
+    /// A merge group whose rule-path diff differs from the one the carried evidence mutated.
+    CarriedDiff,
+}
+
+impl Reason {
+    /// True if a code owner's approval of the head settles it. Every reason is named here, so
+    /// a new one does not compile until it is placed.
+    #[must_use]
+    pub fn settleable(self) -> bool {
+        match self {
+            Self::Evidence => false,
+            Self::UnapprovedEdit
+            | Self::NoMutant
+            | Self::BuildFile
+            | Self::Refused
+            | Self::CarriedDiff => true,
+        }
+    }
 }
 
 /// One way in which the head is looser than the base, or not proven.
@@ -341,12 +400,19 @@ pub struct Verdict {
     /// Why a step could not reach a result: no verdict. A step that fails adds its reason here
     /// and the judge goes on, so that no failure drops a finding of an earlier or later step
     /// (review of #57, round 11). Only [`settled`] turns these into notes, and only when there
-    /// is no finding.
+    /// is no finding and each is settleable ([`Reason::settleable`]).
     pub failed: Vec<String>,
-    /// Every step that the judge entered, in order, for the fault-injection test.
+    /// Every step that the judge entered, in order.
     pub visited: Vec<Step>,
+    /// Every step that reached its body with its inputs ([`Verdict::reach`]).
+    pub reached: Vec<Step>,
+    /// Every step that returned before its body, with why: its inputs are missing, which a
+    /// failure of another step says, or it does not apply to this diff.
+    pub skipped: Vec<(Step, String)>,
     /// The steps that could not reach a result, each once.
     broken: Vec<Step>,
+    /// Every failure and unproven item that no approval settles ([`Reason::settleable`]).
+    unsettled: Vec<String>,
     /// Every changed path, rule path or not; empty if the scope could not be read.
     changed: Vec<String>,
     /// The fingerprint of the head tree; empty if the scope could not be read.
@@ -360,6 +426,8 @@ pub struct Verdict {
 /// What the steps of a verdict found out that later steps read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Progress {
+    /// True once the changed paths are known.
+    scoped: bool,
     /// True once the observations are known to be of these trees.
     observed: bool,
     /// True if the reviewer app approved the head commit, and the review gate read everything
@@ -369,14 +437,31 @@ struct Progress {
 
 impl Verdict {
     /// Records that `step` could not reach a result, for `reason`: no verdict, beside whatever
-    /// the other steps found.
+    /// the other steps found. Its evidence is missing or broken ([`Reason::Evidence`]), which no
+    /// approval settles.
     pub fn fail(&mut self, step: Step, reason: impl fmt::Display) {
+        self.fail_for(step, Reason::Evidence, reason);
+    }
+
+    /// Records that `step` could not reach a result, for `reason`, of the kind `why`.
+    pub fn fail_for(&mut self, step: Step, why: Reason, reason: impl fmt::Display) {
         let reason = reason.to_string();
         assert!(!reason.is_empty(), "a failure says why");
-        self.failed.push(format!("{}: {reason}", step.name()));
+        let line = format!("{}: {reason}", step.name());
+        if !why.settleable() {
+            self.unsettled.push(line.clone());
+        }
+        self.failed.push(line);
         if !self.broken.contains(&step) {
             self.broken.push(step);
         }
+    }
+
+    /// True if a code owner's approval may settle this verdict's failures and unproven items:
+    /// each is unprovable though the evidence is complete ([`Reason::settleable`]).
+    #[must_use]
+    pub fn is_settleable(&self) -> bool {
+        self.unsettled.is_empty()
     }
 
     /// True if `step` could not reach a result.
@@ -398,25 +483,60 @@ impl Verdict {
         }
     }
 
-    /// Enters `step`: records the visit, and applies the faults that `tools` plants. Returns
-    /// false if the step is to fail at once, which it then has recorded.
-    fn enter(&mut self, step: Step, tools: &Tools<'_>) -> bool {
+    /// Enters `step`: records the visit.
+    fn enter(&mut self, step: Step) {
         if !self.visited.contains(&step) {
             self.visited.push(step);
         }
+    }
+
+    /// Records that `step` reached its body with its inputs, where it records what it finds. A
+    /// finding that `tools` plants for the step is recorded here.
+    fn reach(&mut self, step: Step, tools: &Tools<'_>) {
+        if self.reached.contains(&step) {
+            return;
+        }
+        self.reached.push(step);
         if tools.faults.find == Some(step) {
             let message = format!("an injected finding of the step `{}`", step.name());
-            self.record(Finding::new(
-                &format!("injected/{}", step.name()),
-                Check::RuleSet,
-                message,
-            ));
+            let place = format!("injected/{}", step.name());
+            self.record(Finding::new(&place, Check::RuleSet, message));
         }
-        if tools.faults.fail == Some(step) {
-            self.fail(step, "an injected failure");
-            return false;
+    }
+
+    /// Records that `step` returns before its body, for `why`.
+    fn skip(&mut self, step: Step, why: &str) {
+        assert!(!self.reached.contains(&step), "a step that reached its body did not skip it");
+        self.skipped.push((step, why.to_owned()));
+    }
+
+    /// What `step` read, as `read`, unless `tools` plants a failure of the step here: then an
+    /// error, which the step handles as it handles a real one. A step that also finds fails
+    /// only once it has reached its body, so that it finds and then fails.
+    fn inject<T, E: fmt::Display>(
+        &self,
+        step: Step,
+        tools: &Tools<'_>,
+        read: Result<T, E>,
+    ) -> Result<T, String> {
+        let faults = tools.faults;
+        let after_finding = faults.find != Some(step) || self.reached.contains(&step);
+        if faults.fail == Some(step) && after_finding {
+            return Err("an injected failure".to_owned());
         }
-        true
+        read.map_err(|error| error.to_string())
+    }
+
+    /// True, having recorded the failure, if `tools` plants a failure of `step` at the read
+    /// that comes next, as [`Verdict::inject`] decides.
+    fn faulted(&mut self, step: Step, tools: &Tools<'_>) -> bool {
+        match self.inject(step, tools, Ok::<(), String>(())) {
+            Ok(()) => false,
+            Err(reason) => {
+                self.fail(step, reason);
+                true
+            }
+        }
     }
 
     /// The verdict line: the last line of the summary. It is the verdict under today's
@@ -509,9 +629,16 @@ impl Verdict {
         lines.join("\n") + "\n"
     }
 
-    /// Something the ratchet cannot vouch for: no verdict, unless a code owner approved the
-    /// head or reviews the PR anyway.
-    fn unprovable(&mut self, what: String) {
+    /// Something the ratchet cannot vouch for, of the kind `why`: no verdict, unless a code
+    /// owner approved the head or reviews the PR anyway and `why` is settleable. Evidence that
+    /// is missing, such as a skipped check, stays unproven whoever approved.
+    fn unprovable(&mut self, why: Reason, what: String) {
+        if !why.settleable() {
+            self.unsettled.push(what.clone());
+            self.unproven_after.push(what.clone());
+            self.unproven.push(what);
+            return;
+        }
         if !self.owner_approved && !self.owner_reviews_after {
             self.unproven_after.push(what.clone());
         }
@@ -527,17 +654,18 @@ impl Verdict {
 
 /// The step [`Step::Scope`]: the changed paths, split into rule paths and the rest, whether
 /// the base's CODEOWNERS owns any of them, and the fingerprint of the head tree. A part that
-/// cannot be read fails the step and leaves the others to be read; a head with a symbolic link
-/// fails it too, and leaves the fingerprint unknown, so that no observation of it is judged.
+/// cannot be read fails the step and leaves the others to be read. A head with a symbolic link
+/// is a form the ratchet refuses ([`Reason::Refused`]); its fingerprint still counts, so that
+/// what was observed of it is judged, and its findings fail it.
 fn scope_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
-    if !verdict.enter(Step::Scope, tools) {
-        return;
-    }
-    match tree::changed_paths(base, head) {
+    verdict.enter(Step::Scope);
+    verdict.reach(Step::Scope, tools);
+    match verdict.inject(Step::Scope, tools, tree::changed_paths(base, head)) {
         Ok(changed) => {
             let (rule_paths, outside): (Vec<String>, Vec<String>) =
                 changed.iter().cloned().partition(|path| scope::is_rule_path(path));
             (verdict.rule_paths, verdict.outside, verdict.changed) = (rule_paths, outside, changed);
+            verdict.progress.scoped = true;
         }
         Err(error) => verdict.fail(Step::Scope, format!("cannot compare the trees: {error}")),
     }
@@ -546,18 +674,17 @@ fn scope_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict
         Err(reason) => verdict.fail(Step::Scope, reason),
     }
     match tree::fingerprint(head) {
-        Ok((head_tree, links)) => match links.first() {
-            Some(link) => verdict.fail(
-                Step::Scope,
-                format!(
+        Ok((head_tree, links)) => {
+            verdict.head_tree = head_tree;
+            if let Some(link) = links.first() {
+                let reason = format!(
                     "the head holds {} symbolic link(s), such as `{link}`; the ratchet never \
-                     follows links, so that observe's copy and the judge read the same regular \
-                     files",
+                     follows links, and the compiler would",
                     links.len()
-                ),
-            ),
-            None => verdict.head_tree = head_tree,
-        },
+                );
+                verdict.fail_for(Step::Scope, Reason::Refused, reason);
+            }
+        }
         Err(error) => verdict.fail(Step::Scope, format!("cannot read the head tree: {error}")),
     }
     assert_eq!(
@@ -585,50 +712,70 @@ fn owners_of(base: &Path, changed: &[String]) -> Result<(bool, bool), String> {
 }
 
 /// Runs the head's tools on the base's cases and records what they printed. Runs head code.
-///
-/// # Errors
-///
-/// Returns what failed: the trees cannot be read, the head's xtask does not build, or a tool
-/// cannot be started.
-pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Observations, String> {
+/// Each phase that fails records why in the observations, as [`Observations::failures`], and
+/// the others go on, so that a failure the head chooses never drops what was already observed
+/// (review of #57, round 14): the fingerprints, the tidy corpus with end to end, the lint
+/// library, the lint cases, and the mutation and null-mutant runs of each workspace. The
+/// judge's step for a phase fails on its recorded failure.
+#[must_use]
+pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Observations {
     assert!(base.is_absolute() && head.is_absolute(), "the trees have absolute paths");
     let mut scoped = Verdict::default();
     scope_step(base, head, tools, &mut scoped);
-    if !scoped.failed.is_empty() {
-        return Err(scoped.failed.join("; and "));
-    }
-    let Verdict { changed, rule_paths, head_tree, .. } = scoped;
-    let corpus = observations::corpus_fingerprint(base)?.0;
     let mut observed = Observations {
         skipped: true,
-        seed: tools.seed(&corpus, &head_tree),
-        corpus,
-        head: head_tree,
         commit: tools.commit.clone().unwrap_or_default(),
         pr_head: tools.pr_head.clone().unwrap_or_default(),
-        runs: Vec::new(),
+        ..Observations::default()
     };
-    if !changed.iter().any(|path| scope::is_tooling(path)) {
-        return Ok(observed);
+    let fingerprinted = observations::corpus_fingerprint(base).and_then(|(corpus, _)| {
+        let head_tree = Some(scoped.head_tree.clone()).filter(|tree| !tree.is_empty());
+        Ok((corpus, head_tree.ok_or("cannot read the head tree")?))
+    });
+    match observing(tools, Step::Observations, fingerprinted) {
+        Ok((corpus, head_tree)) => (observed.corpus, observed.head) = (corpus, head_tree),
+        Err(reason) => observed.fail(Step::Observations, reason),
     }
-    let head_xtask = match &tools.head_xtask {
-        Some(binary) => binary.clone(),
-        None => build_xtask(&tools.cargo, head)?,
-    };
-    fs::create_dir_all(&tools.work)
-        .map_err(|error| format!("cannot create the work directory: {error}"))?;
-    let scratch = Scratch::copy_of(head, &tools.work.join("head-tree"))
-        .map_err(|error| format!("cannot copy the head tree: {error}"))?;
-    observed.runs = corpus::observe(base, &scratch, &head_xtask, &mut corpus::rng(observed.seed))?;
-    if changed.iter().any(|path| scope::is_lint_tooling(path)) {
-        let rng = &mut lint::rng(observed.seed);
-        observed.runs.extend(lint::observe(base, head, &scratch, &head_xtask, tools, rng)?);
-    }
-    if tools.mutants {
-        observed.runs.extend(mutants::observe(base, head, &rule_paths, tools)?);
+    observed.seed = tools.seed(&observed.corpus, &observed.head);
+    let known = scoped.progress.scoped;
+    let touches = |is: fn(&str) -> bool| !known || scoped.changed.iter().any(|path| is(path));
+    if !touches(scope::is_tooling) {
+        return observed;
     }
     observed.skipped = false;
-    Ok(observed)
+    let head_xtask = match &tools.head_xtask {
+        Some(binary) => Ok(binary.clone()),
+        None => build_xtask(&tools.cargo, head),
+    };
+    let scratch = fs::create_dir_all(&tools.work)
+        .map_err(|error| format!("cannot create the work directory: {error}"))
+        .and_then(|()| {
+            Scratch::copy_of(head, &tools.work.join("head-tree"))
+                .map_err(|error| format!("cannot copy the head tree: {error}"))
+        });
+    let ran = head_xtask.as_deref().map_err(Clone::clone);
+    let planted = scratch.as_ref().map_err(Clone::clone);
+    corpus::observe(base, planted.clone(), ran.clone(), tools, &mut observed);
+    if touches(scope::is_lint_tooling) {
+        lint::observe(base, head, planted, ran, tools, &mut observed);
+    }
+    if tools.mutants {
+        mutants::observe(base, head, &scoped.rule_paths, tools, &mut observed);
+    }
+    observed
+}
+
+/// What a phase of `observe` read, as `read`, unless `tools` plants a failure of the phase
+/// `step`: then an error, which the phase records as it records a real one.
+fn observing<T, E: fmt::Display>(
+    tools: &Tools<'_>,
+    step: Step,
+    read: Result<T, E>,
+) -> Result<T, String> {
+    if tools.faults.fail_observing == Some(step) {
+        return Err("an injected failure".to_owned());
+    }
+    read.map_err(|error| error.to_string())
 }
 
 /// Judges the observations against the base's corpus and the head's source. Runs no head
@@ -690,14 +837,17 @@ pub fn judge_with(
     let range = tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned());
     let mut verdict = Verdict { range, ..Verdict::default() };
     scope_step(base, head, tools, &mut verdict);
-    let scoped = !verdict.has_failed(Step::Scope);
+    let scoped = verdict.progress.scoped;
     if scoped && !verdict.changed.iter().any(|path| scope::is_tooling(path)) {
         if let Err(reason) = observed {
             verdict.fail(Step::Observations, reason);
         }
-        verdict
-            .notes
-            .push("No change to `xtask/`, `lints/` or a rule path: nothing to prove.".to_owned());
+        let nothing = "No change to `xtask/`, `lints/` or a rule path: nothing to prove.";
+        for step in STEPS.into_iter().skip(1) {
+            verdict.enter(step);
+            verdict.skip(step, nothing);
+        }
+        verdict.notes.push(nothing.to_owned());
         return verdict;
     }
     rule_set_step(base, head, tools, &mut verdict);
@@ -709,7 +859,7 @@ pub fn judge_with(
     lint::judge(base, head, here, tools, lint_changed, &mut verdict);
     judge_proof(base, head, here, tools, &mut verdict);
     verdict.findings.sort();
-    assert!(verdict.visited.len() <= STEPS.len(), "each step is visited once");
+    assert!(STEPS.starts_with(&verdict.visited), "the steps are entered once each, in order");
     verdict
 }
 
@@ -720,13 +870,15 @@ fn observations_step(
     tools: &Tools<'_>,
     verdict: &mut Verdict,
 ) {
-    if !verdict.enter(Step::Observations, tools) {
-        return;
-    }
-    let observed = match observed {
+    verdict.enter(Step::Observations);
+    verdict.reach(Step::Observations, tools);
+    let observed = match verdict.inject(Step::Observations, tools, observed) {
         Ok(observed) => observed,
         Err(reason) => return verdict.fail(Step::Observations, reason),
     };
+    for reason in observed.failures_of(Step::Observations) {
+        verdict.fail(Step::Observations, format!("observing failed: {reason}"));
+    }
     if verdict.head_tree.is_empty() {
         return verdict.fail(
             Step::Observations,
@@ -745,14 +897,14 @@ fn observations_step(
 /// The step [`Step::OwnerApproval`]: whether a code owner approved the head commit, which turns
 /// what the ratchet cannot prove into notes ([`Verdict::unprovable`]).
 fn owner_approval_step(base: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
-    if !verdict.enter(Step::OwnerApproval, tools) {
-        return;
-    }
-    if let Some(source) = &tools.review {
-        match owner_approval(base, source) {
-            Ok(approved) => verdict.owner_approved = approved,
-            Err(reason) => verdict.fail(Step::OwnerApproval, reason),
-        }
+    verdict.enter(Step::OwnerApproval);
+    let Some(source) = &tools.review else {
+        return verdict.skip(Step::OwnerApproval, "no reviews are read (`--no-review`)");
+    };
+    verdict.reach(Step::OwnerApproval, tools);
+    match verdict.inject(Step::OwnerApproval, tools, owner_approval(base, source)) {
+        Ok(approved) => verdict.owner_approved = approved,
+        Err(reason) => verdict.fail(Step::OwnerApproval, reason),
     }
 }
 
@@ -804,13 +956,15 @@ fn observed_here(
 /// a rule of the base and in the head for a new one. Each of the three reads fails alone: a
 /// tree that cannot be read as the dialect allows.
 fn rule_set_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
-    if !verdict.enter(Step::RuleSet, tools) {
-        return;
-    }
+    verdict.enter(Step::RuleSet);
+    verdict.reach(Step::RuleSet, tools);
     verdict.ran(Check::RuleSet);
-    source::check(base, head, verdict);
-    for tree in [base, head] {
+    source::check(base, head, tools, verdict);
+    // A tree that cannot be read as the dialect allows: the head's is a form the ratchet
+    // refuses, the base's is missing evidence.
+    for (tree, why) in [(base, Reason::Evidence), (head, Reason::Refused)] {
         match source::rules_without_cases(base, tree) {
+            Err(reason) => verdict.fail_for(Step::RuleSet, why, reason),
             Ok(uncovered) => {
                 for rule in uncovered {
                     let message = format!(
@@ -820,10 +974,10 @@ fn rule_set_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verd
                     verdict.record(Finding::new(source::REGISTRY, Check::RuleSet, message));
                 }
             }
-            Err(reason) => verdict.fail(Step::RuleSet, reason),
         }
     }
     match source::new_rules_without_cases(base, head) {
+        Err(reason) => verdict.fail_for(Step::RuleSet, Reason::Refused, reason),
         Ok(uncovered) => {
             for rule in uncovered {
                 let message = format!(
@@ -833,7 +987,6 @@ fn rule_set_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verd
                 verdict.record(Finding::new(source::REGISTRY, Check::RuleSet, message));
             }
         }
-        Err(reason) => verdict.fail(Step::RuleSet, reason),
     }
 }
 
@@ -877,10 +1030,13 @@ fn judge_proof(
     tools: &Tools<'_>,
     verdict: &mut Verdict,
 ) {
-    if !verdict.has_failed(Step::Scope) && verdict.rule_paths.is_empty() {
-        verdict.notes.push(
-            "Mutation testing and the review check skipped: no rule path changed.".to_owned(),
-        );
+    if verdict.progress.scoped && verdict.rule_paths.is_empty() {
+        let skipped = "Mutation testing and the review check skipped: no rule path changed.";
+        for step in [Step::Classify, Step::Carry, Step::Mutants, Step::NullRun, Step::ReviewGate] {
+            verdict.enter(step);
+            verdict.skip(step, skipped);
+        }
+        verdict.notes.push(skipped.to_owned());
         return;
     }
     classify_step(base, head, tools, verdict);
@@ -901,31 +1057,42 @@ fn judge_proof(
 /// The step [`Step::Classify`]: whether the rule-path diff is additive or an edit. A diff that
 /// cannot be classified is no verdict, but its missed mutants and the review gate's findings
 /// still count (review of #57, round 12): the class is only for the coverage of the hunks and
-/// for the edit gate.
+/// for the edit gate. A diff the class cannot read is a form the ratchet refuses.
 fn classify_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
-    if !verdict.enter(Step::Classify, tools) || verdict.rule_paths.is_empty() {
+    verdict.enter(Step::Classify);
+    if verdict.rule_paths.is_empty() {
+        return verdict.skip(Step::Classify, "the rule paths are not known; the scope says why");
+    }
+    verdict.reach(Step::Classify, tools);
+    if verdict.faulted(Step::Classify, tools) {
         return;
     }
     match class::classify(base, head, &verdict.rule_paths) {
         Ok(class) => verdict.class = Some(class),
-        Err(reason) => verdict.fail(Step::Classify, reason),
+        Err(reason) => verdict.fail_for(Step::Classify, Reason::Refused, reason),
     }
 }
 
 /// The step [`Step::Carry`]: for a merge group, that the carried mutation evidence can be read
 /// and is of this rule-path diff ([`carry::check`]). When it fails, mutation testing has no
-/// evidence, and every other step is judged on.
+/// evidence, and every other step is judged on. Evidence that cannot be read never settles;
+/// another rule-path diff than the carried one does ([`Reason::CarriedDiff`]).
 fn carry_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
-    if !verdict.enter(Step::Carry, tools) || !tools.mutants {
-        return;
+    verdict.enter(Step::Carry);
+    if !tools.mutants {
+        return verdict.skip(Step::Carry, "mutation testing is skipped (`--no-mutants`)");
     }
-    match &tools.carried {
-        None => {}
-        Some(Err(reason)) => verdict.fail(Step::Carry, reason),
-        Some(Ok(carried)) => match carry::check(base, head, carried, tools.pr_head.as_deref()) {
-            Ok(note) => verdict.notes.push(note),
-            Err(reason) => verdict.fail(Step::Carry, reason),
-        },
+    let Some(carried) = &tools.carried else {
+        return verdict.skip(Step::Carry, "no evidence is carried: not a merge group");
+    };
+    verdict.reach(Step::Carry, tools);
+    let read = verdict.inject(Step::Carry, tools, carried.as_ref().map_err(Clone::clone));
+    let checked = read
+        .map_err(|reason| (Reason::Evidence, reason))
+        .and_then(|evidence| carry::check(base, head, evidence, tools.pr_head.as_deref()));
+    match checked {
+        Ok(note) => verdict.notes.push(note),
+        Err((why, reason)) => verdict.fail_for(Step::Carry, why, reason),
     }
 }
 
@@ -945,20 +1112,23 @@ fn conclude(verdict: &mut Verdict) {
         ));
     } else {
         if let Some(what) = unapproved_edit(&class) {
-            verdict.unprovable(what);
+            verdict.unprovable(Reason::UnapprovedEdit, what);
         }
         for what in uncovered {
-            verdict.unprovable(what);
+            verdict.unprovable(Reason::NoMutant, what);
         }
     }
     // A manifest or build file decides how the rule code builds, which nothing here reads: only
     // a code owner's approval settles it, never the reviewer app's (maintainer's decision,
     // review of #55, round 3).
     for path in &class.build_files {
-        verdict.unprovable(format!(
-            "{path} is a manifest or build file in the rule paths, which only a code owner's \
+        verdict.unprovable(
+            Reason::BuildFile,
+            format!(
+                "{path} is a manifest or build file in the rule paths, which only a code owner's \
              approval of the head commit settles"
-        ));
+            ),
+        );
     }
 }
 
@@ -989,24 +1159,25 @@ fn unapproved_edit(class: &class::Class) -> Option<String> {
 /// repository without the app, is a note. An edit to existing rule code needs the app's
 /// approval of the head commit with no finding, which the step records for [`conclude`].
 fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) {
-    if !verdict.enter(Step::ReviewGate, tools) {
-        return;
-    }
+    verdict.enter(Step::ReviewGate);
     let Some(source) = &tools.review else {
+        verdict.skip(Step::ReviewGate, "no reviews are read (`--no-review`)");
         return verdict.unprovable(
+            Reason::Evidence,
             "the review check was skipped (`--no-review`), so a request for changes or an open \
              thread by the reviewer app is not seen"
                 .to_owned(),
         );
     };
     let Some(reviewer) = &source.reviewer else {
+        verdict.skip(Step::ReviewGate, "no reviewer app is configured");
         return verdict.notes.push(format!(
             "No reviewer app is configured (`NAMI_REVIEWER_LOGIN`, such as {}; it runs in CI, \
              #59). An additive diff needs none; an edit needs a code owner's approval.",
             review::REVIEWER_APP
         ));
     };
-    review::check(source.reviews, source.pull, &source.head, reviewer, verdict);
+    review::check(source.reviews, source.pull, &source.head, reviewer, tools, verdict);
 }
 
 /// Observes and judges in one process: for local runs and the tests.
@@ -1018,35 +1189,39 @@ pub fn check(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Verdict, Str
     into_result(check_all(base, head, tools))
 }
 
-/// [`check`] as one accumulator ([`judge_all`]): an observation that fails is a step that
-/// could not reach a result, and the steps that need no observations run all the same
-/// ([`judge_unobserved`]).
+/// [`check`] as one accumulator ([`judge_all`]): a phase of [`observe`] that fails is
+/// recorded, and its step fails in the judge.
 #[must_use]
 pub fn check_all(base: &Path, head: &Path, tools: &Tools<'_>) -> Verdict {
-    match observe(base, head, tools) {
-        Ok(observed) => judge_all(base, head, &observed, tools),
-        Err(reason) => judge_unobserved(base, head, tools, &reason),
-    }
+    judge_all(base, head, &observe(base, head, tools), tools)
 }
 
 /// `verdict`, settled by a code owner if it can be. A code owner's approval of the head commit
-/// settles every no verdict that is no finding: a head outside the dialect or with a symbolic
-/// link, missing observations or carried evidence, a tool that failed. Each becomes a note, and
-/// so does each unproven item, and the verdict passes. So a rule-path PR that the ratchet
-/// cannot judge needs the owner, never the admin bypass (review of #55). A verdict with any
-/// finding is never settled: it fails, and its summary lists what was not judged as well
-/// (review of #57, round 11).
+/// settles a no verdict only when each of its reasons is unprovable though the evidence is
+/// complete ([`Reason::settleable`]): a form the ratchet refuses, such as a file outside the
+/// dialect or a symbolic link, or a merge group whose rule-path diff differs from the carried
+/// one. Each becomes a note, and so does each unproven item, and the verdict passes. Evidence
+/// that is missing, unreadable or mismatched, or a tool that failed, is never settled: the PR
+/// is fixed or the job re-run, so an honest PR never needs the admin bypass (review of #57,
+/// round 14). A verdict with any finding is never settled: it fails, and its summary lists what
+/// was not judged as well (round 11).
 ///
 /// # Errors
 ///
-/// No verdict, naming every failed step, when `verdict` has no finding and no code owner
-/// approved the head, or no review source is given; with the reason too if the approval cannot
-/// be read.
+/// No verdict, naming every failed step, when `verdict` has no finding and holds missing
+/// evidence, or no code owner approved the head, or no review source is given; with the reason
+/// too if the approval cannot be read.
 pub fn settled(base: &Path, tools: &Tools<'_>, mut verdict: Verdict) -> Result<Verdict, String> {
     if verdict.failed.is_empty() || !verdict.findings.is_empty() {
         return Ok(verdict);
     }
     let reasons = verdict.failed.join("; and ");
+    if !verdict.is_settleable() {
+        return Err(format!(
+            "{reasons}. No approval settles missing or broken evidence: fix the PR, or re-run \
+             the job (ADR-0022)"
+        ));
+    }
     let Some(source) = &tools.review else {
         return Err(reasons);
     };
@@ -1120,24 +1295,34 @@ fn tail(text: &str, lines: usize) -> String {
     all.get(start..).unwrap_or_default().join(" | ")
 }
 
+/// Tools that run nothing and read no reviews, for unit tests of single steps.
+#[cfg(test)]
+pub(crate) fn plain_tools() -> Tools<'static> {
+    Tools {
+        head_xtask: None,
+        cargo: "cargo".into(),
+        work: "/w".into(),
+        mutants: false,
+        review: None,
+        seed: None,
+        commits: None,
+        pr_head: None,
+        commit: None,
+        carried: None,
+        faults: Faults::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Check, Finding, Tools, Verdict, same_commits, tail};
+    use super::{Check, Finding, Reason, Step, Tools, Verdict, same_commits, tail};
     use crate::ratchet::observations::Observations;
 
     fn tools(pr_head: Option<&str>, commits: Option<&str>) -> Tools<'static> {
         Tools {
-            head_xtask: None,
-            cargo: "cargo".into(),
-            work: "/w".into(),
-            mutants: false,
-            review: None,
-            seed: None,
             commits: commits.map(str::to_owned),
             pr_head: pr_head.map(str::to_owned),
-            commit: None,
-            carried: None,
-            faults: super::Faults::default(),
+            ..super::plain_tools()
         }
     }
 
@@ -1181,7 +1366,7 @@ mod tests {
         assert_eq!(verdict.line(), "ratchet: pass");
         verdict.outside.push("docs/TIGER_STYLE.md".to_owned());
         assert!(verdict.line().starts_with("ratchet: pass, outside the rule paths: 1"));
-        verdict.unprovable("no mutant".to_owned());
+        verdict.unprovable(Reason::NoMutant, "no mutant".to_owned());
         assert!(verdict.line().starts_with("ratchet: no verdict, 1 thing(s) unproven"));
         let finding = Finding::new("a.rs:3", Check::TidyCorpus, "what; fix".to_owned());
         assert_eq!(finding.to_string(), "a.rs:3: error[ratchet-tidy-corpus]: what; fix");
@@ -1193,7 +1378,7 @@ mod tests {
         assert!(summary.contains("- **Unproven:** no mutant"), "{summary}");
         assert!(summary.contains("- `docs/TIGER_STYLE.md`"), "{summary}");
         let mut owned = Verdict { owner_reviews: true, ..Verdict::default() };
-        owned.unprovable("no mutant".to_owned());
+        owned.unprovable(Reason::NoMutant, "no mutant".to_owned());
         assert_eq!((owned.unproven.len(), owned.notes.len()), (0, 1));
         assert_eq!(owned.line(), "ratchet: pass");
         assert!(owned.line_after().starts_with("ratchet: no verdict, 1"), "unowned after the flip");
@@ -1202,11 +1387,38 @@ mod tests {
         assert!(shown.contains("after ADR-0022 (rule paths unowned): `ratchet: no verdict"));
         assert!(shown.ends_with("\nratchet: pass\n"), "the exit code follows today's verdict");
         let mut still = Verdict { owner_reviews: true, owner_reviews_after: true, ..owned };
-        still.unprovable("no reviewer".to_owned());
+        still.unprovable(Reason::UnapprovedEdit, "no reviewer".to_owned());
         assert_eq!(still.unproven_after.len(), 1, "only the earlier item; the owner still reviews");
         let mut approved = Verdict { owner_approved: true, ..Verdict::default() };
-        approved.unprovable("no mutant".to_owned());
+        approved.unprovable(Reason::NoMutant, "no mutant".to_owned());
         assert!(approved.unproven.is_empty() && approved.unproven_after.is_empty());
+        assert!(approved.is_settleable(), "a hunk without a mutant is settleable");
+        approved.unprovable(Reason::Evidence, "mutation testing was skipped".to_owned());
+        assert_eq!(approved.unproven, ["mutation testing was skipped"], "missing evidence stays");
+        assert!(!approved.is_settleable(), "missing evidence is never settled");
+    }
+
+    // Goal: round 14 of #57's review: an approval settles only what is unprovable though the
+    // evidence is complete; a failure of the default kind, missing or broken evidence, never.
+    #[test]
+    fn only_complete_evidence_settles() {
+        let settleable = [
+            Reason::UnapprovedEdit,
+            Reason::NoMutant,
+            Reason::BuildFile,
+            Reason::Refused,
+            Reason::CarriedDiff,
+        ];
+        assert!(settleable.iter().all(|why| why.settleable()) && !Reason::Evidence.settleable());
+        let mut refused = Verdict::default();
+        refused.fail_for(Step::Scope, Reason::Refused, "a symbolic link");
+        assert!(refused.is_settleable() && refused.has_failed(Step::Scope));
+        refused.fail(Step::LintLibrary, "the library run was killed");
+        assert!(!refused.is_settleable(), "{:?}", refused.failed);
+        assert_eq!(
+            refused.failed,
+            ["scope: a symbolic link", "lint library: the library run was killed"]
+        );
     }
 
     // Goal: an edit leaves its first change unproven, counting the rest; an additive diff leaves

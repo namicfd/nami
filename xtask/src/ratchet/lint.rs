@@ -211,58 +211,82 @@ fn split_location(location: &str) -> Option<(String, u32, u32)> {
     Some((path.to_owned(), line.parse().ok()?, column.parse().ok()?))
 }
 
-/// Runs the head's lint library on the base's UI cases, and the head's `cargo xtask dylint` on
-/// each case planted as an example of a crate drawn from the head tree. Runs head code; judges
-/// nothing.
-///
-/// # Errors
-///
-/// Returns what failed if the base's cases cannot be read or the scratch trees written.
+/// The phases of `observe` for [`Step::LintLibrary`] and [`Step::LintCases`]: runs the head's
+/// lint library on the base's UI cases, and the head's `cargo xtask dylint` on each case
+/// planted as an example of a crate drawn from the head tree, into `observed`. Runs head code;
+/// judges nothing. What fails is recorded as its phase's failure, and the other phase, and the
+/// runs gathered, are kept (review of #57, round 14).
 pub fn observe(
     base: &Path,
     head: &Path,
-    scratch: &Scratch,
-    head_xtask: &Path,
+    copied: Result<&Scratch, String>,
+    built: Result<&Path, String>,
     tools: &Tools<'_>,
-    rng: &mut Rng,
-) -> Result<Vec<Run>, String> {
-    let cases = cases(base)?;
-    if cases.is_empty() {
-        return Ok(Vec::new());
-    }
-    let (name, placements) = plan(&cases, &plant_crates(scratch.root())?, rng);
-    let package = tools.work.join("ui-head");
-    write_package(&package, &name, &cases)
-        .map_err(|error| format!("cannot write {}: {error}", package.display()))?;
-    let (output, other) = run_library(tools, head, "head", &package)?;
-    let library = Run {
-        subject: UI_DIRECTORY.to_owned(),
-        placement: String::new(),
-        mode: "library".to_owned(),
-        exit: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: other,
-        files: BTreeMap::new(),
+    observed: &mut Observations,
+) {
+    let cases = match cases(base) {
+        Ok(cases) => cases,
+        Err(reason) => {
+            observed.fail(Step::LintLibrary, &reason);
+            return observed.fail(Step::LintCases, reason);
+        }
     };
-    let mut runs = vec![library];
-    for (case, placement) in cases.iter().zip(&placements) {
-        runs.push(run_dylint(case, placement, scratch, head_xtask, tools)?);
+    if cases.is_empty() {
+        return;
     }
-    Ok(runs)
+    let crates = copied.clone().and_then(|copy| plant_crates(copy.root()));
+    let (name, drawn) = plan(&cases, crates, &mut rng(observed.seed));
+    let package = tools.work.join("ui-head");
+    let ran = write_package(&package, &name, &cases)
+        .map_err(|error| format!("cannot write {}: {error}", package.display()))
+        .and_then(|()| run_library(tools, head, "head", &package));
+    match super::observing(tools, Step::LintLibrary, ran) {
+        Ok((output, other)) => observed.runs.push(Run {
+            subject: UI_DIRECTORY.to_owned(),
+            placement: String::new(),
+            mode: "library".to_owned(),
+            exit: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: other,
+            files: BTreeMap::new(),
+        }),
+        Err(reason) => observed.fail(Step::LintLibrary, reason),
+    }
+    let ready =
+        drawn.and_then(|drawn| copied.and_then(|copy| built.map(|xtask| (drawn, copy, xtask))));
+    let (placements, scratch, head_xtask) = match super::observing(tools, Step::LintCases, ready) {
+        Ok(ready) => ready,
+        Err(reason) => return observed.fail(Step::LintCases, reason),
+    };
+    for (case, placement) in cases.iter().zip(&placements) {
+        match run_dylint(case, placement, scratch, head_xtask, tools) {
+            Ok(run) => observed.runs.push(run),
+            Err(reason) => observed.fail(Step::LintCases, reason),
+        }
+    }
 }
 
 /// The head package's random name, and where each case is planted as an example: a crate of
-/// `crates` and a random file name, drawn from `rng`. The judge draws them again.
-fn plan(cases: &[UiCase], crates: &[String], rng: &mut Rng) -> (String, Vec<String>) {
+/// `crates` and a random file name, drawn from `rng`, or why the crates are not known. The
+/// judge draws them again; the name is drawn first, so that the head's library runs under it
+/// whatever the crates.
+fn plan(
+    cases: &[UiCase],
+    crates: Result<Vec<String>, String>,
+    rng: &mut Rng,
+) -> (String, Result<Vec<String>, String>) {
     let name = rng.stem();
-    let placements: Vec<String> = cases
-        .iter()
-        .map(|_| {
-            let crate_directory = rng.pick(crates);
-            format!("{crate_directory}/examples/{}.rs", rng.stem())
-        })
-        .collect();
-    assert_eq!(placements.len(), cases.len(), "one placement per case");
+    let placements = crates.map(|crates| {
+        let placements: Vec<String> = cases
+            .iter()
+            .map(|_| {
+                let crate_directory = rng.pick(&crates);
+                format!("{crate_directory}/examples/{}.rs", rng.stem())
+            })
+            .collect();
+        assert_eq!(placements.len(), cases.len(), "one placement per case");
+        placements
+    });
     (name, placements)
 }
 
@@ -321,13 +345,16 @@ pub fn rng(seed: u64) -> Rng {
     Rng::new(seed ^ LINT_STREAM)
 }
 
-/// What the lint corpus's steps share: the base's cases, where each is planted, and what the
-/// base's library reports on them.
+/// What the lint corpus's steps share: the base's cases, where each is planted or why that is
+/// not known, and what the base's library reports on them.
 struct Setup {
     cases: Vec<UiCase>,
-    placements: Vec<String>,
+    placements: Result<Vec<String>, String>,
     expected: Vec<Diagnostic>,
 }
+
+/// Why the lint steps skip when the lint corpus could not be read.
+const NO_CORPUS: &str = "the base's lint corpus is not known; the lint-corpus step says why";
 
 /// Judges the recorded lint runs in three steps: [`Step::LintCorpus`] reads the base's cases and
 /// runs the base's library here on them, which gives what must be reported; then
@@ -345,7 +372,7 @@ pub fn judge(
     verdict: &mut Verdict,
 ) {
     let mut setup = None;
-    corpus_step(base, head, observations.filter(|_| changed), tools, &mut setup, verdict);
+    corpus_step(base, head, observations, tools, changed, &mut setup, verdict);
     if !changed {
         verdict.notes.push("Lint checks skipped: nothing below `lints/` changed.".to_owned());
     }
@@ -355,22 +382,26 @@ pub fn judge(
 }
 
 /// The step [`Step::LintCorpus`]: the base's cases, their placements drawn again, and the
-/// base library's diagnostics, into `setup`.
+/// base library's diagnostics, into `setup`. Placements that cannot be drawn leave the library
+/// to be judged; only the placed cases need them (review of #57, round 14).
 fn corpus_step(
     base: &Path,
     head: &Path,
     observations: Option<&Observations>,
     tools: &Tools<'_>,
+    changed: bool,
     setup: &mut Option<Setup>,
     verdict: &mut Verdict,
 ) {
-    if !verdict.enter(Step::LintCorpus, tools) {
-        return;
+    verdict.enter(Step::LintCorpus);
+    if !changed {
+        return verdict.skip(Step::LintCorpus, "nothing below `lints/` changed");
     }
     let Some(observations) = observations else {
-        return;
+        return verdict.skip(Step::LintCorpus, super::NO_OBSERVATIONS);
     };
-    let cases = match cases(base) {
+    verdict.reach(Step::LintCorpus, tools);
+    let cases = match verdict.inject(Step::LintCorpus, tools, cases(base)) {
         Ok(cases) if cases.is_empty() => {
             let reason = format!("the base has no UI cases in {UI_DIRECTORY}");
             return verdict.fail(Step::LintCorpus, reason);
@@ -378,10 +409,7 @@ fn corpus_step(
         Ok(cases) => cases,
         Err(reason) => return verdict.fail(Step::LintCorpus, reason),
     };
-    let placements = match plant_crates(head) {
-        Ok(crates) => plan(&cases, &crates, &mut rng(observations.seed)).1,
-        Err(reason) => return verdict.fail(Step::LintCorpus, reason),
-    };
+    let placements = plan(&cases, plant_crates(head), &mut rng(observations.seed)).1;
     match base_expectations(base, &cases, tools) {
         Ok(expected) => *setup = Some(Setup { cases, placements, expected }),
         Err(reason) => verdict.fail(Step::LintCorpus, reason),
@@ -397,15 +425,19 @@ fn library_step(
     tools: &Tools<'_>,
     verdict: &mut Verdict,
 ) {
-    if !verdict.enter(Step::LintLibrary, tools) {
-        return;
-    }
+    verdict.enter(Step::LintLibrary);
     let (Some(observations), Some(setup)) = (observations, setup) else {
-        return;
+        return verdict.skip(Step::LintLibrary, NO_CORPUS);
     };
-    let Some(library) = observations.runs_of(UI_DIRECTORY, "library").next() else {
-        let reason = "the observations hold no run of the head's lint library";
-        return verdict.fail(Step::LintLibrary, reason);
+    verdict.reach(Step::LintLibrary, tools);
+    for reason in observations.failures_of(Step::LintLibrary) {
+        verdict.fail(Step::LintLibrary, format!("observing failed: {reason}"));
+    }
+    let run = observations.runs_of(UI_DIRECTORY, "library").next();
+    let missing = "the observations hold no run of the head's lint library";
+    let library = match verdict.inject(Step::LintLibrary, tools, run.ok_or(missing)) {
+        Ok(library) => library,
+        Err(reason) => return verdict.fail(Step::LintLibrary, reason),
     };
     let reported = parse_json(&library.stdout);
     let errors = reported.iter().filter(|diagnostic| diagnostic.level == "error").count();
@@ -427,15 +459,21 @@ fn cases_step(
     tools: &Tools<'_>,
     verdict: &mut Verdict,
 ) {
-    if !verdict.enter(Step::LintCases, tools) {
-        return;
-    }
+    verdict.enter(Step::LintCases);
     let (Some(observations), Some(setup)) = (observations, setup) else {
-        return;
+        return verdict.skip(Step::LintCases, NO_CORPUS);
     };
-    assert_eq!(setup.cases.len(), setup.placements.len(), "one placement per case");
+    verdict.reach(Step::LintCases, tools);
+    for reason in observations.failures_of(Step::LintCases) {
+        verdict.fail(Step::LintCases, format!("observing failed: {reason}"));
+    }
+    let placements = match &setup.placements {
+        Ok(placements) => placements,
+        Err(reason) => return verdict.fail(Step::LintCases, reason),
+    };
+    assert_eq!(setup.cases.len(), placements.len(), "one placement per case");
     verdict.ran(Check::EndToEnd);
-    for (case, placement) in setup.cases.iter().zip(&setup.placements) {
+    for (case, placement) in setup.cases.iter().zip(placements) {
         let file = format!("{}.rs", case.stem);
         let of_case: Vec<&Diagnostic> =
             setup.expected.iter().filter(|diagnostic| diagnostic.file == file).collect();
@@ -448,7 +486,7 @@ fn cases_step(
             verdict.fail(Step::LintCases, reason);
             continue;
         };
-        match judge_dylint(run, &of_case) {
+        match verdict.inject(Step::LintCases, tools, judge_dylint(run, &of_case)) {
             Ok(found) => found.into_iter().for_each(|finding| verdict.record(finding)),
             Err(problem) => verdict.fail(Step::LintCases, problem),
         }

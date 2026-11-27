@@ -5,13 +5,14 @@
 //! the base's code. The head's code can lie in what it prints; the threat model covers that.
 //! What the judge cannot read is no verdict, never a pass.
 
+use super::Step;
 use crate::json::{self, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 /// The version of this format. A judge refuses any other.
-const FORMAT: &str = "3";
+const FORMAT: &str = "4";
 
 /// One run of a head tool on one base case.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,9 +50,24 @@ pub struct Observations {
     pub pr_head: String,
     /// Every run, in the order they ran.
     pub runs: Vec<Run>,
+    /// Every phase of `observe` that failed, as the judge's step that reads it, with why. The
+    /// runs gathered before and after it are kept (review of #57, round 14).
+    pub failures: Vec<(Step, String)>,
 }
 
 impl Observations {
+    /// Records that the phase of `observe` for `step` failed, for `reason`.
+    pub fn fail(&mut self, step: Step, reason: impl std::fmt::Display) {
+        let reason = reason.to_string();
+        assert!(!reason.is_empty(), "a failure says why");
+        self.failures.push((step, reason));
+    }
+
+    /// Why the phase of `observe` for `step` failed, each time it did.
+    pub fn failures_of(&self, step: Step) -> impl Iterator<Item = &str> {
+        self.failures.iter().filter(move |(of, _)| *of == step).map(|(_, why)| why.as_str())
+    }
+
     /// The runs of one mode for one subject.
     pub fn runs_of<'a>(&'a self, subject: &'a str, mode: &'a str) -> impl Iterator<Item = &'a Run> {
         self.runs.iter().filter(move |run| run.subject == subject && run.mode == mode)
@@ -61,9 +77,16 @@ impl Observations {
     #[must_use]
     pub fn to_json(&self) -> String {
         let runs: Vec<String> = self.runs.iter().map(run_json).collect();
+        let failures: Vec<String> = self
+            .failures
+            .iter()
+            .map(|(step, why)| {
+                format!("{{\"step\":{},\"reason\":{}}}", json::quote(step.name()), json::quote(why))
+            })
+            .collect();
         format!(
             "{{\"format\":{},\"skipped\":{},\"seed\":{},\"corpus\":{},\"head\":{},\
-             \"commit\":{},\"pr_head\":{},\"runs\":[\n{}\n]}}\n",
+             \"commit\":{},\"pr_head\":{},\"failures\":[{}],\"runs\":[\n{}\n]}}\n",
             json::quote(FORMAT),
             self.skipped,
             json::quote(&self.seed.to_string()),
@@ -71,6 +94,7 @@ impl Observations {
             json::quote(&self.head),
             json::quote(&self.commit),
             json::quote(&self.pr_head),
+            failures.join(","),
             runs.join(",\n")
         )
     }
@@ -99,7 +123,14 @@ impl Observations {
         let runs = runs.iter().map(run_from).collect::<Result<Vec<_>, _>>()?;
         let (corpus, head) = (text_of(&value, "corpus")?, text_of(&value, "head")?);
         let (commit, pr_head) = (text_of(&value, "commit")?, text_of(&value, "pr_head")?);
-        Ok(Self { skipped, seed, corpus, head, commit, pr_head, runs })
+        let failures = value
+            .get("failures")
+            .and_then(Value::as_array)
+            .ok_or("the observations have no `failures`")?
+            .iter()
+            .map(failure_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { skipped, seed, corpus, head, commit, pr_head, runs, failures })
     }
 
     /// Reads observations from a file.
@@ -137,6 +168,17 @@ fn run_json(run: &Run) -> String {
         json::quote(&run.stderr),
         files.join(",")
     )
+}
+
+/// Reads one recorded failure of a phase: the step that reads it, and why.
+fn failure_from(value: &Value) -> Result<(Step, String), String> {
+    let name = text_of(value, "step")?;
+    let step = Step::from_name(&name).ok_or_else(|| format!("no step is named `{name}`"))?;
+    let reason = text_of(value, "reason")?;
+    if reason.is_empty() {
+        return Err(format!("the failure of `{name}` says no reason"));
+    }
+    Ok((step, reason))
 }
 
 fn text_of(value: &Value, key: &str) -> Result<String, String> {
@@ -212,7 +254,7 @@ pub fn corpus_fingerprint(base: &Path) -> Result<(String, u32), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Observations, Run, corpus_fingerprint};
+    use super::{Observations, Run, Step, corpus_fingerprint};
     use std::collections::BTreeMap;
 
     fn run(exit: Option<i32>) -> Run {
@@ -242,18 +284,28 @@ mod tests {
             commit: "ef".to_owned(),
             pr_head: String::new(),
             runs: vec![run(Some(2)), run(None)],
+            failures: vec![(Step::NullRun, "lints: \"quoted\"".to_owned())],
         };
         assert_eq!(Observations::from_json(&observations.to_json()), Ok(observations.clone()));
         assert_eq!(observations.runs_of("xtask/fixtures/tidy/a.fires.fixture", "file").count(), 2);
+        assert_eq!(
+            observations.failures_of(Step::NullRun).collect::<Vec<_>>(),
+            ["lints: \"quoted\""]
+        );
+        assert_eq!(observations.failures_of(Step::Mutants).count(), 0, "only the step's failures");
         assert!(Observations::from_json("{}").is_err());
         assert!(
             Observations::from_json(
-                &observations.to_json().replace("\"format\":\"3\"", "\"format\":\"2\"")
+                &observations.to_json().replace("\"format\":\"4\"", "\"format\":\"3\"")
             )
             .is_err()
         );
         let broken = observations.to_json().replace("\"exit\":2", "\"exit\":\"2\"");
         assert!(Observations::from_json(&broken).unwrap_err().contains("exit"));
+        let unknown = observations.to_json().replace("\"null mutant\"", "\"nothing\"");
+        assert!(Observations::from_json(&unknown).unwrap_err().contains("no step is named"));
+        let silent = observations.to_json().replace("\"lints: \\\"quoted\\\"\"", "\"\"");
+        assert!(Observations::from_json(&silent).unwrap_err().contains("says no reason"));
         assert!(Observations::read(std::path::Path::new("/no/such/file")).is_err());
     }
 

@@ -23,7 +23,8 @@
 //! also runs the head's tests, as cargo-mutants runs them, on a copy of the head in which every
 //! file that has mutants carries a change that alters no behaviour ([`null_mutant`]): a blank
 //! line at the top and a comment at the end. If any test fails there, the mutant evidence of
-//! that workspace proves nothing. This closes the tests that pin the file's layout or length,
+//! that workspace proves nothing, which is no verdict that no approval settles: the test is
+//! fixed (review of #57, round 14). This closes the tests that pin the file's layout or length,
 //! however they read it. A test written to pin its content instead, by hashing the code
 //! without its first lines, by an anchor inside the mutated code or by comparing tokens, passes
 //! the null mutant and still fails on every real one: that needs deliberate code, so it is a
@@ -32,13 +33,14 @@
 //!
 //! The copy keeps every file's permissions, so that a script a test runs stays executable
 //! (round 8). A head file that already holds the null mutant's comment is no verdict, since a
-//! test could tell the null mutant from the head by it. The run is given [`NULL_SECONDS_MAX`]
+//! test could tell the null mutant from the head by it; the observer records that as the null
+//! run's failure and keeps the mutation run (round 14). The run is given [`NULL_SECONDS_MAX`]
 //! seconds in a process group of its own, which is killed whole when the time is up, and its
 //! output is kept in `null-<workspace>.stdout` and `.stderr` in the work directory (round 9).
 //! A run that was killed, or that left out a file with mutants, is no verdict.
 
 use super::observations::{Observations, Run};
-use super::{Check, Finding, Step, Tools, Verdict};
+use super::{Check, Finding, Reason, Step, Tools, Verdict};
 use crate::json::{self, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -107,44 +109,61 @@ fn line_count(text: &str) -> u64 {
     u64::try_from(text.lines().filter(|line| !line.trim().is_empty()).count()).expect("counts fit")
 }
 
-/// The changed rule-path Rust sources of the head that belong to `workspace`.
+/// The changed rule-path Rust sources of the head that belong to `workspace`: regular files,
+/// never a symbolic link, which the ratchet refuses ([`super::Reason::Refused`]) and never
+/// follows, so that the null mutant's copy, which holds no links, has every file it changes.
 fn sources<'a>(head: &Path, rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
     rule_paths
         .iter()
         .filter(|path| path.starts_with(workspace.sources) && is_rust_source(path))
-        .filter(|path| head.join(path).is_file())
+        .filter(|path| fs::symlink_metadata(head.join(path)).is_ok_and(|meta| meta.is_file()))
         .collect()
 }
 
-/// Runs cargo-mutants on the head, once per workspace with changed rule-path sources, and
-/// records what it left. Runs head code; judges nothing.
-///
-/// # Errors
-///
-/// Returns what failed if the diff cannot be built or written.
+/// The phases of `observe` for [`Step::Mutants`] and [`Step::NullRun`]: runs cargo-mutants on
+/// the head, once per workspace with changed rule-path sources, then the null mutant where
+/// there are mutants, and records what they left into `observed`. Runs head code; judges
+/// nothing. What fails is recorded as its phase's failure, naming the workspace, and the runs
+/// gathered are kept: a null mutant that cannot be made keeps the mutation run and its missed
+/// mutants (review of #57, round 14).
 pub fn observe(
     base: &Path,
     head: &Path,
     rule_paths: &[String],
     tools: &Tools<'_>,
-) -> Result<Vec<Run>, String> {
-    let mut runs = Vec::new();
+    observed: &mut Observations,
+) {
     for workspace in &WORKSPACES {
         let changed = sources(head, rule_paths, workspace);
         if changed.is_empty() {
             continue;
         }
-        let mut diff = String::new();
-        for path in &changed {
-            diff.push_str(&unified_diff(base, head, path, workspace.directory)?);
-        }
-        let (run, mutated) = run_mutants(head, workspace, &diff, tools)?;
-        runs.push(run);
-        if !mutated.is_empty() {
-            runs.push(run_null(head, workspace, &mutated, tools)?);
+        let diff: Result<String, String> = changed
+            .iter()
+            .map(|path| unified_diff(base, head, path, workspace.directory))
+            .collect();
+        let ran = diff.and_then(|diff| run_mutants(head, workspace, &diff, tools));
+        let (mutation, mutated) = match super::observing(tools, Step::Mutants, ran) {
+            Ok(ran) => ran,
+            Err(reason) => {
+                observed.fail(Step::Mutants, format!("{}: {reason}", workspace.name));
+                continue;
+            }
+        };
+        observed.runs.push(mutation);
+        let nulled = mutated.and_then(|files| {
+            if files.is_empty() {
+                Ok(None)
+            } else {
+                run_null(head, workspace, &files, tools).map(Some)
+            }
+        });
+        match super::observing(tools, Step::NullRun, nulled) {
+            Ok(Some(null)) => observed.runs.push(null),
+            Ok(None) => {}
+            Err(reason) => observed.fail(Step::NullRun, format!("{}: {reason}", workspace.name)),
         }
     }
-    Ok(runs)
 }
 
 /// The head's `file`, whose text is `text`, with a change that alters no behaviour: a blank
@@ -422,15 +441,19 @@ pub fn judge(inputs: &Inputs<'_>, verdict: &mut Verdict) {
 /// The step [`Step::Mutants`]: each workspace's mutation run, into `verdict`, and where its
 /// mutants are, into `starts`.
 fn mutation_step(inputs: &Inputs<'_>, starts: &mut Starts, verdict: &mut Verdict) {
-    if !verdict.enter(Step::Mutants, inputs.tools) {
-        return;
-    }
+    verdict.enter(Step::Mutants);
     if !inputs.tools.mutants {
-        return verdict.unprovable("mutation testing was skipped (`--no-mutants`)".to_owned());
+        verdict.skip(Step::Mutants, "mutation testing is skipped (`--no-mutants`)");
+        let what = "mutation testing was skipped (`--no-mutants`)".to_owned();
+        return verdict.unprovable(Reason::Evidence, what);
     }
     let Some(evidence) = inputs.evidence else {
-        return;
+        return verdict.skip(Step::Mutants, NO_EVIDENCE);
     };
+    verdict.reach(Step::Mutants, inputs.tools);
+    for reason in evidence.failures_of(Step::Mutants) {
+        verdict.fail(Step::Mutants, format!("observing failed: {reason}"));
+    }
     verdict.ran(Check::Mutants);
     for workspace in &WORKSPACES {
         if !sources(inputs.head, inputs.rule_paths, workspace).is_empty() {
@@ -450,9 +473,13 @@ fn mutation_run(
     starts: &mut Starts,
     verdict: &mut Verdict,
 ) {
-    let Some(run) = evidence.runs_of(workspace.name, "mutants").next() else {
-        let reason = format!("the observations hold no mutation run of {}", workspace.name);
-        return verdict.fail(Step::Mutants, reason);
+    let found = evidence
+        .runs_of(workspace.name, "mutants")
+        .next()
+        .ok_or_else(|| format!("the observations hold no mutation run of {}", workspace.name));
+    let run = match verdict.inject(Step::Mutants, inputs.tools, found) {
+        Ok(run) => run,
+        Err(reason) => return verdict.fail(Step::Mutants, reason),
     };
     if let Some(Some(missed)) = run.files.get(MISSED) {
         for finding in missed_findings(missed, workspace.directory) {
@@ -500,26 +527,36 @@ fn mutation_run(
 }
 
 /// The step [`Step::NullRun`]: the null-mutant run of each workspace whose mutation run has
-/// mutants. A failed one leaves that workspace's mutant evidence unproven, even for an approved
-/// edit: only a code owner's approval stands in for it (review of #55, thread 2).
+/// mutants. A run whose tests fail shows that the workspace's mutant evidence proves nothing,
+/// and fails the step like a run that is missing or killed: no approval stands in for it, and
+/// the test that depends on the source text is fixed instead (review of #57, round 14).
 fn null_step(inputs: &Inputs<'_>, starts: &Starts, verdict: &mut Verdict) {
-    if !verdict.enter(Step::NullRun, inputs.tools) || !inputs.tools.mutants {
-        return;
+    verdict.enter(Step::NullRun);
+    if !inputs.tools.mutants {
+        return verdict.skip(Step::NullRun, "mutation testing is skipped (`--no-mutants`)");
     }
     let Some(evidence) = inputs.evidence else {
-        return;
+        return verdict.skip(Step::NullRun, NO_EVIDENCE);
     };
+    verdict.reach(Step::NullRun, inputs.tools);
+    for reason in evidence.failures_of(Step::NullRun) {
+        verdict.fail(Step::NullRun, format!("observing failed: {reason}"));
+    }
     for workspace in &WORKSPACES {
         let Some(here) = starts.get(workspace.name) else {
             continue;
         };
-        match judge_null(evidence, workspace, here) {
-            Ok(Some(what)) => verdict.unprovable(what),
+        match verdict.inject(Step::NullRun, inputs.tools, judge_null(evidence, workspace, here)) {
+            Ok(Some(what)) => verdict.fail(Step::NullRun, what),
             Ok(None) => {}
             Err(reason) => verdict.fail(Step::NullRun, reason),
         }
     }
 }
+
+/// Why the mutation steps skip without evidence.
+const NO_EVIDENCE: &str =
+    "no mutation evidence of these trees; the observations or carried-evidence step says why";
 
 /// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, whose
 /// tables the rule-set check reads as data, and whose other changes are edits.
@@ -725,13 +762,13 @@ pub fn with_headers(diff: &str, relative: &str, is_new: bool) -> String {
 
 /// Lists and runs cargo-mutants on the head with the diff, and records what it left. Returns
 /// the run, and the files with mutants relative to the workspace, which the null mutant
-/// changes.
+/// changes, or why the listing cannot be read.
 fn run_mutants(
     head: &Path,
     workspace: &Workspace,
     diff: &str,
     tools: &Tools<'_>,
-) -> Result<(Run, BTreeSet<String>), String> {
+) -> Result<(Run, Result<BTreeSet<String>, String>), String> {
     let diff_file = tools.work.join(format!("mutants-{}.diff", workspace.name));
     let output_directory = tools.work.join(format!("mutants-{}", workspace.name));
     fs::write(&diff_file, diff).map_err(|error| format!("cannot write the diff: {error}"))?;
@@ -762,8 +799,10 @@ fn run_mutants(
     let listing = mutants(true)?;
     let listing_text = String::from_utf8_lossy(&listing.stdout).into_owned();
     let listed = listing_text.lines().filter(|line| !line.trim().is_empty()).count();
+    // A listing that cannot be read leaves the mutation run to be made and kept; only the
+    // null mutant needs the files.
     let mutated =
-        if listing.status.success() { listed_files(&listing_text)? } else { BTreeSet::new() };
+        if listing.status.success() { listed_files(&listing_text) } else { Ok(BTreeSet::new()) };
     let listed = if listing.status.success() { Some(listed.to_string()) } else { None };
     let output = if listed.as_deref() == Some("0") { listing } else { mutants(false)? };
     let read =

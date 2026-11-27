@@ -280,9 +280,14 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
     };
     match &arguments.mode {
         Mode::Observe(out) => {
-            let observed = super::observe(&base, &head, &tools)?;
+            // Written whatever failed: each failure is recorded in it, and the judge's step for
+            // that phase fails on it, while the rest is judged (review of #57, round 14).
+            let observed = super::observe(&base, &head, &tools);
             fs::write(out, observed.to_json())
                 .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
+            for (step, reason) in &observed.failures {
+                eprintln!("ratchet observe: {} failed: {reason}", step.name());
+            }
             Ok(None)
         }
         Mode::Judge(file) => {

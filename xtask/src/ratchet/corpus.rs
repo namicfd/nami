@@ -19,7 +19,7 @@
 use super::observations::{Observations, Run};
 use super::plant::{self, Rng};
 use super::tree::{Scratch, is_plain_relative};
-use super::{Check, Finding, Step, Tools, Verdict};
+use super::{Check, Finding, NO_OBSERVATIONS, Step, Tools, Verdict};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,44 +184,66 @@ pub fn plan(
     Ok(plantings)
 }
 
-/// The files of the tree at `root`, relative to it, which placements are drawn from.
+/// The regular files of the tree at `root`, relative to it, which placements are drawn from.
+/// Symbolic links are left out: the observer's scratch copy holds none, so that the judge draws
+/// from the head the placements the observer drew from its copy.
 fn files_of(root: &Path) -> Result<Vec<String>, String> {
     let entries = super::tree::entries(root)
         .map_err(|error| format!("cannot list the tree {}: {error}", root.display()))?;
-    Ok(entries.into_keys().collect())
+    let files: Vec<String> = entries
+        .into_iter()
+        .filter(|(_, entry)| matches!(entry, super::tree::Entry::File(_)))
+        .map(|(path, _)| path)
+        .collect();
+    Ok(files)
 }
 
-/// Plants every base fixture in the scratch copy of the head tree as [`plan`] says, and runs
-/// the head's `tidy --file` on it, and for a firing fixture `tidy --root` on the whole tree.
-/// Runs head code; judges nothing.
-///
-/// # Errors
-///
-/// Returns what failed if a base fixture is broken or the scratch tree cannot be written.
+/// The phase of `observe` for [`Step::TidyCorpus`]: plants every base fixture in the scratch
+/// copy of the head tree as [`plan`] says, and runs the head's `tidy --file` on it, and for a
+/// firing fixture `tidy --root` on the whole tree, into `observed`. Runs head code; judges
+/// nothing. What fails is recorded as the phase's failure, and the runs gathered are kept.
 pub fn observe(
     base: &Path,
-    scratch: &Scratch,
-    head_xtask: &Path,
-    rng: &mut Rng,
-) -> Result<Vec<Run>, String> {
-    let fixtures = fixtures(base)?;
-    let plantings = plan(base, &fixtures, scratch.root(), &files_of(scratch.root())?, rng)?;
-    let mut runs = Vec::new();
+    copied: Result<&Scratch, String>,
+    built: Result<&Path, String>,
+    tools: &Tools<'_>,
+    observed: &mut Observations,
+) {
+    let ready = copied.and_then(|copy| built.map(|xtask| (copy, xtask)));
+    let (scratch, head_xtask) = match super::observing(tools, Step::TidyCorpus, ready) {
+        Ok(ready) => ready,
+        Err(reason) => return observed.fail(Step::TidyCorpus, reason),
+    };
+    let drawn = fixtures(base).and_then(|fixtures| {
+        let files = files_of(scratch.root())?;
+        let plantings = plan(base, &fixtures, scratch.root(), &files, &mut rng(observed.seed))?;
+        Ok((fixtures, plantings))
+    });
+    let (fixtures, plantings) = match drawn {
+        Ok(drawn) => drawn,
+        Err(reason) => return observed.fail(Step::TidyCorpus, reason),
+    };
     for planting in &plantings {
         let fixture = fixtures.get(planting.fixture).expect("a planting names a fixture");
-        let planted = scratch
-            .plant(&planting.placement, &planting.text)
-            .map_err(|error| format!("cannot plant {}: {error}", fixture.file))?;
+        let planted = match scratch.plant(&planting.placement, &planting.text) {
+            Ok(planted) => planted,
+            Err(error) => {
+                observed.fail(Step::TidyCorpus, format!("cannot plant {}: {error}", fixture.file));
+                continue;
+            }
+        };
         let file = scratch.root().join(&planting.placement);
         let at = &planting.placement;
-        runs.push(run_tidy(head_xtask, scratch.root(), fixture, at, "--file", &file));
+        observed.runs.push(run_tidy(head_xtask, scratch.root(), fixture, at, "--file", &file));
         if fixture.fires {
             let root = scratch.root().to_path_buf();
-            runs.push(run_tidy(head_xtask, &root, fixture, at, "--root", &root));
+            observed.runs.push(run_tidy(head_xtask, &root, fixture, at, "--root", &root));
         }
-        planted.remove().map_err(|error| format!("cannot restore the scratch tree: {error}"))?;
+        if let Err(error) = planted.remove() {
+            let reason = format!("cannot restore the scratch tree: {error}");
+            return observed.fail(Step::TidyCorpus, reason);
+        }
     }
-    Ok(runs)
 }
 
 /// Runs the head's `xtask tidy <option> <argument>` and records it.
@@ -292,13 +314,14 @@ pub fn judge(
     tools: &Tools<'_>,
     verdict: &mut Verdict,
 ) {
-    if !verdict.enter(Step::TidyCorpus, tools) {
-        return;
-    }
+    verdict.enter(Step::TidyCorpus);
     let Some(observations) = observations else {
-        return;
+        return verdict.skip(Step::TidyCorpus, NO_OBSERVATIONS);
     };
-    let fixtures = match fixtures(base) {
+    for reason in observations.failures_of(Step::TidyCorpus) {
+        verdict.fail(Step::TidyCorpus, format!("observing failed: {reason}"));
+    }
+    let fixtures = match verdict.inject(Step::TidyCorpus, tools, fixtures(base)) {
         Ok(fixtures) if fixtures.is_empty() => {
             return verdict.fail(
                 Step::TidyCorpus,
@@ -314,6 +337,7 @@ pub fn judge(
         Ok(plantings) => plantings,
         Err(reason) => return verdict.fail(Step::TidyCorpus, reason),
     };
+    verdict.reach(Step::TidyCorpus, tools);
     verdict.ran(Check::TidyCorpus);
     verdict.ran(Check::EndToEnd);
     let mut found_runs = 0_usize;
@@ -333,7 +357,8 @@ pub fn judge(
                 continue;
             };
             found_runs += 1;
-            match judge_run(base, head, fixture, &planting.text, run) {
+            let judged = judge_run(base, head, fixture, &planting.text, run);
+            match verdict.inject(Step::TidyCorpus, tools, judged) {
                 Ok(found) => found.into_iter().for_each(|finding| verdict.record(finding)),
                 Err(problem) => verdict.fail(Step::TidyCorpus, problem),
             }
