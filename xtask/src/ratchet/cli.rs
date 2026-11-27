@@ -223,7 +223,7 @@ pub fn run(options: &[&str]) -> ExitCode {
             print!("{}", verdict.summary());
             if !verdict.findings.is_empty() {
                 ExitCode::FAILURE
-            } else if verdict.unproven.is_empty() {
+            } else if verdict.unproven.is_empty() && verdict.failed.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(EXIT_NO_VERDICT)
@@ -288,14 +288,15 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
             Ok(None)
         }
         Mode::Judge(file) => {
-            let judged = match unread {
-                Some(error) => Err(error),
-                None => Observations::read(file)
-                    .and_then(|observed| super::judge(&base, &head, &observed, &tools)),
+            let judged = match unread.map_or_else(|| Observations::read(file), Err) {
+                Ok(observed) => super::judge_all(&base, &head, &observed, &tools),
+                Err(reason) => Verdict::unjudged(reason, &tools),
             };
             super::settled(&base, &tools, judged).map(Some)
         }
-        Mode::Both => super::settled(&base, &tools, super::check(&base, &head, &tools)).map(Some),
+        Mode::Both => {
+            super::settled(&base, &tools, super::check_all(&base, &head, &tools)).map(Some)
+        }
     }
 }
 

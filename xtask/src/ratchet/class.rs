@@ -131,6 +131,10 @@ pub struct Class {
     /// a union. The new code that uses them has the mutants, and the new cases show what they
     /// declare (review of #57, round 8: the canonical new lint had three hunks without one).
     pub declarations: BTreeMap<String, Vec<(u32, u32)>>,
+    /// The manifests and build files of the rule paths that the diff touches. Each is an edit
+    /// that only a code owner's approval settles, not the reviewer app's (review of #55,
+    /// round 3: the maintainer's decision).
+    pub build_files: Vec<String>,
 }
 
 impl Class {
@@ -163,6 +167,7 @@ pub fn classify(base: &Path, head: &Path, rule_paths: &[String]) -> Result<Class
                 "{path}: a manifest or build file in the rule paths, which can change how the rule \
                  code builds (review of #55)"
             ));
+            class.build_files.push(path.clone());
         } else if is_code(path) {
             code.push(Code::read(path, before, after)?);
         } else if path != RULES_DOC && before.is_some() {

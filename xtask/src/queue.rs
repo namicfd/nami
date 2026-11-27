@@ -217,6 +217,9 @@ fn file_failure(
         ));
     }
     let vocabulary = vocabulary()?;
+    if let Some(noted) = note_on_sibling(forge, &details, &failures_of_pull, &vocabulary)? {
+        return Ok(noted);
+    }
     let report = Failure {
         pull,
         group: group_of(forge, &entry, &details)?,
@@ -232,6 +235,40 @@ fn file_failure(
     let options = FileOptions { kind: "bug", needs_decision: !by_bot, new: true, path: "-" };
     let number = issue::file_number(&draft, &options, github, trust)?;
     Ok(format!("filed #{number}: {title}\n"))
+}
+
+/// One issue per merge group: when both `ci` and `guardrails` fail for one merge group, the
+/// second run to finish finds the issue of the first among `failures_of_pull`, the open
+/// trusted issues of the same PR by their run, and adds its failed jobs to it as a comment
+/// instead of filing another (review of #57, round 11). Returns what it did, or `None` if no
+/// issue records a run of the same merge group: the same queue branch and tested commit.
+///
+/// # Errors
+///
+/// When GitHub cannot be asked.
+fn note_on_sibling(
+    forge: &dyn Forge,
+    details: &Run,
+    failures_of_pull: &[(u64, u32)],
+    vocabulary: &Vocabulary,
+) -> Result<Option<String>, String> {
+    for (its_run, number) in failures_of_pull {
+        let sibling = forge.run(*its_run)?;
+        let same_group =
+            sibling.head_sha == details.head_sha && sibling.head_branch == details.head_branch;
+        if sibling.id != *its_run || !same_group || sibling.path == details.path {
+            continue;
+        }
+        let jobs = failed_jobs(forge, details.id, vocabulary)?;
+        let repository = forge.repository()?;
+        let note = failure::sibling_note(details.id, &repository, &jobs, vocabulary);
+        forge.post_comment(*number, &note)?;
+        return Ok(Some(format!(
+            "#{number} records run {its_run} of the same merge group; added run {} to it\n",
+            details.id
+        )));
+    }
+    Ok(None)
 }
 
 /// Why PR `entry.pull` has not left the queue for good after run `details`, or `None` if it
@@ -414,6 +451,8 @@ mod tests {
         files: BTreeMap<u32, String>,
         comments: String,
         run: String,
+        /// Other runs, by ID; any other ID is answered with `run`.
+        other_runs: BTreeMap<u64, String>,
         messages: &'static str,
         state: (String, String),
         queue_runs: String,
@@ -453,8 +492,9 @@ mod tests {
             self.edited.borrow_mut().push((id, body.to_owned()));
             Ok(())
         }
-        fn run(&self, _id: u64) -> Result<Run, String> {
-            run_from_json(&parse(&self.run).unwrap())
+        fn run(&self, id: u64) -> Result<Run, String> {
+            let text = self.other_runs.get(&id).unwrap_or(&self.run);
+            run_from_json(&parse(text).unwrap())
         }
         fn jobs(&self, _id: u64) -> Result<Vec<Job>, String> {
             jobs_from_json(&parse(JOBS).unwrap())
@@ -712,7 +752,7 @@ mod tests {
     // failed `gate` (review of #57, round 10); an answer about another run than the one asked
     // for is an error.
     #[test]
-    fn only_runs_of_ci_count() {
+    fn only_runs_of_the_queue_workflows_count() {
         let renamed = RUN.replace(".github/workflows/ci.yml", ".github/workflows/mine.yml");
         let fake = Fake { run: renamed, ..dropped() };
         let output = run(&fake, &["failed", "--run", "900"]).unwrap();
@@ -729,6 +769,43 @@ mod tests {
         let other = Fake { run: RUN.replace("\"id\": 900", "\"id\": 901"), ..dropped() };
         let error = run(&other, &["failed", "--run", "900"]).expect_err("another run");
         assert_eq!(error, "GitHub answered with run 901 when asked for run 900");
+    }
+
+    // Goal: review of #57, round 11: when `ci` and `guardrails` both fail for one merge group,
+    // the second run adds its failed jobs to the first run's issue as a comment and files
+    // nothing; a run of the same workflow, or of another merge group, is no sibling.
+    #[test]
+    fn one_merge_group_gets_one_issue() {
+        let guardrails = RUN
+            .replace("\"id\": 900", "\"id\": 901")
+            .replace(".github/workflows/ci.yml", ".github/workflows/guardrails.yml");
+        let title = "PR #51 failed in the merge queue (run 900)";
+        let recorded = issues() + &issue_line(9, title, "nami-agent[bot]", "open");
+        let sibling = Fake {
+            run: guardrails.clone(),
+            other_runs: BTreeMap::from([(900, RUN.to_owned())]),
+            issues: recorded.clone(),
+            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
+            ..dropped()
+        };
+        let output = run(&sibling, &["failed", "--run", "901"]).unwrap();
+        assert_eq!(output, "#9 records run 900 of the same merge group; added run 901 to it\n");
+        assert!(sibling.filed.borrow().is_empty(), "no second issue");
+        let posted = sibling.posted.borrow();
+        let (number, note) = posted.first().expect("a comment on the first issue");
+        assert_eq!(*number, 9);
+        assert!(note.contains("https://github.com/namicfd/nami/actions/runs/901"), "{note}");
+        assert!(note.contains("Job `gate` failed"), "{note}");
+        let other_group = RUN.replace("0123456789abcdef", "fedcba9876543210");
+        let separate = Fake {
+            run: guardrails,
+            other_runs: BTreeMap::from([(900, other_group)]),
+            issues: recorded,
+            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
+            ..dropped()
+        };
+        let filed = run(&separate, &["failed", "--run", "901"]).unwrap();
+        assert!(filed.starts_with("filed #70"), "another merge group: {filed}");
     }
 
     // Goal: a re-run finds the bot's open issue by its title and files nothing; runs that are

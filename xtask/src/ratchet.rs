@@ -251,6 +251,11 @@ pub struct Verdict {
     pub class: Option<class::Class>,
     /// What the summary should say besides the findings: counts, skipped checks and why.
     pub notes: Vec<String>,
+    /// Why a step could not reach a result: no verdict. A step that fails adds its reason here
+    /// and the judge goes on, so that no failure drops a finding of an earlier or later step
+    /// (review of #57, round 11). Only [`settled`] turns these into notes, and only when there
+    /// is no finding.
+    pub failed: Vec<String>,
 }
 
 impl Verdict {
@@ -275,6 +280,12 @@ impl Verdict {
             self.class.as_ref().map_or(String::new(), |class| format!(" ({})", class.name()));
         if !self.findings.is_empty() {
             format!("ratchet: fail{class}, {} finding(s)", self.findings.len())
+        } else if !self.failed.is_empty() {
+            format!(
+                "ratchet: no verdict{class}, {} step(s) could not be judged; the code owner \
+                 decides",
+                self.failed.len()
+            )
         } else if !unproven.is_empty() {
             format!(
                 "ratchet: no verdict{class}, {} thing(s) unproven; the code owner decides",
@@ -323,6 +334,7 @@ impl Verdict {
             lines.extend(class.edits.iter().map(|edit| format!("- **Edit:** {edit}")));
         }
         lines.extend(self.notes.iter().map(|note| format!("- {note}")));
+        lines.extend(self.failed.iter().map(|why| format!("- **Not judged (no verdict):** {why}")));
         lines.extend(self.unproven_after.iter().map(|what| format!("- **Unproven:** {what}")));
         if !self.outside.is_empty() {
             lines.extend([String::new(), "Outside the rule paths:".to_owned(), String::new()]);
@@ -335,6 +347,16 @@ impl Verdict {
         }
         lines.extend([String::new(), self.line()]);
         lines.join("\n") + "\n"
+    }
+
+    /// A verdict that could not judge at all, for `reason`, before it knew the trees.
+    #[must_use]
+    pub fn unjudged(reason: String, tools: &Tools<'_>) -> Self {
+        Self {
+            range: tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned()),
+            failed: vec![reason],
+            ..Self::default()
+        }
     }
 
     fn add(&mut self, check: Check, findings: Vec<Finding>) {
@@ -434,23 +456,106 @@ pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Observatio
 ///
 /// # Errors
 ///
-/// No verdict: the trees or the observations cannot be read, the base's corpus is empty or
-/// differs from the one observed, or a check cannot reach a result.
+/// No verdict, naming every step that could not reach a result, when one could not and
+/// nothing was found. A verdict with a finding is a verdict even then: it fails, and its
+/// summary lists the steps that were not judged ([`judge_all`]).
 pub fn judge(
     base: &Path,
     head: &Path,
     observed: &Observations,
     tools: &Tools<'_>,
 ) -> Result<Verdict, String> {
+    into_result(judge_all(base, head, observed, tools))
+}
+
+/// `verdict` as [`judge`] and [`check`] give it: a verdict when it holds a finding or when
+/// every step reached a result, and otherwise no verdict, naming every failed step.
+fn into_result(verdict: Verdict) -> Result<Verdict, String> {
+    if verdict.failed.is_empty() || !verdict.findings.is_empty() {
+        Ok(verdict)
+    } else {
+        Err(verdict.failed.join("; and "))
+    }
+}
+
+/// Judges the observations into one accumulator: every step adds its findings, and a step that
+/// cannot reach a result adds its reason to [`Verdict::failed`] and the others go on, so that
+/// no failure drops a finding (review of #57, round 11). Only the checks that the observations
+/// are of these trees, which come before any finding, end the judging early.
+#[must_use]
+pub fn judge_all(base: &Path, head: &Path, observed: &Observations, tools: &Tools<'_>) -> Verdict {
     assert!(base.is_absolute() && head.is_absolute(), "the trees have absolute paths");
-    let (changed, mut verdict, head_tree) = scope_of(base, head)?;
+    let (changed, mut verdict, head_tree) = match scope_of(base, head) {
+        Ok(scoped) => scoped,
+        Err(reason) => return Verdict::unjudged(reason, tools),
+    };
     verdict.range = tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned());
     if !changed.iter().any(|path| scope::is_tooling(path)) {
         verdict
             .notes
             .push("No change to `xtask/`, `lints/` or a rule path: nothing to prove.".to_owned());
-        return Ok(verdict);
+        return verdict;
     }
+    match observed_here(base, observed, tools, &head_tree) {
+        Ok(note) => verdict.notes.push(note),
+        Err(reason) => {
+            verdict.failed.push(reason);
+            return verdict;
+        }
+    }
+    match rule_set(base, head) {
+        Ok(findings) => verdict.add(Check::RuleSet, findings),
+        Err(reason) => verdict.failed.push(reason),
+    }
+    // Each finding names its own check; corpus and end-to-end findings come from one pass.
+    let mut rng = plant::Rng::new(observed.seed);
+    let drawn = match corpus::judge(base, head, observed, &mut rng) {
+        Ok((findings, failed)) => {
+            verdict.add(Check::TidyCorpus, findings);
+            verdict.failed.extend(failed);
+            true
+        }
+        Err(reason) => {
+            verdict.failed.push(reason);
+            false
+        }
+    };
+    if !changed.iter().any(|path| scope::is_lint_tooling(path)) {
+        verdict.notes.push("Lint checks skipped: nothing below `lints/` changed.".to_owned());
+    } else if !drawn {
+        verdict.failed.push(
+            "the lint corpus was not judged: its placements are drawn after the tidy corpus's, \
+             which could not be drawn"
+                .to_owned(),
+        );
+    } else {
+        match lint::judge(base, head, observed, tools, &mut rng) {
+            Ok((findings, failed)) => {
+                verdict.add(Check::LintCorpus, findings);
+                verdict.failed.extend(failed);
+            }
+            Err(reason) => verdict.failed.push(reason),
+        }
+    }
+    verdict.add(Check::EndToEnd, Vec::new());
+    judge_proof(base, head, observed, tools, &mut verdict);
+    verdict.findings.sort();
+    verdict
+}
+
+/// Checks that `observed` are the observations of these trees: of the head tree `head_tree`,
+/// of the base's corpus, of the commits judged, and drawn with the seed they give. Returns the
+/// summary's note about the corpus.
+///
+/// # Errors
+///
+/// No verdict, before any finding: the observations are of something else.
+fn observed_here(
+    base: &Path,
+    observed: &Observations,
+    tools: &Tools<'_>,
+    head_tree: &str,
+) -> Result<String, String> {
     if observed.head != head_tree {
         return Err(format!(
             "the observations are of another head tree (fingerprint {}, here {head_tree}); the \
@@ -468,30 +573,17 @@ pub fn judge(
         ));
     }
     same_commits(observed, tools)?;
-    if observed.seed != tools.seed(&corpus, &head_tree) {
+    if observed.seed != tools.seed(&corpus, head_tree) {
         return Err(format!(
             "the observations were drawn with the seed {}, not the one this base and head give; \
              the placements cannot be checked",
             observed.seed
         ));
     }
-    verdict.notes.push(format!(
+    Ok(format!(
         "Base corpus: {files} files, fingerprint {corpus}, placement seed {}.",
         observed.seed
-    ));
-    verdict.add(Check::RuleSet, rule_set(base, head)?);
-    // Each finding names its own check; corpus and end-to-end findings come from one pass.
-    let mut rng = plant::Rng::new(observed.seed);
-    verdict.add(Check::TidyCorpus, corpus::judge(base, head, observed, &mut rng)?);
-    if changed.iter().any(|path| scope::is_lint_tooling(path)) {
-        verdict.add(Check::LintCorpus, lint::judge(base, head, observed, tools, &mut rng)?);
-    } else {
-        verdict.notes.push("Lint checks skipped: nothing below `lints/` changed.".to_owned());
-    }
-    verdict.add(Check::EndToEnd, Vec::new());
-    judge_proof(base, head, observed, tools, &mut verdict)?;
-    verdict.findings.sort();
-    Ok(verdict)
+    ))
 }
 
 /// The rule-set check, read from the trees as data: the tables only tighten, every check call
@@ -559,46 +651,32 @@ fn judge_proof(
     observed: &Observations,
     tools: &Tools<'_>,
     verdict: &mut Verdict,
-) -> Result<(), String> {
+) {
     if let Some(source) = &tools.review {
-        let codeowners = fs::read_to_string(base.join(CODEOWNERS))
-            .map_err(|error| format!("cannot read the base's {CODEOWNERS}: {error}"))?;
-        verdict.owner_approved =
-            review::owner_approved(source.reviews, source.pull, &source.head, &codeowners)?;
+        match owner_approval(base, source) {
+            Ok(approved) => verdict.owner_approved = approved,
+            Err(reason) => verdict.failed.push(reason),
+        }
     }
     if verdict.rule_paths.is_empty() {
         verdict.notes.push(
             "Mutation testing and the review check skipped: no rule path changed.".to_owned(),
         );
-        return Ok(());
+        return;
     }
-    let class = class::classify(base, head, &verdict.rule_paths)?;
+    let class = match class::classify(base, head, &verdict.rule_paths) {
+        Ok(class) => class,
+        Err(reason) => {
+            // The review gate's findings, such as the app's request for changes, still count.
+            verdict.failed.push(reason);
+            let _approved = review_gate(tools, verdict);
+            return;
+        }
+    };
     // What mutation testing could not show. For an edit, the reviewer app's approval stands in
     // for it: a test edited with the code it tests pins the edit, so mutants prove little there.
-    let mut uncovered = Vec::new();
-    if tools.mutants {
-        let evidence = match &tools.carried {
-            Some(carried) => {
-                let note = carry::check(base, head, carried, tools.pr_head.as_deref())?;
-                verdict.notes.push(note);
-                &carried.observations
-            }
-            None => observed,
-        };
-        let rule_paths = verdict.rule_paths.clone();
-        let judged = mutants::judge(base, head, &rule_paths, evidence, &tools.work, &class)?;
-        verdict.notes.extend(judged.notes);
-        uncovered = judged.unproven;
-        // A failed null run stays unproven even for an approved edit: only a code owner's
-        // approval stands in for it (review of #55, thread 2).
-        for what in judged.null_failed {
-            verdict.unprovable(what);
-        }
-        verdict.add(Check::Mutants, judged.findings);
-    } else {
-        verdict.unprovable("mutation testing was skipped (`--no-mutants`)".to_owned());
-    }
-    let approved = review_gate(tools, verdict)?;
+    let uncovered = judge_mutants(base, head, observed, tools, &class, verdict);
+    let approved = review_gate(tools, verdict);
     if class.is_edit() && approved {
         verdict.notes.push(format!(
             "An edit to existing rule code: the reviewer app approved the head commit, which \
@@ -613,8 +691,68 @@ fn judge_proof(
             verdict.unprovable(what);
         }
     }
+    // A manifest or build file decides how the rule code builds, which nothing here reads: only
+    // a code owner's approval settles it, never the reviewer app's (maintainer's decision,
+    // review of #55, round 3).
+    for path in &class.build_files {
+        verdict.unprovable(format!(
+            "{path} is a manifest or build file in the rule paths, which only a code owner's \
+             approval of the head commit settles"
+        ));
+    }
     verdict.class = Some(class);
-    Ok(())
+}
+
+/// Whether a code owner approved the head commit of the pull request that `source` names.
+///
+/// # Errors
+///
+/// No verdict if the base's CODEOWNERS or the reviews cannot be read.
+fn owner_approval(base: &Path, source: &ReviewSource<'_>) -> Result<bool, String> {
+    let codeowners = fs::read_to_string(base.join(CODEOWNERS))
+        .map_err(|error| format!("cannot read the base's {CODEOWNERS}: {error}"))?;
+    review::owner_approved(source.reviews, source.pull, &source.head, &codeowners)
+}
+
+/// Mutation testing of the rule-path diff, from the observations or the carried evidence, into
+/// `verdict`. Returns the hunks without a mutant of their own, which an approved edit needs
+/// none for. What cannot be judged goes into [`Verdict::failed`].
+fn judge_mutants(
+    base: &Path,
+    head: &Path,
+    observed: &Observations,
+    tools: &Tools<'_>,
+    class: &class::Class,
+    verdict: &mut Verdict,
+) -> Vec<String> {
+    if !tools.mutants {
+        verdict.unprovable("mutation testing was skipped (`--no-mutants`)".to_owned());
+        return Vec::new();
+    }
+    let evidence = match &tools.carried {
+        Some(carried) => match carry::check(base, head, carried, tools.pr_head.as_deref()) {
+            Ok(note) => {
+                verdict.notes.push(note);
+                &carried.observations
+            }
+            Err(reason) => {
+                verdict.failed.push(reason);
+                return Vec::new();
+            }
+        },
+        None => observed,
+    };
+    let rule_paths = verdict.rule_paths.clone();
+    let judged = mutants::judge(base, head, &rule_paths, evidence, &tools.work, class);
+    verdict.notes.extend(judged.notes);
+    verdict.failed.extend(judged.failed);
+    // A failed null run stays unproven even for an approved edit: only a code owner's approval
+    // stands in for it (review of #55, thread 2).
+    for what in judged.null_failed {
+        verdict.unprovable(what);
+    }
+    verdict.add(Check::Mutants, judged.findings);
+    judged.unproven
 }
 
 /// What an edit to existing rule code leaves unproven without the reviewer app's approval: the
@@ -631,15 +769,15 @@ fn unapproved_edit(class: &class::Class) -> Option<String> {
 /// The review gate ([`review::check`]): its findings go into `verdict`. An additive diff needs
 /// nothing more, so a head that the reviewer app has not reviewed, or a repository without the
 /// app, is a note. Returns true if the app approved the head commit with no finding, which an
-/// edit to existing rule code needs.
-fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> Result<bool, String> {
+/// edit to existing rule code needs. A gate that cannot be read goes into [`Verdict::failed`].
+fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> bool {
     let Some(source) = &tools.review else {
         verdict.unprovable(
             "the review check was skipped (`--no-review`), so a request for changes or an open \
              thread by the reviewer app is not seen"
                 .to_owned(),
         );
-        return Ok(false);
+        return false;
     };
     let Some(reviewer) = &source.reviewer else {
         verdict.notes.push(format!(
@@ -647,9 +785,15 @@ fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> Result<bool, String>
              #59). An additive diff needs none; an edit needs a code owner's approval.",
             review::REVIEWER_APP
         ));
-        return Ok(false);
+        return false;
     };
-    let gate = review::check(source.reviews, source.pull, &source.head, reviewer)?;
+    let gate = match review::check(source.reviews, source.pull, &source.head, reviewer) {
+        Ok(gate) => gate,
+        Err(reason) => {
+            verdict.failed.push(reason);
+            return false;
+        }
+    };
     let clean = gate.findings.is_empty();
     verdict.notes.push(format!(
         "{reviewer} {} the head commit.",
@@ -660,7 +804,7 @@ fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> Result<bool, String>
         }
     ));
     verdict.add(Check::Review, gate.findings);
-    Ok(gate.approved && clean)
+    gate.approved && clean
 }
 
 /// Observes and judges in one process: for local runs and the tests.
@@ -669,49 +813,60 @@ fn review_gate(tools: &Tools<'_>, verdict: &mut Verdict) -> Result<bool, String>
 ///
 /// No verdict, as for [`observe`] and [`judge`].
 pub fn check(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Verdict, String> {
-    let observed = observe(base, head, tools)?;
-    judge(base, head, &observed, tools)
+    into_result(check_all(base, head, tools))
 }
 
-/// `judged`, or, if it is no verdict and a code owner approved the pull request's head commit,
-/// a pass that lists why the ratchet could not judge. A code owner's approval settles every
-/// no verdict that is no finding: a head outside the dialect or with a symbolic link, missing
-/// observations or carried evidence, a tool that failed. So a rule-path PR that the ratchet
-/// cannot judge needs the owner, never the admin bypass (review of #55). Findings still fail,
-/// since they come with a verdict.
+/// [`check`] as one accumulator ([`judge_all`]): an observation that fails is a step that
+/// could not reach a result.
+#[must_use]
+pub fn check_all(base: &Path, head: &Path, tools: &Tools<'_>) -> Verdict {
+    match observe(base, head, tools) {
+        Ok(observed) => judge_all(base, head, &observed, tools),
+        Err(reason) => Verdict::unjudged(reason, tools),
+    }
+}
+
+/// `verdict`, settled by a code owner if it can be. A code owner's approval of the head commit
+/// settles every no verdict that is no finding: a head outside the dialect or with a symbolic
+/// link, missing observations or carried evidence, a tool that failed. Each becomes a note, and
+/// so does each unproven item, and the verdict passes. So a rule-path PR that the ratchet
+/// cannot judge needs the owner, never the admin bypass (review of #55). A verdict with any
+/// finding is never settled: it fails, and its summary lists what was not judged as well
+/// (review of #57, round 11).
 ///
 /// # Errors
 ///
-/// The no verdict of `judged`, when no review source is given or no code owner approved the
-/// head; or no verdict if the reviews or the base's CODEOWNERS cannot be read.
-pub fn settled(
-    base: &Path,
-    tools: &Tools<'_>,
-    judged: Result<Verdict, String>,
-) -> Result<Verdict, String> {
-    let reason = match judged {
-        Ok(verdict) => return Ok(verdict),
-        Err(reason) => reason,
-    };
-    let Some(source) = &tools.review else {
-        return Err(reason);
-    };
-    let codeowners = fs::read_to_string(base.join(CODEOWNERS))
-        .map_err(|error| format!("{reason}; and cannot read the base's {CODEOWNERS}: {error}"))?;
-    if !review::owner_approved(source.reviews, source.pull, &source.head, &codeowners)? {
-        return Err(reason);
+/// No verdict, naming every failed step, when `verdict` has no finding and no code owner
+/// approved the head, or no review source is given; with the reason too if the approval cannot
+/// be read.
+pub fn settled(base: &Path, tools: &Tools<'_>, mut verdict: Verdict) -> Result<Verdict, String> {
+    if verdict.failed.is_empty() || !verdict.findings.is_empty() {
+        return Ok(verdict);
     }
-    let note = format!(
-        "No verdict: {reason}. A code owner approved the head commit, which settles it \
-         (ADR-0022)."
-    );
-    let verdict = Verdict {
-        owner_approved: true,
-        range: tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned()),
-        notes: vec![note],
-        ..Verdict::default()
+    let reasons = verdict.failed.join("; and ");
+    let Some(source) = &tools.review else {
+        return Err(reasons);
     };
-    assert!(verdict.findings.is_empty() && verdict.unproven.is_empty(), "a settled pass");
+    match owner_approval(base, source) {
+        Ok(true) => {}
+        Ok(false) => return Err(reasons),
+        Err(problem) => {
+            return Err(format!(
+                "{reasons}; and the code owner's approval cannot be read: {problem}"
+            ));
+        }
+    }
+    verdict.owner_approved = true;
+    for reason in std::mem::take(&mut verdict.failed) {
+        verdict.notes.push(format!(
+            "No verdict: {reason}. A code owner approved the head commit, which settles it \
+             (ADR-0022)."
+        ));
+    }
+    for what in std::mem::take(&mut verdict.unproven) {
+        verdict.notes.push(format!("{what}; a code owner's approval of the head stands in."));
+    }
+    verdict.unproven_after.clear();
     Ok(verdict)
 }
 

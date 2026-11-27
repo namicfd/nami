@@ -7,8 +7,8 @@ name: queue
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  # `guardrails` holds the required `ratchet` check (ADR-0022), whose queue failures are filed
-  # like `ci`'s.
+  # `guardrails` holds the `ratchet` check (ADR-0022, required once the flip lands), whose queue
+  # failures are filed like `ci`'s.
   workflow_run:
     workflows: [ci, guardrails]
     types: [completed]

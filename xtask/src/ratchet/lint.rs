@@ -311,19 +311,21 @@ fn run_dylint(
 }
 
 /// Judges the recorded lint runs: the base's library, run here on the base's own cases, gives
-/// what must be reported; the head's runs must report all of it.
+/// what must be reported; the head's runs must report all of it. Returns the findings, and the
+/// placed runs that could not be judged, each no verdict without dropping another's finding
+/// (review of #57, round 11).
 ///
 /// # Errors
 ///
-/// No verdict: a base without UI cases, a base library that does not reproduce the base's
-/// `.stderr`, or a missing or unreadable run.
+/// No verdict before any finding: a base without UI cases, a base library that does not
+/// reproduce the base's `.stderr`, or a missing or unreadable run of the head's library.
 pub fn judge(
     base: &Path,
     head: &Path,
     observations: &Observations,
     tools: &Tools<'_>,
     rng: &mut Rng,
-) -> Result<Vec<Finding>, String> {
+) -> Result<(Vec<Finding>, Vec<String>), String> {
     let cases = cases(base)?;
     if cases.is_empty() {
         return Err(format!("the base has no UI cases in {UI_DIRECTORY}"));
@@ -338,20 +340,26 @@ pub fn judge(
     let errors = reported.iter().filter(|diagnostic| diagnostic.level == "error").count();
     exits_agree("the head's lint library", library.exit, errors)?;
     let mut findings = missing_diagnostics(&expected, &reported, &library.stderr);
+    let mut failed = Vec::new();
     for (case, placement) in cases.iter().zip(&placements) {
         let file = format!("{}.rs", case.stem);
         let of_case: Vec<&Diagnostic> =
             expected.iter().filter(|diagnostic| diagnostic.file == file).collect();
         let subject = format!("{UI_DIRECTORY}/{file}");
-        let run = observations
-            .runs_of(&subject, "dylint")
-            .find(|run| run.placement == *placement)
-            .ok_or_else(|| {
-                format!("no `xtask dylint` run of {subject} at {placement}, which the seed draws")
-            })?;
-        findings.extend(judge_dylint(run, &of_case)?);
+        let Some(run) =
+            observations.runs_of(&subject, "dylint").find(|run| run.placement == *placement)
+        else {
+            failed.push(format!(
+                "no `xtask dylint` run of {subject} at {placement}, which the seed draws"
+            ));
+            continue;
+        };
+        match judge_dylint(run, &of_case) {
+            Ok(found) => findings.extend(found),
+            Err(problem) => failed.push(problem),
+        }
     }
-    Ok(findings)
+    Ok((findings, failed))
 }
 
 /// The lint diagnostics of the base's own library on its cases, after checking that they

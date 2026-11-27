@@ -401,15 +401,27 @@ pub struct Judged {
     /// No approval by the reviewer app stands in for that, only a code owner's (review of
     /// #55, thread 2).
     pub null_failed: Vec<String>,
+    /// What could not be judged, per workspace: a missing run, an unexpected exit code, a
+    /// timeout, or an unreadable or inconsistent listing, `outcomes.json` or `missed.txt`. Each
+    /// is no verdict, and none of them drops another workspace's missed mutants (review of #57,
+    /// round 11).
+    pub failed: Vec<String>,
 }
 
-/// Judges the recorded mutation runs. `class` holds, by file, the lines of the dispatch calls
-/// and of the new declarations, whose hunks need no mutant of their own. `Err` is no verdict.
-///
-/// # Errors
-///
-/// No verdict: a missing run, an unexpected exit code, or an unreadable or inconsistent
-/// listing, `outcomes.json` or `missed.txt`.
+/// What [`judge`] judges.
+struct Inputs<'a> {
+    base: &'a Path,
+    head: &'a Path,
+    rule_paths: &'a [String],
+    observations: &'a Observations,
+    work: &'a Path,
+    class: &'a super::class::Class,
+}
+
+/// Judges the recorded mutation runs, workspace by workspace. `class` holds, by file, the lines
+/// of the dispatch calls and of the new declarations, whose hunks need no mutant of their own.
+/// What cannot be judged goes into [`Judged::failed`], and the other workspaces are judged on.
+#[must_use]
 pub fn judge(
     base: &Path,
     head: &Path,
@@ -417,44 +429,68 @@ pub fn judge(
     observations: &Observations,
     work: &Path,
     class: &super::class::Class,
-) -> Result<Judged, String> {
+) -> Judged {
+    let inputs = Inputs { base, head, rule_paths, observations, work, class };
     let mut judged = Judged::default();
     for workspace in &WORKSPACES {
         if sources(head, rule_paths, workspace).is_empty() {
             continue;
         }
-        let run = observations.runs_of(workspace.name, "mutants").next().ok_or_else(|| {
+        if let Err(problem) = judge_workspace(&inputs, workspace, &mut judged) {
+            judged.failed.push(problem);
+        }
+    }
+    judged
+}
+
+/// Judges the mutation run of one workspace into `judged`. Its missed mutants are recorded as
+/// soon as the run is read, so that a later failure keeps them.
+///
+/// # Errors
+///
+/// No verdict for this workspace, as for [`Judged::failed`].
+fn judge_workspace(
+    inputs: &Inputs<'_>,
+    workspace: &Workspace,
+    judged: &mut Judged,
+) -> Result<(), String> {
+    let run =
+        inputs.observations.runs_of(workspace.name, "mutants").next().ok_or_else(|| {
             format!("the observations hold no mutation run of {}", workspace.name)
         })?;
-        let (count, missed) = read_run(run)?;
-        let missed_count = missed.lines().filter(|line| !line.trim().is_empty()).count();
-        judged
-            .notes
-            .push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
-        // The registry's tables are data, which the rule-set check reads, so a data-only change
-        // passes with no mutant. Every other hunk needs one of its own, unless each of its
-        // lines is exempt (`hunks::is_exempt`): a comment or blank, test code, a dispatch call,
-        // a new declaration, or a registration that a dispatch call appended lints to.
-        let starts =
-            if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
-        let mut uncovered = Vec::new();
-        for path in changed_sources(rule_paths, workspace) {
-            uncovered.extend(uncovered_hunks(base, head, path, &starts, work, class)?);
-        }
-        assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
-        if count > 0 {
-            judged.null_failed.extend(judge_null(observations, workspace, &starts)?);
-            judged.unproven.extend(uncovered);
-        } else if let Some(first) = uncovered.first() {
-            judged.unproven.push(format!(
-                "the rule-path change in {} yields no mutant, so mutation testing proves \
-                 nothing about it (a changed constant or a deleted line makes none); {first}",
-                workspace.name
-            ));
-        }
-        judged.findings.extend(missed_findings(&missed, workspace.directory));
+    let (count, missed) = read_run(run)?;
+    let missed_count = missed.lines().filter(|line| !line.trim().is_empty()).count();
+    judged.notes.push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
+    judged.findings.extend(missed_findings(&missed, workspace.directory));
+    // The registry's tables are data, which the rule-set check reads, so a data-only change
+    // passes with no mutant. Every other hunk needs one of its own, unless each of its lines is
+    // exempt (`hunks::is_exempt`): a comment or blank, test code, a dispatch call, a new
+    // declaration, or a registration that a dispatch call appended lints to.
+    let starts =
+        if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
+    let mut uncovered = Vec::new();
+    for path in changed_sources(inputs.rule_paths, workspace) {
+        uncovered.extend(uncovered_hunks(
+            inputs.base,
+            inputs.head,
+            path,
+            &starts,
+            inputs.work,
+            inputs.class,
+        )?);
     }
-    Ok(judged)
+    assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
+    if count > 0 {
+        judged.null_failed.extend(judge_null(inputs.observations, workspace, &starts)?);
+        judged.unproven.extend(uncovered);
+    } else if let Some(first) = uncovered.first() {
+        judged.unproven.push(format!(
+            "the rule-path change in {} yields no mutant, so mutation testing proves nothing \
+             about it (a changed constant or a deleted line makes none); {first}",
+            workspace.name
+        ));
+    }
+    Ok(())
 }
 
 /// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, whose

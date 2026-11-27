@@ -255,18 +255,24 @@ jobs:
               | awk -F '\t' -v sha="${pr_head}" -v branch="${branch}" -v repo="${GH_REPO}" \
                 '$3 == "completed" && $4 == sha && $5 == branch && $6 == repo { print $1, $2 }' \
               | sort -r | cut -d ' ' -f 2 || true)
+            # The newest of at most five matching runs whose observing job succeeded and whose
+            # artifact downloads: an older one is tried when a newer one's download fails.
+            tried=0
             for candidate in ${candidates}; do
+              [ "${tried}" -lt 5 ] || break
+              tried=$((tried + 1))
               observed=$(gh api "repos/${GH_REPO}/actions/runs/${candidate}/jobs?per_page=100" \
                 --jq '.jobs[] | select(.name == "ratchet (head)") | .conclusion' || true)
-              if [ "${observed}" = success ]; then
+              [ "${observed}" = success ] || continue
+              rm -rf "${carried}"
+              if gh run download "${candidate}" --name ratchet-observations --dir "${carried}"; then
                 run="${candidate}"
                 break
               fi
             done
           fi
           commit=""
-          if [ -n "${run}" ] && gh run download "${run}" --name ratchet-observations \
-            --dir "${carried}"; then
+          if [ -n "${run}" ]; then
             commit=$(jq -r '.commit // empty' "${carried}/observations.json" 2> /dev/null || true)
           fi
           if [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] && git fetch --quiet --no-tags origin "${commit}" \

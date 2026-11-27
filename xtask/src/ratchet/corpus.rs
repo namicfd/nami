@@ -273,51 +273,58 @@ fn base_reports(
 
 /// Judges the recorded tidy runs against the base's fixtures, read from the base's own
 /// checkout, at the placements drawn again from `rng`, which starts at the observed seed.
-/// Returns the corpus and end-to-end findings.
+/// Returns the corpus and end-to-end findings, and what could not be judged: a planting
+/// without its run, a run that cannot be read, or runs that the seed does not draw. Each is
+/// no verdict, and none of them drops a finding of another planting (review of #57, round 11).
 ///
 /// # Errors
 ///
-/// No verdict: a base without fixtures, a planting without its runs, a run at a placement that
-/// was not drawn, a placement where the base does not report what the case is for, or a run
-/// whose output cannot be read.
+/// No verdict before any placement is drawn: a base without fixtures, or one whose cases
+/// cannot be planted. Then `rng` has not drawn what the lint corpus draws after it.
 pub fn judge(
     base: &Path,
     head: &Path,
     observations: &Observations,
     rng: &mut Rng,
-) -> Result<Vec<Finding>, String> {
+) -> Result<(Vec<Finding>, Vec<String>), String> {
     let fixtures = fixtures(base)?;
     if fixtures.is_empty() {
         return Err(format!("the base has no fixtures in {FIXTURE_DIRECTORY}"));
     }
     let plantings = plan(base, &fixtures, head, &files_of(head)?, rng)?;
-    let mut findings = Vec::new();
-    let mut judged = 0_usize;
+    let (mut findings, mut failed) = (Vec::new(), Vec::new());
+    let (mut drawn, mut found_runs) = (0_usize, 0_usize);
     for planting in &plantings {
         let fixture = fixtures.get(planting.fixture).expect("a planting names a fixture");
         let at = planting.placement.to_string_lossy().into_owned();
         let modes: &[&str] = if fixture.fires { &["file", "tree"] } else { &["file"] };
         for mode in modes {
-            let run = observations
-                .runs_of(&fixture.file, mode)
-                .find(|run| run.placement == at)
-                .ok_or_else(|| {
-                    format!(
-                        "no `tidy` {mode} run of {} at {at}, which the seed draws",
-                        fixture.file
-                    )
-                })?;
-            findings.extend(judge_run(base, head, fixture, &planting.text, run)?);
-            judged += 1;
+            drawn += 1;
+            let Some(run) =
+                observations.runs_of(&fixture.file, mode).find(|run| run.placement == at)
+            else {
+                failed.push(format!(
+                    "no `tidy` {mode} run of {} at {at}, which the seed draws",
+                    fixture.file
+                ));
+                continue;
+            };
+            found_runs += 1;
+            match judge_run(base, head, fixture, &planting.text, run) {
+                Ok(found) => findings.extend(found),
+                Err(problem) => failed.push(problem),
+            }
         }
     }
     let recorded = observations.runs.iter().filter(|run| run.mode == "file" || run.mode == "tree");
-    if recorded.count() != judged {
-        return Err(format!(
-            "the observations hold tidy runs that the seed does not draw ({judged} drawn)"
+    let present = recorded.count();
+    if present != found_runs {
+        failed.push(format!(
+            "the observations hold tidy runs that the seed does not draw ({drawn} drawn, \
+             {present} recorded)"
         ));
     }
-    Ok(findings)
+    Ok((findings, failed))
 }
 
 /// Judges one run of a case with the text `text`: the base's reports at the placement, against

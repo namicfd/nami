@@ -24,9 +24,10 @@ pub const QUEUE_PREFIX: &str = "gh-readonly-queue/";
 /// The workflow whose job and step names an issue may quote, relative to the root.
 pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
-/// The workflow of the required `ratchet` check (ADR-0022), whose merge-queue failures are filed
-/// too: a rule PR whose carried mutation evidence no longer matches, because another rule PR
-/// changed the same files first, is fixed by a rebase, like any other queue failure.
+/// The workflow of the `ratchet` check (ADR-0022), a required check once the policy flip makes
+/// it one, whose merge-queue failures are filed too: a rule PR whose carried mutation evidence
+/// no longer matches, because another rule PR changed the same files first, is fixed by a
+/// rebase, like any other queue failure.
 pub const GUARDRAILS_WORKFLOW: &str = ".github/workflows/guardrails.yml";
 
 /// The workflows whose failed merge-queue runs are filed, and whose job and step names an issue
@@ -75,7 +76,6 @@ impl Vocabulary {
                 .map_err(|error| format!("cannot read {path} on {reference}: {error}"))?;
             workflows.push(workflow);
         }
-        assert_eq!(workflows.len(), QUEUE_WORKFLOWS.len(), "one text per workflow");
         Self::from_workflow(&workflows.join("\n"), root)
     }
 
@@ -277,6 +277,29 @@ pub fn finding(failure: &Failure, vocabulary: &Vocabulary) -> String {
     pieces.push(proposed_fix(pull, failure.author == BOT_LOGIN));
     let text = pieces.concat();
     assert!(!text.contains('@'), "nothing in the finding can mention anyone");
+    text
+}
+
+/// The comment that adds run `run` of the same merge group, of the other workflow, to the issue
+/// that records the first failed run: its link and its failed jobs, quoting only what
+/// `vocabulary` holds, as the finding does.
+#[must_use]
+pub fn sibling_note(
+    run: u64,
+    repository: &str,
+    jobs: &[FailedJob],
+    vocabulary: &Vocabulary,
+) -> String {
+    let run_url = format!("https://github.com/{repository}/actions/runs/{run}");
+    let mut pieces = vec![format!(
+        "The same merge group also failed in another required workflow: run {run_url}.\n\n"
+    )];
+    if jobs.is_empty() {
+        pieces.push("No job of the run reports a failure; read the run's page.\n".to_owned());
+    }
+    pieces.extend(jobs.iter().map(|failed| job_line(failed, &run_url, vocabulary)));
+    let text = pieces.concat();
+    assert!(!text.contains('@'), "nothing in the note can mention anyone");
     text
 }
 
