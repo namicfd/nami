@@ -138,12 +138,15 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   file, of any trait, with lifetime parameters used only in the trait path and the method
   signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand the new rule's
   reports to the existing ones as `violations.extend(new_rule(&..))`, where `new_rule` returns
-  `Vec<Violation>` and `violations` is the list the function returns or reports into. Don't
+  `Vec<Violation>` and `violations` is the list the function returns or reports into. Pass
+  literals, `&place`, or a `&T` parameter of the function as it is (`new_rule(path, &lines)`
+  in `text::check`). Don't
   nest an `impl`, trait, module, `macro_rules!` or constant in a function, don't write
   `unsafe` or an attribute beyond `doc`, `derive`, `must_use`, `inline`, `expect` and `test`,
   and don't read files, the environment, the clock, threads or the network, nor use
   `include_str!`, `file!` or `env!`, not even in a test. In a lint, don't reach `dcx` or
-  `sess`. No test may depend on the source text or line numbers of the file it tests: the
+  `sess`, not even as `float_reduction` reads `tcx.sess`: copying that makes the PR an edit.
+  No test may depend on the source text or line numbers of the file it tests: the
   ratchet runs the tests on a copy with a blank line and a comment added, and gives no verdict
   if one fails.
 - **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
