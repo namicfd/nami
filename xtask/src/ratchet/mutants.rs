@@ -319,8 +319,8 @@ pub struct Judged {
     pub unproven: Vec<String>,
 }
 
-/// Judges the recorded mutation runs. `dispatch` holds the head lines of the dispatch calls
-/// by file, whose hunks need no mutant of their own. `Err` is no verdict.
+/// Judges the recorded mutation runs. `class` holds, by file, the lines of the dispatch calls
+/// and of the new declarations, whose hunks need no mutant of their own. `Err` is no verdict.
 ///
 /// # Errors
 ///
@@ -332,7 +332,7 @@ pub fn judge(
     rule_paths: &[String],
     observations: &Observations,
     work: &Path,
-    dispatch: &BTreeMap<String, Vec<(u32, u32)>>,
+    class: &super::class::Class,
 ) -> Result<Judged, String> {
     let mut judged = Judged::default();
     for workspace in &WORKSPACES {
@@ -353,8 +353,14 @@ pub fn judge(
             if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
         let mut uncovered = Vec::new();
         for path in changed_sources(rule_paths, workspace) {
-            let calls = dispatch.get(path.as_str()).map_or(&[][..], Vec::as_slice);
-            uncovered.extend(uncovered_hunks(base, head, path, &starts, work, calls)?);
+            let lines = |map: &BTreeMap<String, Vec<(u32, u32)>>| {
+                map.get(path.as_str()).map_or(Vec::new(), Clone::clone)
+            };
+            let exempt = Exempt {
+                head: [lines(&class.dispatch), lines(&class.declarations)].concat(),
+                base: lines(&class.replaced),
+            };
+            uncovered.extend(uncovered_hunks(base, head, path, &starts, work, &exempt)?);
         }
         assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
         if count > 0 {
@@ -419,15 +425,23 @@ fn mutant_starts(run: &Run, directory: &str) -> Result<BTreeMap<String, Vec<u32>
     Ok(starts)
 }
 
-/// Every hunk of `path` that needs a mutant and contains none, as an unproven item. `calls` are
-/// the head lines of its dispatch calls, which need none.
+/// The lines of a file that need no mutant besides its test module, on each side: in the head,
+/// the dispatch calls and the new declarations; in the base, the statements a dispatch call
+/// replaced.
+struct Exempt {
+    head: Vec<(u32, u32)>,
+    base: Vec<(u32, u32)>,
+}
+
+/// Every hunk of `path` that needs a mutant and contains none, as an unproven item. The lines
+/// of `exempt` need none.
 fn uncovered_hunks(
     base: &Path,
     head: &Path,
     path: &str,
     starts: &BTreeMap<String, Vec<u32>>,
     work: &Path,
-    calls: &[(u32, u32)],
+    exempt: &Exempt,
 ) -> Result<Vec<String>, String> {
     let ranges = |root: &Path| -> Result<Vec<(u32, u32)>, String> {
         match super::source::read_optional(root, path)? {
@@ -435,8 +449,9 @@ fn uncovered_hunks(
             None => Ok(Vec::new()),
         }
     };
-    let (base_ranges, mut head_ranges) = (ranges(base)?, ranges(head)?);
-    head_ranges.extend_from_slice(calls);
+    let (mut base_ranges, mut head_ranges) = (ranges(base)?, ranges(head)?);
+    head_ranges.extend_from_slice(&exempt.head);
+    base_ranges.extend_from_slice(&exempt.base);
     let lines = starts.get(path).map_or(&[][..], Vec::as_slice);
     let mut unproven = Vec::new();
     for hunk in super::hunks::hunks(base, head, path, work)? {

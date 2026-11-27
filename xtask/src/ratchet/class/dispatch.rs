@@ -16,8 +16,11 @@
 //! - `place.register_late_lint_pass(Box::new(|_| Box::new(NewPass)));`, and the same with
 //!   `register_early_lint_pass`, for a new lint pass.
 //!
-//! Every argument of a call is a literal or a shared reference to a path or a field of one: no
-//! `&mut`, no value that may be a `&mut` reborrowed, no method call, block or closure. So a
+//! Every argument of a call is a literal, a shared reference to a path or a field of one, or a
+//! parameter of the function that is a shared reference itself and is never bound again
+//! ([`super::sinks::shared_parameters`]: `trailing_space(path, &lines)` in `text::check`,
+//! review of #57, round 8): no `&mut`, no value that may be a `&mut` reborrowed, no method
+//! call, block or closure. So a
 //! tidy rule's new code gets nothing through its arguments that it could change the existing
 //! rules' state with; the rule modules hold no `Cell`, `RefCell` or atomics behind a shared
 //! reference.
@@ -55,21 +58,31 @@ pub struct Sides<'a> {
     pub head: &'a str,
 }
 
+/// What a dispatch call may name of the function it is in.
+#[derive(Debug, Default)]
+pub struct Places {
+    /// The report lists ([`super::sinks::report_lists`]), the only places `extend` may add
+    /// to.
+    pub lists: BTreeSet<String>,
+    /// The parameters that hold a shared reference wherever the body's top level runs
+    /// ([`super::sinks::shared_parameters`]), which a call may pass as they are.
+    pub shared: BTreeSet<String>,
+}
+
 /// The new items that `statement` dispatches, if it is a dispatch call in the file
-/// `caller` (see the module documentation). `lists` are the report lists of the function it
-/// is in ([`super::sinks::report_lists`]), the only places `extend` may add to.
+/// `caller` (see the module documentation), in a function whose places are `places`.
 #[must_use]
 pub fn names(
     statement: &Stmt,
     caller: &str,
     new: &NewNames,
-    lists: &BTreeSet<String>,
+    places: &Places,
 ) -> Option<Vec<String>> {
     let Stmt::Expr(expression, Some(_)) = statement else {
         return None;
     };
     if let Expr::Call(call) = expression {
-        return new_call(call, caller, new).map(|(name, _)| vec![name]);
+        return new_call(call, caller, new, &places.shared).map(|(name, _)| vec![name]);
     }
     let Expr::MethodCall(call) = expression else {
         return None;
@@ -84,8 +97,9 @@ pub fn names(
     if method == EXTEND
         && let Expr::Call(inner) = argument
     {
-        let into_list = place_name(&call.receiver).is_some_and(|place| lists.contains(&place));
-        let (name, function) = new_call(inner, caller, new)?;
+        let into_list =
+            place_name(&call.receiver).is_some_and(|place| places.lists.contains(&place));
+        let (name, function) = new_call(inner, caller, new, &places.shared)?;
         let reports = function.is_some_and(|key| new.reports.contains(&key));
         return (into_list && reports).then(|| vec![name]);
     }
@@ -160,12 +174,14 @@ pub fn module_file(caller: &str, segments: &[String]) -> Option<String> {
 
 /// The name a call `f(args)` from the file `caller` dispatches, if `f` resolves by its path to
 /// a function new in the file that defines it, or to a function of a type new in its file, and
-/// every argument is read only. A name alone would let a new `fn line_of` in one file make a
+/// every argument is read only, `shared` naming the parameters that may be passed as they are.
+/// A name alone would let a new `fn line_of` in one file make a
 /// call of an existing `line_of` in another look new (review of #57, round 5).
 fn new_call(
     call: &syn::ExprCall,
     caller: &str,
     new: &NewNames,
+    shared: &BTreeSet<String>,
 ) -> Option<(String, Option<(String, String)>)> {
     let Expr::Path(function) = &*call.func else {
         return None;
@@ -186,15 +202,20 @@ fn new_call(
     let of_type = owners.split_last().is_some_and(|(owner, modules)| {
         module_file(caller, modules).is_some_and(|file| new.types.contains(&(file, owner.clone())))
     });
-    let read_only = call.args.iter().all(is_read_only);
+    let read_only = call.args.iter().all(|argument| is_read_only(argument, shared));
     ((defined.is_some() || of_type) && read_only).then(|| (names.join("::"), defined))
 }
 
-/// True for an argument that gives the callee no way to change existing state: a literal, or a
-/// shared reference to a place.
-fn is_read_only(argument: &Expr) -> bool {
+/// True for an argument that gives the callee no way to change existing state: a literal, a
+/// shared reference to a place, or one of the `shared` parameters.
+fn is_read_only(argument: &Expr, shared: &BTreeSet<String>) -> bool {
     if let Expr::Lit(literal) = argument {
         return literal.attrs.is_empty();
+    }
+    if let Expr::Path(path) = argument {
+        let name = path.path.get_ident().map(ToString::to_string);
+        let plain = path.attrs.is_empty() && path.qself.is_none();
+        return plain && name.is_some_and(|name| shared.contains(&name));
     }
     let Expr::Reference(reference) = argument else {
         return false;

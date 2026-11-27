@@ -94,6 +94,48 @@ pub fn report_lists(
     lists
 }
 
+/// The parameters of `signature` that a dispatch call at the top level of `block` may pass as
+/// they are: bound by a plain name, without `mut`, `ref` or a subpattern, to a shared reference
+/// `&T`, and never bound again in `block` nor mentioned by a macro there. Such a name holds a
+/// shared reference wherever it is read, as `&place` would (review of #57, round 8: an honest
+/// `trailing_space(path, &lines)` in `text::check`, where `&path` is a needless borrow).
+#[must_use]
+pub fn shared_parameters(signature: &syn::Signature, block: &syn::Block) -> BTreeSet<String> {
+    let mut shared = BTreeSet::new();
+    for input in &signature.inputs {
+        if let syn::FnArg::Typed(typed) = input
+            && let syn::Pat::Ident(binding) = &*typed.pat
+            && binding.by_ref.is_none()
+            && binding.mutability.is_none()
+            && binding.subpat.is_none()
+            && let syn::Type::Reference(reference) = &*typed.ty
+            && reference.mutability.is_none()
+        {
+            let name = binding.ident.to_string();
+            let mut bindings = Bindings { name: &name, found: false };
+            bindings.visit_block(block);
+            if !bindings.found && !macro_mentions_in(block, &[&name]) {
+                let _new = shared.insert(name);
+            }
+        }
+    }
+    assert!(shared.len() <= signature.inputs.len(), "at most one name per parameter");
+    shared
+}
+
+/// Finds a pattern that binds `name`, at any depth.
+struct Bindings<'n> {
+    name: &'n str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for Bindings<'_> {
+    fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+        self.found |= node.ident == self.name;
+        syn::visit::visit_pat_ident(self, node);
+    }
+}
+
 /// True if `Violation` is the crate's own type in `file`: imported without a rename or
 /// declared there, and nothing renamed to it.
 fn is_own_report_type(file: &syn::File) -> bool {

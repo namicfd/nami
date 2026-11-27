@@ -36,12 +36,6 @@ impl Hunk {
         let count = u32::try_from(self.added.len()).ok().filter(|count| *count > 0)?;
         Some((self.head_first, self.head_first + count - 1))
     }
-
-    /// The base lines it removes, as an inclusive range; `None` for a pure addition.
-    fn base_lines(&self) -> Option<(u32, u32)> {
-        let count = u32::try_from(self.removed.len()).ok().filter(|count| *count > 0)?;
-        Some((self.base_first, self.base_first + count - 1))
-    }
 }
 
 /// Reads the hunks of a zero-context unified diff.
@@ -126,16 +120,20 @@ fn is_comment(line: &str) -> bool {
     trimmed.is_empty() || trimmed.starts_with("//")
 }
 
-/// True if `range` lies inside one of `ranges`; true for no range at all.
-fn inside(range: Option<(u32, u32)>, ranges: &[(u32, u32)]) -> bool {
-    range.is_none_or(|(first, last)| ranges.iter().any(|(from, to)| *from <= first && last <= *to))
+/// True if every line of `lines`, the first of which is line `first`, is a comment or blank,
+/// or lies inside one of `ranges`.
+fn covered(first: u32, lines: &[String], ranges: &[(u32, u32)]) -> bool {
+    let inside = |number: u32| ranges.iter().any(|(from, to)| *from <= number && number <= *to);
+    lines.iter().zip(first..).all(|(line, number)| is_comment(line) || inside(number))
 }
 
-/// True if a hunk needs no mutant: comments only, or inside the exempt ranges of both sides.
+/// True if a hunk needs no mutant: each of its lines, on both sides, is a comment or blank, or
+/// lies inside an exempt range of its side. Line by line, so that a hunk of two new
+/// declarations with a blank line between them is exempt (review of #57, round 8).
 #[must_use]
 pub fn is_exempt(hunk: &Hunk, head_ranges: &[(u32, u32)], base_ranges: &[(u32, u32)]) -> bool {
-    let comments = hunk.added.iter().chain(&hunk.removed).all(|line| is_comment(line));
-    comments || (inside(hunk.head_lines(), head_ranges) && inside(hunk.base_lines(), base_ranges))
+    covered(hunk.head_first, &hunk.added, head_ranges)
+        && covered(hunk.base_first, &hunk.removed, base_ranges)
 }
 
 /// True if a mutant starts on one of the hunk's added lines; a pure deletion contains none.
@@ -171,8 +169,9 @@ mod tests {
     }
 
     // Goal: a hunk contains a mutant only if one starts on an added line; a pure deletion
-    // contains none; comments, and changes inside the test module on both sides, need none. A
-    // constant is no exemption: a changed constant is an edit.
+    // contains none; comments, and changes inside the test module on both sides, need none,
+    // judged line by line across several ranges. A constant is no exemption: a changed constant
+    // is an edit.
     #[test]
     fn coverage_is_per_hunk() {
         let changed = hunk(5, &["a", "b"], 5, &["c"]);
@@ -184,6 +183,10 @@ mod tests {
         assert!(!is_exempt(&changed, &[(6, 10)], &[(1, 9)]), "the head side is outside");
         let deletion = hunk(5, &[], 5, &["a", "b"]);
         assert!(is_exempt(&deletion, &[], &[(4, 6)]) && !is_exempt(&deletion, &[], &[(4, 5)]));
+        let two = hunk(5, &["a", "", "b", "  // c"], 5, &[]);
+        assert!(is_exempt(&two, &[(5, 5), (7, 7)], &[]), "two ranges and a blank line");
+        assert!(!is_exempt(&two, &[(5, 5)], &[]), "a line outside every range");
+        assert!(!is_exempt(&two, &[(7, 7)], &[]), "the first line outside");
         let text = "const A: u8 = 1;\nfn f() {\n    const B: u8 = 2;\n}\n\
                     #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n\
                     static C: u8 = 3;\nstruct S;\nimpl S {\n    const D: u8 = 4;\n}\n";

@@ -552,8 +552,7 @@ fn judge_proof(
     let mut uncovered = Vec::new();
     if tools.mutants {
         let rule_paths = verdict.rule_paths.clone();
-        let judged =
-            mutants::judge(base, head, &rule_paths, observed, &tools.work, &class.dispatch)?;
+        let judged = mutants::judge(base, head, &rule_paths, observed, &tools.work, &class)?;
         verdict.notes.extend(judged.notes);
         uncovered = judged.unproven;
         verdict.add(Check::Mutants, judged.findings);

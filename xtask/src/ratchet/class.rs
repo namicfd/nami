@@ -118,6 +118,14 @@ pub struct Class {
     /// The head lines of every dispatch call, by file: the new rule's case shows that it runs,
     /// so a hunk of them needs no mutant of its own.
     pub dispatch: BTreeMap<String, Vec<(u32, u32)>>,
+    /// The base lines of every statement that a dispatch call replaced, a registration with
+    /// new lints appended, by file: the other side of such a hunk.
+    pub replaced: BTreeMap<String, Vec<(u32, u32)>>,
+    /// The head lines of every new item that holds no code a mutant could change, by file: a
+    /// lint or lint pass declared by macro, a file module's declaration, a struct, an enum or
+    /// a union. The new code that uses them has the mutants, and the new cases show what they
+    /// declare (review of #57, round 8: the canonical new lint had three hunks without one).
+    pub declarations: BTreeMap<String, Vec<(u32, u32)>>,
 }
 
 impl Class {
@@ -172,6 +180,33 @@ pub fn classify(base: &Path, head: &Path, rule_paths: &[String]) -> Result<Class
 fn is_code(path: &str) -> bool {
     let rust = Path::new(path).extension().is_some_and(|extension| extension == "rs");
     rust && !path.starts_with("lints/ui/") && !path.starts_with("xtask/fixtures/")
+}
+
+/// True for a new item that holds no code a mutant could change: a lint or lint pass declared
+/// by macro, a file module's declaration, a struct, an enum or a union.
+fn is_declaration(item: &syn::Item) -> bool {
+    match item {
+        syn::Item::Macro(declared) => lint_macro_name(&declared.mac).is_some(),
+        syn::Item::Mod(module) => module.content.is_none(),
+        syn::Item::Struct(_) | syn::Item::Enum(_) | syn::Item::Union(_) => true,
+        syn::Item::Const(_)
+        | syn::Item::ExternCrate(_)
+        | syn::Item::Fn(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Impl(_)
+        | syn::Item::Static(_)
+        | syn::Item::Trait(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Type(_)
+        | syn::Item::Use(_)
+        | syn::Item::Verbatim(_)
+        | _ => false,
+    }
+}
+
+/// A line number of a span, as the hunks count them.
+fn line_of(position: usize) -> u32 {
+    u32::try_from(position).expect("source files have fewer than 2^32 lines")
 }
 
 /// One side of a changed Rust file: its text, which the spans point into, and its syntax.
@@ -239,6 +274,9 @@ impl Code {
             let found = NewItem { path: &self.path, item, named: &named, tokens };
             if let Some(problem) = found.problem(shadowed, new) {
                 class.edits.push(format!("{}: the new item `{key}` {problem}", self.path));
+            } else if is_declaration(item) {
+                let lines = (line_of(item.span().start().line), line_of(item.span().end().line));
+                class.declarations.entry(self.path.clone()).or_default().push(lines);
             }
         }
         let Some(base) = &self.base else {
@@ -1159,7 +1197,10 @@ impl Existing<'_> {
         before: Function<'_>,
         after: Function<'_>,
     ) -> Result<(), String> {
-        let lists = sinks::report_lists(before.signature, before.block, owner, &self.base.file);
+        let places = dispatch::Places {
+            lists: sinks::report_lists(before.signature, before.block, owner, &self.base.file),
+            shared: sinks::shared_parameters(before.signature, before.block),
+        };
         let path = self.code.path.clone();
         let base_open = before.block.brace_token.span.open();
         let head_open = after.block.brace_token.span.open();
@@ -1179,14 +1220,18 @@ impl Existing<'_> {
                 continue;
             }
             let sides = dispatch::Sides { base: &self.base.text, head: &self.head.text };
-            let appended = base_statement
-                .and_then(|old| dispatch::appended_lints(old, statement, sides, self.new));
+            let appended = base_statement.and_then(|old| {
+                dispatch::appended_lints(old, statement, sides, self.new).map(|names| (old, names))
+            });
             let found = match appended {
-                Some(names) => {
+                Some((old, names)) => {
                     index += 1;
+                    let span = old.span();
+                    let lines = (line_of(span.start().line), line_of(span.end().line));
+                    self.class.replaced.entry(path.clone()).or_default().push(lines);
                     Some(names)
                 }
-                None => dispatch::names(statement, &self.code.path, self.new, &lists),
+                None => dispatch::names(statement, &self.code.path, self.new, &places),
             };
             let Some(names) = found else {
                 self.edit(&format!(
@@ -1206,11 +1251,8 @@ impl Existing<'_> {
 
     /// Records a dispatch call of `names` in `function`: its lines, and each name once.
     fn record(&mut self, function: &str, statement: &syn::Stmt, names: Vec<String>) {
-        let line = |position: usize| {
-            u32::try_from(position).expect("source files have fewer than 2^32 lines")
-        };
         let span = statement.span();
-        let lines = (line(span.start().line), line(span.end().line));
+        let lines = (line_of(span.start().line), line_of(span.end().line));
         assert!(lines.0 <= lines.1, "a statement ends after it starts");
         let ranges = self.class.dispatch.entry(self.code.path.clone()).or_default();
         ranges.push(lines);
@@ -2091,6 +2133,89 @@ mod tests {
             &[(lib, Some(&base), Some(&head)), (extra, None, Some(&reading))],
         );
         assert_edit(&sensitive, "names `env`");
+    }
+
+    // Goal: round 8 of #57's review: the new items that hold no code a mutant could change, a
+    // struct, an enum, a union, a file module's declaration and a lint or pass declared by
+    // macro, are recorded with their lines, doc comments included; a function, a trait and an
+    // `impl` are not. A registration with a new lint appended records the base's statement.
+    #[test]
+    fn declarations_are_recorded_with_their_lines() {
+        let path = "lints/src/extra.rs";
+        let text = "/// A.\nstruct A;\n\nenum B {\n    C,\n}\n\nunion D {\n    e: u8,\n}\n\n\
+                    fn f() {}\n\ntrait G {}\n\nimpl G for A {}\n";
+        let class = class_of("class-declarations", &[(path, None, Some(text))]);
+        assert_eq!(class.edits, Vec::<String>::new());
+        assert_eq!(class.declarations.get(path), Some(&vec![(1, 2), (4, 6), (8, 10)]));
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let lints = "NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);";
+        let head = replaced(&base, lints, "NAMI_RECURSION, NAMI_FLOAT_REDUCTION, NAMI_EXTRA]);");
+        let head = replaced(&head, "mod recursion;", "mod extra;\nmod recursion;");
+        let declared = "dylint_linting::declare_lint! {\n    /// A new lint.\n    pub NAMI_EXTRA,\
+                        \n    Deny,\n    \"a new lint\"\n}\n\n\
+                        dylint_linting::declare_lint_pass!(NamiExtra => [NAMI_EXTRA]);\n";
+        let head = format!("{head}\n{declared}");
+        let module = class_of("class-module", &[(lib, Some(&base), Some(&head))]);
+        let line_in = |source: &str, wanted: &str| {
+            let lines: Vec<&str> = source.lines().collect();
+            let index = lines.iter().rposition(|line| line.contains(wanted)).unwrap();
+            u32::try_from(index + 1).unwrap()
+        };
+        let (named, lint) = (line_in(&head, "mod extra;"), line_in(&head, "declare_lint! {"));
+        let pass = line_in(&head, "declare_lint_pass!(NamiExtra");
+        let expected = vec![(named, named), (lint, lint + 5), (pass, pass)];
+        assert_eq!(module.declarations.get(lib), Some(&expected), "{:?}", module.edits);
+        let registration = line_in(&base, lints);
+        assert_eq!(module.replaced.get(lib), Some(&vec![(registration, registration)]));
+    }
+
+    // Goal: round 8 of #57's review: the canonical new line rule is additive. Its dispatch call
+    // `trailing_space(path, &lines)` passes `text::check`'s parameter `path: &Path` as it is,
+    // since `&path` would be a needless borrow. A parameter bound with `mut`, `ref` or a
+    // subpattern, or of type `&mut`, or bound again in the body or mentioned by a macro there,
+    // and a local passed as it is, make the call an edit.
+    #[test]
+    fn a_shared_reference_parameter_may_be_passed_as_it_is() {
+        let text = "xtask/src/tidy/text.rs";
+        let base = real(text);
+        let tail = "    }\n    violations\n}\n\n/// True if the first line above";
+        let rule = "\nfn trailing_space(path: &Path, lines: &[&str]) -> Vec<Violation> {\n    \
+                    assert!(!lines.is_empty() || path.has_root(), \"x\");\n    Vec::new()\n}\n";
+        let head = |side: &str, arguments: &str| {
+            let call = format!(
+                "    }}\n    violations.extend(trailing_space({arguments}));\n    violations\n}}\
+                 \n\n/// True if the first line above"
+            );
+            format!("{}{rule}", replaced(side, tail, &call))
+        };
+        let class = edited("class-shared", text, &head(&base, "path, &lines"));
+        assert_eq!(class.edits, Vec::<String>::new(), "the canonical rule");
+        let local = edited("class-shared-local", text, &head(&base, "path, lines"));
+        assert_edit(&local, "`check` changed beyond a dispatch call");
+        let signature = "pub fn check(path: &Path, text: &str)";
+        let first = "    let mut violations = Vec::new();\n";
+        let bases = [
+            replaced(&base, signature, "pub fn check(mut path: &Path, text: &str)"),
+            replaced(&base, signature, "pub fn check(ref path: &Path, text: &str)"),
+            replaced(&base, signature, "pub fn check(path @ _: &Path, text: &str)"),
+            replaced(&base, signature, "pub fn check(path: &mut Path, text: &str)"),
+            replaced(&base, first, &format!("{first}    let path = path;\n")),
+            replaced(
+                &base,
+                first,
+                &format!("{first}    debug_assert!(path.is_relative(), \"x\");\n"),
+            ),
+        ];
+        for other in &bases {
+            let files = [(text, Some(other.as_str()), Some(head(other, "path, &lines")))];
+            let files: Vec<(&str, Option<&str>, Option<&str>)> = files
+                .iter()
+                .map(|(path, before, after)| (*path, *before, after.as_deref()))
+                .collect();
+            let refused = class_of("class-shared-not", &files);
+            assert_edit(&refused, "`check` changed beyond a dispatch call");
+        }
     }
 
     // Goal: a new file may import names, but a glob, at any depth of the import tree, is an edit,
