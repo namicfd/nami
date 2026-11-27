@@ -173,6 +173,6 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
 
 Run the check yourself first, inside a checkout of `main`:
 `cargo xtask ratchet --base . --head <your tree> --no-review`. Without a review, it reports the
-skipped review check as unproven, so its verdict line says `no verdict` for a change to rule paths
-only; with an owned path changed too, such as the style guide, it can read `pass (..), outside
-the rule paths`. Read the findings, the class and the other unproven items.
+skipped review check as unproven, missing evidence that nothing settles, so its verdict line says
+`no verdict` for a change to rule paths, whatever else changed. Read the findings, the class and
+the other unproven items.

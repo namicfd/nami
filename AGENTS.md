@@ -18,9 +18,9 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 - `cargo xtask protected`: list the protected paths your branch changes, for the PR description.
 - `cargo xtask ratchet --base . --head <your tree> --no-review`: run inside a checkout of `main` to
   see the findings and the class (`additive` or `edit`) of your rule change (ADR-0022). Without
-  the reviews the review check is unproven, so for a change to rule paths only the local verdict
-  line says `no verdict` even when CI would pass; with an owned path changed too, it can read
-  `pass (..), outside the rule paths`. Read the findings and the unproven items above it.
+  the reviews the review check is skipped, which is missing evidence, so for a change to rule
+  paths the local verdict line says `no verdict` even when CI would pass. Read the findings and
+  the unproven items above it.
 - `cargo xtask issue file` and `cargo xtask issue show <n>`: file a finding outside your task as
   a GitHub issue, and read an issue (ADR-0021). They run gh, so prefix them with
   `GH_TOKEN=$(xtask/agent-token.sh)`, like `cargo xtask task ready` and `claim`.
