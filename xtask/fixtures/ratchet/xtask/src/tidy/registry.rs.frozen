@@ -43,7 +43,7 @@ pub struct Rule {
     /// What the rule sees and what it misses: its exact reach, its exemptions and its known
     /// gaps, or empty if the summary says it all. This text lives here and in `docs/RULES.md`,
     /// not in `docs/TIGER_STYLE.md`, which states only the rule, its reason and its tag, so that
-    /// tightening a rule changes only the rule paths (ADR-0022, pending; issue #53).
+    /// tightening a rule changes only the rule paths (ADR-0022; issue #53).
     pub detail: &'static str,
     /// Where the reason is written down: an ADR, a `TIGER_STYLE.md` section or a document.
     pub reference: &'static str,

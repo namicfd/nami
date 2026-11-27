@@ -714,9 +714,9 @@ mod tests {
         );
     }
 
-    // Goal: the real CODEOWNERS is the flip that the ratchet's "after ADR-0022" verdict
-    // assumes: its owned lines, with an owner-less line for each rule path appended, give the
-    // same lines, so the shadow evidence is the verdict this file gives.
+    // Goal: the real CODEOWNERS is the flip that the ratchet's verdict with the rule paths
+    // unowned assumes: its owned lines, with an owner-less line for each rule path appended,
+    // give the same lines, so that verdict is the one this file gives.
     #[test]
     fn the_real_codeowners_is_the_ratchets_flip() {
         let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))

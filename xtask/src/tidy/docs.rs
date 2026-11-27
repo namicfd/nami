@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-// Which files are ADRs decides which files the ADR rules check, so it is core (ADR-0022, pending).
+// Which files are ADRs decides which files the ADR rules check, so it is core (ADR-0022).
 pub use super::{ADR_DIRECTORY, is_adr_file_name};
 
 /// Sections every ADR must have (ADR-0000).
