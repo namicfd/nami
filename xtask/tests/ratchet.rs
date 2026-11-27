@@ -57,6 +57,9 @@ exit "$code"
 ///   them in human form on the examples of the crates of the workspace it runs in.
 /// - Both exit 101 if they reported something and 0 if not, or 0 whatever they reported while
 ///   `lints/src/exit-zero` exists.
+/// - `cargo nextest ...` and `cargo test ...`, the null mutant's test runs, pass unless the tree
+///   they run in has a `fake-pins.txt` of `path size` lines and a file there is not of its
+///   size: a test that pins the source text.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 if [ "$1" = build ]; then
     if [ -e broken-build ]; then
@@ -110,6 +113,17 @@ if [ "$1" = mutants ]; then
         [ -e "$dir/src/fake-missed.txt" ] && cp "$dir/src/fake-missed.txt" "$out/missed.txt"
     fi
     [ "$missed" -gt 0 ] && exit 2
+    exit 0
+fi
+if [ "$1" = nextest ] || [ "$1" = test ]; then
+    if [ -e fake-pins.txt ]; then
+        while read -r file size; do
+            if [ "$(wc -c < "$file")" -ne "$size" ]; then
+                echo "test failed: $file is not $size bytes" >&2
+                exit 101
+            fi
+        done < fake-pins.txt
+    fi
     exit 0
 fi
 if [ "$1" != dylint ]; then
@@ -689,7 +703,7 @@ fn the_after_line_is_the_verdict_after_the_flip() {
         check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &reviews)).unwrap()
     };
     write(&case.head(), "xtask/src/tidy/text.rs", "fn rule() -> bool { true }\n");
-    for mutants in ["src/a.rs:1:1: fake\n", ""] {
+    for mutants in ["xtask/src/tidy/text.rs:1:1: fake\n", ""] {
         write(&case.head(), "src/fake-mutants.txt", mutants);
         write(&case.base(), "src/fake-mutants.txt", mutants);
         let shadow = run(today);
@@ -772,6 +786,35 @@ fn mutation_results_are_read_strictly() {
     write(&case.head(), "xtask/expect-budget.txt", "1\n");
     let owned = check(&case.base(), &case.head(), &tools).unwrap();
     assert!(owned.owner_reviews && owned.unproven.is_empty(), "{}", owned.summary());
+}
+
+// Goal: round 7 of #57's review: a new test that pins its file through an existing helper
+// (`read_optional`), which names nothing the class refuses, is additive, but the null mutant
+// shows that a test depends on the file's source text, so the mutant evidence proves nothing
+// and the diff gets no verdict. Without the pin, the same diff passes.
+#[test]
+fn a_test_that_pins_its_file_gives_no_verdict() {
+    let case = Case::new("null-mutant");
+    let text = "xtask/src/tidy/text.rs";
+    let source = "fn rule() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    // Goal: \
+                  pin.\n    #[test]\n    fn pinned() {\n        let text = \
+                  crate::ratchet::source::read_optional(std::path::Path::new(\"..\"), \
+                  \"xtask/src/tidy/text.rs\").unwrap().unwrap();\n        \
+                  assert_eq!(text.len(), 1);\n    }\n}\n";
+    write(&case.head(), text, source);
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let unpinned = check(&case.base(), &case.head(), &tools).unwrap();
+    assert!(unpinned.unproven.is_empty(), "{}", unpinned.summary());
+    write(&case.head(), "fake-pins.txt", &format!("{text} {}\n", source.len()));
+    let pinned = check(&case.base(), &case.head(), &tools).unwrap();
+    let expected = "a test depends on the source text of xtask/src/tidy/text.rs";
+    assert!(pinned.unproven.iter().any(|what| what.contains(expected)), "{}", pinned.summary());
+    assert!(pinned.line().starts_with("ratchet: no verdict (additive)"), "{}", pinned.line());
+    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let mut dropped = observed.clone();
+    dropped.runs.retain(|run| run.mode != "null");
+    let error = judge(&case.base(), &case.head(), &dropped, &tools).unwrap_err();
+    assert!(error.contains("no null-mutant run of xtask"), "{error}");
 }
 
 // Goal: an additive diff merges on the ratchet's proof alone: it passes when the reviewer app
