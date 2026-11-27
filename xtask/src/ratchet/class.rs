@@ -43,11 +43,14 @@
 //! - (c) new registry rows, and changed rows that the data checks prove only tighten: no
 //!   changed field outside those the rule-set check compares or that only document
 //!   ([`super::dialect::registry::unproven_rows`]);
-//! - (d) new fixtures, UI cases and other new files in the rule paths, and new items inside an
+//! - (d) new fixtures, UI cases and other new files in the rule paths, but no manifest or build
+//!   file ([`BUILD_FILES`]); and the items of a new test module, and new items inside an
 //!   existing test module whose existing items stay as they are, if they name none of
-//!   [`SENSITIVE`], use none of [`INPUT_MACROS`], and pass the attribute, nesting and `unsafe`
-//!   checks of (a) at every depth; and a null-mutant run shows that no test depends on the
-//!   source text of a mutated file ([`super::mutants`]);
+//!   [`SENSITIVE`], use none of [`INPUT_MACROS`], and pass [`test_item_problem`]: the
+//!   attribute, nesting and `unsafe` checks of (a) at every depth, no constant, static,
+//!   `extern` block, module or macro, and an `impl` only of a type the test module declares
+//!   (review of #55, thread 1); and a null-mutant run shows that no test depends on the source
+//!   text of a mutated file ([`super::mutants`]);
 //! - (e) a changed documentation field of a registry row, and a changed doc comment anywhere;
 //! - (f) the regenerated `docs/RULES.md`.
 //!
@@ -155,7 +158,12 @@ pub fn classify(base: &Path, head: &Path, rule_paths: &[String]) -> Result<Class
     for path in rule_paths {
         let before = super::source::read_optional(base, path)?;
         let after = super::source::read_optional(head, path)?;
-        if is_code(path) {
+        if is_build_file(path) {
+            class.edits.push(format!(
+                "{path}: a manifest or build file in the rule paths, which can change how the rule \
+                 code builds (review of #55)"
+            ));
+        } else if is_code(path) {
             code.push(Code::read(path, before, after)?);
         } else if path != RULES_DOC && before.is_some() {
             let what = if after.is_some() { "changed" } else { "deleted" };
@@ -182,6 +190,23 @@ pub fn classify(base: &Path, head: &Path, rule_paths: &[String]) -> Result<Class
 fn is_code(path: &str) -> bool {
     let rust = Path::new(path).extension().is_some_and(|extension| extension == "rs");
     rust && !path.starts_with("lints/ui/") && !path.starts_with("xtask/fixtures/")
+}
+
+/// The names of the files that tell cargo or rustup how to build: a new one in a rule path is
+/// an edit, and so is a changed or deleted one.
+const BUILD_FILES: [&str; 6] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+    "config.toml",
+];
+
+/// True for a manifest or build file, by its name, or anything below a `.cargo` directory.
+fn is_build_file(path: &str) -> bool {
+    let name = Path::new(path).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
+    BUILD_FILES.contains(&name) || path.split('/').any(|part| part == ".cargo")
 }
 
 /// True for a new item that holds no code a mutant could change: a lint or lint pass declared
@@ -414,7 +439,12 @@ impl NewItem<'_> {
         if let syn::Item::Mod(module) = self.item
             && dialect::is_test_module(module)
         {
-            return None;
+            // Every item of a new test module is judged as a new item of an existing one is
+            // (review of #55, thread 1).
+            return module_items(module).iter().find_map(|item| {
+                let problem = test_item_problem(item, module)?;
+                Some(format!("holds a test item that {problem}"))
+            });
         }
         let attributes = item_attributes(self.item);
         if let Some(attribute) = attributes.iter().find(|attribute| !is_allowed(attribute)) {
@@ -460,9 +490,10 @@ fn reads_outside(tokens: TokenStream, named: &BTreeSet<String>) -> Option<String
 }
 
 /// The names that reach the compiler's shared state from lint code: the diagnostic context
-/// and the session, and the calls that reset, steal or flush what other lints reported. Each
-/// counts also as the prefix of a name (`steal_*`, `emit_stashed_*`). A new lint pass shares
-/// the `LateContext` with the existing ones, so `cx.tcx.dcx().reset_err_count()` in its
+/// and the session, and the calls that reset, steal or flush what other lints reported. A name
+/// is refused if it equals one of them or starts with one followed by `_` (`steal_*`,
+/// `emit_stashed_*`); `sessions` or `dcxs` pass, as names that reach nothing. A new lint pass
+/// shares the `LateContext` with the existing ones, so `cx.tcx.dcx().reset_err_count()` in its
 /// `check_crate_post` would make the reports of `nami_recursion` exit 0 (review of #57,
 /// round 7). `lint::exits_agree` turns such a run into no verdict; this refuses it earlier.
 pub const COMPILER_STATE: [&str; 7] =
@@ -512,6 +543,68 @@ fn input_macro(stream: TokenStream) -> Option<String> {
         }
     }
     panic!("an item has more than {TOKENS_MAX} token sequences");
+}
+
+/// What makes an item of the test module `module`, a new one or a new item of an existing one,
+/// an edit (review of #55, thread 1): an attribute outside [`ATTRIBUTES`] on it; what
+/// [`nested_item`] refuses at any depth in it (`unsafe` code, an `extern` block, a nested
+/// constant, `impl`, trait, module or `macro_rules!`); or a kind that a test needs not: a
+/// constant or static, an `extern` block, a module, a macro, a type alias, or an `impl` other
+/// than a plain one of a type that `module` declares.
+fn test_item_problem(item: &syn::Item, module: &syn::ItemMod) -> Option<String> {
+    let attributes = item_attributes(item);
+    if let Some(attribute) = attributes.iter().find(|attribute| !is_allowed(attribute)) {
+        let name = dialect::path_text(attribute.path());
+        return Some(format!("carries the attribute `{name}`, which can change what it does"));
+    }
+    if let Some(nested) = nested_item(item) {
+        return Some(nested);
+    }
+    match item {
+        syn::Item::Fn(_)
+        | syn::Item::Struct(_)
+        | syn::Item::Enum(_)
+        | syn::Item::Union(_)
+        | syn::Item::Trait(_)
+        | syn::Item::Use(_) => None,
+        syn::Item::Impl(block) => test_impl_problem(block, module),
+        syn::Item::Const(_) | syn::Item::Static(_) => Some(
+            "is a constant or static: mutation testing makes no mutant for its value".to_owned(),
+        ),
+        syn::Item::ExternCrate(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Macro(_)
+        | syn::Item::Mod(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Type(_)
+        | syn::Item::Verbatim(_)
+        | _ => Some(
+            "is not a function, a type, an import or a plain `impl` of a type of the test \
+             module"
+                .to_owned(),
+        ),
+    }
+}
+
+/// What makes an `impl` in the test module `module` an edit: a self type that is not a single
+/// name of a struct, enum, union or trait that `module` declares, such as an existing type of
+/// the rule code, or generic parameters or a `where` clause, which can make it apply to more.
+fn test_impl_problem(block: &syn::ItemImpl, module: &syn::ItemMod) -> Option<String> {
+    let declared: BTreeSet<String> = module_items(module).iter().filter_map(type_name).collect();
+    let named = if let syn::Type::Path(path) = &*block.self_ty
+        && path.qself.is_none()
+    {
+        path.path.get_ident().map(ToString::to_string)
+    } else {
+        None
+    };
+    let local = named.is_some_and(|name| declared.contains(&name));
+    let plain = block.generics.params.is_empty() && block.generics.where_clause.is_none();
+    (!local || !plain).then(|| {
+        "is an `impl` of a type the test module does not declare, or a generic one, which can \
+         change what existing code calls"
+            .to_owned()
+    })
 }
 
 /// What `item` holds, at any depth, that makes it an edit: an `impl`, a trait, a module, a
@@ -1178,7 +1271,7 @@ impl Existing<'_> {
         for item in module_items(head) {
             let text = self.normal_head(item.span())?;
             if !before.contains(&text) {
-                self.check_new_test(item)?;
+                self.check_new_test(item, head)?;
             }
             let _new = after.insert(text);
         }
@@ -1191,20 +1284,14 @@ impl Existing<'_> {
         Ok(())
     }
 
-    /// A new item of an existing test module is an edit if it names one of [`SENSITIVE`] or
-    /// uses one of [`INPUT_MACROS`] ([`reads_outside`]), carries an attribute outside
-    /// [`ATTRIBUTES`], or holds, at any depth, what [`nested_item`] refuses: an attribute
-    /// outside them, `unsafe` code, an `extern` block, a constant, or a nested `impl`, trait,
-    /// module or `macro_rules!`.
-    fn check_new_test(&mut self, item: &syn::Item) -> Result<(), String> {
+    /// A new item of the existing test module `module` is an edit if it names one of
+    /// [`SENSITIVE`] or uses one of [`INPUT_MACROS`] ([`reads_outside`]), or if
+    /// [`test_item_problem`] refuses it.
+    fn check_new_test(&mut self, item: &syn::Item, module: &syn::ItemMod) -> Result<(), String> {
         let tokens = tokens_at(&self.code.path, &self.head.text, item.span())?;
         let named = identifiers_at(&self.code.path, &self.head.text, item.span())?;
-        let attributes = item_attributes(item);
-        let refused = attributes.iter().find(|attribute| !is_allowed(attribute)).map(|attribute| {
-            let name = dialect::path_text(attribute.path());
-            format!("carries the attribute `{name}`, which can change what it does")
-        });
-        let Some(problem) = reads_outside(tokens, &named).or(refused).or_else(|| nested_item(item))
+        let Some(problem) =
+            reads_outside(tokens, &named).or_else(|| test_item_problem(item, module))
         else {
             return Ok(());
         };
@@ -1686,6 +1773,51 @@ mod tests {
         let module = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn pinned() {\n        let _ = \
                       std::fs::read_to_string(\"lints/src/extra.rs\");\n    }\n}\n";
         assert_edit(&class_of("class-pinned-module", &[(path, None, Some(module))]), "names `fs`");
+    }
+
+    // Goal: review of #55, thread 1: every item of a new test module is judged as a new item of
+    // an existing test module is. The reviewer's probes, each in a new file's test module and
+    // in the existing test module of `rust_source.rs`, are edits: `#[unsafe(no_mangle)]`, an
+    // `unsafe` block, a constant, an `impl` of an existing type, an `extern` block, and a
+    // nested module. A test module with an import, a helper type and its plain `impl` stays
+    // additive.
+    #[test]
+    fn every_item_of_a_new_test_module_is_judged() {
+        let probes = [
+            ("#[unsafe(no_mangle)]\n    fn f() {}", "carries the attribute `unsafe`"),
+            ("fn f() {\n        unsafe {}\n    }", "`unsafe`"),
+            ("const C: u8 = 1;", "is a constant or static"),
+            ("impl super::Existing {}", "an `impl` of a type the test module does not declare"),
+            ("impl<T> Helper for T {}", "an `impl` of a type the test module does not declare"),
+            ("extern \"C\" {\n        fn g();\n    }", "an `extern` block"),
+            ("mod inner {}", "is not a function, a type, an import"),
+        ];
+        let path = "lints/src/extra.rs";
+        let module = |item: &str| {
+            format!(
+                "struct Existing;\n\n#[cfg(test)]\nmod tests {{\n    use super::*;\n\n    \
+                 trait Helper {{}}\n\n    {item}\n}}\n"
+            )
+        };
+        let plain =
+            module("struct Fake;\n\n    impl Helper for Fake {}\n\n    #[test]\n    fn t() {}");
+        let additive = class_of("class-test-module", &[(path, None, Some(&plain))]);
+        assert_eq!(additive.edits, Vec::<String>::new(), "a plain test module");
+        let base = real(RULES);
+        let test = "    const NONE: [&str; 0] = [];\n";
+        for (item, expected) in probes {
+            let new_file =
+                class_of("class-test-module-probe", &[(path, None, Some(&module(item)))]);
+            assert_edit(&new_file, "holds a test item that");
+            assert!(new_file.edits[0].contains(expected), "{item}: {:?}", new_file.edits);
+            let head = replaced(&base, test, &format!("{test}\n    {item}\n"));
+            let existing = edited("class-test-item-probe", RULES, &head);
+            assert!(
+                existing.edits.iter().any(|edit| edit.contains(expected)),
+                "{item}: {:?}",
+                existing.edits
+            );
+        }
     }
 
     // Goal: what a new item holds is judged at every depth: an attribute outside the allowed
@@ -2367,6 +2499,26 @@ mod tests {
         }
         let tidy = format!("{}\nfn sessions() -> u8 {{ 1 }}\n", real(RULES));
         assert!(!edited("class-tidy-sess", RULES, &tidy).is_edit(), "not lint code");
+    }
+
+    // Goal: review of #55: a manifest or build file in a rule path is an edit even when it is
+    // new, by its name or below a `.cargo` directory; a fixture named like one is not.
+    #[test]
+    fn a_new_manifest_in_a_rule_path_is_an_edit() {
+        for path in [
+            "lints/src/extra/Cargo.toml",
+            "lints/ui/Cargo.lock",
+            "lints/src/build.rs",
+            "lints/ui/rust-toolchain.toml",
+            "lints/ui/rust-toolchain",
+            "lints/src/.cargo/config.toml",
+            "lints/src/.cargo/other",
+        ] {
+            let class = class_of("class-manifest", &[(path, None, Some("[package]\n"))]);
+            assert_edit(&class, &format!("{path}: a manifest or build file"));
+        }
+        let fixture = [("xtask/fixtures/tidy/cargo.fires.fixture", None, Some("x"))];
+        assert!(!class_of("class-manifest-fixture", &fixture).is_edit());
     }
 
     // Goal: new fixtures and UI cases, and the regenerated rule list, are additive; a changed or

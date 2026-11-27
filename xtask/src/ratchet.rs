@@ -474,17 +474,7 @@ pub fn judge(
         "Base corpus: {files} files, fingerprint {corpus}, placement seed {}.",
         observed.seed
     ));
-    let mut rule_set = source::check(base, head)?;
-    for tree in [base, head] {
-        for uncovered in source::rules_without_cases(base, tree)? {
-            let message = format!(
-                "rule {uncovered} has code in a rule path and no firing case in the base; \
-                 give it a fixture first, or move its code to the core (ADR-0022)"
-            );
-            rule_set.push(Finding::new(source::REGISTRY, Check::RuleSet, message));
-        }
-    }
-    verdict.add(Check::RuleSet, rule_set);
+    verdict.add(Check::RuleSet, rule_set(base, head)?);
     // Each finding names its own check; corpus and end-to-end findings come from one pass.
     let mut rng = plant::Rng::new(observed.seed);
     verdict.add(Check::TidyCorpus, corpus::judge(base, head, observed, &mut rng)?);
@@ -497,6 +487,34 @@ pub fn judge(
     judge_proof(base, head, observed, tools, &mut verdict)?;
     verdict.findings.sort();
     Ok(verdict)
+}
+
+/// The rule-set check, read from the trees as data: the tables only tighten, every check call
+/// stays, and every rule with code in a rule path has a firing case, in the base for a rule of
+/// the base and in the head for a new one.
+///
+/// # Errors
+///
+/// No verdict: a tree that cannot be read as the dialect allows.
+fn rule_set(base: &Path, head: &Path) -> Result<Vec<Finding>, String> {
+    let mut rule_set = source::check(base, head)?;
+    for tree in [base, head] {
+        for uncovered in source::rules_without_cases(base, tree)? {
+            let message = format!(
+                "rule {uncovered} has code in a rule path and no firing case in the base; \
+                 give it a fixture first, or move its code to the core (ADR-0022)"
+            );
+            rule_set.push(Finding::new(source::REGISTRY, Check::RuleSet, message));
+        }
+    }
+    for uncovered in source::new_rules_without_cases(base, head)? {
+        let message = format!(
+            "the new rule {uncovered} has code in a rule path and no firing case in the head; \
+             add its fixture to `xtask/fixtures/tidy/` in this PR (ADR-0022)"
+        );
+        rule_set.push(Finding::new(source::REGISTRY, Check::RuleSet, message));
+    }
+    Ok(rule_set)
 }
 
 /// Fails, for no verdict, if the observations name another commit than the one judged, or
@@ -558,6 +576,11 @@ fn judge_proof(
         let judged = mutants::judge(base, head, &rule_paths, observed, &tools.work, &class)?;
         verdict.notes.extend(judged.notes);
         uncovered = judged.unproven;
+        // A failed null run stays unproven even for an approved edit: only a code owner's
+        // approval stands in for it (review of #55, thread 2).
+        for what in judged.null_failed {
+            verdict.unprovable(what);
+        }
         verdict.add(Check::Mutants, judged.findings);
     } else {
         verdict.unprovable("mutation testing was skipped (`--no-mutants`)".to_owned());

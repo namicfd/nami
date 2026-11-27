@@ -813,6 +813,20 @@ fn a_test_that_pins_its_file_gives_no_verdict() {
     let expected = "a test depends on the source text of xtask/src/tidy/text.rs";
     assert!(pinned.unproven.iter().any(|what| what.contains(expected)), "{}", pinned.summary());
     assert!(pinned.line().starts_with("ratchet: no verdict (additive)"), "{}", pinned.line());
+    // Review of #55, thread 2: for an edit, the reviewer app's approval does not stand in for a
+    // failed null run; a code owner's does.
+    let fixture = "xtask/fixtures/tidy/line-length.fires.fixture";
+    write(&case.head(), fixture, &format!("{}\n", real(fixture)));
+    let approved =
+        check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &APPROVED));
+    let approved = approved.unwrap();
+    assert!(approved.unproven.iter().any(|what| what.contains(expected)), "{}", approved.summary());
+    assert!(approved.line().starts_with("ratchet: no verdict (edit)"), "{}", approved.line());
+    let owner = FakeReviews { approval: Some(("owner", "head")), ..APPROVED };
+    let owned = check(&case.base(), &case.head(), &case.tools(NOTHING, "any", NOTHING, &owner));
+    let owned = owned.unwrap().line();
+    assert!(owned.starts_with("ratchet: pass (edit)"), "a code owner's approval: {owned}");
+    write(&case.head(), fixture, &real(fixture));
     let observed = observe(&case.base(), &case.head(), &tools).unwrap();
     let mut dropped = observed.clone();
     dropped.runs.retain(|run| run.mode != "null");

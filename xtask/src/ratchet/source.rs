@@ -407,6 +407,38 @@ pub fn rules_without_cases(base: &Path, tree: &Path) -> Result<Vec<String>, Stri
     Ok(uncovered)
 }
 
+/// The head's new rules, registered in the head and not in the base, whose code sits in a rule
+/// path of the head and that have no firing fixture in the head. A new rule's case comes with
+/// the head, which the canonical new rule shows; without one, nothing but the head's own
+/// tests would say that it fires (review of #55, thread 2).
+///
+/// # Errors
+///
+/// Returns what is unreadable, a symbolic link among it.
+pub fn new_rules_without_cases(base: &Path, head: &Path) -> Result<Vec<String>, String> {
+    let base_text = read_optional(base, REGISTRY)?.ok_or("the base has no rule registry")?;
+    let Some(head_text) = read_optional(head, REGISTRY)? else {
+        return Ok(Vec::new());
+    };
+    let known = parse_registry(&base_text)?.ids();
+    let added: Vec<String> =
+        parse_registry(&head_text)?.ids().difference(&known).cloned().collect();
+    let mut uncovered = Vec::new();
+    for module in RULE_MODULES {
+        let Some(text) = read_optional(head, module)? else {
+            continue;
+        };
+        let literals = dialect::rules::literals(module, &text)?;
+        for id in added.iter().filter(|id| literals.contains(*id)) {
+            let fixture = format!("{}/{id}.fires.fixture", super::corpus::FIXTURE_DIRECTORY);
+            if read_optional(head, &fixture)?.is_none() {
+                uncovered.push(format!("{id} ({module})"));
+            }
+        }
+    }
+    Ok(uncovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -649,5 +681,28 @@ mod tests {
         scratch.write(text, "const RULE: &str = \"assertion-density\";\n");
         let uncovered = rules_without_cases(scratch.root(), scratch.root()).unwrap();
         assert_eq!(uncovered, ["assertion-density (xtask/src/tidy/text.rs)"]);
+    }
+
+    // Goal: review of #55, thread 2: a new rule's case must come with the head. The canonical
+    // new rule with its fixtures has none missing; without its firing fixture it is named; and
+    // a head with no registry, or a rule of the base, is not this check's.
+    #[test]
+    fn a_new_rule_needs_its_case_in_the_head() {
+        let diff = crate::ratchet::canonical::TEXT_RULE;
+        let scratch = crate::tidy::scratch::Scratch::new("ratchet-new-rule-case");
+        scratch.write(&format!("base/{}", super::REGISTRY), &real_registry());
+        let fires = "xtask/fixtures/tidy/trailing-space.fires.fixture";
+        for (path, _, head) in diff.changes().unwrap() {
+            scratch.write(&format!("head/{path}"), &head);
+        }
+        let (base, head) = (scratch.root().join("base"), scratch.root().join("head"));
+        assert_eq!(super::new_rules_without_cases(&base, &head).unwrap(), Vec::<String>::new());
+        std::fs::remove_file(head.join(fires)).unwrap();
+        let missing = super::new_rules_without_cases(&base, &head).unwrap();
+        assert_eq!(missing, ["trailing-space (xtask/src/tidy/text.rs)"]);
+        let unchanged = super::new_rules_without_cases(&base, &base).unwrap();
+        assert_eq!(unchanged, Vec::<String>::new(), "no new rule");
+        std::fs::remove_file(head.join(super::REGISTRY)).unwrap();
+        assert_eq!(super::new_rules_without_cases(&base, &head).unwrap(), Vec::<String>::new());
     }
 }

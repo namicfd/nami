@@ -392,8 +392,13 @@ pub struct Judged {
     pub findings: Vec<Finding>,
     /// The number of mutants per workspace.
     pub notes: Vec<String>,
-    /// Changes that yield no mutant, which mutation testing cannot vouch for.
+    /// Changes that yield no mutant, which mutation testing cannot vouch for. For an edit, the
+    /// reviewer app's approval stands in for them.
     pub unproven: Vec<String>,
+    /// Workspaces whose null-mutant run failed, so that their mutant evidence proves nothing.
+    /// No approval by the reviewer app stands in for that, only a code owner's (review of
+    /// #55, thread 2).
+    pub null_failed: Vec<String>,
 }
 
 /// Judges the recorded mutation runs. `class` holds, by file, the lines of the dispatch calls
@@ -436,7 +441,7 @@ pub fn judge(
         }
         assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
         if count > 0 {
-            judged.unproven.extend(judge_null(observations, workspace, &starts)?);
+            judged.null_failed.extend(judge_null(observations, workspace, &starts)?);
             judged.unproven.extend(uncovered);
         } else if let Some(first) = uncovered.first() {
             judged.unproven.push(format!(
