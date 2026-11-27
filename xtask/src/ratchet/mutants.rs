@@ -216,9 +216,8 @@ fn output_within(
     let _redirected = command.stdout(file(&out)?).stderr(file(&err)?);
     let mut child =
         command.spawn().map_err(|error| format!("cannot run the null mutant: {error}"))?;
-    let polls = seconds * 1000 / NULL_POLL_MILLISECONDS;
     let mut status = None;
-    for _ in 0..polls {
+    for _ in 0..polls_within(seconds) {
         status = child.try_wait().map_err(|error| format!("cannot wait for the tests: {error}"))?;
         if status.is_some() {
             break;
@@ -233,6 +232,13 @@ fn output_within(
         return Ok((None, read(&out), stderr));
     };
     Ok((status.code(), read(&out), read(&err)))
+}
+
+/// How many polls, [`NULL_POLL_MILLISECONDS`] apart, fill `seconds`.
+fn polls_within(seconds: u64) -> u64 {
+    let polls = seconds * 1000 / NULL_POLL_MILLISECONDS;
+    assert!(polls >= seconds, "a poll is at most a second apart");
+    polls
 }
 
 /// The files that a listing of cargo-mutants names, relative to the workspace: the part of
@@ -701,6 +707,8 @@ mod tests {
         let (killed, _, why) = super::output_within(&mut slow, work.root(), 1).unwrap();
         assert_eq!(killed, None);
         assert!(why.contains("did not finish within 1 s"), "{why}");
+        assert_eq!(super::polls_within(1), 5, "200 ms apart");
+        assert_eq!(super::polls_within(super::NULL_SECONDS_MAX), 18_000, "an hour");
     }
 
     /// Observations with one null run of the lint workspace over `files`, exiting `exit`.
