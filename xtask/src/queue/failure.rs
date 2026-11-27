@@ -25,8 +25,8 @@ pub const QUEUE_PREFIX: &str = "gh-readonly-queue/";
 /// The workflow whose job and step names an issue may quote, relative to the root.
 pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
-/// The workflow of the `ratchet` check (ADR-0022), a required check once the policy flip makes
-/// it one, whose merge-queue failures are filed too: a rule PR whose carried mutation evidence
+/// The workflow of the required `ratchet` check (ADR-0022), whose merge-queue failures are
+/// filed too: a rule PR whose carried mutation evidence
 /// no longer matches, because another rule PR changed the same files first, is fixed by a
 /// rebase, like any other queue failure.
 pub const GUARDRAILS_WORKFLOW: &str = ".github/workflows/guardrails.yml";

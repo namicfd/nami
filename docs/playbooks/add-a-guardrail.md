@@ -91,7 +91,9 @@ replacement, not only the offence.
 
 ## 5. Make the documents agree
 
-Tidy fails until all of these are done.
+Tidy fails until all of these are done, but the tag: no check asks for a tag yet, so a rule may
+merge untagged, and `docs/RULES.md` lists it. Until #77 moves the tags out of the style guide, a
+rule whose tag you add there makes the PR wait for the owner, since the style guide is core.
 
 - Tag the rule in `docs/TIGER_STYLE.md`: `[tidy:<id>]`, `[clippy:<lint>]`, `[rustc:<lint>]` or
   `[dylint:<lint>]`. If the rule is new, add its paragraph there: the rule, its reason and an
@@ -132,11 +134,12 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
 
 - **Additive** (ADR-0022, point 2): new functions and types, one dispatch call per new item, new
   rule and ban rows (not `PLANNED` rows), new fixtures and UI cases, reworded docs. It merges on
-  the ratchet's proof alone, with no approval needed (the AI review still runs, step 7); an open
-  request for changes or thread by the reviewer app still blocks it. Write a new rule this way
-  when you can: add its code beside the old, leave existing functions, constants and tests as they are, and give a new type only
-  plain `impl`s in its own file, of any trait, with lifetime parameters used only in the trait
-  path and the method signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand
+  the ratchet's proof alone, with no approval needed (the AI review of AGENTS.md's "Done means"
+  still runs); an open request for changes or thread by the reviewer app still blocks it. Write
+  a new rule this way when you can: add its code beside the old, leave existing functions,
+  constants and tests as they are, and give a new type only plain `impl`s in its own file, of
+  any trait, with lifetime parameters used only in the trait path and the method signatures
+  (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand
   the new rule's reports to the existing ones as `violations.extend(new_rule(&..))`, where
   `new_rule` returns `Vec<Violation>` and `violations` is the list the function returns or
   reports into. Pass literals, `&place`, or a `&T` parameter of the function as it is
@@ -147,9 +150,9 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   `macro_rules!` or constant in a function, don't write `unsafe` or an attribute beyond `doc`,
   `derive`, `must_use`, `inline`, `expect` and `test`, and don't read files, the environment,
   the clock, threads or the network, nor use `include_str!`, `file!` or `env!`, not even in a
-  test. In a test module, write functions,
-  helper types and their plain `impl`s and imports only. In a lint, don't reach `dcx` or `sess`,
-  not even as `float_reduction` reads `tcx.sess`: copying that makes the PR an edit. No test
+  test. In a test module, write functions, helper types and their plain `impl`s and imports
+  only. In a lint, don't reach `dcx` or `sess`, not even as `float_reduction` reads `tcx.sess`:
+  copying that makes the PR an edit. No test
   may depend on the source text or line numbers of the file it tests: the ratchet runs the
   tests on a copy with a blank line and a comment added, and gives no verdict if one fails.
   **Tags:** until #77 (rule tags out of the style guide) lands, a new rule whose tag goes
@@ -163,8 +166,9 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   head commit (#59) or a code owner's approval of it. Until that app exists, only a code owner's
   approval counts, and for a manifest or build file it always is the only one. Findings fail the
   PR even with an approval: fix them. The rule paths have no owner, so GitHub does not ask for
-  that review: once the summary says `(edit)`, request it with `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer
-  cxkoda` (the login in `.github/CODEOWNERS`). Say in the PR description why the edit does not
+  that review: once the summary says `(edit)`, request it with
+  `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer cxkoda` (the login in
+  `.github/CODEOWNERS`). Say in the PR description why the edit does not
   loosen the rule.
 
 Run the check yourself first, inside a checkout of `main`:

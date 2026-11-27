@@ -140,7 +140,8 @@ instead of merging automatically, so:
 The protected paths are:
 
 - **Manifests and lockfile:** every `Cargo.toml` and `Cargo.lock`. A manifest or build file under
-  a rule path (`Cargo.toml`, `build.rs`, `.cargo/`, a toolchain file) has no code owner, but the
+  a rule path (a file named `Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`,
+  `rust-toolchain` or `config.toml`, or anything below `.cargo/`) has no code owner, but the
   ratchet calls it an edit that only a code owner's approval settles; the reviewer app's is not
   enough.
 - **Tool configuration:** `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`,

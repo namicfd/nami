@@ -1,5 +1,6 @@
-# Paths that always need maintainer review (ADR-0008).
-# Effective once the repo is on GitHub with code-owner review required (ADR-0009).
+# Paths that need maintainer review (ADR-0008, ADR-0009). The rule paths at the end have no owner:
+# the required `ratchet` check proves a change to them, and an edit to existing rule code also
+# needs the reviewer app's or a code owner's approval (ADR-0022).
 
 # Manifests, lockfile and tool configuration.
 /Cargo.toml                @cxkoda
