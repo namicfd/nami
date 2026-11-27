@@ -132,9 +132,9 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
 
 - **Additive** (ADR-0022, point 2): new functions and types, one dispatch call per new item, new
   rule and ban rows (not `PLANNED` rows), new fixtures and UI cases, reworded docs. It merges on
-  the ratchet's proof alone, with no review needed; an open request for changes or thread by the
-  reviewer app still blocks it. Write a new rule this way when you can: add its code beside the
-  old, leave existing functions, constants and tests as they are, and give a new type only
+  the ratchet's proof alone, with no approval needed (the AI review still runs, step 7); an open
+  request for changes or thread by the reviewer app still blocks it. Write a new rule this way
+  when you can: add its code beside the old, leave existing functions, constants and tests as they are, and give a new type only
   plain `impl`s in its own file, of any trait, with lifetime parameters used only in the trait
   path and the method signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand
   the new rule's reports to the existing ones as `violations.extend(new_rule(&..))`, where
@@ -152,7 +152,7 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   not even as `float_reduction` reads `tcx.sess`: copying that makes the PR an edit. No test
   may depend on the source text or line numbers of the file it tests: the ratchet runs the
   tests on a copy with a blank line and a comment added, and gives no verdict if one fails.
-  **Tags:** until the issue "Rule tags live in the style guide" lands, a new rule whose tag goes
+  **Tags:** until #77 (rule tags out of the style guide) lands, a new rule whose tag goes
   in `docs/TIGER_STYLE.md` (step 5), which is core, waits for the owner. A rule may also merge
   untagged: `docs/RULES.md` lists it.
 - **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
@@ -160,9 +160,10 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   `macro_rules!` or inline module; a new lint below `Deny`; a manifest or build file in a rule
   path; a new member of an existing `impl`; an `impl` in another file than its type, with type
   or const parameters, or with a `where` clause. It waits for the reviewer app's approval of its
-  head commit (#59) or a code owner's approval of it, and until that app exists for the latter.
-  The rule paths have no owner, so GitHub does not ask for that review: once the summary says
-  `(edit)`, request it with `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer
+  head commit (#59) or a code owner's approval of it. Until that app exists, only a code owner's
+  approval counts, and for a manifest or build file it always is the only one. Findings fail the
+  PR even with an approval: fix them. The rule paths have no owner, so GitHub does not ask for
+  that review: once the summary says `(edit)`, request it with `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer
   cxkoda` (the login in `.github/CODEOWNERS`). Say in the PR description why the edit does not
   loosen the rule.
 

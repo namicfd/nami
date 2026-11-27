@@ -139,8 +139,10 @@ instead of merging automatically, so:
 
 The protected paths are:
 
-- **Manifests and lockfile:** every `Cargo.toml` and `Cargo.lock`. One under a rule path has no
-  code owner, but the ratchet calls it an edit, so it waits for the owner too.
+- **Manifests and lockfile:** every `Cargo.toml` and `Cargo.lock`. A manifest or build file under
+  a rule path (`Cargo.toml`, `build.rs`, `.cargo/`, a toolchain file) has no code owner, but the
+  ratchet calls it an edit that only a code owner's approval settles; the reviewer app's is not
+  enough.
 - **Tool configuration:** `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`,
   `.cargo/` and `.config/`.
 - **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`, except
@@ -148,7 +150,8 @@ The protected paths are:
   fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths is either:
   - **additive** (new functions and types beside the old code, a new lint at `Deny`, new
     fixtures and UI cases, new rule and ban rows): it merges on the required `ratchet` check's
-    proof alone, with no review needed, even before the reviewer app exists. The check proves
+    proof alone, with no approval needed, even before the reviewer app exists (the AI review of
+    "Done means" still runs). The check proves
     that every case `main` writes down still holds, the rule tables only tighten, and mutation
     testing misses nothing; an open request for changes or thread by the reviewer app
     (`NAMI_REVIEWER_LOGIN`, not the agents' bot) still blocks it;
@@ -156,15 +159,16 @@ The protected paths are:
     new constant or static, a new `PLANNED` row, a `use` added to an existing file (write full
     paths instead), a new top-level `macro_rules!` or inline module, a new lint below `Deny`, a
     manifest, or an `impl` that is not a plain `impl` of a type new in its file): it waits for
-    the reviewer app's approval of its head
-    commit (#59), or for a code owner's approval of it; until the app exists, only the latter.
+    the reviewer app's approval of its head commit (#59), or for a code owner's approval of it;
+    until the app exists, and for a manifest always, only the latter. Findings fail it even with
+    an approval: fix them.
     GitHub does not ask the owner, because the rule paths have no owner: when the `ratchet`
     summary says `(edit)`, request the code owner's review yourself, with
     `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer cxkoda` (the login in
     `.github/CODEOWNERS`), and say in the description why the edit is needed.
 
-  A PR that also touches a path outside the rule paths waits for the owner as before. Until the
-  issue "Rule tags live in the style guide" lands, a new rule whose tag goes in
+  A PR that also touches a path outside the rule paths waits for the owner as before. Until
+  #77 (rule tags out of the style guide) lands, a new rule whose tag goes in
   `docs/TIGER_STYLE.md`, which is core, waits for the owner. A rule may also merge untagged:
   `docs/RULES.md` lists it.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
