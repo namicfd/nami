@@ -13,6 +13,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use xtask::ratchet::observations::Observations;
 use xtask::ratchet::review::{AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread};
 use xtask::ratchet::tree::Scratch;
 use xtask::ratchet::{
@@ -794,6 +795,55 @@ fn mutation_results_are_read_strictly() {
     assert!(owned.owner_reviews && owned.unproven.is_empty(), "{}", owned.summary());
 }
 
+// Goal: round 10 of #57's review: in a merge group, the judge of an observation without
+// mutants reads the PR's carried mutation evidence. The identical rule-path diff passes with a
+// note; carried evidence without a mutation run, of another head tree, or of another rule-path
+// diff gives no verdict.
+#[test]
+fn a_merge_group_carries_the_pr_s_mutation_evidence() {
+    let case = Case::new("carried");
+    let text = "xtask/src/tidy/text.rs";
+    write(&case.head(), text, "fn rule() -> bool {\n    true\n}\n");
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let observed = observe(&case.base(), &case.head(), &tools).unwrap();
+    let carried = case.place.path("carried");
+    for (tree, from) in [("base", case.base()), ("head", case.head())] {
+        let _copy = Scratch::copy_of(&from, &carried.join(tree)).expect("copied");
+    }
+    let keep = |observations: &Observations| {
+        fs::write(carried.join(carry::OBSERVATIONS), observations.to_json()).expect("writable");
+    };
+    keep(&observed);
+    let mut queue = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    queue.mutants = false;
+    let queued = observe(&case.base(), &case.head(), &queue).unwrap();
+    assert!(queued.runs.iter().all(|run| run.mode != "mutants"), "the queue observes no mutants");
+    let judged = || {
+        let mut with = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+        with.carried = Some(carry::Carried::read(&carried).expect("the carried directory reads"));
+        judge(&case.base(), &case.head(), &queued, &with)
+    };
+    let verdict = judged().unwrap();
+    assert_eq!(verdict.line(), "ratchet: pass (additive)", "{}", verdict.summary());
+    assert!(
+        verdict.notes.iter().any(|note| note.contains("carried over")),
+        "{}",
+        verdict.summary()
+    );
+    let mut stripped = observed.clone();
+    stripped.runs.retain(|run| run.mode != "mutants");
+    keep(&stripped);
+    assert!(judged().unwrap_err().contains("no mutation run of xtask"), "no mutation run");
+    keep(&observed);
+    write(&carried.join("head"), "docs/later.md", "Written after the observation.\n");
+    assert!(judged().unwrap_err().contains("another head tree"), "a mismatched fingerprint");
+    write(&carried.join("head"), text, "fn rule() -> bool {\n    false\n}\n");
+    let mut other = observed.clone();
+    other.head = xtask::ratchet::tree::fingerprint(&carried.join("head")).expect("readable").0;
+    keep(&other);
+    assert!(judged().unwrap_err().contains("another rule-path diff"), "another diff");
+}
+
 // Goal: round 7 of #57's review: a new test that pins its file through an existing helper
 // (`read_optional`), which names nothing the class refuses, is additive, but the null mutant
 // shows that a test depends on the file's source text, so the mutant evidence proves nothing
@@ -1200,7 +1250,8 @@ fn assert_canonical(run: &Canonical) {
 // Goal: round 8 of #57's review: the ratchet is complete for a canonical new text rule. The
 // full ratchet, with real tools and mutants, on this checkout plus the rule, its dispatch call,
 // its registry row and its two fixtures, passes as additive with no review; and so does the
-// merge group's run, with the PR's mutation evidence carried over, within the queue's budget.
+// merge group's run, with the PR's mutation evidence carried over. The clock is no input of a
+// test (ADR-0005), so the queue's time is measured from the timestamps of the output lines.
 #[test]
 #[ignore = "runs the full ratchet with real cargo, dylint and cargo-mutants for many minutes, \
             past nextest's limit; run it with `cargo test --locked -p xtask --test ratchet -- \
@@ -1212,7 +1263,7 @@ fn canonical_new_text_rule_passes_as_additive() {
 // Goal: round 8 of #57's review: the ratchet is complete for a canonical new lint. The full
 // ratchet, with real tools and mutants, on this checkout plus the lint, its registration and a
 // UI case, passes as additive with no review; and so does the merge group's run, with the PR's
-// mutation evidence carried over, within the queue's budget.
+// mutation evidence carried over; the time is measured outside, as for the text rule.
 #[test]
 #[ignore = "runs the full ratchet with real cargo, dylint and cargo-mutants for many minutes, \
             past nextest's limit; run it with `cargo test --locked -p xtask --test ratchet -- \

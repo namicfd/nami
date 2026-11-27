@@ -84,7 +84,8 @@ pub fn rule_diff(base: &Path, head: &Path) -> Result<Vec<Change>, String> {
 ///
 /// # Errors
 ///
-/// No verdict: an observation of another pull request head, or whose rule-path diff is not the
+/// No verdict: an observation of another pull request head, one that skipped the head, one of
+/// another tree than the carried head (by fingerprint), or one whose rule-path diff is not the
 /// queued merge's, path for path and text for text.
 pub fn check(
     base: &Path,
@@ -101,6 +102,20 @@ pub fn check(
             observed.pr_head
         ));
     }
+    if observed.skipped {
+        return Err(
+            "the carried observation skipped the head, so it holds no mutation evidence".to_owned()
+        );
+    }
+    let (observed_tree, links) = super::tree::fingerprint(&carried.head)
+        .map_err(|error| format!("cannot read the carried head tree: {error}"))?;
+    if observed.head != observed_tree || !links.is_empty() {
+        return Err(format!(
+            "the carried observation is of another head tree (fingerprint {}, the carried tree's \
+             {observed_tree}), so its runs say nothing about these trees",
+            observed.head
+        ));
+    }
     let queued = rule_diff(base, head)?;
     let earlier = rule_diff(&carried.base, &carried.head)?;
     if queued != earlier {
@@ -109,8 +124,10 @@ pub fn check(
         };
         return Err(format!(
             "the carried mutation evidence observed another rule-path diff than the queued \
-             merge's (observed {:?}, queued {:?}, or the same paths with other text); re-run \
-             the pull request's `guardrails` workflow on its head, then queue it again",
+             merge's (observed {:?}, queued {:?}, or the same paths with other text), as when \
+             another rule PR that touches these files merged first. Push again, rebased onto \
+             the new main, so that the ratchet observes this PR on its new base, then queue it \
+             again; re-running the workflow does not help, because it observes the same merge",
             paths(&earlier),
             paths(&queued)
         ));
@@ -150,8 +167,14 @@ mod tests {
         tree(&scratch, "queue/base", &[(rule, "fn a() {}\n"), ("xtask/src/tidy.rs", "newer\n")]);
         tree(&scratch, "queue/head", &[(rule, "fn a() {}\nfn b() {}\n"), ("crates/x.rs", "y\n")]);
         let root = scratch.root();
-        let observations = Observations { pr_head: "abc".to_owned(), ..Observations::default() };
-        let carried = Carried {
+        let observed_tree =
+            crate::ratchet::tree::fingerprint(&root.join("carried/head")).unwrap().0;
+        let observations = Observations {
+            pr_head: "abc".to_owned(),
+            head: observed_tree,
+            ..Observations::default()
+        };
+        let mut carried = Carried {
             observations,
             base: root.join("carried/base"),
             head: root.join("carried/head"),
@@ -161,9 +184,19 @@ mod tests {
         assert!(note.contains("rule-path diff of 1 path(s) is the queued merge's"), "{note}");
         let other = check(&queue_base, &queue_head, &carried, Some("def")).unwrap_err();
         assert!(other.contains("observed the pull request head `abc`, not `def`"), "{other}");
+        carried.observations.skipped = true;
+        let skipped = check(&queue_base, &queue_head, &carried, None).unwrap_err();
+        assert!(skipped.contains("skipped the head"), "{skipped}");
+        carried.observations.skipped = false;
+        scratch.write("carried/head/docs/later.md", "x\n");
+        let moved = check(&queue_base, &queue_head, &carried, None).unwrap_err();
+        assert!(moved.contains("is of another head tree"), "{moved}");
+        std::fs::remove_file(root.join("carried/head/docs/later.md")).unwrap();
         scratch.write(&format!("queue/head/{rule}"), "fn a() {}\nfn c() {}\n");
         let text = check(&queue_base, &queue_head, &carried, None).unwrap_err();
         assert!(text.contains("another rule-path diff"), "{text}");
+        assert!(text.contains("Push again, rebased onto the new main"), "{text}");
+        assert!(text.contains("re-running the workflow does not help"), "{text}");
         scratch.write(&format!("queue/head/{rule}"), "fn a() {}\nfn b() {}\n");
         scratch.write("queue/head/lints/ui/new.rs", "fn main() {}\n");
         let paths = check(&queue_base, &queue_head, &carried, None).unwrap_err();

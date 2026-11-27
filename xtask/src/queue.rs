@@ -181,11 +181,11 @@ fn file_failure(
     if details.id != run {
         return Err(format!("GitHub answered with run {} when asked for run {run}", details.id));
     }
-    if details.path != failure::CI_WORKFLOW {
+    if !failure::QUEUE_WORKFLOWS.contains(&details.path.as_str()) {
         return Ok(format!(
             "run {run} is a run of `{}`, not of {}; nothing to file\n",
             details.path,
-            failure::CI_WORKFLOW
+            failure::QUEUE_WORKFLOWS.join(" or ")
         ));
     }
     if details.event != "merge_group" || details.conclusion.as_deref() != Some("failure") {
@@ -707,8 +707,10 @@ mod tests {
         assert!(run(&fake, &["failed", "--run", "900"]).unwrap().starts_with("filed #70"));
     }
 
-    // Goal: only a run of `ci.yml` counts, so a workflow that a PR adds under the name `ci`
-    // files nothing; an answer about another run than the one asked for is an error.
+    // Goal: only a run of `ci.yml` or `guardrails.yml` counts, so a workflow that a PR adds
+    // under the name `ci` files nothing, and a failed `ratchet` in the queue is filed like a
+    // failed `gate` (review of #57, round 10); an answer about another run than the one asked
+    // for is an error.
     #[test]
     fn only_runs_of_ci_count() {
         let renamed = RUN.replace(".github/workflows/ci.yml", ".github/workflows/mine.yml");
@@ -716,9 +718,13 @@ mod tests {
         let output = run(&fake, &["failed", "--run", "900"]).unwrap();
         assert_eq!(
             output,
-            "run 900 is a run of `.github/workflows/mine.yml`, not of .github/workflows/ci.yml; \
-             nothing to file\n"
+            "run 900 is a run of `.github/workflows/mine.yml`, not of .github/workflows/ci.yml \
+             or .github/workflows/guardrails.yml; nothing to file\n"
         );
+        let ratchet = RUN.replace(".github/workflows/ci.yml", ".github/workflows/guardrails.yml");
+        let guardrails = Fake { run: ratchet, ..dropped() };
+        let filed = run(&guardrails, &["failed", "--run", "900"]).unwrap();
+        assert!(filed.starts_with("filed #"), "{filed}");
         assert!(fake.filed.borrow().is_empty());
         let other = Fake { run: RUN.replace("\"id\": 900", "\"id\": 901"), ..dropped() };
         let error = run(&other, &["failed", "--run", "900"]).expect_err("another run");

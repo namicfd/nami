@@ -155,16 +155,18 @@ pub fn observe(
 /// No verdict: the head's file already holds the null mutant's comment, so a test could tell
 /// the null mutant from the head by it (review of #57, round 9).
 pub fn null_mutant(file: &str, text: &str) -> Result<String, String> {
+    // `listed_files` gives only plain relative paths; another name here is a caller's bug.
+    assert!(
+        super::tree::is_plain_relative(Path::new(file)),
+        "the null mutant's file is named relative to its workspace: {file}"
+    );
     if text.contains(NULL_COMMENT) {
         return Err(format!(
             "the head's {file} already holds the null mutant's comment `{NULL_COMMENT}`, so the \
              null mutant cannot be told apart from it"
         ));
     }
-    let mutated = format!("\n{text}\n{NULL_COMMENT}\n");
-    assert!(mutated.contains(text), "the null mutant keeps the file's text");
-    assert_eq!(mutated.matches(NULL_COMMENT).count(), 1, "the null mutant adds one comment");
-    Ok(mutated)
+    Ok(format!("\n{text}\n{NULL_COMMENT}\n"))
 }
 
 /// Runs the head's tests, as cargo-mutants runs them, on a copy of the head in which each of
