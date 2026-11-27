@@ -960,6 +960,8 @@ fn a_code_owner_approval_settles_a_no_verdict() {
     let owner = FakeReviews { approval: Some(("owner", "head")), ..REVIEWED };
     let verdict = settle(&owner).expect("the owner's approval settles it");
     assert_eq!(verdict.line(), "ratchet: pass", "{}", verdict.summary());
+    assert!(verdict.owner_approved, "the summary says the owner approved");
+    assert_eq!(verdict.range, "the two trees given", "the summary names what was judged");
     let note = verdict.notes.first().map_or("", String::as_str);
     assert!(note.contains("No verdict: the head holds 1 symbolic link(s)"), "{note}");
     assert!(note.contains("A code owner approved the head commit"), "{note}");
