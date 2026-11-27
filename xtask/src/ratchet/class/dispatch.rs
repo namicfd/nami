@@ -16,9 +16,17 @@
 //! - `place.register_late_lint_pass(Box::new(|_| Box::new(NewPass)));`, and the same with
 //!   `register_early_lint_pass`, for a new lint pass.
 //!
-//! Every argument of a call is a literal or a shared reference to a path or a field of one, so
-//! the new code gets no way to change the state that the existing rules read: no `&mut`, no
-//! value that may be a `&mut` reborrowed, no method call, block or closure.
+//! Every argument of a call is a literal or a shared reference to a path or a field of one: no
+//! `&mut`, no value that may be a `&mut` reborrowed, no method call, block or closure. So a
+//! tidy rule's new code gets nothing through its arguments that it could change the existing
+//! rules' state with; the rule modules hold no `Cell`, `RefCell` or atomics behind a shared
+//! reference.
+//!
+//! A lint pass is different: the compiler hands every pass the same `LateContext`, through
+//! which shared references reach the compiler's diagnostics and session. New lint code that
+//! names them is an edit ([`super::COMPILER_STATE`]), and `lint::exits_agree` is the backstop:
+//! a dylint run whose exit code disagrees with the errors it printed, as one whose error count
+//! a pass reset would, gives no verdict.
 
 use super::NewNames;
 use super::sinks::place_name;

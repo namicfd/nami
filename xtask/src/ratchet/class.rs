@@ -42,8 +42,10 @@
 //!   changed field outside those the rule-set check compares or that only document
 //!   ([`super::dialect::registry::unproven_rows`]);
 //! - (d) new fixtures, UI cases and other new files in the rule paths, and new items inside an
-//!   existing test module whose existing items stay as they are, if they use none of
-//!   [`INPUT_MACROS`];
+//!   existing test module whose existing items stay as they are, if they name none of
+//!   [`SENSITIVE`], use none of [`INPUT_MACROS`], and pass the attribute, nesting and `unsafe`
+//!   checks of (a) at every depth; and a null-mutant run shows that no test depends on the
+//!   source text of a mutated file ([`super::mutants`]);
 //! - (e) a changed documentation field of a registry row, and a changed doc comment anywhere;
 //! - (f) the regenerated `docs/RULES.md`.
 //!
@@ -366,6 +368,9 @@ impl NewItem<'_> {
         if let Some(problem) = reads_outside(self.tokens.clone(), self.named) {
             return Some(problem);
         }
+        if let Some(problem) = compiler_state(self.path, self.named) {
+            return Some(problem);
+        }
         if let syn::Item::Mod(module) = self.item
             && dialect::is_test_module(module)
         {
@@ -411,6 +416,33 @@ fn reads_outside(tokens: TokenStream, named: &BTreeSet<String>) -> Option<String
         "names `{sensitive}`: new code that reads the environment, the clock, a process, a \
          thread, the network or a file can pin the file rather than the rule, or behave \
          differently in CI than where the ratchet observes it"
+    ))
+}
+
+/// The names that reach the compiler's shared state from lint code: the diagnostic context
+/// and the session, and the calls that reset, steal or flush what other lints reported. Each
+/// counts also as the prefix of a name (`steal_*`, `emit_stashed_*`). A new lint pass shares
+/// the `LateContext` with the existing ones, so `cx.tcx.dcx().reset_err_count()` in its
+/// `check_crate_post` would make the reports of `nami_recursion` exit 0 (review of #57,
+/// round 7). `lint::exits_agree` turns such a run into no verdict; this refuses it earlier.
+pub const COMPILER_STATE: [&str; 7] =
+    ["dcx", "sess", "session", "reset_err_count", "steal", "abort_if_errors", "emit_stashed"];
+
+/// What makes new lint code in `path` reach the compiler's shared state, if it names one of
+/// [`COMPILER_STATE`] among `named`.
+fn compiler_state(path: &str, named: &BTreeSet<String>) -> Option<String> {
+    if !path.starts_with("lints/src/") {
+        return None;
+    }
+    let found = named.iter().find(|name| {
+        COMPILER_STATE.iter().any(|state| {
+            name.as_str() == *state
+                || name.strip_prefix(state).is_some_and(|rest| rest.starts_with('_'))
+        })
+    })?;
+    Some(format!(
+        "names `{found}`, which reaches the compiler's diagnostics or session, shared with the \
+         existing lints"
     ))
 }
 
@@ -1072,8 +1104,8 @@ impl Existing<'_> {
         Ok(())
     }
 
-    /// Every item of the base's test module must be the head's. New ones are additive, unless
-    /// they use one of [`INPUT_MACROS`].
+    /// Every item of the base's test module must be the head's. New ones are additive unless
+    /// [`Self::check_new_test`] finds them an edit.
     fn compare_tests(&mut self, base: &syn::ItemMod, head: &syn::ItemMod) -> Result<(), String> {
         let mut before = BTreeSet::new();
         for item in module_items(base) {
@@ -1096,12 +1128,21 @@ impl Existing<'_> {
         Ok(())
     }
 
-    /// A new item of an existing test module is an edit if it reads from outside
-    /// ([`reads_outside`]).
+    /// A new item of an existing test module is an edit if it names one of [`SENSITIVE`] or
+    /// uses one of [`INPUT_MACROS`] ([`reads_outside`]), carries an attribute outside
+    /// [`ATTRIBUTES`], or holds, at any depth, what [`nested_item`] refuses: an attribute
+    /// outside them, `unsafe` code, an `extern` block, a constant, or a nested `impl`, trait,
+    /// module or `macro_rules!`.
     fn check_new_test(&mut self, item: &syn::Item) -> Result<(), String> {
         let tokens = tokens_at(&self.code.path, &self.head.text, item.span())?;
         let named = identifiers_at(&self.code.path, &self.head.text, item.span())?;
-        let Some(problem) = reads_outside(tokens, &named) else {
+        let attributes = item_attributes(item);
+        let refused = attributes.iter().find(|attribute| !is_allowed(attribute)).map(|attribute| {
+            let name = dialect::path_text(attribute.path());
+            format!("carries the attribute `{name}`, which can change what it does")
+        });
+        let Some(problem) = reads_outside(tokens, &named).or(refused).or_else(|| nested_item(item))
+        else {
             return Ok(());
         };
         let key = item_key(&self.code.path, &self.head.text, item)?;
@@ -1612,6 +1653,18 @@ mod tests {
             let head = format!("{base}{new}\n{item}\n");
             assert_edit(&edited(&format!("class-depth-{index}"), RULES, &head), expected);
         }
+        let test = "    const NONE: [&str; 0] = [];\n";
+        let in_tests = [
+            ("    #[unsafe(export_name = \"x\")]\n    fn helper() {}\n", "the attribute `unsafe`"),
+            ("    fn helper() -> u8 {\n        unsafe { 1 }\n    }\n", "an `unsafe` block"),
+            ("    fn helper() {\n        impl Extra {}\n    }\n", "an `impl` inside"),
+        ];
+        for (index, (item, expected)) in in_tests.iter().enumerate() {
+            let head = replaced(&base, test, &format!("{test}\n{item}"));
+            let class = edited(&format!("class-depth-test-{index}"), RULES, &head);
+            assert_edit(&class, "the new test `fn helper`");
+            assert!(class.edits[0].contains(expected), "{expected}: {:?}", class.edits);
+        }
     }
 
     // Goal: a dispatch call resolves its callee by path: a new `fn line_of` in another file does
@@ -1787,6 +1840,62 @@ mod tests {
         }
     }
 
+    // Goal: round 7 of #57's review: a list is a report list only if the base only adds to it.
+    // On three synthetic bases of `text.rs`, the same additive-looking dispatch is an edit: one
+    // that sorts and dedups its list before returning it, one with an exemption list used in a
+    // filter, and one that imports another type `as Violation`. On the real base it is additive.
+    #[test]
+    fn a_report_list_is_one_the_base_only_adds_to() {
+        let text = "xtask/src/tidy/text.rs";
+        let real_base = real(text);
+        let end = "        }\n    }\n    violations\n}\n";
+        let call = "        }\n    }\n    violations.extend(trailing_space(&lines));\n    \
+                    violations\n}\n";
+        let rule = "\nfn trailing_space(lines: &&[&str]) -> Vec<Violation> {\n    \
+                    assert!(lines.len() < 1 << 30, \"x\");\n    Vec::new()\n}\n";
+        let deduped_end = "        }\n    }\n    violations.sort_by_key(|violation| \
+                           violation.line);\n    violations.dedup_by_key(|violation| \
+                           violation.line);\n    violations\n}\n";
+        let exemption = "\npub fn exempt(path: &Path, text: &str) -> Vec<Violation> {\n    let \
+                         known: Vec<Violation> = Vec::new();\n    check(path, \
+                         text).into_iter().filter(|violation| \
+                         !known.contains(violation)).collect()\n}\n";
+        let known_call = "    let known: Vec<Violation> = Vec::new();\n    \
+                          known.extend(trailing_space(&text));\n";
+        let renamed =
+            real_base.replace("use super::Violation;", "use super::Exemption as Violation;");
+        let deduped = replaced(&real_base, end, deduped_end);
+        let filtered = format!("{real_base}{exemption}");
+        let bases = [
+            (
+                deduped.clone(),
+                replaced(
+                    &deduped,
+                    "    violations.sort_by_key",
+                    "    violations.extend(trailing_space(&lines));\n    \
+                     violations.sort_by_key",
+                ),
+            ),
+            (
+                filtered.clone(),
+                replaced(&filtered, "    let known: Vec<Violation> = Vec::new();\n", known_call),
+            ),
+            (renamed.clone(), replaced(&renamed, end, call)),
+        ];
+        for (index, (base, head)) in bases.iter().enumerate() {
+            let head = format!("{head}{rule}");
+            let class =
+                class_of(&format!("class-only-adds-{index}"), &[(text, Some(base), Some(&head))]);
+            assert!(
+                class.edits.iter().any(|edit| edit.contains("beyond a dispatch call")),
+                "{index}: {:?}",
+                class.edits
+            );
+        }
+        let head = format!("{}{rule}", replaced(&real_base, end, call));
+        assert_eq!(edited("class-only-adds-real", text, &head).edits, Vec::<String>::new());
+    }
+
     // Goal: a new rule's reports extend a method's `self.violations` additively.
     #[test]
     fn extend_into_a_report_field_is_additive() {
@@ -1831,10 +1940,14 @@ mod tests {
 
     // Goal: the report lists of a function are read from the base's declarations: a typed or
     // returned local, a `&mut Vec<Violation>` parameter, a `self` field of that type, and a
-    // field of a returned struct literal; nothing else.
+    // field of a returned struct literal; nothing else, and nothing without `Violation`
+    // imported as itself.
     #[test]
     fn report_lists_are_read_from_declarations() {
-        let source = "struct V { violations: Vec<Violation>, names: Vec<String> }\nfn f(out: &mut \
+        let unimported = "fn g() -> Vec<Violation> { let returned = Vec::new(); returned }";
+        assert_eq!(lists_of(unimported, "g", None), Vec::<String>::new(), "no import");
+        let source = "use super::Violation;\nstruct V { violations: Vec<Violation>, names: \
+                      Vec<String> }\nfn f(out: &mut \
                       Vec<Violation>, names: &mut Vec<String>) -> Vec<Violation> { let typed: \
                       Vec<Violation> = Vec::new(); let other = Vec::new(); let visitor = V { \
                       violations: Vec::new(), names: Vec::new() }; Report { violations: \
@@ -2012,6 +2125,34 @@ mod tests {
         assert_edit(&edited("class-mod-inline", lib, &inline), "is not a function");
         let nested = [("lints/src/extra.rs", None, Some("mod deeper;\n"))];
         assert_edit(&class_of("class-mod-nested", &nested), "is not a function");
+    }
+
+    // Goal: round 7 of #57's review: a new lint pass that reaches the compiler's shared state,
+    // such as `cx.tcx.dcx().reset_err_count()` in `check_crate_post`, is an edit, though it is
+    // registered through the allowed forms; the same names in a tidy rule are not lint code.
+    #[test]
+    fn new_lint_code_may_not_reach_compiler_state() {
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let pass = "    lint_store.register_late_lint_pass(Box::new(|_| Box::new(NamiTidyUp)));\n";
+        let lints = "    lint_store.register_lints(&[NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);\n";
+        let tidy_up = "\ndylint_linting::declare_lint! {\n    /// Tidies up.\n    pub \
+                       NAMI_TIDY_UP,\n    Deny,\n    \"tidies up\"\n}\n\n\
+                       dylint_linting::declare_lint_pass!(NamiTidyUp => [NAMI_TIDY_UP]);\n\n\
+                       impl<'tcx> LateLintPass<'tcx> for NamiTidyUp {\n    fn \
+                       check_crate_post(&mut self, cx: &LateContext<'tcx>) {\n        \
+                       cx.tcx.dcx().reset_err_count();\n    }\n}\n";
+        let appended =
+            lints.replace("NAMI_FLOAT_REDUCTION]", "NAMI_FLOAT_REDUCTION, NAMI_TIDY_UP]");
+        let head = format!("{}{tidy_up}", replaced(&base, lints, &format!("{appended}{pass}")));
+        assert_edit(&edited("class-tidy-up", lib, &head), "names `dcx`");
+        for name in ["sess", "steal_mir", "abort_if_errors", "emit_stashed_diagnostics"] {
+            let probe =
+                head.replace("cx.tcx.dcx().reset_err_count()", &format!("let _ = cx.tcx.{name}"));
+            assert_edit(&edited("class-tidy-up-name", lib, &probe), &format!("names `{name}`"));
+        }
+        let tidy = format!("{}\nfn sessions() -> u8 {{ 1 }}\n", real(RULES));
+        assert!(!edited("class-tidy-sess", RULES, &tidy).is_edit(), "not lint code");
     }
 
     // Goal: new fixtures and UI cases, and the regenerated rule list, are additive; a changed or
