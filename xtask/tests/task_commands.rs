@@ -471,7 +471,8 @@ fn a_humans_failed_pull_request_is_held_without_the_label() {
     assert_eq!(task(&["ready"]), Ok("a\tTask a\n".to_owned()), "the issue is held");
     let refused = task(&["claim", "issue-3"]).expect_err("a human's PR");
     assert!(refused.contains("#45 was not opened by the bot, so agents never push"), "{refused}");
-    assert!(refused.contains("a human rebases it (ADR-0021, point 6)"), "{refused}");
+    let handover = "a human rebases or renumbers it, re-queues it and closes issue #3 (ADR-0021";
+    assert!(refused.contains(handover), "{refused}");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
@@ -562,7 +563,7 @@ fn queue_failures_of_other_prs_are_held() {
     for id in ["issue-3", "issue-4"] {
         let held = task(&github, &["claim", id]).expect_err("a human's PR");
         assert!(held.contains("#45 was not opened by the bot, so agents never push"), "{held}");
-        assert!(held.contains("a human rebases it"), "{held}");
+        assert!(held.contains("a human rebases or renumbers it, re-queues it"), "{held}");
     }
     github.issues[2].author = "nami-agent[bot]".to_owned();
     github.forks = vec![45];

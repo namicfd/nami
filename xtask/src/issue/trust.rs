@@ -797,9 +797,34 @@ mod tests {
         assert_eq!(trusted_comments(&comments, &trust).1, 1, "its comments are left out");
         let removed = [event("owner", true, 0), event(CI_LOGIN, false, 2)];
         assert!(unworkable(&failure, &removed, &[], &trust).is_some(), "it cannot decide");
-        // Nor can it record a decision (point 7): only the bot's records count.
-        let records = [comment(CI_LOGIN, RECORD, 1, 1)];
-        let recorded = unworkable(&failure, &removed, &records, &trust);
-        assert!(recorded.is_some(), "the CI app's decision record is not the bot's");
+    }
+
+    // Goal: the CI app cannot answer a question through point 7. On the bot's own issue, whose
+    // label only the bot touched, a record by the CI app is no record: the bot posted none.
+    #[test]
+    fn a_ci_decision_record_does_not_count() {
+        let trust = trust();
+        let bug = issue(BOT_LOGIN, &["bug"]);
+        let by_ci = [comment(CI_LOGIN, RECORD, 5, 5)];
+        let reason = unworkable(&bug, &round(), &by_ci, &trust).expect("no bot record");
+        assert!(reason.contains("posted no comment before"), "{reason}");
+        let by_bot = [comment(BOT_LOGIN, RECORD, 5, 5)];
+        assert_eq!(unworkable(&bug, &round(), &by_bot, &trust), None, "the bot's record counts");
+    }
+
+    // Goal: a queue-failure issue that the CI app filed, with the label that it added, is never
+    // lifted under point 7, even by the bot after a valid record: the bot did not open it, so
+    // only a code owner lifts the label.
+    #[test]
+    fn a_ci_filed_label_is_lifted_only_by_a_code_owner() {
+        let trust = trust().with_ci(crate::queue::shape::tests::vocabulary(), "namicfd/nami");
+        let failure = ci_issue(51, 9);
+        let events = [event(CI_LOGIN, true, 2), event(BOT_LOGIN, false, 10)];
+        let records = [comment(BOT_LOGIN, RECORD, 5, 5)];
+        let reason = unworkable(&failure, &events, &records, &trust).expect("a code owner's call");
+        let expected = "`nami-ci[bot]` opened the issue, so only a code owner";
+        assert!(reason.contains(expected), "{reason}");
+        let by_owner = [event(CI_LOGIN, true, 2), event("owner", false, 10)];
+        assert_eq!(unworkable(&failure, &by_owner, &[], &trust), None, "a code owner lifts it");
     }
 }

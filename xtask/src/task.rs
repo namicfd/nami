@@ -384,7 +384,10 @@ fn queue_failure_hold(
         format!("#{pull}, which issue #{number} names, is not a pull request; a human closes it")
     } else if fix.author != trust::BOT_LOGIN {
         // Held whatever the labels say: `needs-decision` is not what keeps agents off it.
-        format!("#{pull} was not opened by the bot, so agents never push to it; a human rebases it")
+        format!(
+            "#{pull} was not opened by the bot, so agents never push to it; a human rebases or \
+             renumbers it, re-queues it and closes issue #{number}"
+        )
     } else if !fix.is_open {
         format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")
     } else if !github.head_is_here(pull)? {
