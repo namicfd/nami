@@ -147,6 +147,11 @@ jobs:
             exit 0
           fi
           rustup toolchain install
+          # Only a change below `lints/`, or to the dylint wrapper, makes the judge run dylint.
+          if ! git -C "${GITHUB_WORKSPACE}" diff --name-only "$(git rev-parse HEAD)" HEAD \
+            | grep --quiet -E '^(lints/|xtask/src/dylint\.rs$)'; then
+            exit 0
+          fi
           (cd lints && rustup toolchain install)
           # The versions are those of .github/actions/setup/action.yml.
           cargo install --locked --root "${RUNNER_TEMP}/tools" cargo-dylint@6.4.0 dylint-link@6.4.0

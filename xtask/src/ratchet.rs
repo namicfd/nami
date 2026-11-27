@@ -58,6 +58,7 @@
 //! without its approval) where no code owner reviews.
 
 pub mod canonical;
+pub mod carry;
 pub mod class;
 pub mod cli;
 mod corpus;
@@ -207,6 +208,10 @@ pub struct Tools<'a> {
     /// The commit whose tree `observe` copies, such as GitHub's test merge, recorded so that a
     /// later judge can check it judges the same commit.
     pub commit: Option<String>,
+    /// For a merge group: the mutation evidence of the pull request's own observation, which
+    /// the judge reads instead of the observations' when the rule-path diffs are identical
+    /// ([`carry`]); `None` reads the observations'.
+    pub carried: Option<carry::Carried>,
 }
 
 impl Tools<'_> {
@@ -572,8 +577,16 @@ fn judge_proof(
     // for it: a test edited with the code it tests pins the edit, so mutants prove little there.
     let mut uncovered = Vec::new();
     if tools.mutants {
+        let evidence = match &tools.carried {
+            Some(carried) => {
+                let note = carry::check(base, head, carried, tools.pr_head.as_deref())?;
+                verdict.notes.push(note);
+                &carried.observations
+            }
+            None => observed,
+        };
         let rule_paths = verdict.rule_paths.clone();
-        let judged = mutants::judge(base, head, &rule_paths, observed, &tools.work, &class)?;
+        let judged = mutants::judge(base, head, &rule_paths, evidence, &tools.work, &class)?;
         verdict.notes.extend(judged.notes);
         uncovered = judged.unproven;
         // A failed null run stays unproven even for an approved edit: only a code owner's
@@ -723,6 +736,7 @@ mod tests {
             commits: commits.map(str::to_owned),
             pr_head: pr_head.map(str::to_owned),
             commit: None,
+            carried: None,
         }
     }
 

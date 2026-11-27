@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::ratchet::review::{AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread};
 use xtask::ratchet::tree::Scratch;
-use xtask::ratchet::{Check, ReviewSource, Tools, Verdict, canonical, check, judge, observe};
+use xtask::ratchet::{
+    Check, ReviewSource, Tools, Verdict, canonical, carry, check, judge, observe,
+};
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
 /// subcommand option `@ONLY@` (`--file`, `--root`), or for all when it is `any`. A tidy run left
@@ -363,6 +365,7 @@ impl Case {
             commits: None,
             pr_head: None,
             commit: None,
+            carried: None,
         }
     }
 
@@ -1105,11 +1108,41 @@ fn apply(head: &Path, diff: &canonical::Diff) {
     }
 }
 
-/// The full ratchet, observe and judge with mutation testing and the null mutant, run with the
-/// real cargo, dylint and cargo-mutants. The base is a copy of this checkout, and the head a
-/// copy with the canonical `diff` applied and `docs/RULES.md` written by the head's xtask. The
-/// review is that of a pull request nobody reviewed, with no reviewer app set up.
-fn run_canonical(diff: &canonical::Diff) -> Verdict {
+/// The tools of a canonical run: the real cargo, dylint and cargo-mutants, scratch output in
+/// `work`, and the review of a pull request nobody reviewed, with no reviewer app set up.
+fn real_tools(work: PathBuf, mutants: bool, carried: Option<carry::Carried>) -> Tools<'static> {
+    Tools {
+        head_xtask: None,
+        cargo: "cargo".into(),
+        work,
+        mutants,
+        review: Some(ReviewSource {
+            reviews: &Unreviewed,
+            pull: 1,
+            head: "head".to_owned(),
+            reviewer: None,
+        }),
+        seed: None,
+        commits: None,
+        pr_head: None,
+        commit: None,
+        carried,
+    }
+}
+
+/// What a canonical run gives: the pull request's verdict and the merge group's.
+struct Canonical {
+    pull_request: Verdict,
+    merge_group: Verdict,
+}
+
+/// The full ratchet as CI runs it, with the real tools. The base is a copy of this checkout,
+/// and the head a copy with the canonical `diff` applied and `docs/RULES.md` written by the
+/// head's xtask. The pull request's run observes with mutation testing and the null mutant
+/// and judges. The merge group's run then observes the queued merge without them, as
+/// `guardrails.yml` does, and judges with the pull request's observation carried over; its
+/// base has moved on outside the rule paths (review of #55, thread 7).
+fn run_canonical(diff: &canonical::Diff) -> Canonical {
     let place = Temporary::new(&format!("canonical-{}", diff.name));
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask is a member");
     let copy = |tree: &str| {
@@ -1125,49 +1158,65 @@ fn run_canonical(diff: &canonical::Diff) -> Verdict {
         .status()
         .expect("cargo runs");
     assert!(rules.success(), "the head's xtask writes docs/RULES.md");
-    let tools = Tools {
-        head_xtask: None,
-        cargo: "cargo".into(),
-        work: place.path("work"),
-        mutants: true,
-        review: Some(ReviewSource {
-            reviews: &Unreviewed,
-            pull: 1,
-            head: "head".to_owned(),
-            reviewer: None,
-        }),
-        seed: None,
-        commits: None,
-        pr_head: None,
-        commit: None,
-    };
-    let verdict = check(&base, &head, &tools).expect("the ratchet reaches a verdict");
-    println!("{}", verdict.summary());
-    verdict
+    let tools = real_tools(place.path("work-pr"), true, None);
+    let observed = observe(&base, &head, &tools).expect("the pull request is observed");
+    let pull_request = judge(&base, &head, &observed, &tools).expect("a verdict on the PR");
+    println!("{}", pull_request.summary());
+    let carried = place.path("carried");
+    for (tree, from) in [("carried/base", &base), ("carried/head", &head)] {
+        let _copy = Scratch::copy_of(from, &place.path(tree)).expect("the trees can be copied");
+    }
+    fs::write(carried.join(carry::OBSERVATIONS), observed.to_json()).expect("writable");
+    let (queue_base, queue_head) = (copy("queue-base"), copy("queue-head"));
+    for tree in [&queue_base, &queue_head] {
+        write(tree, "docs/queued-meanwhile.md", "Another PR merged ahead in the queue.\n");
+    }
+    apply(&queue_head, diff);
+    let listed = fs::read_to_string(head.join("docs/RULES.md")).expect("the head's rule list");
+    write(&queue_head, "docs/RULES.md", &listed);
+    // The clock is no input of a test (ADR-0005); whoever measures the queue's cost timestamps
+    // these two lines of the output.
+    println!("canonical {}: the merge group starts", diff.name);
+    let queue_observe = real_tools(place.path("work-queue"), false, None);
+    let queued = observe(&queue_base, &queue_head, &queue_observe).expect("the merge is observed");
+    let carried = carry::Carried::read(&carried).expect("the carried evidence reads");
+    let queue_judge = real_tools(place.path("work-queue-judge"), true, Some(carried));
+    let merge_group = judge(&queue_base, &queue_head, &queued, &queue_judge).expect("a verdict");
+    println!("canonical {}: the merge group ends\n{}", diff.name, merge_group.summary());
+    Canonical { pull_request, merge_group }
+}
+
+/// Asserts what a canonical run must show: both verdicts additive passes, with mutation
+/// testing, the merge group's from the carried evidence.
+fn assert_canonical(run: &Canonical) {
+    for verdict in [&run.pull_request, &run.merge_group] {
+        assert_eq!(verdict.line_after(), "ratchet: pass (additive)", "{}", verdict.summary());
+        assert!(verdict.checks.contains(&Check::Mutants), "mutants: {}", verdict.summary());
+    }
+    let carried = run.merge_group.notes.iter().any(|note| note.contains("carried over"));
+    assert!(carried, "the merge group reads the PR's evidence: {}", run.merge_group.summary());
 }
 
 // Goal: round 8 of #57's review: the ratchet is complete for a canonical new text rule. The
 // full ratchet, with real tools and mutants, on this checkout plus the rule, its dispatch call,
-// its registry row and its two fixtures, passes as additive with no review.
+// its registry row and its two fixtures, passes as additive with no review; and so does the
+// merge group's run, with the PR's mutation evidence carried over, within the queue's budget.
 #[test]
 #[ignore = "runs the full ratchet with real cargo, dylint and cargo-mutants for many minutes, \
             past nextest's limit; run it with `cargo test --locked -p xtask --test ratchet -- \
             --ignored canonical`"]
 fn canonical_new_text_rule_passes_as_additive() {
-    let verdict = run_canonical(&canonical::TEXT_RULE);
-    assert_eq!(verdict.line_after(), "ratchet: pass (additive)", "{}", verdict.summary());
-    assert!(verdict.checks.contains(&Check::Mutants), "mutants ran: {}", verdict.summary());
+    assert_canonical(&run_canonical(&canonical::TEXT_RULE));
 }
 
 // Goal: round 8 of #57's review: the ratchet is complete for a canonical new lint. The full
 // ratchet, with real tools and mutants, on this checkout plus the lint, its registration and a
-// UI case, passes as additive with no review.
+// UI case, passes as additive with no review; and so does the merge group's run, with the PR's
+// mutation evidence carried over, within the queue's budget.
 #[test]
 #[ignore = "runs the full ratchet with real cargo, dylint and cargo-mutants for many minutes, \
             past nextest's limit; run it with `cargo test --locked -p xtask --test ratchet -- \
             --ignored canonical`"]
 fn canonical_new_lint_passes_as_additive() {
-    let verdict = run_canonical(&canonical::LINT);
-    assert_eq!(verdict.line_after(), "ratchet: pass (additive)", "{}", verdict.summary());
-    assert!(verdict.checks.contains(&Check::Mutants), "mutants ran: {}", verdict.summary());
+    assert_canonical(&run_canonical(&canonical::LINT));
 }

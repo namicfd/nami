@@ -5,6 +5,7 @@
 //!
 //!   observe:  --out <file>                      write what the head's tools print
 //!   judge:    --observations <file>             judge what they printed
+//!             [--carried <dir>]                 mutation evidence of an earlier observation
 //!   neither:  observe and judge in one process
 //!
 //!   (--pr <number> --pr-head <sha> [--reviewer <app login>]
@@ -20,7 +21,10 @@
 //! and the judge gives no verdict if the pull request has moved on. `--commits` names the
 //! commits whose trees are judged, for the summary; its head must be the commit that `observe`
 //! recorded with `--commit`, if it did. Without `--seed`, the placements are drawn
-//! from a seed of the head's content, so that a re-run draws the same ones.
+//! from a seed of the head's content, so that a re-run draws the same ones. `--carried` names a
+//! directory with a pull request's `observations.json` and the trees `base/` and `head/` it
+//! observed; a merge group's judge reads its mutation evidence when the rule-path diffs are
+//! identical, and gives no verdict otherwise ([`super::carry`]).
 
 use super::observations::Observations;
 use super::review::GhReviews;
@@ -36,7 +40,7 @@ const EXIT_NO_VERDICT: u8 = 2;
 const USAGE: &str = "usage: cargo xtask ratchet [observe --out <file> | judge --observations \
                      <file>] --base <dir> --head <dir> [(--pr <number> --pr-head <sha> \
                      [--reviewer <login>]) | --no-review] [--commits <base>..<head>] \
-                     [--commit <sha>] \
+                     [--commit <sha>] [--carried <dir>] \
                      [--no-mutants] [--head-xtask <file>] [--seed <number>] [--work <dir>]";
 
 /// True for a full commit hash.
@@ -67,6 +71,9 @@ struct Arguments {
     head_xtask: Option<PathBuf>,
     seed: Option<u64>,
     work: Option<PathBuf>,
+    /// A directory with a pull request's observation and the trees it observed, whose mutation
+    /// evidence a merge group's judge reads ([`super::carry`]).
+    carried: Option<PathBuf>,
 }
 
 fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
@@ -82,7 +89,7 @@ fn parse(options: &[&str]) -> Result<Arguments, String> {
     let mut rest = options.iter();
     let (mut base, mut head, mut pull, mut reviewer, mut no_review) =
         (None, None, None, None, false);
-    let (mut pull_head, mut commits, mut commit) = (None, None, None);
+    let (mut pull_head, mut commits, mut commit, mut carried) = (None, None, None, None);
     let (mut mutants, mut head_xtask, mut seed, mut work, mut file) =
         (true, None, None, None, None);
     for _ in 0..options.len() {
@@ -105,6 +112,7 @@ fn parse(options: &[&str]) -> Result<Arguments, String> {
             "--work" => work = Some(PathBuf::from(value()?)),
             "--out" if subcommand == "observe" => file = Some(PathBuf::from(value()?)),
             "--observations" if subcommand == "judge" => file = Some(PathBuf::from(value()?)),
+            "--carried" if subcommand == "judge" => carried = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option `{other}`; {USAGE}")),
         }
     }
@@ -129,6 +137,7 @@ fn parse(options: &[&str]) -> Result<Arguments, String> {
         head_xtask,
         seed,
         work,
+        carried,
     })
 }
 
@@ -263,6 +272,7 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
         commits: arguments.commits.clone(),
         pr_head: arguments.pull_head.clone(),
         commit: arguments.commit.clone(),
+        carried: arguments.carried.as_deref().map(super::carry::Carried::read).transpose()?,
     };
     match &arguments.mode {
         Mode::Observe(out) => {

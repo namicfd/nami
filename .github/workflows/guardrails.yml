@@ -100,11 +100,16 @@ jobs:
   # fingerprint of the head tree it copied. Its steps get no token: checkout uses a read-only one
   # and does not keep it. The placements are drawn from a seed of the head's content, so a
   # re-run draws the same ones.
+  #
+  # In a merge group it observes without mutation testing and the null mutant: the judge reads
+  # their evidence from the pull request's own observation instead, if the rule-path diff is
+  # identical (ADR-0022, amending ADR-0009). So both jobs fit in the queue's 30 minutes:
+  # 18 here and 12 for the judge.
   ratchet-head:
     name: ratchet (head)
     runs-on: ubuntu-latest
     # Mutation testing of a large lint change is the slow part (ADR-0022, Consequences).
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 18 || 120 }}
     permissions:
       contents: read
     steps:
@@ -128,6 +133,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          EVENT: ${{ github.event_name }}
         run: |
           mkdir -p "${RUNNER_TEMP}/observations"
           if ! grep --quiet '"observe"' xtask/src/ratchet/cli.rs 2> /dev/null; then
@@ -137,9 +143,16 @@ jobs:
           # The observations record the commit observed and the PR head, so that a judge run
           # after a review judges exactly this commit (ratchet-review.yml).
           pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
+          # A base whose judge cannot read carried evidence observes mutants in the queue too.
+          no_mutants=()
+          if [ "${EVENT}" = merge_group ] && grep --quiet '"--carried"' xtask/src/ratchet/cli.rs
+          then
+            no_mutants=(--no-mutants)
+          fi
           cargo xtask ratchet observe --base . --head "${GITHUB_WORKSPACE}" \
             --out "${RUNNER_TEMP}/observations/observations.json" --work "${RUNNER_TEMP}/work" \
-            --pr-head "${pr_head}" --commit "$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
+            --pr-head "${pr_head}" --commit "$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+            "${no_mutants[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -163,11 +176,13 @@ jobs:
     needs: ratchet-head
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    # Reading the reviews and their threads is the review check.
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 12 || 60 }}
+    # Reading the reviews and their threads is the review check; reading runs finds a merge
+    # group's carried evidence.
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -179,6 +194,9 @@ jobs:
         run: |
           base="${QUEUE_BASE:-$(git rev-parse HEAD^1)}"
           git worktree add --detach "${RUNNER_TEMP}/base" "${base}"
+      # The lint library's toolchain and dylint only when something below `lints/`, or the
+      # dylint wrapper, changed: that is when the judge runs the lint checks
+      # (`scope::is_lint_tooling`).
       - name: Toolchains and the pinned dylint, installed in this job
         working-directory: ${{ runner.temp }}/base
         run: |
@@ -186,6 +204,12 @@ jobs:
             exit 0
           fi
           rustup toolchain install
+          if ! git -C "${GITHUB_WORKSPACE}" diff --name-only "$(git rev-parse HEAD)" HEAD \
+            | grep --quiet -E '^(lints/|xtask/src/dylint\.rs$)'; then
+            echo "Nothing below \`lints/\` changed: dylint is not installed." \
+              >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
           (cd lints && rustup toolchain install)
           # The versions are those of .github/actions/setup/action.yml.
           cargo install --locked --root "${RUNNER_TEMP}/tools" cargo-dylint@6.4.0 dylint-link@6.4.0
@@ -195,6 +219,35 @@ jobs:
         with:
           name: ratchet-observations
           path: ${{ runner.temp }}/observations
+      # A merge group carries the mutation evidence over from the pull request's last
+      # `guardrails` run on its head: its observations and the two trees they observed, the test
+      # merge and its first parent. The judge compares their rule-path diff with the queued
+      # merge's, and gives no verdict unless they are identical or if anything here is missing.
+      - name: The pull request's mutation evidence (merge group)
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          pr_head="$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')"
+          carried="${RUNNER_TEMP}/carried"
+          run=$(gh run list --workflow guardrails.yml --event pull_request --commit "${pr_head}" \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          commit=""
+          if [ -n "${run}" ] && gh run download "${run}" --name ratchet-observations \
+            --dir "${carried}"; then
+            commit=$(jq -r '.commit // empty' "${carried}/observations.json" 2> /dev/null || true)
+          fi
+          if [ -n "${commit}" ] && git fetch --quiet --no-tags origin "${commit}" \
+            && [ "$(git rev-parse "${commit}^2" 2> /dev/null)" = "${pr_head}" ]; then
+            git worktree add --detach "${carried}/base" "${commit}^1"
+            git worktree add --detach "${carried}/head" "${commit}"
+          else
+            rm -rf "${carried}"
+            echo "No observation of the PR head ${pr_head} with its observed commit was found." \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
       - name: The base's ratchet judges
         working-directory: ${{ runner.temp }}/base
         env:
@@ -215,11 +268,18 @@ jobs:
           number="${PR_NUMBER:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')}"
           pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
           commits="$(git rev-parse HEAD)..$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
+          # Without the carried evidence, a merge group's judge finds no mutation run and gives
+          # no verdict.
+          carried=()
+          if [ -d "${RUNNER_TEMP}/carried/head" ]; then
+            carried=(--carried "${RUNNER_TEMP}/carried")
+          fi
           set +e
           cargo xtask ratchet judge --base . --head "${GITHUB_WORKSPACE}" \
             --observations "${RUNNER_TEMP}/observations/observations.json" \
             --pr "${number}" --pr-head "${pr_head}" --commits "${commits}" \
-            --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" > "${RUNNER_TEMP}/ratchet.md"
+            --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" "${carried[@]}" \
+            > "${RUNNER_TEMP}/ratchet.md"
           status=$?
           cat "${RUNNER_TEMP}/ratchet.md" >> "${GITHUB_STEP_SUMMARY}"
           exit "${status}"
