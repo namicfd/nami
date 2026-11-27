@@ -561,8 +561,8 @@ fn queue_failures_of_other_prs_are_held() {
     assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "both are held");
     for id in ["issue-3", "issue-4"] {
         let held = task(&github, &["claim", id]).expect_err("a human's PR");
-        assert!(held.contains("#45 was opened by `owner`, not by `nami-agent[bot]`"), "{held}");
-        assert!(held.contains("a human rebases or renumbers it"), "{held}");
+        assert!(held.contains("#45 was not opened by the bot, so agents never push"), "{held}");
+        assert!(held.contains("a human rebases it"), "{held}");
     }
     github.issues[2].author = "nami-agent[bot]".to_owned();
     github.forks = vec![45];
