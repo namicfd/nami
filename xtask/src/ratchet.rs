@@ -58,10 +58,17 @@
 //! A Markdown summary goes to stdout; its last line is the verdict.
 //!
 //! **Exit code.** 0: pass, also when paths outside the rule paths changed (`pass, outside the
-//! rule paths`: CODEOWNERS decides on those). 1: fail, at least one finding. 2: no verdict:
-//! bad arguments, a tool that could not run or answer, an output that cannot be read, or a
-//! change the ratchet cannot vouch for (no mutant, no reviewer app, an edit
-//! without its approval) where no code owner reviews.
+//! rule paths`: CODEOWNERS decides on those). 1: fail, at least one finding. 2: no verdict, in
+//! three kinds:
+//! - in all cases, whoever reviews or approved: bad arguments, a tool that could not run or
+//!   answer, an output or observation that cannot be read or is of other trees, a skipped
+//!   check, a failed null-mutant run, or a merge group whose rule-path diff is not the carried
+//!   one. The fix is a change to the PR or a re-run, never an approval;
+//! - until a code owner approves the head commit: a form the ratchet refuses, such as a file
+//!   outside the dialect, a symbolic link or a name that is not valid UTF-8;
+//! - where no code owner reviews or has approved the head commit: something the ratchet cannot
+//!   vouch for though its evidence is complete, a hunk without a mutant, an edit without the
+//!   reviewer app's approval, or a build file.
 
 pub mod canonical;
 pub mod carry;
@@ -247,6 +254,10 @@ pub struct Faults {
     pub find: Option<Step>,
     /// The phase of `observe` that fails.
     pub fail_observing: Option<Step>,
+    /// The kind `fail` is recorded as, whatever the step's own error path says: `None` keeps
+    /// the step's kind, mostly [`Reason::Evidence`]; [`Reason::Refused`] tests the settleable
+    /// path.
+    pub fail_as: Option<Reason>,
 }
 
 /// Why the ratchet could not reach a verdict on something, and whether a code owner's approval
@@ -268,6 +279,9 @@ pub enum Reason {
     /// the class does not read.
     Refused,
     /// A merge group whose rule-path diff differs from the one the carried evidence mutated.
+    /// Never settled: no approval merges rule text that was not mutation-tested in that exact
+    /// form; the PR is rebased and pushed, so that it is observed on its new base (maintainer's
+    /// priority, review of #57, round 15).
     CarriedDiff,
 }
 
@@ -277,12 +291,8 @@ impl Reason {
     #[must_use]
     pub fn settleable(self) -> bool {
         match self {
-            Self::Evidence => false,
-            Self::UnapprovedEdit
-            | Self::NoMutant
-            | Self::BuildFile
-            | Self::Refused
-            | Self::CarriedDiff => true,
+            Self::Evidence | Self::CarriedDiff => false,
+            Self::UnapprovedEdit | Self::NoMutant | Self::BuildFile | Self::Refused => true,
         }
     }
 }
@@ -433,6 +443,8 @@ struct Progress {
     /// True if the reviewer app approved the head commit, and the review gate read everything
     /// and found nothing.
     app_approved: bool,
+    /// The kind of the planted failure that the step records next ([`Faults::fail_as`]).
+    injected_as: Option<Reason>,
 }
 
 impl Verdict {
@@ -445,6 +457,7 @@ impl Verdict {
 
     /// Records that `step` could not reach a result, for `reason`, of the kind `why`.
     pub fn fail_for(&mut self, step: Step, why: Reason, reason: impl fmt::Display) {
+        let why = self.progress.injected_as.take().unwrap_or(why);
         let reason = reason.to_string();
         assert!(!reason.is_empty(), "a failure says why");
         let line = format!("{}: {reason}", step.name());
@@ -514,7 +527,7 @@ impl Verdict {
     /// error, which the step handles as it handles a real one. A step that also finds fails
     /// only once it has reached its body, so that it finds and then fails.
     fn inject<T, E: fmt::Display>(
-        &self,
+        &mut self,
         step: Step,
         tools: &Tools<'_>,
         read: Result<T, E>,
@@ -522,6 +535,7 @@ impl Verdict {
         let faults = tools.faults;
         let after_finding = faults.find != Some(step) || self.reached.contains(&step);
         if faults.fail == Some(step) && after_finding {
+            self.progress.injected_as = faults.fail_as;
             return Err("an injected failure".to_owned());
         }
         read.map_err(|error| error.to_string())
@@ -558,19 +572,19 @@ impl Verdict {
     fn line_with(&self, unproven: &[String]) -> String {
         let class =
             self.class.as_ref().map_or(String::new(), |class| format!(" ({})", class.name()));
+        // Missing or broken evidence is no question for the code owner (review of #57, round
+        // 15): only what is settleable is theirs to decide.
+        let remedy =
+            if self.is_settleable() { "the code owner decides" } else { "fix the PR or re-run" };
         if !self.findings.is_empty() {
             format!("ratchet: fail{class}, {} finding(s)", self.findings.len())
         } else if !self.failed.is_empty() {
             format!(
-                "ratchet: no verdict{class}, {} step(s) could not be judged; the code owner \
-                 decides",
+                "ratchet: no verdict{class}, {} step(s) could not be judged; {remedy}",
                 self.failed.len()
             )
         } else if !unproven.is_empty() {
-            format!(
-                "ratchet: no verdict{class}, {} thing(s) unproven; the code owner decides",
-                unproven.len()
-            )
+            format!("ratchet: no verdict{class}, {} thing(s) unproven; {remedy}", unproven.len())
         } else if self.outside.is_empty() {
             format!("ratchet: pass{class}")
         } else {
@@ -687,6 +701,20 @@ fn scope_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict
         }
         Err(error) => verdict.fail(Step::Scope, format!("cannot read the head tree: {error}")),
     }
+    // A name that is not valid UTF-8 has no text that every reader agrees on: it is refused
+    // before anything converts it, and no step reads it (review of #57, round 15).
+    match tree::refused(head) {
+        Ok(refused) => {
+            for (path, why) in refused {
+                let reason = format!(
+                    "the head's path `{path}` {why}, which the ratchet cannot name soundly; \
+                     rename it"
+                );
+                verdict.fail_for(Step::Scope, Reason::Refused, reason);
+            }
+        }
+        Err(error) => verdict.fail(Step::Scope, format!("cannot read the head tree: {error}")),
+    }
     assert_eq!(
         verdict.rule_paths.len() + verdict.outside.len(),
         verdict.changed.len(),
@@ -734,7 +762,13 @@ pub fn observe(base: &Path, head: &Path, tools: &Tools<'_>) -> Observations {
     });
     match observing(tools, Step::Observations, fingerprinted) {
         Ok((corpus, head_tree)) => (observed.corpus, observed.head) = (corpus, head_tree),
-        Err(reason) => observed.fail(Step::Observations, reason),
+        Err(reason) => {
+            // Without the fingerprints no seed can be drawn, and the judge refuses observations
+            // of trees it cannot check, so nothing more is observed; the failure is recorded,
+            // never asserted (review of #57, round 15).
+            observed.fail(Step::Observations, reason);
+            return observed;
+        }
     }
     observed.seed = tools.seed(&observed.corpus, &observed.head);
     let known = scoped.progress.scoped;
@@ -1075,8 +1109,9 @@ fn classify_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verd
 
 /// The step [`Step::Carry`]: for a merge group, that the carried mutation evidence can be read
 /// and is of this rule-path diff ([`carry::check`]). When it fails, mutation testing has no
-/// evidence, and every other step is judged on. Evidence that cannot be read never settles;
-/// another rule-path diff than the carried one does ([`Reason::CarriedDiff`]).
+/// evidence, and every other step is judged on. Neither evidence that cannot be read nor
+/// another rule-path diff than the carried one ([`Reason::CarriedDiff`]) ever settles: the PR is
+/// rebased and pushed (review of #57, round 15).
 fn carry_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict) {
     verdict.enter(Step::Carry);
     if !tools.mutants {
@@ -1199,12 +1234,12 @@ pub fn check_all(base: &Path, head: &Path, tools: &Tools<'_>) -> Verdict {
 /// `verdict`, settled by a code owner if it can be. A code owner's approval of the head commit
 /// settles a no verdict only when each of its reasons is unprovable though the evidence is
 /// complete ([`Reason::settleable`]): a form the ratchet refuses, such as a file outside the
-/// dialect or a symbolic link, or a merge group whose rule-path diff differs from the carried
-/// one. Each becomes a note, and so does each unproven item, and the verdict passes. Evidence
-/// that is missing, unreadable or mismatched, or a tool that failed, is never settled: the PR
-/// is fixed or the job re-run, so an honest PR never needs the admin bypass (review of #57,
-/// round 14). A verdict with any finding is never settled: it fails, and its summary lists what
-/// was not judged as well (round 11).
+/// dialect, a symbolic link or a name that is not valid UTF-8. Each becomes a note, and so does
+/// each unproven item, and the verdict passes. Evidence that is missing, unreadable or
+/// mismatched, a tool that failed, and a merge group whose rule-path diff is not the carried
+/// one are never settled: an honest PR's remedy is a change to the PR, or a re-run (review of
+/// #57, rounds 14 and 15). A verdict with any finding is never settled: it fails, and its
+/// summary lists what was not judged as well (round 11).
 ///
 /// # Errors
 ///
@@ -1398,27 +1433,33 @@ mod tests {
         assert!(!approved.is_settleable(), "missing evidence is never settled");
     }
 
-    // Goal: round 14 of #57's review: an approval settles only what is unprovable though the
-    // evidence is complete; a failure of the default kind, missing or broken evidence, never.
+    // Goal: rounds 14 and 15 of #57's review: an approval settles only what is unprovable
+    // though the evidence is complete; missing or broken evidence, and a merge group's carried
+    // rule-path diff that differs, never. The verdict line asks the code owner only for what is
+    // theirs to settle, and otherwise for a fix or a re-run.
     #[test]
     fn only_complete_evidence_settles() {
-        let settleable = [
-            Reason::UnapprovedEdit,
-            Reason::NoMutant,
-            Reason::BuildFile,
-            Reason::Refused,
-            Reason::CarriedDiff,
-        ];
-        assert!(settleable.iter().all(|why| why.settleable()) && !Reason::Evidence.settleable());
+        let settleable =
+            [Reason::UnapprovedEdit, Reason::NoMutant, Reason::BuildFile, Reason::Refused];
+        assert!(settleable.iter().all(|why| why.settleable()));
+        assert!(!Reason::Evidence.settleable() && !Reason::CarriedDiff.settleable());
         let mut refused = Verdict::default();
         refused.fail_for(Step::Scope, Reason::Refused, "a symbolic link");
         assert!(refused.is_settleable() && refused.has_failed(Step::Scope));
+        assert!(refused.line().ends_with("; the code owner decides"), "{}", refused.line());
         refused.fail(Step::LintLibrary, "the library run was killed");
         assert!(!refused.is_settleable(), "{:?}", refused.failed);
+        assert!(refused.line().ends_with("; fix the PR or re-run"), "{}", refused.line());
         assert_eq!(
             refused.failed,
             ["scope: a symbolic link", "lint library: the library run was killed"]
         );
+        let mut carried = Verdict::default();
+        carried.fail_for(Step::Carry, Reason::CarriedDiff, "another rule-path diff");
+        assert!(!carried.is_settleable(), "rebase and push instead");
+        let mut skipped = Verdict::default();
+        skipped.unprovable(Reason::Evidence, "mutation testing was skipped".to_owned());
+        assert!(skipped.line().ends_with("thing(s) unproven; fix the PR or re-run"));
     }
 
     // Goal: an edit leaves its first change unproven, counting the rest; an additive diff leaves

@@ -18,16 +18,29 @@ const SKIPPED_AT_ROOT: [&str; 5] =
 /// Upper bound on the directories one walk visits (`TIGER_STYLE.md`, Limits).
 const DIRECTORIES_MAX: u32 = 100_000;
 
-/// What sits at a path: a regular file with its bytes, or a symbolic link with its target.
+/// What sits at a path: a regular file with its bytes, a symbolic link with its target, or a
+/// path the ratchet refuses to name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
     /// A regular file.
     File(Vec<u8>),
     /// A symbolic link, which is never followed.
     Link(PathBuf),
+    /// A path whose name is not valid UTF-8, or whose key another name maps to, with why and
+    /// the bytes of the file if it is one. It is keyed by its bytes, escaped, so that no lossy
+    /// text stands for it (review of #57, round 15). It is never read, copied or compared as a
+    /// changed path; the judge refuses the head that holds it ([`refused`]).
+    Refused {
+        /// Why the path is refused.
+        why: String,
+        /// The file's bytes; empty for a directory or a link, which is not entered.
+        content: Vec<u8>,
+    },
 }
 
-/// Every file and link below `root`, by path relative to `root`, with `/` as separator.
+/// Every file and link below `root`, by path relative to `root`, with `/` as separator. A name
+/// that is not valid UTF-8 is keyed by its escaped bytes and refused, and so is a key that two
+/// names map to, whatever order the directory lists them in.
 ///
 /// # Errors
 ///
@@ -41,35 +54,87 @@ pub fn entries(root: &Path) -> io::Result<BTreeMap<String, Entry>> {
             return Ok(found);
         };
         for entry in fs::read_dir(root.join(&directory))? {
-            let entry = entry?;
-            let relative = directory.join(entry.file_name());
-            let kind = entry.file_type()?;
-            // A worktree's `.git` is a file, and is skipped like the directory.
-            if SKIPPED_AT_ROOT.iter().any(|skipped| relative == Path::new(skipped)) {
-                continue;
-            }
-            if kind.is_symlink() {
-                let _replaced =
-                    found.insert(slashed(&relative), Entry::Link(fs::read_link(entry.path())?));
-            } else if kind.is_dir() && !is_skipped(root, &relative) {
-                pending.push(relative);
-            } else if !kind.is_dir() {
-                let _replaced =
-                    found.insert(slashed(&relative), Entry::File(fs::read(entry.path())?));
-            }
+            visit(root, &directory, &entry?, &mut found, &mut pending)?;
         }
     }
     panic!("more than {DIRECTORIES_MAX} directories below {}", root.display());
 }
 
+/// Records one directory entry below `root`, in `directory`, into `found`, or queues it in
+/// `pending` if it is a directory to walk.
+///
+/// # Errors
+///
+/// Returns an error if the entry cannot be read.
+fn visit(
+    root: &Path,
+    directory: &Path,
+    entry: &fs::DirEntry,
+    found: &mut BTreeMap<String, Entry>,
+    pending: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let relative = directory.join(entry.file_name());
+    let kind = entry.file_type()?;
+    // A worktree's `.git` is a file, and is skipped like the directory.
+    if SKIPPED_AT_ROOT.iter().any(|skipped| relative == Path::new(skipped)) {
+        return Ok(());
+    }
+    let (key, named) = key_of(&relative);
+    if !named {
+        let content = if kind.is_file() { fs::read(entry.path())? } else { Vec::new() };
+        let why = "is not valid UTF-8".to_owned();
+        insert(found, key, Entry::Refused { why, content });
+    } else if kind.is_symlink() {
+        insert(found, key, Entry::Link(fs::read_link(entry.path())?));
+    } else if kind.is_dir() && !is_skipped(root, &relative) {
+        pending.push(relative);
+    } else if !kind.is_dir() {
+        insert(found, key, Entry::File(fs::read(entry.path())?));
+    }
+    Ok(())
+}
+
+/// Records `entry` at `key`; a key that is already taken is refused, whichever came first.
+fn insert(found: &mut BTreeMap<String, Entry>, key: String, entry: Entry) {
+    match found.entry(key) {
+        std::collections::btree_map::Entry::Vacant(vacant) => {
+            let _inserted = vacant.insert(entry);
+        }
+        std::collections::btree_map::Entry::Occupied(mut taken) => {
+            let why = format!("is the key of two names, `{}`", taken.key());
+            let _replaced = taken.insert(Entry::Refused { why, content: Vec::new() });
+        }
+    }
+}
+
+/// The paths below `root` that the ratchet refuses ([`Entry::Refused`]), with why. Sorted.
+///
+/// # Errors
+///
+/// Returns an error if the tree cannot be read.
+pub fn refused(root: &Path) -> io::Result<Vec<(String, String)>> {
+    let found = entries(root)?
+        .into_iter()
+        .filter_map(|(path, entry)| match entry {
+            Entry::Refused { why, .. } => Some((path, why)),
+            Entry::File(_) | Entry::Link(_) => None,
+        })
+        .collect();
+    Ok(found)
+}
+
 /// The paths whose entry differs between the two trees: changed, added or removed. Sorted.
+/// Refused paths are never among them: no reader can open them by their key.
 ///
 /// # Errors
 ///
 /// Returns an error if either tree cannot be read.
 pub fn changed_paths(base: &Path, head: &Path) -> io::Result<Vec<String>> {
-    let before = entries(base)?;
-    let after = entries(head)?;
+    let readable = |entry: &Entry| !matches!(entry, Entry::Refused { .. });
+    let mut before = entries(base)?;
+    let mut after = entries(head)?;
+    before.retain(|_, entry| readable(entry));
+    after.retain(|_, entry| readable(entry));
     let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
     let changed: Vec<String> =
         paths.into_iter().filter(|path| before.get(*path) != after.get(*path)).cloned().collect();
@@ -102,17 +167,34 @@ pub fn fingerprint(root: &Path) -> io::Result<(String, Vec<String>)> {
                 hash = crate::dylint::fnv1a(hash, target.as_os_str().as_encoded_bytes());
                 links.push(path);
             }
+            Entry::Refused { why, content } => {
+                hash = crate::dylint::fnv1a(hash, &[2]);
+                hash = crate::dylint::fnv1a(hash, why.as_bytes());
+                hash = crate::dylint::fnv1a(hash, &content);
+            }
         }
         hash = crate::dylint::fnv1a(hash, &[0xff]);
     }
     Ok((format!("{hash:016x}"), links))
 }
 
-/// A path relative to the root, spelled with `/` whatever the platform.
-fn slashed(relative: &Path) -> String {
-    let parts: Vec<String> =
-        relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
-    parts.join("/")
+/// A path relative to the root, spelled with `/` whatever the platform, and whether every part
+/// is valid UTF-8. A part that is not is spelled by its bytes, escaped (`\xff`), never by a
+/// lossy replacement that two names could share.
+fn key_of(relative: &Path) -> (String, bool) {
+    let mut named = true;
+    let parts: Vec<String> = relative
+        .components()
+        .map(|part| {
+            if let Some(text) = part.as_os_str().to_str() {
+                return text.to_owned();
+            }
+            named = false;
+            part.as_os_str().as_encoded_bytes().escape_ascii().to_string()
+        })
+        .collect();
+    assert!(!parts.is_empty(), "a path below the root has a part");
+    (parts.join("/"), named)
 }
 
 /// True for a directory the walk does not enter besides [`SKIPPED_AT_ROOT`]: another checkout
@@ -254,6 +336,36 @@ mod tests {
         assert_eq!(paths, ["crates/a/target/kept.rs", "link", "xtask/src/a.rs"]);
         assert_eq!(found.get("link"), Some(&Entry::Link("xtask/src/a.rs".into())));
         assert_eq!(found.get("xtask/src/a.rs"), Some(&Entry::File(b"a".to_vec())));
+    }
+
+    // Goal: review of #57, round 15: a name that is not valid UTF-8 is keyed by its escaped
+    // bytes and refused, never turned into lossy text; a valid name that spells the same key is
+    // refused with it, whichever the directory lists first. Refused paths are no changed paths,
+    // no copied files, and still count in the fingerprint.
+    #[test]
+    fn names_that_are_not_utf8_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = Temporary::new("ratchet-names-base");
+        let head = Temporary::new("ratchet-names-head");
+        for tree in [&base, &head] {
+            tree.write("lints/src/lib.rs", "kept");
+        }
+        let odd = std::ffi::OsStr::from_bytes(b"\xff.rs");
+        std::fs::write(head.root().join("lints/src").join(odd), "hidden").unwrap();
+        let refused = super::refused(head.root()).unwrap();
+        assert_eq!(refused, [("lints/src/\\xff.rs".to_owned(), "is not valid UTF-8".to_owned())]);
+        assert_eq!(changed_paths(base.root(), head.root()).unwrap(), Vec::<String>::new());
+        let before = super::fingerprint(head.root()).unwrap().0;
+        std::fs::write(head.root().join("lints/src").join(odd), "changed").unwrap();
+        assert_ne!(super::fingerprint(head.root()).unwrap().0, before, "its bytes count");
+        head.write("lints/src/\\xff.rs", "spelled like the escape");
+        let clash = super::refused(head.root()).unwrap();
+        assert_eq!(clash.len(), 1, "{clash:?}");
+        assert!(clash[0].1.starts_with("is the key of two names"), "{clash:?}");
+        let place = Temporary::new("ratchet-names-copy");
+        let copy = Scratch::copy_of(head.root(), &place.root().join("tree")).unwrap();
+        let copied: Vec<String> = entries(copy.root()).unwrap().into_keys().collect();
+        assert_eq!(copied, ["lints/src/lib.rs"], "refused paths are not copied");
     }
 
     // Goal: a path counts as changed when its content differs, when it exists on one side

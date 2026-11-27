@@ -19,8 +19,8 @@ use xtask::ratchet::review::{
 };
 use xtask::ratchet::tree::Scratch;
 use xtask::ratchet::{
-    Check, Faults, ReviewSource, STEPS, Step, Tools, Verdict, canonical, carry, check, check_all,
-    judge, judge_all, judge_unobserved, observe, settled,
+    Check, Faults, Reason, ReviewSource, STEPS, Step, Tools, Verdict, canonical, carry, check,
+    check_all, judge, judge_all, judge_unobserved, observe, settled,
 };
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
@@ -857,6 +857,13 @@ fn a_merge_group_carries_the_pr_s_mutation_evidence() {
     other.head = xtask::ratchet::tree::fingerprint(&carried.join("head")).expect("readable").0;
     keep(&other);
     assert!(judged().unwrap_err().contains("another rule-path diff"), "another diff");
+    // Rule text that was not mutation-tested in this form never merges on an approval: the PR
+    // is rebased and pushed (maintainer's priority, review of #57, round 15).
+    let mut approved = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+    approved.carried = Some(carry::Carried::read(&carried));
+    let unsettled = judge_all(&case.base(), &case.head(), &queued, &approved);
+    let reason = settled(&case.base(), &approved, unsettled).unwrap_err();
+    assert!(reason.contains("another rule-path diff") && reason.contains("No approval"));
     let mut refused = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
     refused.carried = Some(carry::Carried::read(&carried));
     let unused = judge_all(&case.base(), &case.head(), &queued, &refused);
@@ -1307,6 +1314,32 @@ fn the_reviewer_s_round_14_probes_fail() {
     assert!(unlocked.has_failed(Step::LintLibrary), "{:?}", unlocked.failed);
 }
 
+// Goal: round 15 of #57's review, the reviewer's probe: a head file named `lints/src/\xff.rs`,
+// which is not valid UTF-8, no longer panics the judge or the carry check. It is a form the
+// ratchet refuses: beside a tidy loosening, with the code owner's approval, the verdict fails
+// on the corpus's findings; without one, the approval settles it into a pass that names it.
+#[test]
+fn a_name_that_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let case = Case::new("round-15-utf8");
+    let odd = std::ffi::OsStr::from_bytes(b"\xff.rs");
+    fs::write(case.head().join("lints/src").join(odd), "fn hidden() {}\n").expect("writable");
+    let refusal = "scope: the head's path `lints/src/\\xff.rs` is not valid UTF-8";
+    let loose = case.tools("unbounded-loop", "any", NOTHING, &OWNER_APPROVED);
+    let loosened = check_all(&case.base(), &case.head(), &loose);
+    let failed = settled(&case.base(), &loose, loosened).expect("a verdict with findings");
+    assert!(failed.line().starts_with("ratchet: fail"), "{}", failed.summary());
+    assert!(failed.findings.iter().any(|finding| finding.check == Check::TidyCorpus));
+    assert!(failed.failed.iter().any(|why| why.starts_with(refusal)), "{:?}", failed.failed);
+    let honest = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+    let raw = check_all(&case.base(), &case.head(), &honest);
+    let passed = settled(&case.base(), &honest, raw).expect("the approval settles a refused form");
+    assert!(passed.line().starts_with("ratchet: pass"), "{}", passed.summary());
+    assert!(passed.notes.iter().any(|note| note.contains(refusal)), "{}", passed.summary());
+    let diff = carry::rule_diff(&case.base(), &case.head()).expect("the trees are read");
+    assert!(diff.iter().all(|(path, _, _)| path.is_ascii()), "the refused name is not compared");
+}
+
 // Goal: `observe` records the commits it was given, and marks a head without a tooling change
 // as skipped, having run nothing.
 #[test]
@@ -1341,19 +1374,26 @@ fn assert_accounted(raw: &Verdict, what: &str) {
 }
 
 /// Asserts what a planted finding of `find` gives in `raw`, with the code owner's approval: the
-/// step kept it if it reached its body, and settling never passes. With the finding the verdict
-/// fails; without it, the step that dropped it says why, and a planted failure, missing
-/// evidence, stays no verdict.
-fn assert_never_passes(base: &Path, tools: &Tools<'_>, raw: Verdict, find: Step, what: &str) {
+/// step kept it if it reached its body. With the finding the verdict fails. Without it, the
+/// step that dropped it says why; a planted failure of missing evidence stays no verdict, and
+/// one of a refused form, `refused`, which is all that is left, settles into a pass that lists
+/// it.
+fn assert_never_passes(tools: &Tools<'_>, raw: Verdict, find: Step, refused: bool, what: &str) {
+    let base = tools.work.parent().expect("the work directory is in the case").join("base");
     let place = format!("injected/{}", find.name());
     let kept = raw.findings.iter().any(|finding| finding.place == place);
     assert_eq!(kept, raw.reached.contains(&find), "{what}: {}", raw.summary());
-    match settled(base, tools, raw) {
-        Ok(verdict) => {
+    match settled(&base, tools, raw) {
+        Ok(verdict) if kept => {
             assert!(verdict.line().starts_with("ratchet: fail"), "{what}: {}", verdict.summary());
-            assert!(kept, "{what}: a fail with the finding listed: {}", verdict.summary());
         }
-        Err(reason) => assert!(!kept, "{what}: the finding was dropped: {reason}"),
+        Ok(verdict) => {
+            assert!(refused, "{what}: only a refused form settles: {}", verdict.summary());
+            assert!(verdict.line().starts_with("ratchet: pass"), "{what}: {}", verdict.summary());
+            let listed = verdict.notes.iter().any(|note| note.contains("an injected failure"));
+            assert!(listed, "{what}: the settled refusal is listed: {}", verdict.summary());
+        }
+        Err(reason) => assert!(!kept && !refused, "{what}: {reason}"),
     }
 }
 
@@ -1363,8 +1403,10 @@ fn assert_never_passes(base: &Path, tools: &Tools<'_>, raw: Verdict, find: Step,
 // carried evidence that cannot be read. For every pair of a step S that fails and a step T that
 // finds, S itself included (it finds, then fails), S's failure is listed, T's finding is kept
 // whenever T reached its body, and with the owner's approval the verdict fails or stays no
-// verdict, never a pass. The same holds when a phase of `observe` fails instead. A step added
-// to the judge is in `STEPS`, or the first check fails; once there, the matrix covers it.
+// verdict. S fails once with missing evidence and once with a refused form, which settles into
+// a pass only when no finding is left (round 15). The same holds when a phase of `observe`
+// fails instead, also without a fixed seed, as in CI. A step added to the judge is in `STEPS`,
+// or the first check fails; once there, the matrix covers it.
 #[test]
 fn no_failed_step_drops_another_step_s_finding() {
     let case = Case::new("faults");
@@ -1387,23 +1429,29 @@ fn no_failed_step_drops_another_step_s_finding() {
     tools.carried = Some(Err("the carried evidence cannot be read".to_owned()));
     assert_accounted(&judge_all(&base, &head, &observed, &tools), "unreadable carried evidence");
     tools.carried = Some(carry::Carried::read(&carried));
-    for fail in STEPS {
-        for find in STEPS {
-            tools.faults = Faults { fail: Some(fail), find: Some(find), fail_observing: None };
-            let pair = format!("{} fails, {} finds", fail.name(), find.name());
-            let raw = judge_all(&base, &head, &observed, &tools);
-            assert_accounted(&raw, &pair);
-            // The step handles the planted failure as a real one, in its own words.
-            let step = format!("{}: ", fail.name());
-            let listed = |why: &String| why.starts_with(&step) && why.ends_with("injected failure");
-            assert!(raw.failed.iter().any(listed), "{pair}: {:?}", raw.failed);
-            assert_never_passes(&base, &tools, raw, find, &pair);
-        }
+    for (fail, find, fail_as) in STEPS
+        .into_iter()
+        .flat_map(|fail| STEPS.map(|find| (fail, find)))
+        .flat_map(|(fail, find)| [None, Some(Reason::Refused)].map(|kind| (fail, find, kind)))
+    {
+        tools.faults = Faults { fail: Some(fail), find: Some(find), fail_as, ..Faults::default() };
+        let pair = format!("{} fails as {fail_as:?}, {} finds", fail.name(), find.name());
+        let raw = judge_all(&base, &head, &observed, &tools);
+        assert_accounted(&raw, &pair);
+        // The step handles the planted failure as a real one, in its own words.
+        let step = format!("{}: ", fail.name());
+        let listed = |why: &String| why.starts_with(&step) && why.ends_with("injected failure");
+        assert!(raw.failed.iter().any(listed), "{pair}: {:?}", raw.failed);
+        assert_never_passes(&tools, raw, find, fail_as.is_some(), &pair);
     }
     tools.carried = None;
+    // The last phase runs as CI runs it, without a fixed seed (review of #57, round 15).
     let phases = [Step::Observations, Step::TidyCorpus, Step::LintLibrary, Step::LintCases];
-    for phase in phases.into_iter().chain([Step::Mutants, Step::NullRun]) {
+    let seeded =
+        phases.into_iter().chain([Step::Mutants, Step::NullRun]).map(|phase| (phase, true));
+    for (phase, fixed) in seeded.chain([(Step::Observations, false)]) {
         tools.faults = Faults { fail_observing: Some(phase), ..Faults::default() };
+        tools.seed = if fixed { Some(11) } else { None };
         let partial = observe(&base, &head, &tools);
         assert_eq!(
             partial.failures_of(phase).count(),
@@ -1418,7 +1466,7 @@ fn no_failed_step_drops_another_step_s_finding() {
             let raw = judge_all(&base, &head, &partial, &tools);
             assert_accounted(&raw, &what);
             assert!(raw.has_failed(phase), "{what}: the phase's step fails: {:?}", raw.failed);
-            assert_never_passes(&base, &tools, raw, find, &what);
+            assert_never_passes(&tools, raw, find, false, &what);
         }
     }
 }
