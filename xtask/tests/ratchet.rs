@@ -1307,6 +1307,21 @@ fn the_reviewer_s_round_14_probes_fail() {
     assert!(unlocked.has_failed(Step::LintLibrary), "{:?}", unlocked.failed);
 }
 
+// Goal: `observe` records the commits it was given, and marks a head without a tooling change
+// as skipped, having run nothing.
+#[test]
+fn observe_records_its_commits_and_what_it_skipped() {
+    let case = Case::new("observe-records");
+    let mut tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    (tools.pr_head, tools.commit) = (Some("pr-head".to_owned()), Some("merge".to_owned()));
+    let observed = observed_cleanly(&case.base(), &case.head(), &tools);
+    assert_eq!((observed.pr_head.as_str(), observed.commit.as_str()), ("pr-head", "merge"));
+    assert!(!observed.skipped && !observed.runs.is_empty(), "a rule path changed");
+    fs::remove_file(case.head().join("docs/RULES.md")).expect("the head's change");
+    let untouched = observed_cleanly(&case.base(), &case.head(), &tools);
+    assert!(untouched.skipped && untouched.runs.is_empty(), "{untouched:?}");
+}
+
 /// Observes the head with `tools`, and asserts that no phase failed.
 fn observed_cleanly(base: &Path, head: &Path, tools: &Tools<'_>) -> Observations {
     let observed = observe(base, head, tools);
