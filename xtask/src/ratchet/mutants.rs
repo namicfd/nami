@@ -38,7 +38,7 @@
 //! A run that was killed, or that left out a file with mutants, is no verdict.
 
 use super::observations::{Observations, Run};
-use super::{Check, Finding, Tools};
+use super::{Check, Finding, Step, Tools, Verdict};
 use crate::json::{self, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -386,120 +386,139 @@ fn judge_null(
     )))
 }
 
-/// What mutation testing showed: findings, a note per workspace with its mutant count, and
-/// what it could not show.
-#[derive(Debug, Default)]
-pub struct Judged {
-    /// Missed mutants.
-    pub findings: Vec<Finding>,
-    /// The number of mutants per workspace.
-    pub notes: Vec<String>,
-    /// Changes that yield no mutant, which mutation testing cannot vouch for. For an edit, the
-    /// reviewer app's approval stands in for them.
-    pub unproven: Vec<String>,
-    /// Workspaces whose null-mutant run failed, so that their mutant evidence proves nothing.
-    /// No approval by the reviewer app stands in for that, only a code owner's (review of
-    /// #55, thread 2).
-    pub null_failed: Vec<String>,
-    /// What could not be judged, per workspace: a missing run, an unexpected exit code, a
-    /// timeout, or an unreadable or inconsistent listing, `outcomes.json` or `missed.txt`. Each
-    /// is no verdict, and none of them drops another workspace's missed mutants (review of #57,
-    /// round 11).
-    pub failed: Vec<String>,
+/// What the mutation steps judge.
+pub struct Inputs<'a> {
+    /// The base tree.
+    pub base: &'a Path,
+    /// The head tree.
+    pub head: &'a Path,
+    /// The changed rule paths.
+    pub rule_paths: &'a [String],
+    /// The observations or the carried evidence that hold the runs; `None` when neither could
+    /// be judged, which a failed step already says.
+    pub evidence: Option<&'a Observations>,
+    /// The work directory, `--mutants` and the faults.
+    pub tools: &'a Tools<'a>,
+    /// By file, the lines of the dispatch calls and of the new declarations, whose hunks need
+    /// no mutant of their own; `None` if the diff could not be classified, which leaves out
+    /// only the coverage of the hunks.
+    pub class: Option<&'a super::class::Class>,
 }
 
-/// What [`judge`] judges.
-struct Inputs<'a> {
-    base: &'a Path,
-    head: &'a Path,
-    rule_paths: &'a [String],
-    observations: &'a Observations,
-    work: &'a Path,
-    class: Option<&'a super::class::Class>,
+/// The first line of every mutant, by file relative to the root, per workspace whose mutation
+/// run was read and has mutants: what its null run must cover.
+type Starts = BTreeMap<&'static str, BTreeMap<String, Vec<u32>>>;
+
+/// Judges the recorded runs in two steps, workspace by workspace: [`Step::Mutants`], the
+/// mutation runs, and [`Step::NullRun`], the null-mutant runs. A workspace that cannot be
+/// judged fails its step, and the other workspaces are judged on (review of #57, round 11).
+pub fn judge(inputs: &Inputs<'_>, verdict: &mut Verdict) {
+    let mut starts = Starts::new();
+    mutation_step(inputs, &mut starts, verdict);
+    null_step(inputs, &starts, verdict);
+    assert!(starts.values().all(|files| !files.is_empty()), "a run with mutants places them");
 }
 
-/// Judges the recorded mutation runs, workspace by workspace. `class` holds, by file, the lines
-/// of the dispatch calls and of the new declarations, whose hunks need no mutant of their own;
-/// without it (the diff could not be classified), the missed mutants are still read, and only
-/// the coverage of the hunks is left out. What cannot be judged goes into [`Judged::failed`],
-/// and the other workspaces are judged on.
-#[must_use]
-pub fn judge(
-    base: &Path,
-    head: &Path,
-    rule_paths: &[String],
-    observations: &Observations,
-    work: &Path,
-    class: Option<&super::class::Class>,
-) -> Judged {
-    let inputs = Inputs { base, head, rule_paths, observations, work, class };
-    let mut judged = Judged::default();
+/// The step [`Step::Mutants`]: each workspace's mutation run, into `verdict`, and where its
+/// mutants are, into `starts`.
+fn mutation_step(inputs: &Inputs<'_>, starts: &mut Starts, verdict: &mut Verdict) {
+    if !verdict.enter(Step::Mutants, inputs.tools) {
+        return;
+    }
+    if !inputs.tools.mutants {
+        return verdict.unprovable("mutation testing was skipped (`--no-mutants`)".to_owned());
+    }
+    let Some(evidence) = inputs.evidence else {
+        return;
+    };
+    verdict.ran(Check::Mutants);
     for workspace in &WORKSPACES {
-        if sources(head, rule_paths, workspace).is_empty() {
-            continue;
-        }
-        if let Err(problem) = judge_workspace(&inputs, workspace, &mut judged) {
-            judged.failed.push(problem);
+        if !sources(inputs.head, inputs.rule_paths, workspace).is_empty() {
+            mutation_run(inputs, evidence, workspace, starts, verdict);
         }
     }
-    judged
 }
 
-/// Judges the mutation run of one workspace into `judged`. Its missed mutants are recorded from
-/// `missed.txt` before anything that can fail, the exit code, the counts and the timeouts
-/// among them, so that no later failure drops them (review of #57, round 12).
-///
-/// # Errors
-///
-/// No verdict for this workspace, as for [`Judged::failed`].
-fn judge_workspace(
+/// Judges the mutation run of one workspace. Its missed mutants are recorded from `missed.txt`
+/// before anything that can fail, the exit code, the counts and the timeouts among them, so
+/// that no later failure drops them (review of #57, round 12). What cannot be judged fails
+/// [`Step::Mutants`].
+fn mutation_run(
     inputs: &Inputs<'_>,
+    evidence: &Observations,
     workspace: &Workspace,
-    judged: &mut Judged,
-) -> Result<(), String> {
-    let run =
-        inputs.observations.runs_of(workspace.name, "mutants").next().ok_or_else(|| {
-            format!("the observations hold no mutation run of {}", workspace.name)
-        })?;
+    starts: &mut Starts,
+    verdict: &mut Verdict,
+) {
+    let Some(run) = evidence.runs_of(workspace.name, "mutants").next() else {
+        let reason = format!("the observations hold no mutation run of {}", workspace.name);
+        return verdict.fail(Step::Mutants, reason);
+    };
     if let Some(Some(missed)) = run.files.get(MISSED) {
-        judged.findings.extend(missed_findings(missed, workspace.directory));
+        for finding in missed_findings(missed, workspace.directory) {
+            verdict.record(finding);
+        }
     }
-    let (count, missed) = read_run(run)?;
+    let (count, missed) = match read_run(run) {
+        Ok(read) => read,
+        Err(reason) => return verdict.fail(Step::Mutants, reason),
+    };
     let missed_count = missed.lines().filter(|line| !line.trim().is_empty()).count();
-    judged.notes.push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
+    verdict.notes.push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
     // The registry's tables are data, which the rule-set check reads, so a data-only change
     // passes with no mutant. Every other hunk needs one of its own, unless each of its lines is
     // exempt (`hunks::is_exempt`): a comment or blank, test code, a dispatch call, a new
     // declaration, or a registration that a dispatch call appended lints to.
-    let starts =
-        if count == 0 { BTreeMap::new() } else { mutant_starts(run, workspace.directory)? };
+    let placed =
+        if count == 0 { Ok(BTreeMap::new()) } else { mutant_starts(run, workspace.directory) };
+    let here = match placed {
+        Ok(here) => here,
+        Err(reason) => return verdict.fail(Step::Mutants, reason),
+    };
+    assert!(count > 0 || here.is_empty(), "no mutant places without mutants");
+    // Without a class, no hunk can be told exempt; the diff is no verdict already.
     let mut uncovered = Vec::new();
-    for path in changed_sources(inputs.rule_paths, workspace) {
-        // Without a class, no hunk can be told exempt; the diff is no verdict already.
-        let Some(class) = inputs.class else {
-            break;
-        };
-        uncovered.extend(uncovered_hunks(
-            inputs.base,
-            inputs.head,
-            path,
-            &starts,
-            inputs.work,
-            class,
-        )?);
+    if let Some(class) = inputs.class {
+        for path in changed_sources(inputs.rule_paths, workspace) {
+            let work = &inputs.tools.work;
+            match uncovered_hunks(inputs.base, inputs.head, path, &here, work, class) {
+                Ok(hunks) => uncovered.extend(hunks),
+                Err(reason) => verdict.fail(Step::Mutants, reason),
+            }
+        }
     }
-    assert!(count > 0 || starts.is_empty(), "no mutant places without mutants");
     if count > 0 {
-        judged.null_failed.extend(judge_null(inputs.observations, workspace, &starts)?);
-        judged.unproven.extend(uncovered);
+        verdict.uncovered.extend(uncovered);
+        let _replaced = starts.insert(workspace.name, here);
     } else if let Some(first) = uncovered.first() {
-        judged.unproven.push(format!(
+        verdict.uncovered.push(format!(
             "the rule-path change in {} yields no mutant, so mutation testing proves nothing \
              about it (a changed constant or a deleted line makes none); {first}",
             workspace.name
         ));
     }
-    Ok(())
+}
+
+/// The step [`Step::NullRun`]: the null-mutant run of each workspace whose mutation run has
+/// mutants. A failed one leaves that workspace's mutant evidence unproven, even for an approved
+/// edit: only a code owner's approval stands in for it (review of #55, thread 2).
+fn null_step(inputs: &Inputs<'_>, starts: &Starts, verdict: &mut Verdict) {
+    if !verdict.enter(Step::NullRun, inputs.tools) || !inputs.tools.mutants {
+        return;
+    }
+    let Some(evidence) = inputs.evidence else {
+        return;
+    };
+    for workspace in &WORKSPACES {
+        let Some(here) = starts.get(workspace.name) else {
+            continue;
+        };
+        match judge_null(evidence, workspace, here) {
+            Ok(Some(what)) => verdict.unprovable(what),
+            Ok(None) => {}
+            Err(reason) => verdict.fail(Step::NullRun, reason),
+        }
+    }
 }
 
 /// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, whose

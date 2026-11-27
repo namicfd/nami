@@ -11,7 +11,7 @@
 //!
 //! An additive diff ([`super::class`]) merges on the ratchet's proof alone, so it needs no
 //! review by the app. An edit to existing rule code needs the app's latest decision to be an
-//! approval of the head commit ([`Gate::approved`]). A review of an earlier commit does not
+//! approval of the head commit ([`check`]). A review of an earlier commit does not
 //! count, not even when the later commits are fixes: the reviewer re-reviews the new head.
 //! Until the app exists (#59), a code owner's approval of the head stands in for an edit, as
 //! for everything else the ratchet cannot prove.
@@ -30,7 +30,7 @@
 //! [`Reviews`] is what the check needs from GitHub. [`GhReviews`] asks through `gh api`, as
 //! whoever `GH_TOKEN` names; the tests use fixed data.
 
-use super::{Check, Finding};
+use super::{Check, Finding, Step, Verdict};
 use crate::issue::github::parse_lines;
 use crate::json::{self, Value};
 use std::collections::BTreeMap;
@@ -44,8 +44,12 @@ pub const AUTHOR_APP: &str = "nami-agent[bot]";
 /// `NAMI_REVIEWER_LOGIN`.
 pub const REVIEWER_APP: &str = "nami-reviewer[bot]";
 
-/// Most review threads one query returns. A pull request with more is an error.
-const THREADS_MAX: u32 = 100;
+/// Most review threads one page of [`THREADS_QUERY`] holds.
+const THREADS_PER_PAGE: u32 = 100;
+
+/// Most pages of review threads the gate reads: 5000 threads with [`THREADS_PER_PAGE`], far
+/// above any pull request's. A pull request with more fails the gate.
+const THREAD_PAGES_MAX: u32 = 50;
 
 /// The state of a review that no longer counts.
 const DISMISSED: &str = "DISMISSED";
@@ -147,6 +151,23 @@ pub struct Thread {
     pub resolved_by: Option<Actor>,
 }
 
+/// One page of review threads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadPage {
+    /// The page's threads.
+    pub threads: Vec<Thread>,
+    /// The cursor of the next page; `None` on the last.
+    pub next: Option<String>,
+}
+
+impl ThreadPage {
+    /// All of `threads`, as the only page.
+    #[must_use]
+    pub fn last(threads: Vec<Thread>) -> Self {
+        Self { threads, next: None }
+    }
+}
+
 /// What the review check needs from GitHub. Every error says what failed.
 pub trait Reviews {
     /// The pull request.
@@ -163,12 +184,13 @@ pub trait Reviews {
     /// When GitHub cannot be asked.
     fn reviews(&self, pull: u32) -> Result<Vec<Review>, String>;
 
-    /// Every review thread of the pull request.
+    /// One page of the review threads of the pull request: the first with `after` `None`, and
+    /// then the one after the cursor `after` that the page before gave.
     ///
     /// # Errors
     ///
-    /// When GitHub cannot be asked, or the pull request has more threads than one query reads.
-    fn threads(&self, pull: u32) -> Result<Vec<Thread>, String>;
+    /// When GitHub cannot be asked.
+    fn threads(&self, pull: u32, after: Option<&str>) -> Result<ThreadPage, String>;
 
     /// The state each dismissed review had before it was dismissed, by review id, in upper
     /// case as reviews give it.
@@ -195,20 +217,6 @@ fn same_head(request: &Pull, judged: &str, pull: u32) -> Result<(), String> {
          head decides",
         request.head
     ))
-}
-
-/// What the review gate showed. An additive diff needs only that there are no findings; an
-/// edit to existing rule code also needs the approval (ADR-0022).
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Gate {
-    /// A request for changes that stands, an open thread, a thread resolved by someone else, or
-    /// a pull request that the reviewer opened.
-    pub findings: Vec<Finding>,
-    /// True if the reviewer commented on or approved the head commit, for the summary.
-    pub reviewed: bool,
-    /// True if the reviewer's latest decision is an approval of the head commit: what an edit
-    /// to existing rule code needs besides the rest of the gate.
-    pub approved: bool,
 }
 
 /// Whether the reviewer's requests for changes stand.
@@ -272,61 +280,151 @@ fn thread_problems(threads: &[Thread], reviewer: &str) -> Vec<String> {
     problems
 }
 
-/// Applies the review rule to pull request `pull`, whose head must still be `judged`, for the
-/// reviewer app `reviewer`.
-///
-/// # Errors
-///
-/// No verdict if GitHub cannot be asked, if the head has moved on from `judged`, or if
-/// `reviewer` is not an app other than the agents' own.
+/// The step [`Step::ReviewGate`]: applies the review rule to pull request `pull`, whose head
+/// must still be `judged`, for the reviewer app `reviewer`, into `verdict`. It records the
+/// finding that the reviewer opened the PR, then those of its requests for changes, then those
+/// of its threads, page by page, each as soon as it is read. Whatever cannot be read fails the
+/// step without dropping a finding read before or after it (review of #57, round 13): GitHub
+/// cannot be asked, the head has moved on from `judged`, or `reviewer` is not an app other than
+/// the agents' own. It records the app's approval, which an edit needs, only when the
+/// reviewer's latest decision approves the head and the gate read everything and found nothing.
 pub fn check(
     reviews: &dyn Reviews,
     pull: u32,
     judged: &str,
     reviewer: &str,
-) -> Result<Gate, String> {
+    verdict: &mut Verdict,
+) {
     assert!(pull > 0, "pull requests are numbered from 1");
     if !reviewer.ends_with("[bot]") || reviewer == AUTHOR_APP {
-        return Err(format!(
-            "the reviewer `{reviewer}` must be a GitHub App other than {AUTHOR_APP}, named with \
-             `[bot]`"
-        ));
+        return verdict.fail(
+            Step::ReviewGate,
+            format!(
+                "the reviewer `{reviewer}` must be a GitHub App other than {AUTHOR_APP}, named \
+                 with `[bot]`"
+            ),
+        );
     }
+    let (found, failed) = (verdict.findings.len(), verdict.failed.len());
     let app = Actor::app(reviewer);
     let place = format!("pull request #{pull}");
-    let request = reviews.pull(pull)?;
-    same_head(&request, judged, pull)?;
-    let mut gate = Gate::default();
-    let mut report =
-        |message: String| gate.findings.push(Finding::new(&place, Check::Review, message));
-    if request.author == app {
-        report(format!("{reviewer} opened this pull request, so it cannot review it (ADR-0022)"));
+    verdict.ran(Check::Review);
+    match reviews.pull(pull) {
+        Ok(request) => {
+            if request.author == app {
+                let message = format!(
+                    "{reviewer} opened this pull request, so it cannot review it (ADR-0022)"
+                );
+                verdict.record(Finding::new(&place, Check::Review, message));
+            }
+            if let Err(reason) = same_head(&request, judged, pull) {
+                verdict.fail(Step::ReviewGate, reason);
+            }
+        }
+        Err(reason) => verdict.fail(Step::ReviewGate, reason),
     }
-    let all = reviews.reviews(pull)?;
-    let own: Vec<&Review> = all.iter().filter(|review| review.author == app).collect();
+    let decided = decisions(reviews, pull, judged, &app, verdict);
+    thread_findings(reviews, pull, reviewer, verdict);
+    let Some((reviewed, approved)) = decided else {
+        return;
+    };
+    verdict.notes.push(format!(
+        "{reviewer} {} the head commit.",
+        match (approved, reviewed) {
+            (true, _) => "approved",
+            (false, true) => "reviewed, without approving,",
+            (false, false) => "has not reviewed",
+        }
+    ));
+    let clean = verdict.findings.len() == found && verdict.failed.len() == failed;
+    verdict.progress.app_approved = approved && clean;
+}
+
+/// The reviewer's requests for changes on pull request `pull`, as findings into `verdict`, and
+/// whether it reviewed the commit `judged` and its latest decision approves it; `None` if the
+/// reviews cannot be read, which fails [`Step::ReviewGate`].
+fn decisions(
+    reviews: &dyn Reviews,
+    pull: u32,
+    judged: &str,
+    app: &Actor,
+    verdict: &mut Verdict,
+) -> Option<(bool, bool)> {
+    let all = match reviews.reviews(pull) {
+        Ok(all) => all,
+        Err(reason) => {
+            verdict.fail(Step::ReviewGate, reason);
+            return None;
+        }
+    };
+    let own: Vec<&Review> = all.iter().filter(|review| review.author == *app).collect();
     let reviewed_head = own.iter().any(|review| {
         review.commit == judged && (review.state == COMMENTED || review.state == APPROVED)
     });
-    let approved = latest_decision(&all, &app)
+    let approved = latest_decision(&all, app)
         .is_some_and(|decision| decision.state == APPROVED && decision.commit == judged);
     assert!(reviewed_head || !approved, "an approval of the head is a review of it");
-    match objection(&own, &reviews.dismissed(pull)?) {
-        Objection::Standing => report(format!(
-            "{reviewer} requests changes on this pull request; fix them, and have it review the \
-             head again (ADR-0008)"
-        )),
-        Objection::Dismissed => report(format!(
-            "{reviewer}'s request for changes was dismissed, which does not withdraw it; only a \
-             later approval by {reviewer} does (ADR-0022)"
-        )),
-        Objection::Withdrawn => {}
+    // Without the dismissals, a standing request for changes still stands: the dismissals only
+    // tell what a dismissed review was, and a standing one has none after it. A dismissed one
+    // is then not known to be a request for changes, so only the failure says it.
+    let dismissed = reviews.dismissed(pull);
+    let none = BTreeMap::new();
+    let place = format!("pull request #{pull}");
+    let reviewer = &app.login;
+    match (objection(&own, dismissed.as_ref().unwrap_or(&none)), &dismissed) {
+        (Objection::Standing, _) => {
+            let message = format!(
+                "{reviewer} requests changes on this pull request; fix them, and have it review \
+                 the head again (ADR-0008)"
+            );
+            verdict.record(Finding::new(&place, Check::Review, message));
+        }
+        (Objection::Dismissed, Ok(_)) => {
+            let message = format!(
+                "{reviewer}'s request for changes was dismissed, which does not withdraw it; only \
+                 a later approval by {reviewer} does (ADR-0022)"
+            );
+            verdict.record(Finding::new(&place, Check::Review, message));
+        }
+        (Objection::Dismissed, Err(_)) | (Objection::Withdrawn, _) => {}
     }
-    for problem in thread_problems(&reviews.threads(pull)?, reviewer) {
-        report(problem);
+    if let Err(reason) = dismissed {
+        verdict.fail(Step::ReviewGate, reason);
     }
-    gate.approved = approved;
-    gate.reviewed = reviewed_head;
-    Ok(gate)
+    Some((reviewed_head, approved))
+}
+
+/// The findings of the reviewer's threads on pull request `pull`, into `verdict`, page by page,
+/// each page's as soon as it is read. A page that cannot be read, or more than
+/// [`THREAD_PAGES_MAX`] pages, fails [`Step::ReviewGate`].
+fn thread_findings(reviews: &dyn Reviews, pull: u32, reviewer: &str, verdict: &mut Verdict) {
+    let place = format!("pull request #{pull}");
+    let mut after: Option<String> = None;
+    for _page in 0..THREAD_PAGES_MAX {
+        let page = match reviews.threads(pull, after.as_deref()) {
+            Ok(page) => page,
+            Err(reason) => return verdict.fail(Step::ReviewGate, reason),
+        };
+        for problem in thread_problems(&page.threads, reviewer) {
+            verdict.record(Finding::new(&place, Check::Review, problem));
+        }
+        match page.next {
+            Some(next) if after.as_deref() == Some(next.as_str()) => {
+                let reason = format!("GitHub gave the thread cursor `{next}` twice");
+                return verdict.fail(Step::ReviewGate, reason);
+            }
+            Some(next) => after = Some(next),
+            None => return,
+        }
+    }
+    let most = THREADS_PER_PAGE * THREAD_PAGES_MAX;
+    verdict.fail(
+        Step::ReviewGate,
+        format!(
+            "the pull request has more than {most} review threads, more than the ratchet reads; \
+             resolve them, or open a new pull request"
+        ),
+    );
 }
 
 /// True if a user that the base's CODEOWNERS (`codeowners`) names approved the commit judged,
@@ -418,24 +516,29 @@ pub fn dismissed_from(text: &str) -> Result<BTreeMap<u64, String>, String> {
     Ok(found)
 }
 
-/// Reads the threads from the GraphQL answer of [`THREADS_QUERY`].
+/// Reads one page of threads from the GraphQL answer of [`THREADS_QUERY`].
 ///
 /// # Errors
 ///
-/// Returns what is missing if the answer has another shape, or if there are more threads than
-/// one query reads.
-pub fn threads_from(value: &Value) -> Result<Vec<Thread>, String> {
+/// Returns what is missing if the answer has another shape, or if it says there are more pages
+/// and gives no cursor.
+pub fn threads_from(value: &Value) -> Result<ThreadPage, String> {
     let threads = ["data", "repository", "pullRequest", "reviewThreads"]
         .iter()
         .try_fold(value, |inner, key| inner.get(key))
         .ok_or("GitHub sent no review threads; check the pull request number")?;
-    let has_more = threads.get("pageInfo").and_then(|info| info.get("hasNextPage"));
-    if has_more != Some(&Value::Bool(false)) {
-        return Err(format!(
-            "the pull request has more than {THREADS_MAX} review threads, more than the ratchet \
-             reads; resolve them, or open a new pull request"
-        ));
-    }
+    let info = threads.get("pageInfo");
+    let next = match info.and_then(|info| info.get("hasNextPage")) {
+        Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(
+            info.and_then(|info| info.get("endCursor"))
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or("GitHub says there are more review threads, and gives no cursor")?
+                .to_owned(),
+        ),
+        _ => return Err("GitHub sent review threads without `hasNextPage`".to_owned()),
+    };
     let nodes =
         threads.get("nodes").and_then(Value::as_array).ok_or("GitHub sent no thread list")?;
     let mut found = Vec::new();
@@ -457,13 +560,16 @@ pub fn threads_from(value: &Value) -> Result<Vec<Thread>, String> {
             resolved_by,
         });
     }
-    Ok(found)
+    assert!(found.len() <= nodes.len(), "one thread per node");
+    Ok(ThreadPage { threads: found, next })
 }
 
-/// The GraphQL query for the review threads of a pull request.
-const THREADS_QUERY: &str = "query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r)\
-     {pullRequest(number:$n){reviewThreads(first:100){pageInfo{hasNextPage}nodes{isResolved \
-     path resolvedBy{__typename login} comments(first:1){nodes{author{__typename login}}}}}}}}";
+/// The GraphQL query for one page of [`THREADS_PER_PAGE`] review threads of a pull request,
+/// after the cursor `$c`, or the first page without it.
+const THREADS_QUERY: &str = "query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,\
+     name:$r){pullRequest(number:$n){reviewThreads(first:100,after:$c){pageInfo{hasNextPage \
+     endCursor}nodes{isResolved path resolvedBy{__typename login} comments(first:1){nodes{author\
+     {__typename login}}}}}}}}";
 
 /// [`Reviews`] through `gh api`, run in a checkout of the repository.
 #[derive(Debug, Clone)]
@@ -539,11 +645,15 @@ impl Reviews for GhReviews {
         dismissed_from(&self.api(&["--paginate", &path, "--jq", jq])?)
     }
 
-    fn threads(&self, pull: u32) -> Result<Vec<Thread>, String> {
+    fn threads(&self, pull: u32, after: Option<&str>) -> Result<ThreadPage, String> {
         let query = format!("query={THREADS_QUERY}");
         let number = format!("n={pull}");
-        let arguments =
-            ["graphql", "-f", &query, "-F", "o={owner}", "-F", "r={repo}", "-F", &number];
+        let cursor = after.map(|after| format!("c={after}"));
+        let mut arguments =
+            vec!["graphql", "-f", &query, "-F", "o={owner}", "-F", "r={repo}", "-F", &number];
+        if let Some(cursor) = &cursor {
+            arguments.extend(["-f", cursor]);
+        }
         let text = self.api(&arguments)?;
         let value = json::parse(&text)
             .map_err(|error| format!("gh printed invalid JSON: {}", error.message))?;
@@ -554,6 +664,7 @@ impl Reviews for GhReviews {
 #[cfg(test)]
 mod tests {
     use super::{AUTHOR_APP, Actor, GhReviews, Pull, REVIEWER_APP, Review, Reviews, Thread};
+    use super::{THREADS_PER_PAGE, THREADS_QUERY, ThreadPage, Verdict};
     use super::{check, dismissed_from, owner_approved, reviews_from, threads_from};
     use crate::json;
     use std::collections::BTreeMap;
@@ -572,12 +683,29 @@ mod tests {
         fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
             Ok(self.reviews.clone())
         }
-        fn threads(&self, _pull: u32) -> Result<Vec<Thread>, String> {
-            Ok(self.threads.clone())
+        fn threads(&self, _pull: u32, after: Option<&str>) -> Result<ThreadPage, String> {
+            // Pages of a hundred, as GitHub's, with the page number as the cursor.
+            let size = usize::try_from(THREADS_PER_PAGE).expect("a page size fits");
+            let index = after.map_or(0, |cursor| cursor.parse::<usize>().expect("a cursor"));
+            let threads = self.threads.chunks(size).nth(index).unwrap_or_default().to_vec();
+            let next = ((index + 1) * size < self.threads.len()).then(|| (index + 1).to_string());
+            Ok(ThreadPage { threads, next })
         }
         fn dismissed(&self, _pull: u32) -> Result<BTreeMap<u64, String>, String> {
             Ok(self.dismissed.clone())
         }
+    }
+
+    /// The review gate on pull request 7 at `judged`, for `reviewer`, into a verdict of its own.
+    fn gate(fixed: &dyn Reviews, judged: &str, reviewer: &str) -> Verdict {
+        let mut verdict = Verdict::default();
+        check(fixed, 7, judged, reviewer, &mut verdict);
+        verdict
+    }
+
+    /// True if the gate gave no verdict.
+    fn fails(fixed: &dyn Reviews, judged: &str, reviewer: &str) -> bool {
+        !gate(fixed, judged, reviewer).failed.is_empty()
     }
 
     fn fixed(reviews: Vec<Review>, threads: Vec<Thread>) -> Fixed {
@@ -611,10 +739,12 @@ mod tests {
 
     /// The findings' messages, then `not reviewed` if the reviewer did not review the head.
     fn messages(fixed: &Fixed) -> Vec<String> {
-        let gate = check(fixed, 7, "b", REVIEWER_APP).unwrap();
-        let unreviewed = (!gate.reviewed).then(|| "not reviewed".to_owned());
-        let findings = gate.findings.into_iter().map(|finding| finding.message);
-        findings.chain(unreviewed).collect()
+        let verdict = gate(fixed, "b", REVIEWER_APP);
+        assert!(verdict.failed.is_empty(), "{:?}", verdict.failed);
+        let unreviewed =
+            verdict.notes.iter().any(|note| note.ends_with("has not reviewed the head commit."));
+        let findings = verdict.findings.into_iter().map(|finding| finding.message);
+        findings.chain(unreviewed.then(|| "not reviewed".to_owned())).collect()
     }
 
     // Goal: the reviewer app's review on the head, with every thread resolved by it, passes.
@@ -628,9 +758,10 @@ mod tests {
             fixed(vec![review(reviewer(), "b", "COMMENTED")], vec![thread(Some(reviewer()))]);
         assert_eq!(messages(&good), Vec::<String>::new());
         let own = fixed(vec![review(Actor::app(AUTHOR_APP), "b", "COMMENTED")], vec![]);
-        let gate = check(&own, 7, "b", REVIEWER_APP).unwrap();
-        assert!(gate.findings.is_empty(), "a missing review is no finding");
-        assert!(!gate.reviewed && !gate.approved, "{gate:?}");
+        let unreviewed = gate(&own, "b", REVIEWER_APP);
+        assert!(unreviewed.findings.is_empty(), "a missing review is no finding");
+        assert!(!unreviewed.progress.app_approved, "{unreviewed:?}");
+        assert_eq!(messages(&own), ["not reviewed"]);
         let dismissed = messages(&fixed(vec![review(reviewer(), "b", "DISMISSED")], vec![]));
         assert!(dismissed[0].contains("was dismissed") && dismissed.len() == 2, "{dismissed:?}");
         let earlier = fixed(vec![review(reviewer(), "a", "APPROVED")], vec![]);
@@ -655,14 +786,11 @@ mod tests {
             ..fixed(vec![review(reviewer(), "b", "COMMENTED")], vec![])
         };
         assert!(messages(&by_reviewer)[0].contains("opened this pull request"));
-        assert!(check(&good, 7, AUTHOR_APP.trim_end_matches("[bot]"), REVIEWER_APP).is_err());
-        let moved = check(&good, 7, "a", REVIEWER_APP).unwrap_err();
-        assert!(moved.contains("is now b, not the commit judged, a"), "{moved}");
-        assert!(
-            check(&good, 7, "b", AUTHOR_APP).is_err(),
-            "the author's app is never the reviewer"
-        );
-        assert!(check(&good, 7, "b", "nami-reviewer").is_err(), "the reviewer is an app");
+        assert!(fails(&good, AUTHOR_APP.trim_end_matches("[bot]"), REVIEWER_APP));
+        let moved = gate(&good, "a", REVIEWER_APP).failed.join("; ");
+        assert!(moved.contains("review gate: the head of #7 is now b, not the commit judged, a"));
+        assert!(fails(&good, "b", AUTHOR_APP), "the author's app is never the reviewer");
+        assert!(fails(&good, "b", "nami-reviewer"), "the reviewer is an app");
     }
 
     // Goal: the gate shows an approval, which an edit to existing rule code needs, only when the
@@ -671,11 +799,13 @@ mod tests {
     // approval by someone else; a later comment leaves the approval standing.
     #[test]
     fn an_approval_counts_only_as_the_latest_decision_on_the_head() {
-        let approved = |reviews: Vec<Review>| check(&fixed(reviews, vec![]), 7, "b", REVIEWER_APP);
+        let approved = |reviews: Vec<Review>| {
+            gate(&fixed(reviews, vec![]), "b", REVIEWER_APP).progress.app_approved
+        };
         let head = review(reviewer(), "b", "APPROVED");
-        assert!(approved(vec![head.clone()]).unwrap().approved);
+        assert!(approved(vec![head.clone()]));
         let commented = vec![head.clone(), review(reviewer(), "b", "COMMENTED")];
-        assert!(approved(commented).unwrap().approved, "a comment decides nothing");
+        assert!(approved(commented), "a comment decides nothing");
         let refused = [
             vec![review(reviewer(), "b", "COMMENTED")],
             vec![review(reviewer(), "a", "APPROVED"), review(reviewer(), "b", "COMMENTED")],
@@ -684,8 +814,70 @@ mod tests {
             vec![review(Actor::user("owner"), "b", "APPROVED")],
         ];
         for (index, reviews) in refused.into_iter().enumerate() {
-            assert!(!approved(reviews).unwrap().approved, "case {index}");
+            assert!(!approved(reviews), "case {index}");
         }
+        let with_thread = fixed(vec![head.clone()], vec![thread(None)]);
+        assert!(!gate(&with_thread, "b", REVIEWER_APP).progress.app_approved, "an open thread");
+        let moved =
+            gate(&fixed(vec![review(reviewer(), "a", "APPROVED")], vec![]), "a", REVIEWER_APP);
+        assert!(!moved.progress.app_approved, "a head that moved on");
+    }
+
+    /// Reviews whose dismissals and second page of threads cannot be read, nor the reviews
+    /// unless the flag says so.
+    struct Failing(Fixed, bool);
+
+    impl Reviews for Failing {
+        fn pull(&self, pull: u32) -> Result<Pull, String> {
+            self.0.pull(pull)
+        }
+        fn reviews(&self, pull: u32) -> Result<Vec<Review>, String> {
+            if self.1 { self.0.reviews(pull) } else { Err("no reviews".to_owned()) }
+        }
+        fn threads(&self, pull: u32, after: Option<&str>) -> Result<ThreadPage, String> {
+            if after.is_some() {
+                Err("no second page".to_owned())
+            } else {
+                self.0.threads(pull, after)
+            }
+        }
+        fn dismissed(&self, _pull: u32) -> Result<BTreeMap<u64, String>, String> {
+            Err("no dismissals".to_owned())
+        }
+    }
+
+    // Goal: the gate records each finding as it reads it, and what it cannot read fails it
+    // without dropping another (review of #57, round 13): a PR opened by the reviewer with
+    // unreadable reviews, a standing request for changes with unreadable dismissals, and an open
+    // thread on the first page with a second page that cannot be read are all findings. Threads
+    // are read page by page past the first hundred, and a dismissed review of unknown state
+    // without the dismissals is no finding, only the failure.
+    #[test]
+    fn the_gate_records_what_it_read_before_a_failure() {
+        let resolved = (0..THREADS_PER_PAGE).map(|_| thread(Some(reviewer())));
+        let threads: Vec<Thread> = [thread(None)].into_iter().chain(resolved).collect();
+        let opened = Fixed { author: reviewer(), ..fixed(vec![], threads) };
+        let broken = gate(&Failing(opened, false), "b", REVIEWER_APP);
+        let found: Vec<&str> =
+            broken.findings.iter().map(|finding| finding.message.as_str()).collect();
+        assert!(found.len() == 2 && found[0].contains("opened this pull request"), "{found:?}");
+        assert!(found[1].contains("is not resolved"), "{found:?}");
+        assert_eq!(broken.failed, ["review gate: no reviews", "review gate: no second page"]);
+        let many: Vec<Thread> = (0..=THREADS_PER_PAGE)
+            .map(|_| thread(Some(reviewer())))
+            .chain([thread(None)])
+            .collect();
+        let paged =
+            gate(&fixed(vec![review(reviewer(), "b", "COMMENTED")], many), "b", REVIEWER_APP);
+        assert!(paged.failed.is_empty() && paged.findings.len() == 1, "{paged:?}");
+        let standing = vec![numbered(1, "DISMISSED"), numbered(2, "CHANGES_REQUESTED")];
+        let stands = gate(&Failing(fixed(standing, vec![]), true), "b", REVIEWER_APP);
+        assert!(stands.findings[0].message.contains("requests changes"), "{stands:?}");
+        assert_eq!(stands.failed, ["review gate: no dismissals"]);
+        let unknown =
+            gate(&Failing(fixed(vec![numbered(1, "DISMISSED")], vec![]), true), "b", REVIEWER_APP);
+        assert!(unknown.findings.is_empty() && unknown.failed.len() == 1, "{unknown:?}");
+        assert!(THREADS_QUERY.contains(&format!("first:{THREADS_PER_PAGE},")), "the page size");
     }
 
     // Goal: a user account that took the reviewer app's name is not the reviewer: its review,
@@ -768,13 +960,14 @@ mod tests {
 
     // Goal: threads are read with their author and who resolved them, as GitHub names them:
     // an author `Bot` with a bare login, a resolver `User` whose login ends in `[bot]`. An
-    // answer with more pages, or of another shape, is an error.
+    // answer with more pages gives the cursor of the next; one that says so without a cursor,
+    // or of another shape, is an error.
     #[test]
     fn threads_are_read() {
-        let answer = |more: &str| {
+        let answer = |info: &str| {
             json::parse(&format!(
                 "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"reviewThreads\":{{\
-                 \"pageInfo\":{{\"hasNextPage\":{more}}},\"nodes\":[\
+                 \"pageInfo\":{{{info}}},\"nodes\":[\
                  {{\"isResolved\":true,\"path\":\"a.rs\",\"resolvedBy\":\
                  {{\"__typename\":\"User\",\"login\":\"nami-reviewer[bot]\"}},\
                  \"comments\":{{\"nodes\":[{{\"author\":\
@@ -786,7 +979,8 @@ mod tests {
             ))
             .unwrap()
         };
-        let found = threads_from(&answer("false")).unwrap();
+        let page = threads_from(&answer("\"hasNextPage\":false")).unwrap();
+        let found = &page.threads;
         assert_eq!(found[0], thread(Some(reviewer())));
         assert_eq!(
             found[1],
@@ -797,7 +991,12 @@ mod tests {
                 resolved_by: None
             }
         );
-        assert!(threads_from(&answer("true")).unwrap_err().contains("more than 100"));
+        assert_eq!(page.next, None, "the last page");
+        let more = threads_from(&answer("\"hasNextPage\":true,\"endCursor\":\"Y3Vy\"")).unwrap();
+        assert_eq!((more.threads.len(), more.next.as_deref()), (2, Some("Y3Vy")));
+        let lost = threads_from(&answer("\"hasNextPage\":true")).unwrap_err();
+        assert!(lost.contains("gives no cursor"), "{lost}");
+        assert!(threads_from(&answer("")).unwrap_err().contains("without `hasNextPage`"));
         assert!(threads_from(&json::parse("{\"data\":null}").unwrap()).is_err());
     }
 
@@ -809,9 +1008,13 @@ case "$*" in
         user='"user":{"login":"nami-reviewer[bot]","type":"Bot"}'
         echo "{\"id\":3,$user,\"commit_id\":\"abc\",\"state\":\"COMMENTED\"}" ;;
     *issues/7/events*) echo "3 changes_requested" ;;
-    *n=7*)
-        thread='{"isResolved":false,"path":"a.rs","resolvedBy":null,"comments":{"nodes":[]}}'
+    *n=7\ -f\ c=UDI*)
+        thread='{"isResolved":false,"path":"b.rs","resolvedBy":null,"comments":{"nodes":[]}}'
         threads="{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[$thread]}"
+        echo "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":$threads}}}}" ;;
+    *n=7)
+        thread='{"isResolved":false,"path":"a.rs","resolvedBy":null,"comments":{"nodes":[]}}'
+        threads="{\"pageInfo\":{\"hasNextPage\":true,\"endCursor\":\"UDI\"},\"nodes\":[$thread]}"
         echo "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":$threads}}}}" ;;
     *pulls/8\ --jq*) echo "not-a-commit someone User" ;;
     *pulls/9\ --jq*) echo "0123456789abcdef0123456789abcdef01234567 nami-agent[bot] User" ;;
@@ -838,15 +1041,21 @@ esac
             github.dismissed(7).unwrap().get(&3).map(String::as_str),
             Some("CHANGES_REQUESTED")
         );
-        let threads = github.threads(7).unwrap();
-        let open =
-            Thread { path: "a.rs".to_owned(), author: None, resolved: false, resolved_by: None };
-        assert_eq!(threads, [open]);
+        let first = github.threads(7, None).unwrap();
+        let open = |path: &str| Thread {
+            path: path.to_owned(),
+            author: None,
+            resolved: false,
+            resolved_by: None,
+        };
+        assert_eq!(first, ThreadPage { threads: vec![open("a.rs")], next: Some("UDI".to_owned()) });
+        let second = github.threads(7, first.next.as_deref()).unwrap();
+        assert_eq!(second, ThreadPage::last(vec![open("b.rs")]), "the page after the cursor");
         assert!(github.pull(8).unwrap_err().contains("as the head commit of #8"));
         assert!(github.pull(9).unwrap_err().contains("of type `User`"));
         let failed = github.reviews(9).unwrap_err();
         assert!(failed.contains("HTTP 404") && failed.contains("GH_TOKEN"), "{failed}");
-        assert!(github.threads(9).is_err(), "a failed query");
+        assert!(github.threads(9, None).is_err(), "a failed query");
     }
 
     // Goal: only a code owner's approval of the head counts, by each owner's latest decision: not

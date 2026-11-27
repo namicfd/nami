@@ -14,11 +14,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::ratchet::observations::Observations;
-use xtask::ratchet::review::{AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread};
+use xtask::ratchet::review::{
+    AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread, ThreadPage,
+};
 use xtask::ratchet::tree::Scratch;
 use xtask::ratchet::{
-    Check, ReviewSource, Tools, Verdict, canonical, carry, check, check_all, judge, observe,
-    settled,
+    Check, Faults, ReviewSource, STEPS, Tools, Verdict, canonical, carry, check, check_all, judge,
+    judge_all, judge_unobserved, observe, settled,
 };
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
@@ -322,11 +324,12 @@ impl Reviews for FakeReviews {
         }
         Ok(reviews)
     }
-    fn threads(&self, _pull: u32) -> Result<Vec<Thread>, String> {
+    fn threads(&self, _pull: u32, _after: Option<&str>) -> Result<ThreadPage, String> {
         let resolved_by = self.resolved_by.map(actor);
         let path = "lints/src/lib.rs".to_owned();
         let author = Some(Actor::app(REVIEWER_APP));
-        Ok(vec![Thread { path, author, resolved: resolved_by.is_some(), resolved_by }])
+        let thread = Thread { path, author, resolved: resolved_by.is_some(), resolved_by };
+        Ok(ThreadPage::last(vec![thread]))
     }
     fn dismissed(&self, _pull: u32) -> Result<BTreeMap<u64, String>, String> {
         Ok(BTreeMap::new())
@@ -377,6 +380,7 @@ impl Case {
             pr_head: None,
             commit: None,
             carried: None,
+            faults: Faults::default(),
         }
     }
 
@@ -830,7 +834,7 @@ fn a_merge_group_carries_the_pr_s_mutation_evidence() {
     assert!(queued.runs.iter().all(|run| run.mode != "mutants"), "the queue observes no mutants");
     let judged = || {
         let mut with = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
-        with.carried = Some(carry::Carried::read(&carried).expect("the carried directory reads"));
+        with.carried = Some(carry::Carried::read(&carried));
         judge(&case.base(), &case.head(), &queued, &with)
     };
     let verdict = judged().unwrap();
@@ -972,8 +976,9 @@ fn a_code_owner_approval_settles_a_no_verdict() {
     assert_eq!(verdict.line(), "ratchet: pass", "{}", verdict.summary());
     assert!(verdict.owner_approved, "the summary says the owner approved");
     assert_eq!(verdict.range, "the two trees given", "the summary names what was judged");
-    let note = verdict.notes.first().map_or("", String::as_str);
-    assert!(note.contains("No verdict: the head holds 1 symbolic link(s)"), "{note}");
+    let settling = verdict.notes.iter().find(|note| note.starts_with("No verdict:"));
+    let note = settling.map_or("", String::as_str);
+    assert!(note.contains("No verdict: scope: the head holds 1 symbolic link(s)"), "{note}");
     assert!(note.contains("A code owner approved the head commit"), "{note}");
     assert!(settle(&REVIEWED).unwrap_err().contains("symbolic link"), "no approval");
     let earlier = FakeReviews { approval: Some(("owner", "earlier")), ..REVIEWED };
@@ -995,7 +1000,7 @@ impl Reviews for BrokenThreads {
     fn reviews(&self, pull: u32) -> Result<Vec<Review>, String> {
         self.0.reviews(pull)
     }
-    fn threads(&self, _pull: u32) -> Result<Vec<Thread>, String> {
+    fn threads(&self, _pull: u32, _after: Option<&str>) -> Result<ThreadPage, String> {
         Err("GitHub answered 502 for the review threads".to_owned())
     }
     fn dismissed(&self, pull: u32) -> Result<BTreeMap<u64, String>, String> {
@@ -1009,7 +1014,7 @@ impl Reviews for BrokenThreads {
 fn settled_with_findings(
     case: &Case,
     reviews: &dyn Reviews,
-    carried: Option<carry::Carried>,
+    carried: Option<Result<carry::Carried, String>>,
 ) -> Verdict {
     let mut tools = case.tools("unbounded-loop", "any", NOTHING, &OWNER_APPROVED);
     tools.review = Some(ReviewSource {
@@ -1038,8 +1043,9 @@ fn assert_fails_with(verdict: &Verdict, late: &str) {
 
 // Goal: round 11 of #57's review: findings followed by a late no verdict fail, even with the
 // code owner's approval of the head, and show both the findings and what was not judged; for
-// each late step: a mutant that timed out, carried evidence of another tree, review threads
-// that cannot be read, and a rule-path file that does not parse.
+// each late step: a mutant that timed out, carried evidence of another tree or that cannot be
+// read (round 13), review threads that cannot be read, and a rule-path file that does not
+// parse.
 #[test]
 fn findings_survive_a_late_no_verdict() {
     let case = Case::new("late");
@@ -1054,9 +1060,11 @@ fn findings_survive_a_late_no_verdict() {
     }
     let observations = Observations { head: "another tree".to_owned(), ..Observations::default() };
     fs::write(carried.join(carry::OBSERVATIONS), observations.to_json()).expect("writable");
-    let evidence = carry::Carried::read(&carried).expect("the carried directory reads");
+    let evidence = carry::Carried::read(&carried);
     let mismatch = settled_with_findings(&case, &OWNER_APPROVED, Some(evidence));
     assert_fails_with(&mismatch, "another head tree");
+    let unread = Some(Err("cannot read the carried evidence".to_owned()));
+    assert_fails_with(&settled_with_findings(&case, &OWNER_APPROVED, unread), "carried evidence");
     let broken = BrokenThreads(OWNER_APPROVED);
     assert_fails_with(&settled_with_findings(&case, &broken, None), "502 for the review threads");
     write(&case.head(), "xtask/src/tidy/text.rs", "fn broken( {\n");
@@ -1109,12 +1117,10 @@ fn assert_fails_on(verdict: &Verdict, finding: (Check, &str), late: &str) {
     assert!(verdict.failed.iter().any(|why| why.contains(late)), "{late}: {:?}", verdict.failed);
 }
 
-// Goal: round 12 of #57's review, the reviewer's probes: with the code owner's approval,
+// Goal: round 12 of #57's review, two of the reviewer's probes: with the code owner's approval,
 // each fails and shows what it found. A missed mutant and a timeout in one workspace (exit 3,
-// as cargo-mutants 27.1.0 gives it) keep the miss; a rule-set loosening counts though the head
-// does not build; the app's request for changes counts though the observations are of another
-// head tree; a miss counts though a rule-path file does not parse; and a corpus finding counts
-// though the owner's approval cannot be read.
+// as cargo-mutants 27.1.0 gives it) keep the miss, and a miss counts though a rule-path file
+// does not parse, so the diff cannot be classified. The other probes are the next two tests.
 #[test]
 fn the_reviewer_s_round_12_probes_fail() {
     let case = Case::new("round-12-miss-timeout");
@@ -1189,8 +1195,8 @@ impl Reviews for BrokenReviews {
     fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
         Err("GitHub answered 502 for the reviews".to_owned())
     }
-    fn threads(&self, pull: u32) -> Result<Vec<Thread>, String> {
-        self.0.threads(pull)
+    fn threads(&self, pull: u32, after: Option<&str>) -> Result<ThreadPage, String> {
+        self.0.threads(pull, after)
     }
     fn dismissed(&self, pull: u32) -> Result<BTreeMap<u64, String>, String> {
         self.0.dismissed(pull)
@@ -1206,6 +1212,45 @@ fn findings_fail_when_the_approval_cannot_be_read() {
     declare_module(&case.head(), "extra");
     let broken = BrokenReviews(OWNER_APPROVED);
     assert_fails_with(&settled_with_findings(&case, &broken, None), "502 for the reviews");
+}
+
+// Goal: round 13 of #57's review: no failed step drops another step's finding, by
+// construction. The judge enters every step of `STEPS`, in that order, with observations,
+// without them and with carried evidence that cannot be read. And for every step S and every
+// other step T, a judge in which T finds something as it starts and S fails as it starts fails
+// with T's finding and lists S's failure, though the code owner approved the head. A step added
+// to the judge is in `STEPS`, or the first check fails; once there, the matrix covers it.
+#[test]
+fn no_failed_step_drops_another_step_s_finding() {
+    let case = Case::new("faults");
+    write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+    declare_module(&case.head(), "extra");
+    let mut tools = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+    let (base, head) = (case.base(), case.head());
+    let observed = observe(&base, &head, &tools).expect("the head is observed");
+    let clean = judge_all(&base, &head, &observed, &tools);
+    assert_eq!(clean.visited, STEPS, "the judge enters every step, in order");
+    assert!(clean.findings.is_empty() && clean.failed.is_empty(), "{}", clean.summary());
+    let unobserved = judge_unobserved(&base, &head, &tools, "the observing job failed");
+    assert_eq!(unobserved.visited, STEPS, "without observations");
+    tools.carried = Some(Err("the carried evidence cannot be read".to_owned()));
+    assert_eq!(judge_all(&base, &head, &observed, &tools).visited, STEPS, "carried evidence");
+    tools.carried = None;
+    for fail in STEPS {
+        for find in STEPS.into_iter().filter(|step| *step != fail) {
+            tools.faults = Faults { fail: Some(fail), find: Some(find) };
+            let pair = format!("{} fails, {} finds", fail.name(), find.name());
+            let raw = judge_all(&base, &head, &observed, &tools);
+            assert_eq!(raw.visited, STEPS, "{pair}: every step is entered");
+            let verdict = settled(&base, &tools, raw).expect("a verdict with a finding");
+            assert!(verdict.line().starts_with("ratchet: fail"), "{pair}: {}", verdict.summary());
+            let place = format!("injected/{}", find.name());
+            let kept = verdict.findings.iter().any(|finding| finding.place == place);
+            assert!(kept, "{pair}: the finding is kept: {}", verdict.summary());
+            let failure = format!("{}: an injected failure", fail.name());
+            assert!(verdict.failed.contains(&failure), "{pair}: {:?}", verdict.failed);
+        }
+    }
 }
 
 // Goal: the judge draws the placements again from the seed: observations without a drawn run,
@@ -1393,8 +1438,8 @@ impl Reviews for Unreviewed {
     fn reviews(&self, _pull: u32) -> Result<Vec<Review>, String> {
         Ok(Vec::new())
     }
-    fn threads(&self, _pull: u32) -> Result<Vec<Thread>, String> {
-        Ok(Vec::new())
+    fn threads(&self, _pull: u32, _after: Option<&str>) -> Result<ThreadPage, String> {
+        Ok(ThreadPage::default())
     }
     fn dismissed(&self, _pull: u32) -> Result<BTreeMap<u64, String>, String> {
         Ok(BTreeMap::new())
@@ -1439,7 +1484,8 @@ fn real_tools(work: PathBuf, mutants: bool, carried: Option<carry::Carried>) -> 
         commits: None,
         pr_head: None,
         commit: None,
-        carried,
+        carried: carried.map(Ok),
+        faults: Faults::default(),
     }
 }
 

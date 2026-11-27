@@ -19,7 +19,7 @@
 use super::observations::{Observations, Run};
 use super::plant::{self, Rng};
 use super::tree::{Scratch, is_plain_relative};
-use super::{Check, Finding};
+use super::{Check, Finding, Step, Tools, Verdict};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -271,28 +271,51 @@ fn base_reports(
     Ok(reports)
 }
 
-/// Judges the recorded tidy runs against the base's fixtures, read from the base's own
-/// checkout, at the placements drawn again from `rng`, which starts at the observed seed.
-/// Returns the corpus and end-to-end findings, and what could not be judged: a planting
-/// without its run, a run that cannot be read, or runs that the seed does not draw. Each is
-/// no verdict, and none of them drops a finding of another planting (review of #57, round 11).
-///
-/// # Errors
-///
-/// No verdict before any placement is drawn: a base without fixtures, or one whose cases
-/// cannot be planted. Then `rng` has not drawn what the lint corpus draws after it.
+/// The random stream of the tidy corpus's placements, from the observed seed. The lint corpus
+/// draws from a stream of its own ([`super::lint::rng`]), so that each is drawn whatever the
+/// other could not be.
+#[must_use]
+pub fn rng(seed: u64) -> Rng {
+    Rng::new(seed)
+}
+
+/// The step [`Step::TidyCorpus`], with the tidy half of end to end: judges the recorded tidy
+/// runs against the base's fixtures, read from the base's own checkout, at the placements
+/// drawn again from the observed seed. Each finding is recorded as its run is judged; a
+/// planting without its run, a run that cannot be read, or runs that the seed does not draw
+/// each fail the step, and none of them drops a finding of another planting (review of #57,
+/// round 11). Without `observations` of these trees, it finds nothing.
 pub fn judge(
     base: &Path,
     head: &Path,
-    observations: &Observations,
-    rng: &mut Rng,
-) -> Result<(Vec<Finding>, Vec<String>), String> {
-    let fixtures = fixtures(base)?;
-    if fixtures.is_empty() {
-        return Err(format!("the base has no fixtures in {FIXTURE_DIRECTORY}"));
+    observations: Option<&Observations>,
+    tools: &Tools<'_>,
+    verdict: &mut Verdict,
+) {
+    if !verdict.enter(Step::TidyCorpus, tools) {
+        return;
     }
-    let plantings = plan(base, &fixtures, head, &files_of(head)?, rng)?;
-    let (mut findings, mut failed) = (Vec::new(), Vec::new());
+    let Some(observations) = observations else {
+        return;
+    };
+    let fixtures = match fixtures(base) {
+        Ok(fixtures) if fixtures.is_empty() => {
+            return verdict.fail(
+                Step::TidyCorpus,
+                format!("the base has no fixtures in {FIXTURE_DIRECTORY}"),
+            );
+        }
+        Ok(fixtures) => fixtures,
+        Err(reason) => return verdict.fail(Step::TidyCorpus, reason),
+    };
+    let drawn = files_of(head)
+        .and_then(|files| plan(base, &fixtures, head, &files, &mut rng(observations.seed)));
+    let plantings = match drawn {
+        Ok(plantings) => plantings,
+        Err(reason) => return verdict.fail(Step::TidyCorpus, reason),
+    };
+    verdict.ran(Check::TidyCorpus);
+    verdict.ran(Check::EndToEnd);
     let mut found_runs = 0_usize;
     for planting in &plantings {
         let fixture = fixtures.get(planting.fixture).expect("a planting names a fixture");
@@ -302,28 +325,29 @@ pub fn judge(
             let Some(run) =
                 observations.runs_of(&fixture.file, mode).find(|run| run.placement == at)
             else {
-                failed.push(format!(
+                let reason = format!(
                     "no `tidy` {mode} run of {} at {at}, which the seed draws",
                     fixture.file
-                ));
+                );
+                verdict.fail(Step::TidyCorpus, reason);
                 continue;
             };
             found_runs += 1;
             match judge_run(base, head, fixture, &planting.text, run) {
-                Ok(found) => findings.extend(found),
-                Err(problem) => failed.push(problem),
+                Ok(found) => found.into_iter().for_each(|finding| verdict.record(finding)),
+                Err(problem) => verdict.fail(Step::TidyCorpus, problem),
             }
         }
     }
     let recorded = observations.runs.iter().filter(|run| run.mode == "file" || run.mode == "tree");
     let present = recorded.count();
     if present != found_runs {
-        failed.push(format!(
+        let reason = format!(
             "the observations hold tidy runs that the seed does not draw ({found_runs} drawn and \
              found, {present} recorded)"
-        ));
+        );
+        verdict.fail(Step::TidyCorpus, reason);
     }
-    Ok((findings, failed))
 }
 
 /// Judges one run of a case with the text `text`: the base's reports at the placement, against

@@ -19,7 +19,7 @@
 use super::observations::{Observations, Run};
 use super::plant::Rng;
 use super::tree::{Scratch, is_plain_relative};
-use super::{Check, Finding, Tools};
+use super::{Check, Finding, Step, Tools, Verdict};
 use crate::json::{self, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -40,6 +40,9 @@ const UI_EDITION: &str = "2024";
 
 /// Lines of a failing tool's output that a finding quotes.
 const QUOTED_LINES: usize = 12;
+
+/// What the lint corpus's stream of placements mixes into the seed: "lint" in ASCII.
+const LINT_STREAM: u64 = 0x6c69_6e74;
 
 /// One UI case of the base.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,56 +313,146 @@ fn run_dylint(
     })
 }
 
-/// Judges the recorded lint runs: the base's library, run here on the base's own cases, gives
-/// what must be reported; the head's runs must report all of it. Returns the findings, and the
-/// placed runs that could not be judged, each no verdict without dropping another's finding
-/// (review of #57, round 11).
-///
-/// # Errors
-///
-/// No verdict before any finding: a base without UI cases, a base library that does not
-/// reproduce the base's `.stderr`, or a missing or unreadable run of the head's library.
+/// The random stream of the lint corpus's placements, from the observed seed: a stream of its
+/// own, apart from the tidy corpus's ([`super::corpus::rng`]), so that the lint cases are drawn
+/// whatever the tidy corpus could not draw.
+#[must_use]
+pub fn rng(seed: u64) -> Rng {
+    Rng::new(seed ^ LINT_STREAM)
+}
+
+/// What the lint corpus's steps share: the base's cases, where each is planted, and what the
+/// base's library reports on them.
+struct Setup {
+    cases: Vec<UiCase>,
+    placements: Vec<String>,
+    expected: Vec<Diagnostic>,
+}
+
+/// Judges the recorded lint runs in three steps: [`Step::LintCorpus`] reads the base's cases and
+/// runs the base's library here on them, which gives what must be reported; then
+/// [`Step::LintLibrary`] judges the head's library on them, and [`Step::LintCases`] the head's
+/// `xtask dylint` on each placed case. Each records its findings as it finds them, and a broken
+/// library run leaves the placed cases to be judged (review of #57, round 13). `changed` is
+/// false when nothing below `lints/` changed, which skips them; without `observations` of
+/// these trees, they find nothing.
 pub fn judge(
     base: &Path,
     head: &Path,
-    observations: &Observations,
+    observations: Option<&Observations>,
     tools: &Tools<'_>,
-    rng: &mut Rng,
-) -> Result<(Vec<Finding>, Vec<String>), String> {
-    let cases = cases(base)?;
-    if cases.is_empty() {
-        return Err(format!("the base has no UI cases in {UI_DIRECTORY}"));
+    changed: bool,
+    verdict: &mut Verdict,
+) {
+    let mut setup = None;
+    corpus_step(base, head, observations.filter(|_| changed), tools, &mut setup, verdict);
+    if !changed {
+        verdict.notes.push("Lint checks skipped: nothing below `lints/` changed.".to_owned());
     }
-    let (_name, placements) = plan(&cases, &plant_crates(head)?, rng);
-    let expected = base_expectations(base, &cases, tools)?;
-    let library = observations
-        .runs_of(UI_DIRECTORY, "library")
-        .next()
-        .ok_or("the observations hold no run of the head's lint library")?;
+    library_step(observations, setup.as_ref(), tools, verdict);
+    cases_step(observations, setup.as_ref(), tools, verdict);
+    assert!(setup.is_none() || changed, "the lint corpus is read only when lints changed");
+}
+
+/// The step [`Step::LintCorpus`]: the base's cases, their placements drawn again, and the
+/// base library's diagnostics, into `setup`.
+fn corpus_step(
+    base: &Path,
+    head: &Path,
+    observations: Option<&Observations>,
+    tools: &Tools<'_>,
+    setup: &mut Option<Setup>,
+    verdict: &mut Verdict,
+) {
+    if !verdict.enter(Step::LintCorpus, tools) {
+        return;
+    }
+    let Some(observations) = observations else {
+        return;
+    };
+    let cases = match cases(base) {
+        Ok(cases) if cases.is_empty() => {
+            let reason = format!("the base has no UI cases in {UI_DIRECTORY}");
+            return verdict.fail(Step::LintCorpus, reason);
+        }
+        Ok(cases) => cases,
+        Err(reason) => return verdict.fail(Step::LintCorpus, reason),
+    };
+    let placements = match plant_crates(head) {
+        Ok(crates) => plan(&cases, &crates, &mut rng(observations.seed)).1,
+        Err(reason) => return verdict.fail(Step::LintCorpus, reason),
+    };
+    match base_expectations(base, &cases, tools) {
+        Ok(expected) => *setup = Some(Setup { cases, placements, expected }),
+        Err(reason) => verdict.fail(Step::LintCorpus, reason),
+    }
+}
+
+/// The step [`Step::LintLibrary`]: every diagnostic of the base's library on its cases, the
+/// head's library reports too. A run whose exit code disagrees with what it printed shows
+/// nothing, and fails the step.
+fn library_step(
+    observations: Option<&Observations>,
+    setup: Option<&Setup>,
+    tools: &Tools<'_>,
+    verdict: &mut Verdict,
+) {
+    if !verdict.enter(Step::LintLibrary, tools) {
+        return;
+    }
+    let (Some(observations), Some(setup)) = (observations, setup) else {
+        return;
+    };
+    let Some(library) = observations.runs_of(UI_DIRECTORY, "library").next() else {
+        let reason = "the observations hold no run of the head's lint library";
+        return verdict.fail(Step::LintLibrary, reason);
+    };
     let reported = parse_json(&library.stdout);
     let errors = reported.iter().filter(|diagnostic| diagnostic.level == "error").count();
-    exits_agree("the head's lint library", library.exit, errors)?;
-    let mut findings = missing_diagnostics(&expected, &reported, &library.stderr);
-    let mut failed = Vec::new();
-    for (case, placement) in cases.iter().zip(&placements) {
+    if let Err(reason) = exits_agree("the head's lint library", library.exit, errors) {
+        return verdict.fail(Step::LintLibrary, reason);
+    }
+    verdict.ran(Check::LintCorpus);
+    for finding in missing_diagnostics(&setup.expected, &reported, &library.stderr) {
+        verdict.record(finding);
+    }
+}
+
+/// The step [`Step::LintCases`]: the head's `xtask dylint` reports each placed case's
+/// diagnostics. Each finding is recorded as its run is judged; a run that is missing or cannot
+/// be read fails the step, and the others are judged on (review of #57, round 11).
+fn cases_step(
+    observations: Option<&Observations>,
+    setup: Option<&Setup>,
+    tools: &Tools<'_>,
+    verdict: &mut Verdict,
+) {
+    if !verdict.enter(Step::LintCases, tools) {
+        return;
+    }
+    let (Some(observations), Some(setup)) = (observations, setup) else {
+        return;
+    };
+    assert_eq!(setup.cases.len(), setup.placements.len(), "one placement per case");
+    verdict.ran(Check::EndToEnd);
+    for (case, placement) in setup.cases.iter().zip(&setup.placements) {
         let file = format!("{}.rs", case.stem);
         let of_case: Vec<&Diagnostic> =
-            expected.iter().filter(|diagnostic| diagnostic.file == file).collect();
+            setup.expected.iter().filter(|diagnostic| diagnostic.file == file).collect();
         let subject = format!("{UI_DIRECTORY}/{file}");
         let Some(run) =
             observations.runs_of(&subject, "dylint").find(|run| run.placement == *placement)
         else {
-            failed.push(format!(
-                "no `xtask dylint` run of {subject} at {placement}, which the seed draws"
-            ));
+            let reason =
+                format!("no `xtask dylint` run of {subject} at {placement}, which the seed draws");
+            verdict.fail(Step::LintCases, reason);
             continue;
         };
         match judge_dylint(run, &of_case) {
-            Ok(found) => findings.extend(found),
-            Err(problem) => failed.push(problem),
+            Ok(found) => found.into_iter().for_each(|finding| verdict.record(finding)),
+            Err(problem) => verdict.fail(Step::LintCases, problem),
         }
     }
-    Ok((findings, failed))
 }
 
 /// The lint diagnostics of the base's own library on its cases, after checking that they

@@ -255,12 +255,9 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
     }
     let work = work_directory(arguments.work.as_deref(), &head)?;
     let github = GhReviews::new(&head);
-    // Carried evidence that cannot be read is no verdict, which a code owner's approval settles.
-    let (carried, unread) =
-        match arguments.carried.as_deref().map(super::carry::Carried::read).transpose() {
-            Ok(carried) => (carried, None),
-            Err(error) => (None, Some(error)),
-        };
+    // Carried evidence that cannot be read fails its step only, and the observations are
+    // judged all the same (review of #57, round 13).
+    let carried = arguments.carried.as_deref().map(super::carry::Carried::read);
     let tools = Tools {
         head_xtask: arguments.head_xtask.clone(),
         cargo: OsString::from("cargo"),
@@ -279,6 +276,7 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
         pr_head: arguments.pull_head.clone(),
         commit: arguments.commit.clone(),
         carried,
+        faults: super::Faults::default(),
     };
     match &arguments.mode {
         Mode::Observe(out) => {
@@ -288,10 +286,9 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
             Ok(None)
         }
         Mode::Judge(file) => {
-            let judged = match unread.map_or_else(|| Observations::read(file), Err) {
-                Ok(observed) => super::judge_all(&base, &head, &observed, &tools),
-                Err(reason) => super::judge_unobserved(&base, &head, &tools, reason),
-            };
+            let observed = Observations::read(file);
+            let observed = observed.as_ref().map_err(String::as_str);
+            let judged = super::judge_with(&base, &head, observed, &tools);
             super::settled(&base, &tools, judged).map(Some)
         }
         Mode::Both => {
