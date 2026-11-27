@@ -228,14 +228,16 @@ fn ready_issues(
         return Ok((String::new(), Vec::new()));
     }
     let trust = trust::load(root, &format!("{remote}/main"))?;
+    trust::decision_label_exists(&github.repository_labels()?)?;
     let repository = issue::github::repository_of(root, remote);
     let held: BTreeSet<&str> = current.iter().map(|claim| claim.task.as_str()).collect();
     let mut lines = Vec::new();
     let mut left_out = Vec::new();
     for found in candidates {
         let id = issue::id_of(found.number);
-        // The cheap checks first: label events cost one request per issue.
-        if held.contains(id.as_str()) || trust::unworkable(found, &[], &trust).is_some() {
+        // The cheap checks first: label events cost one request per issue, and comments one
+        // more when the bot removed `needs-decision` last.
+        if held.contains(id.as_str()) || trust::unworkable(found, &[], &[], &trust).is_some() {
             continue;
         }
         match is_workable(github, found, &trust, repository.as_deref()) {
@@ -259,8 +261,8 @@ fn is_workable(
     trust: &trust::Trust,
     repository: Option<&str>,
 ) -> Result<bool, String> {
-    let events = github.label_events(found.number)?;
-    if trust::unworkable(found, &events, trust).is_some() {
+    let (events, comments) = issue::history(github, found)?;
+    if trust::unworkable(found, &events, &comments, trust).is_some() {
         return Ok(false);
     }
     Ok(queue_failure_hold(github, found, repository)?.is_none())
@@ -304,8 +306,10 @@ fn claim_issue(
     }
     let found = github.issue(number)?;
     let trust = trust::load(root, &format!("{remote}/main"))?;
-    let events = github.label_events(number)?;
-    if let Some(reason) = trust::unworkable(&found, &events, &trust) {
+    trust::decision_label_exists(&github.repository_labels()?)
+        .map_err(|why| format!("cannot claim `{id}`: {why}"))?;
+    let (events, comments) = issue::history(github, &found)?;
+    if let Some(reason) = trust::unworkable(&found, &events, &comments, &trust) {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
     let repository = issue::github::repository_of(root, remote);
@@ -339,6 +343,8 @@ fn queue_failure_pull(found: &Issue) -> Option<u32> {
 /// Why agents may not work on the queue-failure issue `found` now, or `None` if they may or it
 /// is no queue-failure issue (ADR-0021, point 6):
 ///
+/// - the bot did not open the PR: agents never push to a human's PR, so a human rebases it.
+///   This holds whatever the labels say, so lifting `needs-decision` never releases it;
 /// - the PR it names is open and its description closes the issue: the fix is in flight, and
 ///   the PR's merge closes the issue;
 /// - the PR is closed or merged while the issue is open, or the number is no PR: nobody can
@@ -360,6 +366,9 @@ fn queue_failure_hold(
     let fix = github.issue(pull)?;
     let reason = if !fix.is_pull_request {
         format!("#{pull}, which issue #{number} names, is not a pull request; a human closes it")
+    } else if fix.author != trust::BOT_LOGIN {
+        // Held whatever the labels say: `needs-decision` is not what keeps agents off it.
+        format!("#{pull} was not opened by the bot, so agents never push to it; a human rebases it")
     } else if !fix.is_open {
         format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")
     } else if crate::pr::closes(&fix.body, number, repository) {

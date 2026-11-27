@@ -497,6 +497,15 @@ mod tests {
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(70)
         }
+        fn comment(&self, number: u32, _body: &str) -> Result<Comment, String> {
+            Err(format!("the queue commands comment on #{number} through `Forge`"))
+        }
+        fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
+            Err(format!("the queue commands never remove `{label}` from #{number}"))
+        }
+        fn repository_labels(&self) -> Result<Vec<String>, String> {
+            Err("the queue commands never list the labels".to_owned())
+        }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
             Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
         }

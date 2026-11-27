@@ -38,6 +38,10 @@ pub struct Comment {
     pub author: String,
     /// Its text.
     pub body: String,
+    /// When it was posted.
+    pub created_at: Timestamp,
+    /// When its text last changed: `created_at` if it never did.
+    pub updated_at: Timestamp,
 }
 
 /// A label that someone added to an issue or removed from it.
@@ -49,6 +53,48 @@ pub struct LabelEvent {
     pub actor: String,
     /// True if it was added, false if it was removed.
     pub added: bool,
+    /// When it happened.
+    pub created_at: Timestamp,
+}
+
+/// A time as GitHub's REST API writes it: `2026-11-26T08:24:28Z`, in UTC, to the second. In
+/// this one fixed-width form, the order of the text is the order of time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp(String);
+
+impl Timestamp {
+    /// Reads a time in GitHub's form.
+    ///
+    /// # Errors
+    ///
+    /// Any other form, such as one with fractions of a second or another time zone.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bytes = text.as_bytes();
+        let is_clock = bytes.len() == 20
+            && bytes.iter().enumerate().skip(10).all(|(at, byte)| match at {
+                10 => *byte == b'T',
+                13 | 16 => *byte == b':',
+                19 => *byte == b'Z',
+                _ => byte.is_ascii_digit(),
+            });
+        let is_day = text.get(..10).is_some_and(super::decision::is_date);
+        if !(is_clock && is_day) {
+            return Err(format!("`{text}` is not a time in the form 2026-11-26T08:24:28Z"));
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The time as GitHub wrote it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The day, `YYYY-MM-DD`, in UTC.
+    #[must_use]
+    pub fn day(&self) -> &str {
+        self.0.get(..10).expect("`parse` checked that a time starts with its day")
+    }
 }
 
 /// What the issue commands need from GitHub. Every error says what failed and how to fix it.
@@ -87,6 +133,27 @@ pub trait GitHub {
     ///
     /// When GitHub refuses it or cannot be asked.
     fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String>;
+
+    /// Posts a comment on an issue and returns it as GitHub stored it: author and times.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub refuses it or cannot be asked, or answers without a comment.
+    fn comment(&self, number: u32, body: &str) -> Result<Comment, String>;
+
+    /// Removes a label from an issue.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub refuses it, the issue does not have the label, or GitHub cannot be asked.
+    fn remove_label(&self, number: u32, label: &str) -> Result<(), String>;
+
+    /// The names of the repository's labels.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or there are more than [`LIST_MAX`].
+    fn repository_labels(&self) -> Result<Vec<String>, String>;
 
     /// True while pull request `number` has an entry in the merge queue.
     ///
@@ -134,10 +201,16 @@ pub fn issue_from_json(value: &Value) -> Result<Issue, String> {
 ///
 /// Names the field that is missing or has the wrong type.
 pub fn comment_from_json(value: &Value) -> Result<Comment, String> {
-    Ok(Comment {
+    let comment = Comment {
         author: string_at(value, &["user", "login"])?,
         body: optional_string(value, "body")?,
-    })
+        created_at: timestamp_at(value, "created_at")?,
+        updated_at: timestamp_at(value, "updated_at")?,
+    };
+    if comment.updated_at < comment.created_at {
+        return Err("GitHub sent a comment that changed before it was posted".to_owned());
+    }
+    Ok(comment)
 }
 
 /// Reads one entry of GitHub's issue-events API: a label event, or `None` for any other event.
@@ -156,7 +229,14 @@ pub fn label_event_from_json(value: &Value) -> Result<Option<LabelEvent>, String
         Some(Value::Null) | None => "ghost".to_owned(),
         Some(_) => string_at(value, &["actor", "login"])?,
     };
-    Ok(Some(LabelEvent { label: string_at(value, &["label", "name"])?, actor, added }))
+    let label = string_at(value, &["label", "name"])?;
+    Ok(Some(LabelEvent { label, actor, added, created_at: timestamp_at(value, "created_at")? }))
+}
+
+/// The time in the field `key` of `value`.
+fn timestamp_at(value: &Value, key: &str) -> Result<Timestamp, String> {
+    let text = string_at(value, &[key])?;
+    Timestamp::parse(&text).map_err(|error| format!("GitHub sent a bad `{key}`: {error}"))
 }
 
 /// Parses `gh api --jq '.[]'` output: one JSON value per line.
@@ -325,6 +405,27 @@ impl GitHub for Gh {
         Ok(issue_from_json(&self.one(&arguments, Some(&request))?)?.number)
     }
 
+    fn comment(&self, number: u32, body: &str) -> Result<Comment, String> {
+        let request = format!("{{\"body\": {}}}", json::quote(body));
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
+        let posted = self.one(&["--method", "POST", &path, "--input", "-"], Some(&request))?;
+        comment_from_json(&posted)
+            .map_err(|error| format!("GitHub posted the comment on #{number}, but {error}"))
+    }
+
+    fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
+        let is_plain = label.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-');
+        assert!(is_plain, "the label `{label}` needs no escaping in a URL");
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/labels/{label}");
+        let _ = self.api(&["--method", "DELETE", &path], None)?;
+        Ok(())
+    }
+
+    fn repository_labels(&self) -> Result<Vec<String>, String> {
+        let labels = self.list("repos/{owner}/{repo}/labels?per_page=100")?;
+        labels.iter().map(|label| string_at(label, &["name"])).collect()
+    }
+
     fn is_queued(&self, number: u32) -> Result<bool, String> {
         is_queued_from_json(&self.queue_entry(number)?)
     }
@@ -362,8 +463,8 @@ pub fn is_queued_from_json(graphql: &Value) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Comment, Issue, LabelEvent, comment_from_json, issue_from_json, label_event_from_json,
-        parse_lines,
+        Comment, Issue, LabelEvent, Timestamp, comment_from_json, issue_from_json,
+        label_event_from_json, parse_lines,
     };
     use crate::json::parse;
 
@@ -415,30 +516,79 @@ mod tests {
         }
     }
 
-    // Goal: comments and label events are read; other events are skipped, and a deleted
-    // account is the actor `ghost`.
+    // Goal: comments and label events are read with their times; other events are skipped,
+    // and a deleted account is the actor `ghost`.
     #[test]
     fn comments_and_label_events_are_read() {
-        let comment = parse(r#"{"user": {"login": "someone"}, "body": "Hi"}"#).unwrap();
-        let expected = Comment { author: "someone".to_owned(), body: "Hi".to_owned() };
-        assert_eq!(comment_from_json(&comment), Ok(expected));
-        assert!(comment_from_json(&parse(r#"{"body": "Hi"}"#).unwrap()).is_err(), "no author");
+        let at = |text: &str| Timestamp::parse(text).expect("a time");
+        let comment = |times: &str| {
+            let text = format!(r#"{{"user": {{"login": "someone"}}, "body": "Hi"{times}}}"#);
+            comment_from_json(&parse(&text).unwrap())
+        };
+        let times =
+            r#", "created_at": "2026-11-26T08:00:00Z", "updated_at": "2026-11-26T09:00:00Z""#;
+        let expected = Comment {
+            author: "someone".to_owned(),
+            body: "Hi".to_owned(),
+            created_at: at("2026-11-26T08:00:00Z"),
+            updated_at: at("2026-11-26T09:00:00Z"),
+        };
+        assert_eq!(comment(times), Ok(expected));
+        let unedited = times.replace("T09", "T08");
+        assert!(comment(&unedited).is_ok(), "a comment never edited has one time");
+        let backwards = times.replace("T09", "T07");
+        assert!(comment(&backwards).expect_err("edited first").contains("before it was posted"));
+        assert!(comment("").expect_err("no times").contains("`created_at`"));
+        let late = times.replace("09:00:00Z", "09:00:00.5Z");
+        assert!(comment(&late).expect_err("bad time").contains("bad `updated_at`"));
+        let no_author = r#"{"body": "Hi", "created_at": "2026-11-26T08:00:00Z"}"#;
+        assert!(comment_from_json(&parse(no_author).unwrap()).is_err(), "no author");
 
         let event = |kind: &str, actor: &str| {
-            let text =
-                format!(r#"{{"event": "{kind}", "actor": {actor}, "label": {{"name": "x"}}}}"#);
+            let text = format!(
+                r#"{{"event": "{kind}", "actor": {actor}, "label": {{"name": "x"}},
+                "created_at": "2026-11-26T08:00:00Z"}}"#
+            );
             label_event_from_json(&parse(&text).unwrap())
         };
         let label = |actor: &str, added| LabelEvent {
             label: "x".to_owned(),
             actor: actor.to_owned(),
             added,
+            created_at: at("2026-11-26T08:00:00Z"),
         };
         assert_eq!(event("labeled", r#"{"login": "a"}"#), Ok(Some(label("a", true))));
         assert_eq!(event("unlabeled", r#"{"login": "a"}"#), Ok(Some(label("a", false))));
         assert_eq!(event("unlabeled", "null"), Ok(Some(label("ghost", false))));
         assert_eq!(event("closed", r#"{"login": "a"}"#), Ok(None));
         assert!(event("labeled", "{}").is_err(), "an actor without a login");
+        let untimed = r#"{"event": "labeled", "actor": null, "label": {"name": "x"}}"#;
+        assert!(label_event_from_json(&parse(untimed).unwrap()).is_err(), "an event has a time");
+    }
+
+    // Goal: only GitHub's own form of a time is read, and times order as text does.
+    #[test]
+    fn timestamps_have_one_form() {
+        let early = Timestamp::parse("2026-11-26T08:24:28Z").expect("GitHub's form");
+        let late = Timestamp::parse("2026-11-26T10:00:00Z").expect("GitHub's form");
+        assert!(early < late, "the order of time");
+        assert!(late > early, "and back");
+        for bad in [
+            "2026-11-26T08:24:28",
+            "2026-11-26T08:24:28.000Z",
+            "2026-11-26T08:24:28+00:00",
+            "2026-11-26 08:24:28Z",
+            "2026-11-26T08-24:28Z",
+            "2026-11-26T08:24-28Z",
+            "2026-11-26T08:24:2aZ",
+            "2026-11-26T08:24:280",
+            "2026-02-30T08:24:28Z",
+            "2026-11-26t08:24:28Z",
+            "",
+        ] {
+            let error = Timestamp::parse(bad).expect_err(bad);
+            assert!(error.contains("not a time"), "{bad}: {error}");
+        }
     }
 
     // Goal: a GitHub remote URL in each of git's forms names its `owner/name`; another host or
