@@ -1938,6 +1938,38 @@ mod tests {
         super::sinks::report_lists(signature, block, owner, &file).into_iter().collect()
     }
 
+    // Goal: a report list is one that the base only adds to: a declared `Violation` counts as
+    // the crate's own; a field that another function of the file clears, or that a macro
+    // mentions, is none, though one that another function returns is; a local or a field of a
+    // local that a macro mentions is none.
+    #[test]
+    fn report_lists_need_only_appends() {
+        let declared = "struct Violation;\nfn g() -> Vec<Violation> { let returned = Vec::new(); \
+                        returned }";
+        assert_eq!(lists_of(declared, "g", None), ["returned"]);
+        let fields = "use super::Violation;\nstruct V { violations: Vec<Violation> }\nimpl V { fn \
+                      m(&mut self) { self.violations.push(Violation); } }\nfn take(v: V) -> \
+                      Vec<Violation> { v.violations }";
+        assert_eq!(lists_of(fields, "m", Some("V")), ["self.violations"]);
+        let cleared = format!("{fields}\nfn clear(v: &mut V) {{ v.violations.clear(); }}");
+        assert_eq!(lists_of(&cleared, "m", Some("V")), Vec::<String>::new(), "cleared elsewhere");
+        let shown =
+            format!("{fields}\nfn show(v: &V) {{ assert!(v.violations.is_empty(), \"x\"); }}");
+        assert_eq!(lists_of(&shown, "m", Some("V")), Vec::<String>::new(), "a macro mentions it");
+        let local = "use super::Violation;\nfn g() -> Vec<Violation> { let returned = Vec::new(); \
+                     let _ = format!(\"{:?}\", returned); returned }";
+        assert_eq!(lists_of(local, "g", None), Vec::<String>::new(), "a macro mentions the local");
+        let visitor = "use super::Violation;\nstruct V { violations: Vec<Violation> }\nfn f() -> \
+                       Report { let visitor = V { violations: Vec::new() }; let _ = \
+                       format!(\"{:?}\", visitor.violations); Report { violations: \
+                       visitor.violations } }";
+        assert_eq!(
+            lists_of(visitor, "f", None),
+            Vec::<String>::new(),
+            "a macro mentions the field"
+        );
+    }
+
     // Goal: the report lists of a function are read from the base's declarations: a typed or
     // returned local, a `&mut Vec<Violation>` parameter, a `self` field of that type, and a
     // field of a returned struct literal; nothing else, and nothing without `Violation`
