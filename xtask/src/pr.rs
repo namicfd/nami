@@ -730,7 +730,9 @@ mod tests {
             .collect();
         let owned = owned_lines.join("\n");
         let flipped = crate::ratchet::scope::flipped_codeowners(&owned);
-        assert_eq!(parse_codeowners(&flipped), parse_codeowners(&text));
+        let expected = parse_codeowners(&flipped).expect("the flip of the owned lines parses");
+        let real = parse_codeowners(&text).expect("the real CODEOWNERS parses");
+        assert_eq!(real, expected);
     }
 
     // Goal: each of the three supported forms parses to its own variant; comments, blank lines

@@ -50,8 +50,8 @@ pub struct Rule {
 }
 
 /// Every tidy rule that is written as code. Keep the rows sorted by id. The rows are plain
-/// literals, so that the ratchet (pending, #57) can read them from a pull request's source
-/// without running it (ADR-0022, pending in #55).
+/// literals, so that the ratchet can read them from a pull request's source without running
+/// it (ADR-0022).
 pub const RULES: &[Rule] = &[
     Rule {
         id: "adr-index",
