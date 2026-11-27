@@ -59,7 +59,7 @@ The guardrail tooling is split in two.
 
 **The trusted core** stays code-owned and always needs the maintainer:
 
-- `.github/` (workflows, CODEOWNERS, the setup action), `.claude/` (hooks, settings, agents, the `review-pr` skill), every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/`, `.config/`, the `justfile`;
+- `.github/` (workflows, CODEOWNERS, the setup action), `.claude/` (hooks, settings, agents, the `review-pr` skill), every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.cargo/`, `.config/`, the `justfile`. A manifest or build file under a rule path (`Cargo.toml`, `build.rs`, `.cargo/`, a toolchain file) has no code owner by its path, but the ratchet makes it an edit that only a code owner's approval of the head settles; the reviewer app's `APPROVE` is not enough (maintainer's decision, #55's review, round 3);
 - in `xtask/`:
   - the root lookup (`lib.rs`) and the command line (`main.rs`, `tidy/cli.rs`);
   - in `tidy.rs`: the file walk (`is_walked`), file kinds (`ADR_DIRECTORY`, `is_adr_file_name`, `STYLE_GUIDE`, moved there from `docs.rs` and `style_guide.rs`), and scopes;
@@ -111,7 +111,7 @@ The ratchet sorts each rule-path diff into one class (`xtask/src/ratchet/class.r
 - a new constant or static at any depth, associated constants included (mutation testing makes no mutant for its value), a new macro or inline module, an import into an existing module;
 - `unsafe` code, an `extern` block, or an attribute outside the allowed ones, anywhere in a new item, a new test module's items included;
 - a new lint declared below `Deny`;
-- a manifest or build file in a rule path, new, changed or deleted;
+- a manifest or build file in a rule path, new, changed or deleted, which only a code owner's approval settles;
 - an `extend` on a place that is not a report list of its function, or with a call that does not return `Vec<Violation>`;
 - a registry row change that no data check proves, such as a new planned row or a changed `mechanism`;
 - a changed or deleted fixture, UI case or other file.
@@ -185,7 +185,7 @@ The judge draws the placements again from the recorded seed, after checking that
   - a pull request whose head moved on from the commit judged;
   - something unproven (a hunk without a mutant, a skipped check, an edit without the reviewer app's approval) when no code owner reviews the PR.
 
-  When the base's CODEOWNERS owns a changed path, the owner reviews anyway, and the unproven items become notes. So do they when a user whom the base's CODEOWNERS names has approved the PR's head commit. That approval also settles every no verdict that is not a finding: a file outside the dialect, a symbolic link, missing observations or carried evidence, or a tool that failed. The verdict becomes a pass whose notes give the reason (`ratchet::settled`, #55's review). Findings come with a verdict and still fail. So a rule-only PR that the ratchet cannot vouch for, or cannot judge, needs the owner's approval, never the admin bypass.
+  When the base's CODEOWNERS owns a changed path, the owner reviews anyway, and the unproven items become notes. So do they when a user whom the base's CODEOWNERS names has approved the PR's head commit. That approval also settles every no verdict that is not a finding: a file outside the dialect, a symbolic link, missing observations or carried evidence, or a tool that failed. The verdict becomes a pass whose notes give the reason (`ratchet::settled`, #55's review). **Findings always fail, even with the owner's approval.** The judge adds every step to one verdict: a step that cannot reach a result records its reason and the others go on, so no late no verdict (a mutant that timed out, carried evidence of another tree, a review that cannot be read, a file that does not parse) drops a finding of another step, and one workspace's timeout keeps another's missed mutants. A verdict with any finding is never settled; its summary lists the findings and what could not be judged (#57's review, round 11). So a rule-only PR that the ratchet cannot vouch for, or cannot judge, needs the owner's approval, never the admin bypass.
 
 ### 4. Threat model
 
@@ -224,7 +224,7 @@ In a merge group, the judge diffs the group's head against the group's parent co
   - Its artifact must download. The observed commit must be a full commit whose second parent is the PR head and whose first parent is an ancestor of the group's base, as the review run checks. The observation must not have skipped, and its head fingerprint must be the observed tree's.
   - The judge compares the two rule-path diffs path for path and text for text, and reads the carried runs only if they are identical. It then judges them as it judges its own. Anything else is no verdict. The PR's own diff is the one that was mutated, which can differ from merge-base..head when the base moved; comparing with the observed trees is what makes the mutants' line numbers mean the same.
 - A change to the trusted core between that observation and the queue is not mutated again. The corpus and end to end, which do run again, show how the rules apply on the queued merge; mutants only ever show that the head's tests pin its own rule code.
-- **The consequence: rule PRs that touch the same file merge one at a time.** Once one of them lands, the next one's carried evidence observed another base text of that file, so its rule-path diff differs and its merge group gives no verdict. Two queued PRs that both add `registry.rs` rows hit this every time. The queue-failure job files such a failure like any other (`queue.yml` watches `guardrails` too), and its fix is to rebase the PR onto the new `main` and push. Only a new `pull_request` event refreshes the evidence: a push, a rebase, or an edit of the description. Re-running the workflow observes the same old test merge, and it does not help. So such PRs merge one after another, each rebased after the last one lands. This is the price of the exact-diff rule, which is what makes the carried line numbers mean the same.
+- **The consequence: rule PRs that touch the same file merge one at a time.** Once one of them lands, the next one's carried evidence observed another base text of that file, so its rule-path diff differs and its merge group gives no verdict. Two queued PRs that both add `registry.rs` rows hit this every time. The queue-failure job files such a failure like any other (`queue.yml` watches `guardrails` too; when `ci` fails for the same merge group as well, one issue names both runs), and its fix is to rebase the PR onto the new `main` and push. Only a new `pull_request` event refreshes the evidence: a push, a rebase, or an edit of the description. Re-running the workflow observes the same old test merge, and it does not help. So such PRs merge one after another, each rebased after the last one lands. This is the price of the exact-diff rule, which is what makes the carried line numbers mean the same.
 - In a merge group the head job has 15 minutes and the judge 10, against about 2 minutes each measured, which fits ADR-0009's 30 with time for runners to pick the jobs up. Both judges install the lint library's toolchain and `cargo-dylint` only when something below `lints/`, or the dylint wrapper, changed, which is when they run the lint checks.
 
 ### 6. The review gate
@@ -293,11 +293,11 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 
 ## Consequences
 
-- **An additive PR merges on the ratchet's proof alone,** with no review needed: new fixtures and UI cases, a new ban row with its fixtures, a new tidy rule as new functions and types with one dispatch call and its own visitor, a new lint with its pass and `impl LateLintPass`, reworded documentation. An open request for changes or thread by the reviewer app still blocks it.
+- **An additive PR merges on the ratchet's proof alone,** with no approval needed (the AI review that AGENTS.md's "Done means" asks for still runs): new fixtures and UI cases, a new ban row with its fixtures, a new tidy rule as new functions and types with one dispatch call and its own visitor, a new lint with its pass and `impl LateLintPass`, reworded documentation. An open request for changes or thread by the reviewer app still blocks it.
 - **A data-only change to the registry's tables needs no mutant** (maintainer's decision on #57). The rule-set check reads the tables as data and proves that they only tighten. That holds only for the fields that check compares and those that only document (point 3); a change to any other field is an edit.
 - **An edit to existing rule code waits for the reviewer app's approval of its head commit,** or a code owner's: a changed constant, function, `impl` or test, a fixture changed or deleted, a reworked lint like #31's. Its checks still run, and still fail it on a finding.
 - **The dialect no longer holds code to the base.** Rounds 3 and 4 of #57's review added hold lists for constants, reads of the environment and the functions that apply a ban row; each round found a form they missed. The class replaces them: any change to an existing item is an edit.
-- **A new rule whose tag goes in `docs/TIGER_STYLE.md` still needs the owner for now,** because the style guide is core (#53). Tags are to move out of the style guide in a separate PR (the issue "Rule tags live in the style guide"; maintainer's decision). Until then, no check asks for a tag: a rule may merge untagged, as the canonical `trailing-space` diff does, and `docs/RULES.md` lists it.
+- **A new rule whose tag goes in `docs/TIGER_STYLE.md` still needs the owner for now,** because the style guide is core (#53). Tags are to move out of the style guide in a separate PR (#77; maintainer's decision). Until then, no check asks for a tag: a rule may merge untagged, as the canonical `trailing-space` diff does, and `docs/RULES.md` lists it.
 - **Until the reviewer app exists, an edit needs a code owner's approval of its head commit**, as today, but never the admin bypass. An additive PR does not wait for the app.
 - **Time.** Measured on the maintainer's 32-core machine with warm caches:
   - the ratchet without mutants takes about 30 s for a tidy change and a minute for a lint change, with three placements per case;
@@ -412,6 +412,8 @@ The ratchet lands in shadow mode first: the core moves, then `ratchet observe` a
 | the reviewer app's approval of an edit also waived a failed null-mutant run | waived | unproven until a code owner approves (`a_test_that_pins_its_file_gives_no_verdict`) |
 | a new `Cargo.toml` or other build file under `lints/src/` or `lints/ui/` was a new data file | additive | an edit (`a_new_manifest_in_a_rule_path_is_an_edit`) |
 | the full ratchet, mutants included, ran in every merge group, past the queue's 30 minutes on a lint change | likely timeout | the merge group carries the PR's mutation evidence when the rule-path diff is identical (point 5): 106 s and 132 s on the canonical diffs |
+
+**#57's round 11: a late no verdict dropped findings.** The judge collected findings step by step, and any later failure returned no verdict and dropped them, so a code owner's approval turned 126 findings plus a carried-evidence mismatch into a pass (deliberate in effect, honest in cause). The judge now adds every step to one verdict, and a verdict with a finding is never settled (`findings_survive_a_late_no_verdict`, for a mutant timeout, a carry mismatch, a review that cannot be read and a file that does not parse; `one_workspace_s_timeout_keeps_another_s_misses`).
 
 **#34 replayed with mutation testing** (first version): pass, 35 mutants, 33 caught and 2 unviable.
 
