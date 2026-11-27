@@ -88,6 +88,25 @@ const WITHHELD_VARIABLES: [&str; 5] =
 /// The base's CODEOWNERS, which decides whether the owner reviews a pull request anyway.
 const CODEOWNERS: &str = ".github/CODEOWNERS";
 
+/// Where the frozen copies of rule-path files live, for the ratchet's own tests.
+const FROZEN: &str = "xtask/fixtures/ratchet";
+
+/// The frozen copy of the rule-path file `relative`: `xtask/fixtures/ratchet/<relative>.frozen`,
+/// a snapshot that the ratchet's own tests read instead of the live file. The tests edit their
+/// inputs by exact text, so on the live files an additive change, such as a dispatch call at
+/// the tail of `text::check`, would break them, and the ratchet could never vouch for it
+/// (review of #57, round 8). Only `the_rule_paths_are_in_the_dialect` and the invariant
+/// `every_rule_in_a_rule_path_has_a_case` read the live tree, and neither anchors on text.
+#[must_use]
+pub fn frozen(relative: &str) -> String {
+    assert!(!relative.starts_with('/'), "a frozen copy is named by a relative path");
+    let path = crate::workspace_root().join(FROZEN).join(format!("{relative}.frozen"));
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("the frozen copy {}: {error}", path.display()));
+    assert!(!text.is_empty(), "a frozen copy holds the file's text");
+    text
+}
+
 /// The checks, as they are named in findings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Check {

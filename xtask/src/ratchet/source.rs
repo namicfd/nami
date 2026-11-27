@@ -438,8 +438,9 @@ mod tests {
         assert!(below_a_file.contains("cannot read"), "only a missing file is none");
     }
 
+    /// The frozen copy of the registry ([`crate::ratchet::frozen`]).
     fn real_registry() -> String {
-        std::fs::read_to_string(crate::workspace_root().join(super::REGISTRY)).unwrap()
+        crate::ratchet::frozen(super::REGISTRY)
     }
 
     fn messages(base: &str, head: &str) -> Vec<String> {
@@ -590,9 +591,7 @@ mod tests {
         let pairs: Vec<(&str, &str)> =
             found.iter().map(|(f, c)| (f.as_str(), c.as_str())).collect();
         assert_eq!(pairs, [("V::b", "self.check_y"), ("a", "check_x")]);
-        let real =
-            std::fs::read_to_string(crate::workspace_root().join("xtask/src/tidy/rust_source.rs"))
-                .unwrap();
+        let real = crate::ratchet::frozen("xtask/src/tidy/rust_source.rs");
         let calls = check_calls("rust_source.rs", &real).unwrap();
         let pair = ("Visitor::check_body".to_owned(), "self.check_float_equality".to_owned());
         assert!(calls.contains(&pair), "{calls:?}");

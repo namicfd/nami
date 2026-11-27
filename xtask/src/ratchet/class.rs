@@ -1231,8 +1231,12 @@ mod tests {
 
     const RULES: &str = "xtask/src/tidy/rust_source.rs";
 
+    /// The frozen copy of the rule-path file `relative`, under `xtask/fixtures/ratchet/`. The
+    /// tests never read the live rule files, so that an additive change to one, such as a
+    /// dispatch call at the tail of `text::check`, cannot break the anchors they edit (review
+    /// of #57, round 8).
     fn real(relative: &str) -> String {
-        std::fs::read_to_string(crate::workspace_root().join(relative)).unwrap()
+        crate::ratchet::frozen(relative)
     }
 
     /// `text` with the one occurrence of `from` replaced by `to`.

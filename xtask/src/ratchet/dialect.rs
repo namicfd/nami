@@ -235,8 +235,9 @@ fn without_tests(relative: &str, text: &str) -> Result<TokenStream, String> {
 mod tests {
     use super::{check_head, lints, registry, rules};
 
+    /// The frozen copy of the rule-path file `relative` ([`crate::ratchet::frozen`]).
     fn real(relative: &str) -> String {
-        std::fs::read_to_string(crate::workspace_root().join(relative)).unwrap()
+        crate::ratchet::frozen(relative)
     }
 
     /// Replaces the one occurrence of `from` in `text`.

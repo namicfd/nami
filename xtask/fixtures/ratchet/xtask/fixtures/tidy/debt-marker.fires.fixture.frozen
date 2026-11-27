@@ -1,0 +1,5 @@
+// path: crates/solver/src/example.rs
+//! A marker for unfinished work, left in a comment.
+
+// TODO: fill the ghost cells before the first step.
+fn fill_ghosts() {}

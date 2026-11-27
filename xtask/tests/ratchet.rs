@@ -199,8 +199,10 @@ fn executable(path: &Path, text: &str) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The frozen copy of the rule-path file `relative` (`xtask::ratchet::frozen`), never the live
+/// file, so that an additive change to a rule file cannot break these tests.
 fn real(relative: &str) -> String {
-    fs::read_to_string(xtask::workspace_root().join(relative)).expect("the real file exists")
+    xtask::ratchet::frozen(relative)
 }
 
 /// A CODEOWNERS that owns a core file and `.github/`, and leaves the rule paths unowned, as the

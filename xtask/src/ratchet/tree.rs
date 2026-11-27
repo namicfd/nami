@@ -137,7 +137,10 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Copies the regular files of `source` to `destination`, which is emptied first.
+    /// Copies the regular files of `source` to `destination`, which is emptied first, with
+    /// their permissions: a script that a test runs must stay executable in the copy, or the
+    /// null mutant's run of the tests fails for a reason that is no source text (review of
+    /// #57, round 8).
     ///
     /// # Errors
     ///
@@ -155,6 +158,7 @@ impl Scratch {
                 let target = destination.join(&relative);
                 fs::create_dir_all(target.parent().expect("a file below the root has a parent"))?;
                 fs::write(&target, bytes)?;
+                fs::set_permissions(&target, fs::metadata(source.join(&relative))?.permissions())?;
                 copied += 1;
             }
         }
@@ -272,6 +276,32 @@ mod tests {
         let changed = changed_paths(base.root(), head.root()).unwrap();
         assert_eq!(changed, ["added.rs", "edited.rs", "linked.rs", "removed.rs"]);
         assert_eq!(changed_paths(base.root(), base.root()).unwrap(), Vec::<String>::new());
+    }
+
+    // Goal: the copy keeps each file's permissions, so an executable script runs from the copy
+    // as from the source, and a read-only file stays read-only.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_copies_keep_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = Temporary::new("ratchet-tree-modes");
+        source.write("tools/run.sh", "#!/bin/sh\necho ran\n");
+        source.write("tools/plain.txt", "plain\n");
+        let script = source.root().join("tools/run.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = source.root().join("tools/plain.txt");
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let target = Temporary::new("ratchet-tree-modes-copy");
+        let copy = Scratch::copy_of(source.root(), &target.root().join("copy")).unwrap();
+        let output = std::process::Command::new(copy.root().join("tools/run.sh")).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&copy.root().join("tools/run.sh")), 0o755);
+        assert_eq!(mode(&copy.root().join("tools/plain.txt")), 0o444);
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let copied = copy.root().join("tools/plain.txt");
+        std::fs::set_permissions(&copied, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     // Goal: the copy holds the regular files only, and planting a file over an existing one or
