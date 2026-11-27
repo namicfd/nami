@@ -131,38 +131,43 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
 `no verdict (edit)`):
 
 - **Additive** (ADR-0022, point 2): new functions and types, one dispatch call per new item, new
-  registry rows, new fixtures and UI cases, reworded docs. It merges on the ratchet's proof
-  alone, with no review needed; an open request for changes or thread by the reviewer app still
-  blocks it. Write a new rule this way when you can: add its code beside the old, leave existing
-  functions, constants and tests as they are, and give a new type only plain `impl`s in its own
-  file, of any trait, with lifetime parameters used only in the trait path and the method
-  signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand the new rule's
-  reports to the existing ones as `violations.extend(new_rule(&..))`, where `new_rule` returns
-  `Vec<Violation>` and `violations` is the list the function returns or reports into. Pass
-  literals, `&place`, or a `&T` parameter of the function as it is (`new_rule(path, &lines)`
-  in `text::check`). Declare a new lint at `Deny`. Give a new tidy rule its firing fixture in
-  the same PR. Don't add a constant or static, not even beside the rule: put the value in the
-  function. Don't nest an `impl`, trait, module, `macro_rules!` or constant in a function, don't
-  write `unsafe` or an attribute beyond `doc`, `derive`, `must_use`, `inline`, `expect` and
-  `test`, and don't read files, the environment, the clock, threads or the network, nor use
-  `include_str!`, `file!` or `env!`, not even in a test. In a test module, write functions,
+  rule and ban rows (not `PLANNED` rows), new fixtures and UI cases, reworded docs. It merges on
+  the ratchet's proof alone, with no review needed; an open request for changes or thread by the
+  reviewer app still blocks it. Write a new rule this way when you can: add its code beside the
+  old, leave existing functions, constants and tests as they are, and give a new type only
+  plain `impl`s in its own file, of any trait, with lifetime parameters used only in the trait
+  path and the method signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand
+  the new rule's reports to the existing ones as `violations.extend(new_rule(&..))`, where
+  `new_rule` returns `Vec<Violation>` and `violations` is the list the function returns or
+  reports into. Pass literals, `&place`, or a `&T` parameter of the function as it is
+  (`new_rule(path, &lines)` in `text::check`). Declare a new lint at `Deny`. Give a new tidy
+  rule its firing fixture in the same PR. Don't add a constant or static, not even beside the
+  rule: put the value in the function. Add no `use` to an existing file: write full paths. Add
+  no top-level `macro_rules!` or inline module. Don't nest an `impl`, trait, module,
+  `macro_rules!` or constant in a function, don't write `unsafe` or an attribute beyond `doc`,
+  `derive`, `must_use`, `inline`, `expect` and `test`, and don't read files, the environment,
+  the clock, threads or the network, nor use `include_str!`, `file!` or `env!`, not even in a
+  test. In a test module, write functions,
   helper types and their plain `impl`s and imports only. In a lint, don't reach `dcx` or `sess`,
   not even as `float_reduction` reads `tcx.sess`: copying that makes the PR an edit. No test
   may depend on the source text or line numbers of the file it tests: the ratchet runs the
   tests on a copy with a blank line and a comment added, and gives no verdict if one fails.
-  **A new tidy rule still waits for the owner:** its tag in `docs/TIGER_STYLE.md` (step 5) is
-  core. Never leave the tag out to get an unreviewed merge.
+  **Tags:** until the issue "Rule tags live in the style guide" lands, a new rule whose tag goes
+  in `docs/TIGER_STYLE.md` (step 5), which is core, waits for the owner. A rule may also merge
+  untagged: `docs/RULES.md` lists it.
 - **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
-  constant or static; a new lint below `Deny`; a manifest or build file in a rule path; a new
-  member of an existing `impl`; an `impl` in another file than its type, with type or const
-  parameters, or with a `where` clause. It waits for the reviewer app's approval of its head
-  commit (#59) or a code owner's approval of it, and until that app exists for the latter. The
-  rule paths have no owner, so GitHub does not ask for that review: once the summary says
+  constant or static; a new `PLANNED` row; a `use` added to an existing file; a new top-level
+  `macro_rules!` or inline module; a new lint below `Deny`; a manifest or build file in a rule
+  path; a new member of an existing `impl`; an `impl` in another file than its type, with type
+  or const parameters, or with a `where` clause. It waits for the reviewer app's approval of its
+  head commit (#59) or a code owner's approval of it, and until that app exists for the latter.
+  The rule paths have no owner, so GitHub does not ask for that review: once the summary says
   `(edit)`, request it with `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer
   cxkoda` (the login in `.github/CODEOWNERS`). Say in the PR description why the edit does not
   loosen the rule.
 
 Run the check yourself first, inside a checkout of `main`:
 `cargo xtask ratchet --base . --head <your tree> --no-review`. Without a review, it reports the
-skipped review check as unproven, so its verdict line says `no verdict` for any rule-path change;
-read the findings, the class and the other unproven items.
+skipped review check as unproven, so its verdict line says `no verdict` for a change to rule paths
+only; with an owned path changed too, such as the style guide, it can read `pass (..), outside
+the rule paths`. Read the findings, the class and the other unproven items.
