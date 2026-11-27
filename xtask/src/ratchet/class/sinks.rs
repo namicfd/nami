@@ -17,13 +17,22 @@
 //! - every other use of the place in the base function is the receiver of `push` or `extend`,
 //!   or the value returned, as the final expression or a field of a struct literal that is the
 //!   final expression (`Report { violations: visitor.violations }`); a local must be returned;
-//! - for a field, every access of a field of that name anywhere in the file outside its tests
-//!   is such a use too, so no method of the type, nor any function handed the value, does more;
+//! - for a field, every field access (`Expr::Field`) of a field of that name anywhere in the
+//!   file outside its tests is such a use too;
 //! - no macro in the base function, or for a field in the file, mentions the place.
 //!
 //! Any `retain`, `dedup`, `sort`, `clear`, `truncate`, `drain`, `filter`, indexing or `&mut`
-//! borrow of it makes it no report list, and the dispatch call an edit; so does a place whose
-//! type cannot be read so.
+//! borrow of it that these see makes it no report list, and the dispatch call an edit; so does
+//! a place whose type cannot be read so.
+//!
+//! **What this does not prove.** The proof is per function, and for fields it sees field
+//! accesses only. It does not follow a field taken apart by a pattern (`let Self { violations,
+//! .. } = self`, or in a parameter), a `&mut Vec<Violation>` parameter into its callers, or a
+//! returned list into the function that receives it. A base that post-processed a report list
+//! there would pass. Only post-processing that depends on the other reports can hide one
+//! (`dedup`, `truncate`, a branch on `len()`); no base in the rule paths does it today: its
+//! callers sort stably or filter by rule id. A base that starts to is a reviewed edit (review
+//! of #57, round 8).
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;

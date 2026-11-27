@@ -21,9 +21,13 @@
 //! also runs the head's tests, as cargo-mutants runs them, on a copy of the head in which every
 //! file that has mutants carries a change that alters no behaviour ([`null_mutant`]): a blank
 //! line at the top and a comment at the end. If any test fails there, the mutant evidence of
-//! that workspace proves nothing. This closes the family of tests that pin the file, however
-//! they read it; the class's refusal of `SENSITIVE` names and input macros in new tests is the
-//! cheaper, earlier refusal of the same thing.
+//! that workspace proves nothing. This closes the tests that pin the file's layout or length,
+//! however they read it. A test written to pin its content instead, by hashing the code
+//! without its first lines, by an anchor inside the mutated code or by comparing tokens, passes
+//! the null mutant and still fails on every real one: that needs deliberate code, so it is a
+//! residual risk of the "code written to deceive" kind (ADR-0022), against which the class's
+//! refusal of `SENSITIVE` names and input macros in new tests is what stands. The run is
+//! given [`NULL_SECONDS_MAX`] seconds.
 
 use super::observations::{Observations, Run};
 use super::{Check, Finding, Tools};
@@ -67,6 +71,13 @@ const WORKSPACES: [Workspace; 2] = [
 /// The mode of a null-mutant run, and the name under which it keeps the files it changed.
 const NULL: &str = "null";
 const NULL_FILES: &str = "null-files";
+
+/// Seconds the null mutant's test run may take, its build in a fresh target directory
+/// included, before it is killed and gives no verdict.
+pub const NULL_SECONDS_MAX: u64 = 3600;
+
+/// How often a running null mutant is looked at, in milliseconds.
+const NULL_POLL_MILLISECONDS: u64 = 200;
 
 /// The comment the null mutant appends to each file that has mutants.
 const NULL_COMMENT: &str = "// The ratchet's null mutant: a change that alters no behaviour.";
@@ -129,20 +140,33 @@ pub fn observe(
 /// line number, and a comment line at the end.
 #[must_use]
 pub fn null_mutant(text: &str) -> String {
-    let changed = format!("\n{text}\n{NULL_COMMENT}\n");
-    assert!(changed.len() > text.len(), "the null mutant changes the text");
-    changed
+    assert!(!text.contains(NULL_COMMENT), "a file carries the null mutant at most once");
+    format!("\n{text}\n{NULL_COMMENT}\n")
 }
 
 /// Runs the head's tests, as cargo-mutants runs them, on a copy of the head in which each of
 /// the files that have mutants, relative to the workspace, carries the null mutant, all at
-/// once. Runs head code; judges nothing.
+/// once, for at most [`NULL_SECONDS_MAX`] seconds. Runs head code; judges nothing.
+///
+/// # Errors
+///
+/// Returns what failed: a listed file outside the workspace's rule paths or missing, or a copy,
+/// file or command that cannot be made, written or run.
 fn run_null(
     head: &Path,
     workspace: &Workspace,
     mutated: &BTreeSet<String>,
     tools: &Tools<'_>,
 ) -> Result<Run, String> {
+    assert!(!mutated.is_empty(), "the null mutant runs only where there are mutants");
+    let within = |file: &String| Path::new(workspace.directory).join(file);
+    if let Some(outside) = mutated.iter().find(|file| !within(file).starts_with(workspace.sources))
+    {
+        return Err(format!(
+            "cargo-mutants listed {outside} for {}, outside its rule paths `{}`",
+            workspace.name, workspace.sources
+        ));
+    }
     let destination = tools.work.join(format!("null-{}", workspace.name));
     let copy = super::tree::Scratch::copy_of(head, &destination)
         .map_err(|error| format!("cannot copy the head for the null mutant: {error}"))?;
@@ -157,28 +181,73 @@ fn run_null(
     let target = tools.work.join(format!("null-target-{}", workspace.name));
     let mut command = super::command(&tools.cargo, &directory);
     let _command = command.args(workspace.tests).arg("--target-dir").arg(&target);
-    let output = super::output(&mut command, "the head's tests on the null mutant")?;
+    let (exit, stdout, stderr) = output_within(&mut command, &tools.work, NULL_SECONDS_MAX)?;
     let files: Vec<&str> = mutated.iter().map(String::as_str).collect();
-    Ok(Run {
+    let run = Run {
         subject: workspace.name.to_owned(),
         placement: String::new(),
         mode: NULL.to_owned(),
-        exit: output.status.code(),
-        stdout: super::tail(&String::from_utf8_lossy(&output.stdout), 40),
-        stderr: super::tail(&String::from_utf8_lossy(&output.stderr), 40),
+        exit,
+        stdout: super::tail(&stdout, 40),
+        stderr: super::tail(&stderr, 40),
         files: BTreeMap::from([(NULL_FILES.to_owned(), Some(files.join("\n")))]),
-    })
+    };
+    assert_eq!(run.subject, workspace.name, "the run names its workspace");
+    Ok(run)
+}
+
+/// Runs `command` for at most `seconds`, its output written to files in `work` so that no
+/// pipe fills, and returns its exit code, `None` if it was killed, and what it printed. A run
+/// that does not finish in time is killed and says so on its stderr.
+///
+/// # Errors
+///
+/// Returns what failed if the command or its output files cannot be started or read.
+fn output_within(
+    command: &mut std::process::Command,
+    work: &Path,
+    seconds: u64,
+) -> Result<(Option<i32>, String, String), String> {
+    assert!(seconds > 0, "a time limit is positive");
+    let (out, err) = (work.join("null.stdout"), work.join("null.stderr"));
+    let file = |path: &Path| {
+        fs::File::create(path).map_err(|error| format!("cannot create {}: {error}", path.display()))
+    };
+    let _redirected = command.stdout(file(&out)?).stderr(file(&err)?);
+    let mut child =
+        command.spawn().map_err(|error| format!("cannot run the null mutant: {error}"))?;
+    let polls = seconds * 1000 / NULL_POLL_MILLISECONDS;
+    let mut status = None;
+    for _ in 0..polls {
+        status = child.try_wait().map_err(|error| format!("cannot wait for the tests: {error}"))?;
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(NULL_POLL_MILLISECONDS));
+    }
+    let read = |path: &Path| fs::read_to_string(path).unwrap_or_default();
+    let Some(status) = status else {
+        let _killed = child.kill();
+        let _reaped = child.wait();
+        let stderr = format!("{}\nthe tests did not finish within {seconds} s", read(&err));
+        return Ok((None, read(&out), stderr));
+    };
+    Ok((status.code(), read(&out), read(&err)))
 }
 
 /// The files that a listing of cargo-mutants names, relative to the workspace: the part of
 /// each `path:line:column: what` line before its first colon.
 #[must_use]
 pub fn listed_files(listing: &str) -> BTreeSet<String> {
-    listing
+    let lines = listing.lines().filter(|line| !line.trim().is_empty()).count();
+    let files: BTreeSet<String> = listing
         .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| line.split_once(':').map(|(file, _)| file.to_owned()))
-        .collect()
+        .filter(|file| !file.is_empty())
+        .collect();
+    assert!(files.len() <= lines, "each listed mutant names one file");
+    files
 }
 
 /// What the null-mutant run of `workspace` shows: nothing if every file with mutants (`starts`,
@@ -187,16 +256,26 @@ pub fn listed_files(listing: &str) -> BTreeSet<String> {
 ///
 /// # Errors
 ///
-/// No verdict: no null run, or one that left out a file with mutants.
+/// No verdict: no null run, one that did not finish, or one that left out a file with
+/// mutants.
 fn judge_null(
     observations: &Observations,
     workspace: &Workspace,
     starts: &BTreeMap<String, Vec<u32>>,
 ) -> Result<Option<String>, String> {
+    assert!(!starts.is_empty(), "the null run is judged only where there are mutants");
     let run = observations
         .runs_of(workspace.name, NULL)
         .next()
         .ok_or_else(|| format!("the observations hold no null-mutant run of {}", workspace.name))?;
+    assert_eq!(run.subject, workspace.name, "the run is the workspace's");
+    let Some(exit) = run.exit else {
+        return Err(format!(
+            "the null-mutant run of {} did not finish (killed, or over {NULL_SECONDS_MAX} s): {}",
+            workspace.name,
+            super::tail(&run.stderr, 5)
+        ));
+    };
     let listed = run.files.get(NULL_FILES).cloned().flatten().unwrap_or_default();
     let changed: BTreeSet<String> = listed
         .lines()
@@ -214,17 +293,16 @@ fn judge_null(
             workspace.name
         ));
     }
-    if run.exit == Some(0) {
+    if exit == 0 {
         return Ok(None);
     }
     let files: Vec<&str> = changed.iter().map(String::as_str).collect();
     Ok(Some(format!(
         "the mutant evidence of {} proves nothing: a test depends on the source text of {}; \
          with a blank line at the top and a comment at the end, which alter no behaviour, the \
-         head's tests fail (exit {:?}): {}",
+         head's tests fail (exit {exit}): {}",
         workspace.name,
         files.join(", "),
-        run.exit,
         super::tail(&run.stderr, 5)
     )))
 }
@@ -589,8 +667,25 @@ mod tests {
         let changed = super::null_mutant("fn a() {}\n");
         assert_eq!(changed, format!("\nfn a() {{}}\n\n{NULL_COMMENT}\n"));
         assert_eq!(changed.lines().nth(1), Some("fn a() {}"));
-        let listing = "src/a.rs:1:1: replace a\n\nsrc/a.rs:3:1: delete !\nsrc/b.rs:2:5: x\n";
+        let listing = "src/a.rs:1:1: replace a\n\nsrc/a.rs:3:1: delete !\nsrc/b.rs:2:5: x\n:3: y\n";
         assert_eq!(listed_files(listing).into_iter().collect::<Vec<_>>(), ["src/a.rs", "src/b.rs"]);
+    }
+
+    // Goal: a command that finishes in time gives its exit code and what it printed; one that
+    // does not is killed, gives no exit code, and says why on its stderr.
+    #[cfg(unix)]
+    #[test]
+    fn the_null_run_has_a_time_limit() {
+        let work = crate::tidy::scratch::Scratch::new("ratchet-null-time");
+        let mut quick = std::process::Command::new("sh");
+        let _quick = quick.args(["-c", "echo out; echo err >&2; exit 3"]);
+        let (exit, stdout, stderr) = super::output_within(&mut quick, work.root(), 5).unwrap();
+        assert_eq!((exit, stdout.as_str(), stderr.as_str()), (Some(3), "out\n", "err\n"));
+        let mut slow = std::process::Command::new("sleep");
+        let _slow = slow.arg("10");
+        let (killed, _, why) = super::output_within(&mut slow, work.root(), 1).unwrap();
+        assert_eq!(killed, None);
+        assert!(why.contains("did not finish within 1 s"), "{why}");
     }
 
     /// Observations with one null run of the lint workspace over `files`, exiting `exit`.
@@ -618,7 +713,8 @@ mod tests {
         let failed = judge_null(&null_run("src/a.rs", Some(101)), lints, &starts).unwrap().unwrap();
         assert!(failed.contains("a test depends on the source text of lints/src/a.rs"), "{failed}");
         assert!(failed.contains("test failed: pinned"), "{failed}");
-        assert!(judge_null(&null_run("src/a.rs", None), lints, &starts).unwrap().is_some());
+        let killed = judge_null(&null_run("src/a.rs", None), lints, &starts).unwrap_err();
+        assert!(killed.contains("did not finish"), "{killed}");
         let other = BTreeMap::from([("lints/src/b.rs".to_owned(), vec![1])]);
         let left_out = judge_null(&null_run("src/a.rs", Some(0)), lints, &other).unwrap_err();
         assert!(left_out.contains("left out lints/src/b.rs"), "{left_out}");
