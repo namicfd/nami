@@ -851,7 +851,8 @@ mod tests {
     // unreadable reviews, a standing request for changes with unreadable dismissals, and an open
     // thread on the first page with a second page that cannot be read are all findings. Threads
     // are read page by page past the first hundred, and a dismissed review of unknown state
-    // without the dismissals is no finding, only the failure.
+    // without the dismissals is no finding, only the failure. More than 50 pages, or a cursor
+    // given twice, fails the gate.
     #[test]
     fn the_gate_records_what_it_read_before_a_failure() {
         let resolved = (0..THREADS_PER_PAGE).map(|_| thread(Some(reviewer())));
@@ -878,6 +879,32 @@ mod tests {
             gate(&Failing(fixed(vec![numbered(1, "DISMISSED")], vec![]), true), "b", REVIEWER_APP);
         assert!(unknown.findings.is_empty() && unknown.failed.len() == 1, "{unknown:?}");
         assert!(THREADS_QUERY.contains(&format!("first:{THREADS_PER_PAGE},")), "the page size");
+        let endless = gate(&Endless(fixed(vec![], vec![]), false), "b", REVIEWER_APP);
+        let most = "review gate: the pull request has more than 5000 review threads";
+        assert!(endless.failed.len() == 1 && endless.failed[0].starts_with(most), "{endless:?}");
+        let stuck = gate(&Endless(fixed(vec![], vec![]), true), "b", REVIEWER_APP);
+        assert_eq!(stuck.failed, ["review gate: GitHub gave the thread cursor `0` twice"]);
+    }
+
+    /// Reviews whose threads never end: each page names a next one, a new cursor each time, or
+    /// the same one if the flag says so.
+    struct Endless(Fixed, bool);
+
+    impl Reviews for Endless {
+        fn pull(&self, pull: u32) -> Result<Pull, String> {
+            self.0.pull(pull)
+        }
+        fn reviews(&self, pull: u32) -> Result<Vec<Review>, String> {
+            self.0.reviews(pull)
+        }
+        fn threads(&self, _pull: u32, after: Option<&str>) -> Result<ThreadPage, String> {
+            let page = after.map_or(0, |cursor| cursor.parse::<u32>().expect("a cursor"));
+            let next = if self.1 { 0 } else { page + 1 };
+            Ok(ThreadPage { threads: vec![thread(Some(reviewer()))], next: Some(next.to_string()) })
+        }
+        fn dismissed(&self, pull: u32) -> Result<BTreeMap<u64, String>, String> {
+            self.0.dismissed(pull)
+        }
     }
 
     // Goal: a user account that took the reviewer app's name is not the reviewer: its review,

@@ -808,10 +808,7 @@ fn rule_set_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verd
         return;
     }
     verdict.ran(Check::RuleSet);
-    match source::check(base, head) {
-        Ok(findings) => findings.into_iter().for_each(|finding| verdict.record(finding)),
-        Err(reason) => verdict.fail(Step::RuleSet, reason),
-    }
+    source::check(base, head, verdict);
     for tree in [base, head] {
         match source::rules_without_cases(base, tree) {
             Ok(uncovered) => {

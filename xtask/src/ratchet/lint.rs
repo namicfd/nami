@@ -697,6 +697,20 @@ mod tests {
         }
     }
 
+    // Goal: the lint corpus's stream is its own: apart from the tidy corpus's for one seed, and
+    // different for different seeds, including seeds that differ only in the stream's bits.
+    #[test]
+    fn the_lint_stream_is_its_own() {
+        let first = |seed: u64| super::rng(seed).next_u64();
+        let seeds = [0, 1, super::LINT_STREAM, u64::MAX];
+        for (index, seed) in seeds.iter().enumerate() {
+            assert_ne!(first(*seed), crate::ratchet::corpus::rng(*seed).next_u64(), "{seed}");
+            for other in seeds.iter().skip(index + 1) {
+                assert_ne!(first(*seed), first(*other), "{seed} and {other}");
+            }
+        }
+    }
+
     // Goal: lint diagnostics are read from cargo's JSON at their primary span; messages without
     // a code, other reasons and broken lines are skipped.
     #[test]

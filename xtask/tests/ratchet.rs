@@ -812,7 +812,8 @@ fn mutation_results_are_read_strictly() {
 // Goal: round 10 of #57's review: in a merge group, the judge of an observation without
 // mutants reads the PR's carried mutation evidence. The identical rule-path diff passes with a
 // note; carried evidence without a mutation run, of another head tree, or of another rule-path
-// diff gives no verdict.
+// diff gives no verdict, and refused evidence is not judged. Without mutation testing, the
+// carried evidence is not read at all.
 #[test]
 fn a_merge_group_carries_the_pr_s_mutation_evidence() {
     let case = Case::new("carried");
@@ -856,6 +857,14 @@ fn a_merge_group_carries_the_pr_s_mutation_evidence() {
     other.head = xtask::ratchet::tree::fingerprint(&carried.join("head")).expect("readable").0;
     keep(&other);
     assert!(judged().unwrap_err().contains("another rule-path diff"), "another diff");
+    let mut refused = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    refused.carried = Some(carry::Carried::read(&carried));
+    let unused = judge_all(&case.base(), &case.head(), &queued, &refused);
+    assert!(!unused.checks.contains(&Check::Mutants), "refused evidence is not judged");
+    refused.mutants = false;
+    refused.carried = Some(Err("unreadable".to_owned()));
+    let skipped = judge_all(&case.base(), &case.head(), &queued, &refused);
+    assert!(skipped.failed.is_empty(), "no carried evidence is read without mutation testing");
 }
 
 // Goal: round 7 of #57's review: a new test that pins its file through an existing helper
@@ -1212,6 +1221,57 @@ fn findings_fail_when_the_approval_cannot_be_read() {
     declare_module(&case.head(), "extra");
     let broken = BrokenReviews(OWNER_APPROVED);
     assert_fails_with(&settled_with_findings(&case, &broken, None), "502 for the reviews");
+}
+
+// Goal: a base without tidy fixtures, or without lint UI cases, fails the corpus step that
+// reads them; the lint checks are skipped, with a note, only when nothing below `lints/`
+// changed.
+#[test]
+fn an_empty_base_corpus_fails_its_step() {
+    let judged = |name: &str, emptied: &str| {
+        let case = Case::new(name);
+        write(&case.head(), "lints/src/extra.rs", "fn extra() -> bool { true }\n");
+        declare_module(&case.head(), "extra");
+        let directory = case.base().join(emptied);
+        fs::remove_dir_all(&directory).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+        check_all(&case.base(), &case.head(), &tools)
+    };
+    let no_fixtures = judged("no-fixtures", "xtask/fixtures/tidy");
+    let failed = no_fixtures.failed.join("; ");
+    assert!(failed.contains("tidy corpus: the base has no fixtures"), "{failed}");
+    let no_cases = judged("no-cases", "lints/ui");
+    let unread = no_cases.failed.join("; ");
+    assert!(unread.contains("lint corpus: the base has no UI cases"), "{unread}");
+    let skipped = "Lint checks skipped: nothing below `lints/` changed.";
+    assert!(!no_cases.notes.iter().any(|note| note == skipped), "lints changed");
+    let case = Case::new("no-lint-change");
+    let tools = case.tools(NOTHING, "any", NOTHING, &REVIEWED);
+    let unchanged = check_all(&case.base(), &case.head(), &tools);
+    assert!(unchanged.notes.iter().any(|note| note == skipped), "{}", unchanged.summary());
+}
+
+// Goal: round 13 of #57's review, the reviewer's probe: a head with a symbolic link, whose
+// scope cannot be read, still fails on a rule-set loosening and on the reviewer app's request
+// for changes, with the code owner's approval of the head.
+#[test]
+fn a_symlinked_head_keeps_its_findings() {
+    let case = Case::new("round-13-symlink");
+    let registry = real("xtask/src/tidy/registry.rs");
+    let renamed = replaced(&registry, "id: \"line-length\"", "id: \"line-length-v2\"");
+    write(&case.head(), "xtask/src/tidy/registry.rs", &renamed);
+    std::os::unix::fs::symlink("/etc/hostname", case.head().join("lints/src/linked.rs")).unwrap();
+    let changes =
+        FakeReviews { state: "CHANGES_REQUESTED", approval: Some(("owner", "head")), ..REVIEWED };
+    let tools = case.tools(NOTHING, "any", NOTHING, &changes);
+    let raw = check_all(&case.base(), &case.head(), &tools);
+    let verdict = settled(&case.base(), &tools, raw).expect("a verdict with findings");
+    assert!(verdict.line().starts_with("ratchet: fail"), "{}", verdict.summary());
+    let checks: Vec<Check> = verdict.findings.iter().map(|finding| finding.check).collect();
+    let shown = verdict.summary();
+    assert!(checks.contains(&Check::RuleSet) && checks.contains(&Check::Review), "{shown}");
+    assert!(verdict.failed.iter().any(|why| why.starts_with("scope: the head holds 1 symbolic")));
 }
 
 // Goal: round 13 of #57's review: no failed step drops another step's finding, by
