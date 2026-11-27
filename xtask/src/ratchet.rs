@@ -673,6 +673,48 @@ pub fn check(base: &Path, head: &Path, tools: &Tools<'_>) -> Result<Verdict, Str
     judge(base, head, &observed, tools)
 }
 
+/// `judged`, or, if it is no verdict and a code owner approved the pull request's head commit,
+/// a pass that lists why the ratchet could not judge. A code owner's approval settles every
+/// no verdict that is no finding: a head outside the dialect or with a symbolic link, missing
+/// observations or carried evidence, a tool that failed. So a rule-path PR that the ratchet
+/// cannot judge needs the owner, never the admin bypass (review of #55). Findings still fail,
+/// since they come with a verdict.
+///
+/// # Errors
+///
+/// The no verdict of `judged`, when no review source is given or no code owner approved the
+/// head; or no verdict if the reviews or the base's CODEOWNERS cannot be read.
+pub fn settled(
+    base: &Path,
+    tools: &Tools<'_>,
+    judged: Result<Verdict, String>,
+) -> Result<Verdict, String> {
+    let reason = match judged {
+        Ok(verdict) => return Ok(verdict),
+        Err(reason) => reason,
+    };
+    let Some(source) = &tools.review else {
+        return Err(reason);
+    };
+    let codeowners = fs::read_to_string(base.join(CODEOWNERS))
+        .map_err(|error| format!("{reason}; and cannot read the base's {CODEOWNERS}: {error}"))?;
+    if !review::owner_approved(source.reviews, source.pull, &source.head, &codeowners)? {
+        return Err(reason);
+    }
+    let note = format!(
+        "No verdict: {reason}. A code owner approved the head commit, which settles it \
+         (ADR-0022)."
+    );
+    let verdict = Verdict {
+        owner_approved: true,
+        range: tools.commits.clone().unwrap_or_else(|| "the two trees given".to_owned()),
+        notes: vec![note],
+        ..Verdict::default()
+    };
+    assert!(verdict.findings.is_empty() && verdict.unproven.is_empty(), "a settled pass");
+    Ok(verdict)
+}
+
 /// Builds the head's xtask with `cargo` and returns the binary.
 fn build_xtask(cargo: &OsStr, head: &Path) -> Result<PathBuf, String> {
     let mut command = command(cargo, head);

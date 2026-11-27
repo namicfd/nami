@@ -17,7 +17,7 @@ use xtask::ratchet::observations::Observations;
 use xtask::ratchet::review::{AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread};
 use xtask::ratchet::tree::Scratch;
 use xtask::ratchet::{
-    Check, ReviewSource, Tools, Verdict, canonical, carry, check, judge, observe,
+    Check, ReviewSource, Tools, Verdict, canonical, carry, check, judge, observe, settled,
 };
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
@@ -943,6 +943,33 @@ fn the_judge_reads_the_head_that_was_observed() {
     std::os::unix::fs::symlink("/etc/hostname", case.head().join("lints/src/linked.rs")).unwrap();
     let linked = check(&case.base(), &case.head(), &tools).unwrap_err();
     assert!(linked.contains("1 symbolic link(s), such as `lints/src/linked.rs`"), "{linked}");
+}
+
+// Goal: review of #55: a code owner's approval of the head commit settles a no verdict, here a
+// head with a symbolic link, into a pass that lists the reason; without it, or with an approval
+// of an earlier commit, the no verdict stands; and a verdict, findings included, is left as it
+// is, so findings still fail.
+#[test]
+fn a_code_owner_approval_settles_a_no_verdict() {
+    let case = Case::new("settled");
+    std::os::unix::fs::symlink("/etc/hostname", case.head().join("lints/src/linked.rs")).unwrap();
+    let settle = |reviews: &FakeReviews| {
+        let tools = case.tools(NOTHING, "any", NOTHING, reviews);
+        settled(&case.base(), &tools, check(&case.base(), &case.head(), &tools))
+    };
+    let owner = FakeReviews { approval: Some(("owner", "head")), ..REVIEWED };
+    let verdict = settle(&owner).expect("the owner's approval settles it");
+    assert_eq!(verdict.line(), "ratchet: pass", "{}", verdict.summary());
+    let note = verdict.notes.first().map_or("", String::as_str);
+    assert!(note.contains("No verdict: the head holds 1 symbolic link(s)"), "{note}");
+    assert!(note.contains("A code owner approved the head commit"), "{note}");
+    assert!(settle(&REVIEWED).unwrap_err().contains("symbolic link"), "no approval");
+    let earlier = FakeReviews { approval: Some(("owner", "earlier")), ..REVIEWED };
+    assert!(settle(&earlier).is_err(), "an approval of an earlier commit");
+    fs::remove_file(case.head().join("lints/src/linked.rs")).unwrap();
+    let tools = case.tools("unbounded-loop", "any", NOTHING, &owner);
+    let failed = settled(&case.base(), &tools, check(&case.base(), &case.head(), &tools)).unwrap();
+    assert!(failed.line().starts_with("ratchet: fail"), "findings still fail: {}", failed.line());
 }
 
 // Goal: the judge draws the placements again from the seed: observations without a drawn run,

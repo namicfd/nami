@@ -255,6 +255,12 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
     }
     let work = work_directory(arguments.work.as_deref(), &head)?;
     let github = GhReviews::new(&head);
+    // Carried evidence that cannot be read is no verdict, which a code owner's approval settles.
+    let (carried, unread) =
+        match arguments.carried.as_deref().map(super::carry::Carried::read).transpose() {
+            Ok(carried) => (carried, None),
+            Err(error) => (None, Some(error)),
+        };
     let tools = Tools {
         head_xtask: arguments.head_xtask.clone(),
         cargo: OsString::from("cargo"),
@@ -272,7 +278,7 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
         commits: arguments.commits.clone(),
         pr_head: arguments.pull_head.clone(),
         commit: arguments.commit.clone(),
-        carried: arguments.carried.as_deref().map(super::carry::Carried::read).transpose()?,
+        carried,
     };
     match &arguments.mode {
         Mode::Observe(out) => {
@@ -282,9 +288,14 @@ fn run_checked(options: &[&str]) -> Result<Option<Verdict>, String> {
             Ok(None)
         }
         Mode::Judge(file) => {
-            super::judge(&base, &head, &Observations::read(file)?, &tools).map(Some)
+            let judged = match unread {
+                Some(error) => Err(error),
+                None => Observations::read(file)
+                    .and_then(|observed| super::judge(&base, &head, &observed, &tools)),
+            };
+            super::settled(&base, &tools, judged).map(Some)
         }
-        Mode::Both => super::check(&base, &head, &tools).map(Some),
+        Mode::Both => super::settled(&base, &tools, super::check(&base, &head, &tools)).map(Some),
     }
 }
 
