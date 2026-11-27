@@ -179,6 +179,7 @@ mod tests {
         let missing = Carried::read(scratch.root()).unwrap_err();
         assert!(missing.contains("lacks the trees `base/` and `head/`"), "{missing}");
         scratch.write("base/a", "x");
+        assert!(Carried::read(scratch.root()).is_err(), "the base without the head");
         scratch.write("head/a", "y");
         let carried = Carried::read(scratch.root()).unwrap();
         assert_eq!(carried.observations, Observations::default());
