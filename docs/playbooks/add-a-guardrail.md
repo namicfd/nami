@@ -142,7 +142,10 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   nest an `impl`, trait, module, `macro_rules!` or constant in a function, don't write
   `unsafe` or an attribute beyond `doc`, `derive`, `must_use`, `inline`, `expect` and `test`,
   and don't read files, the environment, the clock, threads or the network, nor use
-  `include_str!`, `file!` or `env!`, not even in a test.
+  `include_str!`, `file!` or `env!`, not even in a test. In a lint, don't reach `dcx` or
+  `sess`. No test may depend on the source text or line numbers of the file it tests: the
+  ratchet runs the tests on a copy with a blank line and a comment added, and gives no verdict
+  if one fails.
 - **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
   member of an existing `impl`; an `impl` in another file than its type, with type or const
   parameters, or with a `where` clause. It waits for the reviewer app's approval of its head
