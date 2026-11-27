@@ -3,10 +3,16 @@
 //! A count of mutants per workspace proves nothing about a hunk that has none: a changed
 //! literal, a deleted line or a moved statement makes no mutant, and another function's mutant
 //! does not test it. So every changed hunk must contain a mutant, one whose span starts on one
-//! of its lines, or be one that cannot change what a rule reports: a hunk of comments and blank
-//! lines only, a hunk inside the test module, or a hunk of dispatch calls, which the new
-//! rule's case shows to run ([`super::class::dispatch`]). The registry's tables are read as
-//! data, so their hunks need no mutant. Any other hunk, a pure deletion among them, is unproven.
+//! of its lines, or be one that cannot change what a rule reports. That is judged line by line
+//! ([`is_exempt`]): each added and removed line must be a comment or blank, or lie in an exempt
+//! range of its side. The exempt ranges are the test module on both sides; in the head, the
+//! dispatch calls, which the new rule's case shows to run ([`super::class::dispatch`]), and the
+//! new declarations that hold no code a mutant could change (`Class::declarations`: lint
+//! macros, file `mod` lines, structs, enums and unions); and in the base, the registrations
+//! that a dispatch call appended new lints to (`Class::replaced`). So a hunk of two new
+//! declarations with a blank line between them needs no mutant (review of #57, round 8). The
+//! registry's tables are read as data, so their hunks need no mutant. Any other hunk, a pure
+//! deletion among them, is unproven.
 //!
 //! A mutant on a line says only that the head's tests pin the head's behaviour there: a test
 //! edited together with the code it tests pins the edit. So for an edit to existing rule code

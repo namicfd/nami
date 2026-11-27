@@ -16,10 +16,12 @@
 //! A diff is additive when each change in the rule paths is one of these:
 //!
 //! - (a) a new top-level item of a Rust file, new or existing: a function, a struct, enum,
-//!   union or trait, a lint or lint pass declared with `declare_lint!`, `declare_tool_lint!`
-//!   or `declare_lint_pass!`, a test module, and in a new file an import without a glob, in an
-//!   existing file a file module `mod name;`. Its attributes, and those of everything in it,
-//!   are only those of [`ATTRIBUTES`]; it, a test or test module among it, names none of
+//!   union or trait, a lint declared at `Deny` or `Forbid` with `declare_lint!` or
+//!   `declare_tool_lint!` (one below `Deny` fails no gate, so it is an edit), a lint pass
+//!   declared with `declare_lint_pass!`, a test module, and in a new file an import without a
+//!   glob, in an existing file a file module `mod name;`. Its attributes, and those of
+//!   everything in it, are only those of [`ATTRIBUTES`]; it, a test or test module among it,
+//!   names none of
 //!   [`SENSITIVE`] and uses none of [`INPUT_MACROS`]; it holds no `unsafe` code, `extern`
 //!   block, associated constant (a constant is an edit at any depth, since no mutant tests its
 //!   value), or `impl`, trait, module or `macro_rules!` nested inside; and in an existing file
@@ -721,7 +723,28 @@ impl<'ast> syn::visit::Visit<'ast> for Lifetimes<'_> {
     }
 }
 
-/// The name of the type an `impl` is for, if it is a single plain segment.
+/// What makes a new lint that `mac` declares an edit: a level below `Deny`, at which its reports
+/// do not fail the gate, so that the lint corpus and the new case say nothing about it (review
+/// of #57, round 9), or a declaration whose level cannot be read. A lint pass has no level.
+fn lint_level_problem(mac: &syn::Macro) -> Option<String> {
+    if mac.path.segments.last().is_some_and(|last| last.ident == PASS_MACRO) {
+        return None;
+    }
+    let declared = crate::tidy::lints::declarations_in(&mac.tokens.to_string());
+    match declared.as_slice() {
+        [lint] if lint.is_enforced() => None,
+        [lint] => Some(format!(
+            "declares the lint `{}` at `{}`, below `Deny`: a new lint that does not fail the \
+             gate is an edit",
+            lint.name, lint.level
+        )),
+        _ => Some(
+            "declares a lint whose level cannot be read as one `pub NAME, Level, \"description\"`"
+                .to_owned(),
+        ),
+    }
+}
+
 /// What makes a new item of this kind in the file `path` an edit, if anything.
 fn kind_problem(
     item: &syn::Item,
@@ -736,7 +759,9 @@ fn kind_problem(
         | syn::Item::Union(_)
         | syn::Item::Trait(_) => None,
         syn::Item::Impl(block) => impl_problem(block, path, new),
-        syn::Item::Macro(item) if lint_macro_name(&item.mac).is_some() => None,
+        syn::Item::Macro(item) if lint_macro_name(&item.mac).is_some() => {
+            lint_level_problem(&item.mac)
+        }
         syn::Item::Use(import) if !existing_file && !is_glob(&import.tree) => None,
         syn::Item::Mod(module) if existing_file && module.content.is_none() => None,
         syn::Item::Const(_) | syn::Item::Static(_) => Some(
@@ -1201,6 +1226,8 @@ impl Existing<'_> {
             lists: sinks::report_lists(before.signature, before.block, owner, &self.base.file),
             shared: sinks::shared_parameters(before.signature, before.block),
         };
+        // A report list is `&mut` or a binding of the body, which a shared parameter never is.
+        assert!(places.lists.is_disjoint(&places.shared), "a shared parameter is no report list");
         let path = self.code.path.clone();
         let base_open = before.block.brace_token.span.open();
         let head_open = after.block.brace_token.span.open();
@@ -2168,6 +2195,32 @@ mod tests {
         assert_eq!(module.declarations.get(lib), Some(&expected), "{:?}", module.edits);
         let registration = line_in(&base, lints);
         assert_eq!(module.replaced.get(lib), Some(&vec![(registration, registration)]));
+    }
+
+    // Goal: round 9 of #57's review: a new lint is additive only at `Deny` or `Forbid`, the
+    // levels that fail the gate; at `Warn` or `Allow`, or with a level that cannot be read, it
+    // is an edit. A lint pass declares no level.
+    #[test]
+    fn a_new_lint_below_deny_is_an_edit() {
+        let path = "lints/src/extra.rs";
+        let declared = |level: &str| {
+            format!(
+                "dylint_linting::declare_lint! {{\n    /// A new lint.\n    pub NAMI_EXTRA,\n    \
+                 {level},\n    \"a new lint\"\n}}\n\n\
+                 dylint_linting::declare_lint_pass!(NamiExtra => [NAMI_EXTRA]);\n"
+            )
+        };
+        for level in ["Deny", "Forbid"] {
+            let class = class_of("class-lint-level", &[(path, None, Some(&declared(level)))]);
+            assert_eq!(class.edits, Vec::<String>::new(), "{level}");
+        }
+        for level in ["Warn", "Allow"] {
+            let class = class_of("class-lint-low", &[(path, None, Some(&declared(level)))]);
+            let expected = format!("declares the lint `nami_extra` at `{level}`, below `Deny`");
+            assert_edit(&class, &expected);
+        }
+        let unread = class_of("class-lint-unread", &[(path, None, Some(&declared("Loud")))]);
+        assert_edit(&unread, "declares a lint whose level cannot be read");
     }
 
     // Goal: round 8 of #57's review: the canonical new line rule is additive. Its dispatch call

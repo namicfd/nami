@@ -57,6 +57,7 @@
 //! change the ratchet cannot vouch for (no mutant, no reviewer app, an edit
 //! without its approval) where no code owner reviews.
 
+pub mod canonical;
 pub mod class;
 pub mod cli;
 mod corpus;
@@ -97,7 +98,8 @@ const FROZEN: &str = "xtask/fixtures/ratchet";
 /// the tail of `text::check`, would break them, and the ratchet could never vouch for it
 /// (review of #57, round 8). Only the guard `the_rule_paths_are_in_the_dialect` reads the live
 /// rule files, and it anchors on no text. The canonical end-to-end tests copy the live tree on
-/// purpose, and are run by hand.
+/// purpose, and are run by hand: they apply the diffs of [`canonical`] to the frozen copies,
+/// and stop with what to update if a live file they edit no longer equals its copy.
 #[must_use]
 pub fn frozen(relative: &str) -> String {
     assert!(!relative.starts_with('/'), "a frozen copy is named by a relative path");

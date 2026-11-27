@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::ratchet::review::{AUTHOR_APP, Actor, Pull, REVIEWER_APP, Review, Reviews, Thread};
 use xtask::ratchet::tree::Scratch;
-use xtask::ratchet::{Check, ReviewSource, Tools, Verdict, check, judge, observe};
+use xtask::ratchet::{Check, ReviewSource, Tools, Verdict, canonical, check, judge, observe};
 
 /// A head's xtask: runs the real one and drops every output line that matches `@DROP@`, for the
 /// subcommand option `@ONLY@` (`--file`, `--root`), or for all when it is `any`. A tidy run left
@@ -1071,27 +1071,39 @@ impl Reviews for Unreviewed {
     }
 }
 
-/// Replaces `from`, which occurs once in the file `relative` of `root`, with `to`.
-fn edit(root: &Path, relative: &str, from: &str, to: &str) {
-    let path = root.join(relative);
-    let text = fs::read_to_string(&path).expect("the file exists");
-    assert_eq!(text.matches(from).count(), 1, "`{from}` occurs once in {relative}");
-    fs::write(path, text.replace(from, to)).expect("writable");
+/// Applies the canonical `diff` to the copy `head` of the checkout: the frozen copies with its
+/// edits applied, and its new files. Each file it edits must still equal its frozen copy, or
+/// its anchors may have drifted, so the test stops and says which copy to update.
+fn apply(head: &Path, diff: &canonical::Diff) {
+    let changes = diff.changes().expect("the canonical diff applies to the frozen copies");
+    for (relative, base, text) in &changes {
+        if let Some(frozen) = base {
+            let live = fs::read_to_string(head.join(relative)).expect("the file exists");
+            assert!(
+                live == *frozen,
+                "{relative} differs from its frozen copy xtask/fixtures/ratchet/{relative}.frozen: \
+                 update the frozen copy to the live file, then fix the anchors of the canonical \
+                 diff `{}` in xtask/src/ratchet/canonical.rs if `canonical` tests fail",
+                diff.name
+            );
+        }
+        write(head, relative, text);
+    }
 }
 
 /// The full ratchet, observe and judge with mutation testing and the null mutant, run with the
 /// real cargo, dylint and cargo-mutants. The base is a copy of this checkout, and the head a
-/// copy with `change` applied and `docs/RULES.md` written by the head's xtask. The review is
-/// that of a pull request nobody reviewed, with no reviewer app set up.
-fn canonical(name: &str, change: fn(&Path)) -> Verdict {
-    let place = Temporary::new(name);
+/// copy with the canonical `diff` applied and `docs/RULES.md` written by the head's xtask. The
+/// review is that of a pull request nobody reviewed, with no reviewer app set up.
+fn run_canonical(diff: &canonical::Diff) -> Verdict {
+    let place = Temporary::new(&format!("canonical-{}", diff.name));
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask is a member");
     let copy = |tree: &str| {
         let scratch = Scratch::copy_of(checkout, &place.path(tree));
         scratch.expect("the checkout can be copied").root().to_path_buf()
     };
     let (base, head) = (copy("base"), copy("head"));
-    change(&head);
+    apply(&head, diff);
     let rules = Command::new("cargo")
         .args(["run", "--locked", "--quiet", "--package", "xtask", "--", "rules", "--write"])
         .current_dir(&head)
@@ -1120,135 +1132,6 @@ fn canonical(name: &str, change: fn(&Path)) -> Verdict {
     verdict
 }
 
-/// A new text rule, `trailing-space`: a function dispatched from `text::check`, its registry
-/// row, and a fixture on which it fires and one on which it does not.
-fn trailing_space_rule(head: &Path) {
-    let text = "xtask/src/tidy/text.rs";
-    let tail = "    }\n    violations\n}\n\n/// True if the first line above";
-    let dispatched = "    }\n    violations.extend(trailing_space(path, &lines));\n    violations\
-                      \n}\n\n/// True if the first line above";
-    edit(head, text, tail, dispatched);
-    let next = "fn to_line_number(";
-    edit(head, text, next, &format!("{TRAILING_SPACE}{next}"));
-    let row = "        reference: \"TIGER_STYLE.md, Comments, docs and commits\",\n    },\n";
-    edit(head, "xtask/src/tidy/registry.rs", row, &format!("{row}{TRAILING_SPACE_ROW}"));
-    let fixtures = "xtask/fixtures/tidy/trailing-space";
-    let path = "// path: crates/solver/src/example.rs\n";
-    let fires = format!("{path}//! A space at the end. \n");
-    write(head, &format!("{fixtures}.fires.fixture"), &fires);
-    let passes = format!("{path}//! No space at the end.\n");
-    write(head, &format!("{fixtures}.passes.fixture"), &passes);
-}
-
-const TRAILING_SPACE: &str = "/// Reports every line that ends in a space or a tab.
-fn trailing_space(path: &Path, lines: &[&str]) -> Vec<Violation> {
-    let mut violations = Vec::new();
-    for (line_index, line) in lines.iter().enumerate() {
-        if line.ends_with([' ', '\\t']) {
-            let message = \"line ends in white space; remove it (TIGER_STYLE.md)\";
-            let line_number = to_line_number(line_index);
-            violations.push(Violation::new(path, line_number, \"trailing-space\", message));
-        }
-    }
-    assert!(violations.len() <= lines.len(), \"a line is reported at most once\");
-    violations
-}
-
-";
-
-const TRAILING_SPACE_ROW: &str = "    Rule {
-        id: \"trailing-space\",
-        kind: RuleKind::Source,
-        summary: \"No line ends in white space.\",
-        detail: \"\",
-        reference: \"TIGER_STYLE.md, Style by the numbers\",
-    },
-";
-
-/// A new lint, `nami_empty_match`: its module, its declaration, pass and registration in the
-/// lint library, and a UI case with the output it expects.
-fn empty_match_lint(head: &Path) {
-    let lib = "lints/src/lib.rs";
-    edit(head, lib, "mod float_reduction;\n", "mod empty_match;\nmod float_reduction;\n");
-    let pass =
-        "dylint_linting::declare_lint_pass!(NamiFloatReduction => [NAMI_FLOAT_REDUCTION]);\n";
-    edit(head, lib, pass, &format!("{pass}{EMPTY_MATCH_DECLARED}"));
-    let lints = "NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);\n";
-    let registered = "NAMI_RECURSION, NAMI_FLOAT_REDUCTION, NAMI_EMPTY_MATCH]);\n";
-    edit(head, lib, lints, registered);
-    let last =
-        "    lint_store.register_late_lint_pass(Box::new(|_| Box::new(NamiFloatReduction)));\n";
-    let new = "    lint_store.register_late_lint_pass(Box::new(|_| Box::new(NamiEmptyMatch)));\n";
-    edit(head, lib, last, &format!("{last}{new}"));
-    let goal = "\n// Goal: each lint fires exactly";
-    let pass_impl = "\nimpl<'tcx> LateLintPass<'tcx> for NamiEmptyMatch {\n    fn check_expr(&mut \
-                     self, cx: &LateContext<'tcx>, expression: &'tcx Expr<'tcx>) {\n        \
-                     empty_match::check_expr(cx, NAMI_EMPTY_MATCH, expression);\n    }\n}\n";
-    edit(head, lib, goal, &format!("{pass_impl}{goal}"));
-    write(head, "lints/src/empty_match.rs", EMPTY_MATCH);
-    write(head, "lints/ui/empty_match.rs", EMPTY_MATCH_CASE);
-    write(head, "lints/ui/empty_match.stderr", EMPTY_MATCH_STDERR);
-}
-
-const EMPTY_MATCH_DECLARED: &str = "
-dylint_linting::declare_lint! {
-    /// Reports a `match` without arms.
-    pub NAMI_EMPTY_MATCH,
-    Deny,
-    \"match without arms\"
-}
-
-dylint_linting::declare_lint_pass!(NamiEmptyMatch => [NAMI_EMPTY_MATCH]);
-";
-
-const EMPTY_MATCH: &str = "//! `nami_empty_match`: no `match` without arms.
-
-use clippy_utils::diagnostics::span_lint;
-use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, Lint};
-
-/// Reports `expression` if it is a `match` without arms.
-pub fn check_expr(cx: &LateContext<'_>, lint: &'static Lint, expression: &Expr<'_>) {
-    if let ExprKind::Match(_, arms, _) = expression.kind
-        && arms.is_empty()
-    {
-        span_lint(cx, lint, expression.span, \"`match` without arms; say it with the type\");
-    }
-}
-";
-
-const EMPTY_MATCH_CASE: &str = "//! `nami_empty_match` fires on a `match` without arms only.
-
-enum Never {}
-
-fn absurd(never: Never) -> u32 {
-    match never {}
-}
-
-fn plain(value: Option<u32>) -> u32 {
-    match value {
-        Some(number) => number,
-        None => 0,
-    }
-}
-
-fn main() {
-    let _unused = (absurd as fn(Never) -> u32, plain(Some(1)));
-}
-";
-
-const EMPTY_MATCH_STDERR: &str = "error: `match` without arms; say it with the type
-  --> $DIR/empty_match.rs:6:5
-   |
-LL |     match never {}
-   |     ^^^^^^^^^^^^^^
-   |
-   = note: `#[deny(nami_empty_match)]` on by default
-
-error: aborting due to 1 previous error
-
-";
-
 // Goal: round 8 of #57's review: the ratchet is complete for a canonical new text rule. The
 // full ratchet, with real tools and mutants, on this checkout plus the rule, its dispatch call,
 // its registry row and its two fixtures, passes as additive with no review.
@@ -1257,7 +1140,7 @@ error: aborting due to 1 previous error
             past nextest's limit; run it with `cargo test --locked -p xtask --test ratchet -- \
             --ignored canonical`"]
 fn canonical_new_text_rule_passes_as_additive() {
-    let verdict = canonical("canonical-text", trailing_space_rule);
+    let verdict = run_canonical(&canonical::TEXT_RULE);
     assert_eq!(verdict.line_after(), "ratchet: pass (additive)", "{}", verdict.summary());
     assert!(verdict.checks.contains(&Check::Mutants), "mutants ran: {}", verdict.summary());
 }
@@ -1270,7 +1153,7 @@ fn canonical_new_text_rule_passes_as_additive() {
             past nextest's limit; run it with `cargo test --locked -p xtask --test ratchet -- \
             --ignored canonical`"]
 fn canonical_new_lint_passes_as_additive() {
-    let verdict = canonical("canonical-lint", empty_match_lint);
+    let verdict = run_canonical(&canonical::LINT);
     assert_eq!(verdict.line_after(), "ratchet: pass (additive)", "{}", verdict.summary());
     assert!(verdict.checks.contains(&Check::Mutants), "mutants ran: {}", verdict.summary());
 }

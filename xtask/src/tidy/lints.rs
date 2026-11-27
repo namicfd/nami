@@ -139,8 +139,10 @@ fn what_it_does(lines: &[String]) -> Option<String> {
 
 /// The lint declarations in one source file. A declaration is the token run
 /// `pub NAME, Level, "description"`, which is what `declare_late_lint!`, `declare_early_lint!`,
-/// `impl_late_lint!` and rustc's `declare_lint!` all take.
-fn declarations_in(text: &str) -> Vec<DylintLint> {
+/// `impl_late_lint!` and rustc's `declare_lint!` all take. The ratchet reads a new lint's
+/// level with it.
+#[must_use]
+pub fn declarations_in(text: &str) -> Vec<DylintLint> {
     let Ok(stream) = text.parse::<TokenStream>() else {
         return Vec::new();
     };

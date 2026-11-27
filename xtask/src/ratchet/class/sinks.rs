@@ -119,7 +119,6 @@ pub fn shared_parameters(signature: &syn::Signature, block: &syn::Block) -> BTre
             }
         }
     }
-    assert!(shared.len() <= signature.inputs.len(), "at most one name per parameter");
     shared
 }
 
