@@ -449,14 +449,20 @@ mod tests {
         findings.into_iter().map(|finding| finding.message).collect()
     }
 
-    // Goal: the real registry is read in full: every registered id, and both bans with their
-    // scope and allowed paths.
+    // Goal: the real registry is read in full: every id its text spells out, and both bans
+    // with their scope and allowed paths. The registry is the frozen copy, so the ids come from
+    // its text, not from the compiled registry, which an additive diff grows.
     #[test]
     fn the_real_registry_is_read() {
-        let registry = parse_registry(&real_registry()).unwrap();
-        let expected: BTreeSet<String> =
-            crate::tidy::registry::rule_ids().map(str::to_owned).collect();
-        assert_eq!(registry.ids(), expected);
+        let text = real_registry();
+        let registry = parse_registry(&text).unwrap();
+        let spelled: BTreeSet<String> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("id: \""))
+            .map(|rest| rest.trim_end_matches("\",").to_owned())
+            .collect();
+        assert!(spelled.len() > 30, "the frozen registry holds every rule of its day");
+        assert_eq!(registry.ids(), spelled);
         let libm = registry.bans.iter().find(|ban| ban.id == "direct-libm").unwrap();
         let ban = Ban {
             id: "direct-libm".to_owned(),
