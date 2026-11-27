@@ -17,7 +17,9 @@ lists the commands and rules you cannot infer from the code. The reasons behind 
 - `cargo xtask doctor`: compare your tools with the pinned versions.
 - `cargo xtask protected`: list the protected paths your branch changes, for the PR description.
 - `cargo xtask ratchet --base . --head <your tree> --no-review`: run inside a checkout of `main` to
-  see what the required `ratchet` check will say about your rule change (ADR-0022).
+  see the findings and the class (`additive` or `edit`) of your rule change (ADR-0022). Without
+  the reviews the review check is unproven, so the local verdict line says `no verdict` even when
+  CI would pass; read the findings and the unproven items above it.
 - `cargo xtask issue file` and `cargo xtask issue show <n>`: file a finding outside your task as
   a GitHub issue, and read an issue (ADR-0021). They run gh, so prefix them with
   `GH_TOKEN=$(xtask/agent-token.sh)`, like `cargo xtask task ready` and `claim`.
@@ -136,22 +138,31 @@ instead of merging automatically, so:
 
 The protected paths are:
 
-- **Manifests and lockfile:** `Cargo.toml` (all of them) and `Cargo.lock`.
+- **Manifests and lockfile:** every `Cargo.toml` and `Cargo.lock`. One under a rule path has no
+  code owner, but the ratchet calls it an edit, so it waits for the owner too.
 - **Tool configuration:** `deny.toml`, `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`,
   `.cargo/` and `.config/`.
 - **Tooling and automation:** `xtask/`, `lints/`, `justfile`, `.github/` and `.claude/`, except
   the rule paths (ADR-0022): the files that define what a tidy rule or a dylint lint reports, their
   fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths is either:
-  - **additive** (new rules beside the old code, new fixtures and UI cases, new rows): it merges
-    on the required `ratchet` check's proof alone, with no review needed, even before the
-    reviewer app exists. The check proves that
-    every case `main` writes down still holds, the rule tables only narrow, and mutation testing
-    misses nothing; an open request for changes or thread by the reviewer app
-    (`NAMI_REVIEWER_LOGIN`, not the agents' bot) still blocks it;
-  - an **edit** to existing rule code (a changed function, constant, test, fixture or UI case, or
-    an `impl` that is not a plain `impl` of a type new in its file): it also waits for the
-    reviewer app's approval of its head commit (#59), and until that app exists for a code
-    owner's.
+  - **additive** (new functions and types beside the old code, a new lint at `Deny`, new
+    fixtures and UI cases, new rows): it merges on the required `ratchet` check's proof alone,
+    with no review needed, even before the reviewer app exists. The check proves that every case
+    `main` writes down still holds, the rule tables only tighten, and mutation testing misses
+    nothing; an open request for changes or thread by the reviewer app (`NAMI_REVIEWER_LOGIN`,
+    not the agents' bot) still blocks it;
+  - an **edit** to existing rule code (a changed function, constant, test, fixture or UI case, a
+    new constant or static, a new lint below `Deny`, a manifest, or an `impl` that is not a plain
+    `impl` of a type new in its file): it waits for the reviewer app's approval of its head
+    commit (#59), or for a code owner's approval of it; until the app exists, only the latter.
+    GitHub does not ask the owner, because the rule paths have no owner: when the `ratchet`
+    summary says `(edit)`, request the code owner's review yourself, with
+    `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer cxkoda` (the login in
+    `.github/CODEOWNERS`), and say in the description why the edit is needed.
+
+  A PR that also touches a path outside the rule paths waits for the owner as before. A new tidy
+  rule is one of them: its tag in `docs/TIGER_STYLE.md`, which is core, makes the PR wait for the
+  owner. Never leave the tag out to merge without review.
 - **Agent instructions:** `AGENTS.md` and `CLAUDE.md`.
 - **Policy:** `docs/design/`, `docs/TIGER_STYLE.md` and `docs/operations/`.
 - **References:** `crates/reference/` and `tools/`.
