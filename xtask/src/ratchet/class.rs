@@ -18,9 +18,12 @@
 //! - (a) a new top-level item of a Rust file, new or existing: a function, a struct, enum,
 //!   union or trait, a lint or lint pass declared with `declare_lint!`, `declare_tool_lint!`
 //!   or `declare_lint_pass!`, a test module, and in a new file an import without a glob, in an
-//!   existing file a file module `mod name;`. Its attributes are only those of [`ATTRIBUTES`];
-//!   it names none of [`SENSITIVE`] and uses none of [`INPUT_MACROS`]; it holds no `impl`,
-//!   trait, module or `macro_rules!` nested inside; and in an existing file its name is no
+//!   existing file a file module `mod name;`. Its attributes, and those of everything in it,
+//!   are only those of [`ATTRIBUTES`]; it, a test or test module among it, names none of
+//!   [`SENSITIVE`] and uses none of [`INPUT_MACROS`]; it holds no `unsafe` code, `extern`
+//!   block, associated constant (a constant is an edit at any depth, since no mutant tests its
+//!   value), or `impl`, trait, module or `macro_rules!` nested inside; and in an existing file
+//!   its name is no
 //!   identifier of the base's file, so that it shadows nothing the existing code names (a
 //!   prelude item such as `drop`, an import, a glob). A new `impl` is additive only for a type
 //!   new in the same file, named by one plain segment, with no type or const parameters and no
@@ -32,7 +35,8 @@
 //!   so it is an edit;
 //! - (b) a dispatch call ([`dispatch`]): a statement inserted at the top level of an existing
 //!   function's body that calls a new function with shared references and literals only, hands
-//!   such a call's result to `extend`, or registers a new lint or lint pass; each new item is
+//!   the result of a new function returning `Vec<Violation>` to `extend` on a report list of
+//!   that function ([`sinks`]), or registers a new lint or lint pass; each new item is
 //!   dispatched once;
 //! - (c) new registry rows, and changed rows that the data checks prove only tighten: no
 //!   changed field outside those the rule-set check compares or that only document
@@ -49,6 +53,7 @@
 //! are compared token for token, with doc comments left out.
 
 pub mod dispatch;
+pub mod sinks;
 
 use super::dialect;
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
@@ -56,12 +61,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use syn::spanned::Spanned;
 
-/// Names that reach the environment, processes or files: `std::env`, `env!`, `option_env!`,
-/// `std::process`, `std::fs`, `std::io`, and the methods of `Path` that ask the file system.
-/// `File` and `OpenOptions` are reached through `fs`, so `syn::File` is no such name. New code
-/// that names one can behave differently in CI than where the ratchet observes it, so it is an
-/// edit.
-pub const SENSITIVE: [&str; 17] = [
+/// Names that reach the environment, the clock, processes, threads, the network or files:
+/// `std::env`, `env!`, `option_env!`, `std::time`, `std::process`, `std::thread`, `std::net`,
+/// `std::fs`, `std::io`, the methods of `Path` that ask the file system, and the workspace root
+/// that xtask's helpers read the tree from. `File` and `OpenOptions` are reached through `fs`,
+/// so `syn::File` is no such name. New code that names one, a test among it, can pin the file
+/// it tests or behave differently in CI than where the ratchet observes it, so it is an edit.
+pub const SENSITIVE: [&str; 23] = [
+    "time",
+    "SystemTime",
+    "Instant",
+    "thread",
+    "net",
+    "workspace_root",
     "symlink_metadata",
     "env",
     "option_env",
@@ -246,6 +258,10 @@ pub struct NewNames {
     pub types: BTreeSet<(String, String)>,
     /// New lints, by their declared name, which is unique in the lint library.
     pub lints: BTreeSet<String>,
+    /// `(file, function)`: the new top-level functions whose return type is exactly
+    /// `Vec<Violation>`, the only ones whose result a dispatch call may `extend` a report list
+    /// with.
+    pub reports: BTreeSet<(String, String)>,
 }
 
 /// The new functions, types and lints of every changed file.
@@ -266,6 +282,11 @@ impl NewNames {
         let at = |name: String| (path.to_owned(), name);
         if let syn::Item::Fn(function) = item {
             let _new = self.functions.insert(at(function.sig.ident.to_string()));
+            if let syn::ReturnType::Type(_, returned) = &function.sig.output
+                && sinks::is_report_list(returned)
+            {
+                let _report = self.reports.insert(at(function.sig.ident.to_string()));
+            }
         } else if let syn::Item::Macro(declared) = item
             && let Some(name) = lint_macro_name(&declared.mac)
         {
@@ -342,11 +363,8 @@ impl NewItem<'_> {
     /// What makes the item an edit, if anything. `shadowed` are the identifiers of the base's
     /// file, for an existing file.
     fn problem(&self, shadowed: Option<&BTreeSet<String>>, new: &NewNames) -> Option<String> {
-        if let Some(input) = input_macro(self.tokens.clone()) {
-            return Some(format!(
-                "uses `{input}!`, which reads the source tree or the environment as it compiles, \
-                 so a test can pin the file rather than the rule"
-            ));
+        if let Some(problem) = reads_outside(self.tokens.clone(), self.named) {
+            return Some(problem);
         }
         if let syn::Item::Mod(module) = self.item
             && dialect::is_test_module(module)
@@ -358,17 +376,8 @@ impl NewItem<'_> {
             let name = dialect::path_text(attribute.path());
             return Some(format!("carries the attribute `{name}`, which can change what it does"));
         }
-        if let Some(sensitive) = SENSITIVE.iter().find(|name| self.named.contains(**name)) {
-            return Some(format!(
-                "names `{sensitive}`: new code that reads the environment, a process or a file \
-                 can behave differently in CI than where the ratchet observes it"
-            ));
-        }
         if let Some(nested) = nested_item(self.item) {
-            return Some(format!(
-                "holds {nested} inside it, which can reach existing items from where the class \
-                 does not look"
-            ));
+            return Some(nested);
         }
         if let Some(problem) = kind_problem(self.item, self.path, shadowed.is_some(), new) {
             return Some(problem);
@@ -382,6 +391,27 @@ impl NewItem<'_> {
             )
         })
     }
+}
+
+/// What makes new code, a test or a test module among it, read from outside: one of
+/// [`INPUT_MACROS`] in `tokens`, or one of [`SENSITIVE`] among `named`. A test that pins the
+/// file it tests, as it compiles (`include_str!(file!())`) or as it runs
+/// (`std::fs::read_to_string`), kills every mutant of the file without testing a rule; other
+/// code can behave differently in CI than where the ratchet observes it (review of #57,
+/// rounds 5 and 6).
+fn reads_outside(tokens: TokenStream, named: &BTreeSet<String>) -> Option<String> {
+    if let Some(input) = input_macro(tokens) {
+        return Some(format!(
+            "uses `{input}!`, which reads the source tree or the environment as it compiles, so \
+             a test can pin the file rather than the rule"
+        ));
+    }
+    let sensitive = SENSITIVE.iter().find(|name| named.contains(**name))?;
+    Some(format!(
+        "names `{sensitive}`: new code that reads the environment, the clock, a process, a \
+         thread, the network or a file can pin the file rather than the rule, or behave \
+         differently in CI than where the ratchet observes it"
+    ))
 }
 
 /// The macros that read the source tree or the environment as code compiles. A new item,
@@ -412,41 +442,124 @@ fn input_macro(stream: TokenStream) -> Option<String> {
     panic!("an item has more than {TOKENS_MAX} token sequences");
 }
 
-/// What `item` holds inside it that the class does not judge: an `impl`, a trait, a module or
-/// a `macro_rules!` nested in a function body, at any depth.
-fn nested_item(item: &syn::Item) -> Option<&'static str> {
+/// What `item` holds, at any depth, that makes it an edit: an `impl`, a trait, a module, a
+/// `macro_rules!`, a constant or a static nested below it; an attribute outside [`ATTRIBUTES`]
+/// on anything in it, an `impl` or trait member among them; and `unsafe` code, an `unsafe
+/// impl` or an `extern` block (review of #57, round 6).
+fn nested_item(item: &syn::Item) -> Option<String> {
     let mut finder = Nested { depth: 0, found: None };
     syn::visit::Visit::visit_item(&mut finder, item);
     assert_eq!(finder.depth, 0, "every item that was entered was left");
     finder.found
 }
 
-/// Finds an item kind that may not nest, below the top-level item.
+/// Finds what may not be inside a new item.
 struct Nested {
+    /// How many items deep the walk is; the new item itself is at 0.
     depth: u32,
-    found: Option<&'static str>,
+    found: Option<String>,
+}
+
+impl Nested {
+    fn flag(&mut self, problem: String) {
+        if self.found.is_none() {
+            self.found = Some(problem);
+        }
+    }
+}
+
+/// The kind of an item that may not nest in a new item, if `node` is one.
+fn nested_kind(node: &syn::Item) -> Option<&'static str> {
+    if let syn::Item::Impl(_) = node {
+        return Some("an `impl`");
+    }
+    if let syn::Item::Trait(_) = node {
+        return Some("a trait");
+    }
+    if let syn::Item::Mod(_) = node {
+        return Some("a module");
+    }
+    if let syn::Item::Const(_) | syn::Item::Static(_) = node {
+        return Some("a constant or static");
+    }
+    if let syn::Item::Macro(declared) = node
+        && declared.mac.path.is_ident("macro_rules")
+    {
+        return Some("a `macro_rules!`");
+    }
+    None
 }
 
 impl<'ast> syn::visit::Visit<'ast> for Nested {
     fn visit_item(&mut self, node: &'ast syn::Item) {
-        let mut kind = None;
-        if let syn::Item::Impl(_) = node {
-            kind = Some("an `impl`");
-        } else if let syn::Item::Trait(_) = node {
-            kind = Some("a trait");
-        } else if let syn::Item::Mod(_) = node {
-            kind = Some("a module");
-        } else if let syn::Item::Macro(declared) = node
-            && declared.mac.path.is_ident("macro_rules")
+        if self.depth > 0
+            && let Some(kind) = nested_kind(node)
         {
-            kind = Some("a `macro_rules!`");
+            self.flag(format!(
+                "holds {kind} inside it, which can reach existing items, or hold a value no \
+                 mutant tests, from where the class does not look"
+            ));
         }
-        if self.depth > 0 && self.found.is_none() {
-            self.found = kind;
+        if let syn::Item::ForeignMod(_) = node {
+            self.flag("holds an `extern` block, which is `unsafe` to call".to_owned());
         }
         self.depth += 1;
         syn::visit::visit_item(self, node);
         self.depth -= 1;
+    }
+
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        if !is_allowed(node) {
+            let name = dialect::path_text(node.path());
+            self.flag(format!(
+                "carries the attribute `{name}` inside it, which can change what it does"
+            ));
+        }
+        syn::visit::visit_attribute(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node.unsafety.is_some() {
+            self.flag("is or holds an `unsafe impl`".to_owned());
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if node.unsafety.is_some() {
+            self.flag("is or holds an `unsafe trait`".to_owned());
+        }
+        syn::visit::visit_item_trait(self, node);
+    }
+
+    fn visit_signature(&mut self, node: &'ast syn::Signature) {
+        if matches!(node.safety, syn::Safety::Unsafe(_)) {
+            self.flag("is or holds an `unsafe fn`".to_owned());
+        }
+        syn::visit::visit_signature(self, node);
+    }
+
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        self.flag("holds an `unsafe` block".to_owned());
+        syn::visit::visit_expr_unsafe(self, node);
+    }
+
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        self.flag(
+            "holds an associated constant: like a top-level one, mutation testing makes no \
+             mutant for its value"
+                .to_owned(),
+        );
+        syn::visit::visit_impl_item_const(self, node);
+    }
+
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        self.flag(
+            "holds an associated constant: like a top-level one, mutation testing makes no \
+             mutant for its value"
+                .to_owned(),
+        );
+        syn::visit::visit_trait_item_const(self, node);
     }
 }
 
@@ -460,8 +573,8 @@ impl<'ast> syn::visit::Visit<'ast> for Nested {
 /// new type's name) can override a trait method or change which method an existing call
 /// resolves to (review of #57, round 5).
 fn impl_problem(block: &syn::ItemImpl, path: &str, new: &NewNames) -> Option<String> {
-    let own = plain_self_type(&block.self_ty)
-        .is_some_and(|name| new.types.contains(&(path.to_owned(), name)));
+    let own = self_type(&block.self_ty)
+        .is_some_and(|(name, plain)| plain && new.types.contains(&(path.to_owned(), name)));
     let mut lifetimes = Vec::new();
     let mut parameters = true;
     for parameter in &block.generics.params {
@@ -539,17 +652,6 @@ impl<'ast> syn::visit::Visit<'ast> for Lifetimes<'_> {
 }
 
 /// The name of the type an `impl` is for, if it is a single plain segment.
-fn plain_self_type(self_ty: &syn::Type) -> Option<String> {
-    let syn::Type::Path(path) = self_ty else {
-        return None;
-    };
-    let [segment] = path.path.segments.iter().collect::<Vec<_>>()[..] else {
-        return None;
-    };
-    let plain = path.qself.is_none() && path.path.leading_colon.is_none();
-    (plain && segment.arguments.is_none()).then(|| segment.ident.to_string())
-}
-
 /// What makes a new item of this kind in the file `path` an edit, if anything.
 fn kind_problem(
     item: &syn::Item,
@@ -582,15 +684,21 @@ fn kind_problem(
     }
 }
 
-/// The name of the type an `impl` is for, if it is a plain path: its last segment.
-fn self_type(self_ty: &syn::Type) -> Option<String> {
+/// The type an `impl` is for, if it is a path without a qualified self: the name of its last
+/// segment, and whether it is that single segment alone, with no arguments and no leading
+/// `::`, as an additive `impl` needs.
+fn self_type(self_ty: &syn::Type) -> Option<(String, bool)> {
     let syn::Type::Path(path) = self_ty else {
         return None;
     };
     if path.qself.is_some() {
         return None;
     }
-    path.path.segments.last().map(|segment| segment.ident.to_string())
+    let last = path.path.segments.last()?;
+    let plain = path.path.segments.len() == 1
+        && path.path.leading_colon.is_none()
+        && last.arguments.is_none();
+    Some((last.ident.to_string(), plain))
 }
 
 /// True if an import tree holds a glob, which can shadow names.
@@ -809,7 +917,7 @@ fn header(path: &str, text: &str, span: Span, open: Span) -> Result<String, Stri
 
 /// A short name of an `impl` for messages: `Visitor`, or `<Visitor as Visit>`.
 fn impl_name(block: &syn::ItemImpl) -> String {
-    let name = self_type(&block.self_ty).unwrap_or_else(|| "a type".to_owned());
+    let name = self_type(&block.self_ty).map_or_else(|| "a type".to_owned(), |(name, _)| name);
     let trait_name = block.trait_.as_ref().and_then(|(path, _)| path.segments.last());
     match trait_name {
         Some(segment) => format!("<{name} as {}>", segment.ident),
@@ -838,6 +946,7 @@ fn module_items(module: &syn::ItemMod) -> &[syn::Item] {
 #[derive(Clone, Copy)]
 struct Function<'a> {
     span: Span,
+    signature: &'a syn::Signature,
     block: &'a syn::Block,
 }
 
@@ -903,8 +1012,9 @@ impl Existing<'_> {
         match (before, after) {
             (syn::Item::Fn(base), syn::Item::Fn(head)) => self.compare_function(
                 &base.sig.ident.to_string(),
-                Function { span: base.span(), block: &base.block },
-                Function { span: head.span(), block: &head.block },
+                None,
+                Function { span: base.span(), signature: &base.sig, block: &base.block },
+                Function { span: head.span(), signature: &head.sig, block: &head.block },
             ),
             (syn::Item::Impl(base), syn::Item::Impl(head)) => self.compare_impl(base, head),
             (syn::Item::Mod(base), syn::Item::Mod(head)) if dialect::is_test_module(base) => {
@@ -938,10 +1048,16 @@ impl Existing<'_> {
                 continue;
             }
             if let (syn::ImplItem::Fn(old), syn::ImplItem::Fn(changed)) = (member, head_member) {
+                let owner = self_type(&base.self_ty).map(|(owner, _)| owner);
                 self.compare_function(
                     &format!("{name}::{}", old.sig.ident),
-                    Function { span: old.span(), block: &old.block },
-                    Function { span: changed.span(), block: &changed.block },
+                    owner.as_deref(),
+                    Function { span: old.span(), signature: &old.sig, block: &old.block },
+                    Function {
+                        span: changed.span(),
+                        signature: &changed.sig,
+                        block: &changed.block,
+                    },
                 )?;
             } else {
                 self.edit(&format!("`{key}` of `{name}` changed"));
@@ -980,27 +1096,29 @@ impl Existing<'_> {
         Ok(())
     }
 
-    /// A new item of an existing test module is an edit if it uses one of [`INPUT_MACROS`].
+    /// A new item of an existing test module is an edit if it reads from outside
+    /// ([`reads_outside`]).
     fn check_new_test(&mut self, item: &syn::Item) -> Result<(), String> {
         let tokens = tokens_at(&self.code.path, &self.head.text, item.span())?;
-        let Some(input) = input_macro(tokens) else {
+        let named = identifiers_at(&self.code.path, &self.head.text, item.span())?;
+        let Some(problem) = reads_outside(tokens, &named) else {
             return Ok(());
         };
         let key = item_key(&self.code.path, &self.head.text, item)?;
-        self.edit(&format!(
-            "the new test `{key}` uses `{input}!`, which pins the source tree or the environment \
-             rather than a rule"
-        ));
+        self.edit(&format!("the new test `{key}` {problem}"));
         Ok(())
     }
 
-    /// The head's body must be the base's with dispatch calls inserted at its top level.
+    /// The head's body must be the base's with dispatch calls inserted at its top level. `owner`
+    /// is the type of a method, whose report fields its dispatch calls may extend.
     fn compare_function(
         &mut self,
         name: &str,
+        owner: Option<&str>,
         before: Function<'_>,
         after: Function<'_>,
     ) -> Result<(), String> {
+        let lists = sinks::report_lists(before.signature, before.block, owner, &self.base.file);
         let path = self.code.path.clone();
         let base_open = before.block.brace_token.span.open();
         let head_open = after.block.brace_token.span.open();
@@ -1027,7 +1145,7 @@ impl Existing<'_> {
                     index += 1;
                     Some(names)
                 }
-                None => dispatch::names(statement, &self.code.path, self.new),
+                None => dispatch::names(statement, &self.code.path, self.new, &lists),
             };
             let Some(names) = found else {
                 self.edit(&format!(
@@ -1424,6 +1542,78 @@ mod tests {
         assert_edit(&class_of("class-input-module", &[(path, None, Some(module))]), "uses `file!`");
     }
 
+    // Goal: round 6 of #57's review, thread 2: a new test that reads the file it tests at run
+    // time is an edit, in an existing test module or a new one; so is a new test that reads the
+    // clock, starts a thread or opens a socket.
+    #[test]
+    fn new_tests_may_not_read_the_file_at_run_time() {
+        let base = real(RULES);
+        let test = "    const NONE: [&str; 0] = [];\n";
+        let pinned = "    #[test]\n    fn the_file_is_the_file() {\n        let text = \
+                      std::fs::read_to_string(\n            \
+                      crate::workspace_root().join(\"xtask/src/tidy/rust_source.rs\"),\n        \
+                      )\n        .unwrap();\n        assert_eq!(text.len(), 12345);\n    }\n";
+        let head = replaced(&base, test, &format!("{test}\n{pinned}"));
+        assert_edit(
+            &edited("class-pinned", RULES, &head),
+            "the new test `fn the_file_is_the_file`",
+        );
+        for body in [
+            "std::time::Instant::now()",
+            "std::thread::spawn(|| ())",
+            "std::net::TcpStream::connect(\"a:1\")",
+        ] {
+            let new_test =
+                format!("    #[test]\n    fn outside() {{\n        let _ = {body};\n    }}\n");
+            let probe = replaced(&base, test, &format!("{test}\n{new_test}"));
+            assert_edit(&edited("class-outside", RULES, &probe), "the new test `fn outside` names");
+        }
+        let path = "lints/src/extra.rs";
+        let module = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn pinned() {\n        let _ = \
+                      std::fs::read_to_string(\"lints/src/extra.rs\");\n    }\n}\n";
+        assert_edit(&class_of("class-pinned-module", &[(path, None, Some(module))]), "names `fs`");
+    }
+
+    // Goal: what a new item holds is judged at every depth: an attribute outside the allowed
+    // ones on an `impl` member or a nested item, `unsafe` code of any kind, an `extern` block,
+    // and a constant, top-level, nested or associated, are edits. A new lint and a new rule with
+    // its own visitor hold none of these and stay additive (the tests above).
+    #[test]
+    fn new_items_are_judged_at_every_depth() {
+        let base = real(RULES);
+        let new = "\nstruct Quieted;\n";
+        let probes = [
+            (
+                "impl Quieted {\n    #[export_name = \"x\"]\n    fn f() {}\n}",
+                "the attribute `export_name` inside",
+            ),
+            (
+                "impl Quieted {\n    #[unsafe(no_mangle)]\n    fn f() {}\n}",
+                "the attribute `unsafe` inside",
+            ),
+            (
+                "fn f() {\n    #[link_section = \"x\"]\n    fn g() {}\n}",
+                "the attribute `link_section` inside",
+            ),
+            ("unsafe impl Send for Quieted {}", "an `unsafe impl`"),
+            ("unsafe trait Hidden {}", "an `unsafe trait`"),
+            ("impl Quieted {\n    unsafe fn f() {}\n}", "an `unsafe fn`"),
+            ("fn f() -> u8 {\n    unsafe { 1 }\n}", "an `unsafe` block"),
+            ("extern \"C\" {\n    fn f();\n}", "an `extern` block"),
+            ("impl Quieted {\n    const LIMIT: u32 = 70;\n}", "an associated constant"),
+            ("trait Limited {\n    const LIMIT: u32 = 70;\n}", "an associated constant"),
+            (
+                "fn f() -> u32 {\n    const LIMIT: u32 = 70;\n    LIMIT\n}",
+                "a constant or static inside",
+            ),
+            ("const LIMIT: u32 = 70;", "is a constant or static"),
+        ];
+        for (index, (item, expected)) in probes.iter().enumerate() {
+            let head = format!("{base}{new}\n{item}\n");
+            assert_edit(&edited(&format!("class-depth-{index}"), RULES, &head), expected);
+        }
+    }
+
     // Goal: a dispatch call resolves its callee by path: a new `fn line_of` in another file does
     // not make a call of `rust_source.rs`'s existing `line_of` a dispatch; the module of a path
     // is found from the caller's file.
@@ -1529,6 +1719,135 @@ mod tests {
         let with_visitor = format!("{head}{own_visitor}");
         let visiting = edited("class-own-visitor", RULES, &with_visitor);
         assert_eq!(visiting.edits, Vec::<String>::new(), "a new rule with its own visitor");
+    }
+
+    // Goal: round 6 of #57's review, thread 1: `extend` adds only to a report list of the base
+    // function, with a new function that returns `Vec<Violation>`. The four probes, which grow an
+    // allow-list, a rebinding set, the enforced lints and an exemption, are edits, and so is a
+    // report-returning call into a list that is not a report list; a new rule's reports into a
+    // method's `self.violations` are additive.
+    #[test]
+    fn extend_adds_only_reports() {
+        let manifest = "xtask/src/tidy/manifest.rs";
+        let manifest_base = real(manifest);
+        let sort = "    names.sort();\n";
+        let vendored =
+            "\nfn vendored(_root: &&Path) -> Vec<String> {\n    vec![\"rayon\".to_owned()]\n}\n";
+        let grown = format!(
+            "{}{vendored}",
+            replaced(&manifest_base, sort, &format!("    names.extend(vendored(&root));\n{sort}"))
+        );
+        let lints = "    let mut lints = Vec::new();\n";
+        let planned = "\nfn planned_lints(_manifest: &&str) -> Vec<String> {\n    Vec::new()\n}\n";
+        let enforced = format!(
+            "{}{planned}",
+            replaced(
+                &manifest_base,
+                lints,
+                &format!("{lints}    lints.extend(planned_lints(&manifest));\n")
+            )
+        );
+        let reports = "\nfn vendored(_root: &&Path) -> Vec<Violation> {\n    Vec::new()\n}\n";
+        let typed = format!(
+            "{}{reports}",
+            replaced(&manifest_base, sort, &format!("    names.extend(vendored(&root));\n{sort}"))
+        );
+        let rules = real(RULES);
+        let visit = "        bindings.visit_pat(pattern);\n";
+        let rebound = "\nfn rebound(_pattern: &&syn::Pat, finder: &&mut FloatEqualityFinder) -> \
+                       Vec<Ident> {\n    finder.floats.clone()\n}\n";
+        let unbound = format!(
+            "{}{rebound}",
+            replaced(
+                &rules,
+                visit,
+                &format!("{visit}        bindings.names.extend(rebound(&pattern, &self));\n")
+            )
+        );
+        let lint = "lints/src/float_reduction.rs";
+        let exits = "    let mut exits = ExitFinder {";
+        let selection = "\nfn let_bindings(_body: &&Body<'_>) -> Vec<HirId> {\n    Vec::new()\n}\n";
+        let exempted = format!(
+            "{}{selection}",
+            replaced(
+                &real(lint),
+                exits,
+                &format!("    parameters.extend(let_bindings(&body));\n{exits}")
+            )
+        );
+        let probes = [
+            (manifest, grown.as_str(), "`workspace_crates` changed beyond a dispatch call"),
+            (manifest, enforced.as_str(), "`enforced_lints` changed beyond a dispatch call"),
+            (manifest, typed.as_str(), "`workspace_crates` changed beyond a dispatch call"),
+            (RULES, unbound.as_str(), "`FloatEqualityFinder::unbind` changed beyond"),
+            (lint, exempted.as_str(), "`is_selection` changed beyond a dispatch call"),
+        ];
+        for (index, (path, head, expected)) in probes.iter().enumerate() {
+            assert_edit(&edited(&format!("class-extend-{index}"), path, head), expected);
+        }
+    }
+
+    // Goal: a new rule's reports extend a method's `self.violations` additively.
+    #[test]
+    fn extend_into_a_report_field_is_additive() {
+        let report = "        self.report(node.loop_token.span, \"unbounded-loop\", message);\n";
+        let loop_rule = "\nfn loop_rule(_node: &&syn::ExprLoop) -> Vec<Violation> {\n    \
+                         Vec::new()\n}\n";
+        let into_field = format!(
+            "{}{loop_rule}",
+            replaced(
+                &real(RULES),
+                report,
+                &format!("{report}        self.violations.extend(loop_rule(&node));\n")
+            )
+        );
+        let additive = edited("class-extend-field", RULES, &into_field);
+        assert_eq!(additive.edits, Vec::<String>::new(), "into `self.violations`");
+    }
+
+    /// The signature and body of an `impl` member that is a method.
+    fn method_of(member: &syn::ImplItem) -> Option<(&syn::Signature, &syn::Block)> {
+        let syn::ImplItem::Fn(method) = member else {
+            return None;
+        };
+        Some((&method.sig, &method.block))
+    }
+
+    /// The report lists of the function or method `name` in `source`, a method of `owner`.
+    fn lists_of(source: &str, name: &str, owner: Option<&str>) -> Vec<String> {
+        let file = syn::parse_file(source).unwrap();
+        let mut functions = Vec::new();
+        for item in &file.items {
+            if let syn::Item::Fn(function) = item {
+                functions.push((&function.sig, &*function.block));
+            }
+            let members = if let syn::Item::Impl(block) = item { &block.items[..] } else { &[] };
+            functions.extend(members.iter().filter_map(method_of));
+        }
+        let (signature, block) =
+            functions.into_iter().find(|(signature, _)| signature.ident == name).unwrap();
+        super::sinks::report_lists(signature, block, owner, &file).into_iter().collect()
+    }
+
+    // Goal: the report lists of a function are read from the base's declarations: a typed or
+    // returned local, a `&mut Vec<Violation>` parameter, a `self` field of that type, and a
+    // field of a returned struct literal; nothing else.
+    #[test]
+    fn report_lists_are_read_from_declarations() {
+        let source = "struct V { violations: Vec<Violation>, names: Vec<String> }\nfn f(out: &mut \
+                      Vec<Violation>, names: &mut Vec<String>) -> Vec<Violation> { let typed: \
+                      Vec<Violation> = Vec::new(); let other = Vec::new(); let visitor = V { \
+                      violations: Vec::new(), names: Vec::new() }; Report { violations: \
+                      visitor.violations, typed, other } }\nfn g() -> Vec<Violation> { let \
+                      returned = Vec::new(); returned }\nfn h() -> Vec<String> { let returned = \
+                      Vec::new(); returned }\nfn k() { let kept: Vec<Violation> = Vec::new(); }\n\
+                      impl V { fn m(&self) {} fn n() {} }";
+        assert_eq!(lists_of(source, "f", None), ["out", "typed", "visitor.violations"]);
+        assert_eq!(lists_of(source, "g", None), ["returned"]);
+        assert_eq!(lists_of(source, "h", None), Vec::<String>::new(), "not a report list");
+        assert_eq!(lists_of(source, "k", None), Vec::<String>::new(), "not returned");
+        assert_eq!(lists_of(source, "m", Some("V")), ["self.violations"]);
+        assert_eq!(lists_of(source, "n", Some("V")), Vec::<String>::new(), "no `self`");
     }
 
     // Goal: a dispatch call that could reach existing state, or names nothing new, is an edit:

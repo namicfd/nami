@@ -6,8 +6,11 @@
 //! - `f(args);` or `module::f(args);`, a call of a new function, or `Type::f(args);` of a
 //!   function of a new type, each resolved by its path to the file that defines it
 //!   ([`module_file`]);
-//! - `place.extend(call);`, where `call` is such a call and `place` a path or a field of one,
-//!   such as `self.violations`: a new rule's reports are added to the existing ones;
+//! - `place.extend(call);`, where `call` calls a new function whose return type is exactly
+//!   `Vec<Violation>`, and `place` is a report list of the function the call is in, such as
+//!   `self.violations` ([`super::sinks`]): a new rule's reports are added to the existing ones,
+//!   and nothing else is. On any other place, such as an allow-list, it is an edit (review of
+//!   #57, round 6);
 //! - `place.register_lints(&[NEW, ..]);` with new lints only, and the base's
 //!   `place.register_lints(&[..]);` with new lints appended;
 //! - `place.register_late_lint_pass(Box::new(|_| Box::new(NewPass)));`, and the same with
@@ -18,6 +21,8 @@
 //! value that may be a `&mut` reborrowed, no method call, block or closure.
 
 use super::NewNames;
+use super::sinks::place_name;
+use std::collections::BTreeSet;
 use syn::spanned::Spanned;
 use syn::{Expr, Stmt};
 
@@ -43,14 +48,20 @@ pub struct Sides<'a> {
 }
 
 /// The new items that `statement` dispatches, if it is a dispatch call in the file
-/// `caller` (see the module documentation).
+/// `caller` (see the module documentation). `lists` are the report lists of the function it
+/// is in ([`super::sinks::report_lists`]), the only places `extend` may add to.
 #[must_use]
-pub fn names(statement: &Stmt, caller: &str, new: &NewNames) -> Option<Vec<String>> {
+pub fn names(
+    statement: &Stmt,
+    caller: &str,
+    new: &NewNames,
+    lists: &BTreeSet<String>,
+) -> Option<Vec<String>> {
     let Stmt::Expr(expression, Some(_)) = statement else {
         return None;
     };
     if let Expr::Call(call) = expression {
-        return new_call(call, caller, new).map(|name| vec![name]);
+        return new_call(call, caller, new).map(|(name, _)| vec![name]);
     }
     let Expr::MethodCall(call) = expression else {
         return None;
@@ -65,7 +76,10 @@ pub fn names(statement: &Stmt, caller: &str, new: &NewNames) -> Option<Vec<Strin
     if method == EXTEND
         && let Expr::Call(inner) = argument
     {
-        return new_call(inner, caller, new).map(|name| vec![name]);
+        let into_list = place_name(&call.receiver).is_some_and(|place| lists.contains(&place));
+        let (name, function) = new_call(inner, caller, new)?;
+        let reports = function.is_some_and(|key| new.reports.contains(&key));
+        return (into_list && reports).then(|| vec![name]);
     }
     if method == LINT_REGISTRATION {
         let names = lint_names(argument)?;
@@ -140,7 +154,11 @@ pub fn module_file(caller: &str, segments: &[String]) -> Option<String> {
 /// a function new in the file that defines it, or to a function of a type new in its file, and
 /// every argument is read only. A name alone would let a new `fn line_of` in one file make a
 /// call of an existing `line_of` in another look new (review of #57, round 5).
-fn new_call(call: &syn::ExprCall, caller: &str, new: &NewNames) -> Option<String> {
+fn new_call(
+    call: &syn::ExprCall,
+    caller: &str,
+    new: &NewNames,
+) -> Option<(String, Option<(String, String)>)> {
     let Expr::Path(function) = &*call.func else {
         return None;
     };
@@ -154,13 +172,14 @@ fn new_call(call: &syn::ExprCall, caller: &str, new: &NewNames) -> Option<String
     }
     let names: Vec<String> = segments.iter().map(|segment| segment.ident.to_string()).collect();
     let (last, owners) = names.split_last()?;
-    let in_module = module_file(caller, owners)
-        .is_some_and(|file| new.functions.contains(&(file, last.clone())));
+    let defined = module_file(caller, owners)
+        .map(|file| (file, last.clone()))
+        .filter(|key| new.functions.contains(key));
     let of_type = owners.split_last().is_some_and(|(owner, modules)| {
         module_file(caller, modules).is_some_and(|file| new.types.contains(&(file, owner.clone())))
     });
     let read_only = call.args.iter().all(is_read_only);
-    ((in_module || of_type) && read_only).then(|| names.join("::"))
+    ((defined.is_some() || of_type) && read_only).then(|| (names.join("::"), defined))
 }
 
 /// True for an argument that gives the callee no way to change existing state: a literal, or a
