@@ -136,9 +136,13 @@ bot. What else the PR needs depends on its class, which the summary names (`pass
   blocks it. Write a new rule this way when you can: add its code beside the old, leave existing
   functions, constants and tests as they are, and give a new type only plain `impl`s in its own
   file, of any trait, with lifetime parameters used only in the trait path and the method
-  signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Don't nest an `impl`,
-  trait, module or `macro_rules!` in a function, and don't use `include_str!`, `file!` or
-  `env!`, not even in a test.
+  signatures (`impl<'tcx> LateLintPass<'tcx> for NewPass` is fine). Hand the new rule's
+  reports to the existing ones as `violations.extend(new_rule(&..))`, where `new_rule` returns
+  `Vec<Violation>` and `violations` is the list the function returns or reports into. Don't
+  nest an `impl`, trait, module, `macro_rules!` or constant in a function, don't write
+  `unsafe` or an attribute beyond `doc`, `derive`, `must_use`, `inline`, `expect` and `test`,
+  and don't read files, the environment, the clock, threads or the network, nor use
+  `include_str!`, `file!` or `env!`, not even in a test.
 - **Edit:** any change to an existing function, constant, `impl`, test, fixture or UI case; a new
   member of an existing `impl`; an `impl` in another file than its type, with type or const
   parameters, or with a `where` clause. It waits for the reviewer app's approval of its head
