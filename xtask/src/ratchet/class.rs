@@ -1848,6 +1848,12 @@ mod tests {
         assert_eq!(lists_of(source, "k", None), Vec::<String>::new(), "not returned");
         assert_eq!(lists_of(source, "m", Some("V")), ["self.violations"]);
         assert_eq!(lists_of(source, "n", Some("V")), Vec::<String>::new(), "no `self`");
+        let place = |text: &str| super::sinks::place_name(&syn::parse_str(text).unwrap());
+        assert_eq!(place("self.a.b").as_deref(), Some("self.a.b"));
+        assert_eq!(place("violations").as_deref(), Some("violations"));
+        for other in ["<A as B>::c", "<A>::c", "a::b", "a.0", "f().a", "(a).b"] {
+            assert_eq!(place(other), None, "{other}");
+        }
     }
 
     // Goal: a dispatch call that could reach existing state, or names nothing new, is an edit:

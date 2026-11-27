@@ -198,7 +198,9 @@ pub fn place_name(expression: &syn::Expr) -> Option<String> {
     let mut current = expression;
     for _ in 0..super::TOKENS_MAX {
         if let syn::Expr::Path(path) = current {
-            if !path.attrs.is_empty() || path.qself.is_some() {
+            // A qualified path (`<A>::c`, `<A as B>::c`) has a leading `::` or two segments, so
+            // `get_ident` refuses it.
+            if !path.attrs.is_empty() {
                 return None;
             }
             fields.push(path.path.get_ident()?.to_string());
