@@ -293,13 +293,12 @@ pub fn judge(
     }
     let plantings = plan(base, &fixtures, head, &files_of(head)?, rng)?;
     let (mut findings, mut failed) = (Vec::new(), Vec::new());
-    let (mut drawn, mut found_runs) = (0_usize, 0_usize);
+    let mut found_runs = 0_usize;
     for planting in &plantings {
         let fixture = fixtures.get(planting.fixture).expect("a planting names a fixture");
         let at = planting.placement.to_string_lossy().into_owned();
         let modes: &[&str] = if fixture.fires { &["file", "tree"] } else { &["file"] };
         for mode in modes {
-            drawn += 1;
             let Some(run) =
                 observations.runs_of(&fixture.file, mode).find(|run| run.placement == at)
             else {
@@ -320,8 +319,8 @@ pub fn judge(
     let present = recorded.count();
     if present != found_runs {
         failed.push(format!(
-            "the observations hold tidy runs that the seed does not draw ({drawn} drawn, \
-             {present} recorded)"
+            "the observations hold tidy runs that the seed does not draw ({found_runs} drawn and \
+             found, {present} recorded)"
         ));
     }
     Ok((findings, failed))
