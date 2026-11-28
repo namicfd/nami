@@ -69,9 +69,10 @@ non-negotiables or the rules in "When a check fails": those hold in full.
   filed as an issue or task and comes soon. Name that issue or task in the PR, and do not build a
   workaround to close the gap meanwhile. This is about the order in which safeguards are built
   or switched on. It never lets you silence a check that fires.
-- **Keep the maintainer's work small.** Their approval is for PRs that could loosen a safeguard:
-  the protected paths. A few extra easy approvals for a short while are fine if they make a
-  change simpler, as long as they do not become permanent.
+- **Keep the maintainer's work small.** Their approval is for the PRs these rules send to a
+  human: the protected paths, where a safeguard could loosen, and `changes-results`. A few extra
+  easy approvals for a short while are fine if they make a change simpler, as long as they do
+  not become permanent.
 - **Decide the order of work yourself.** Do not ask the maintainer about sequencing: choose, and
   report what you did.
 - **Ask the maintainer only what only they can answer:** an approval, a setting only they can
