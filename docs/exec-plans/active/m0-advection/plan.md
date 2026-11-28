@@ -145,17 +145,18 @@ points, so `reference` computes both with arithmetic alone.
 `kernels::math`, clippy bans `f64::sqrt`, `log2` and `powf`, and `reference` must not depend on
 `kernels`. So the few irrational values the checks need are derived constants in
 `thresholds.rs`, each with its derivation in the doc comment and a test that needs only
-multiplication:
+arithmetic. Each test also asserts that both neighbouring `f64` values (`c.next_down()` and
+`c.next_up()`) fail it, so a constant one ulp off is caught:
 
 - ‖u₀″‖₁ = 64√3/9, correctly rounded 12.316805742712017 (u₀″ = 32 (6x² − 6x + 1) changes sign
-  at ½ ± √3/6, so ‖u₀″‖₁ = 4 |u₀′(½ − √3/6)|), tested through the residual (9c/64)² − 3;
+  at ½ ± √3/6, so ‖u₀″‖₁ = 4 |u₀′(½ − √3/6)|). A floating-point residual cannot separate this
+  value from its lower neighbour, so the test is exact, in integers. c is the correctly rounded
+  square root of 12288/81 exactly when (2m − 1)² · 81 < 3 · 2¹¹² < (2m + 1)² · 81, where
+  c = m · 2⁻⁴⁹ (m is the 53-bit significand from `c.to_bits()`). Every product fits in `u128`
+  (at most 114 bits), and no tolerance is needed.
 - 2^(p_formal − δ) for each formal order in use, in M0 only 2^0.9, correctly rounded
-  1.8660659830736148, tested through the residual c¹⁰ − 2⁹.
-
-Each residual must be within a tolerance named in `thresholds.rs`, and the test also asserts
-that both neighbouring `f64` values (`c.next_down()` and `c.next_up()`) fail it, so a constant
-one ulp off is caught. If plain multiplication is too noisy for that, the residual is evaluated
-with an error-free product (`mul_add`, written explicitly, as ADR-0005 allows).
+  1.8660659830736148, tested through the residual c¹⁰ − 2⁹ with plain multiplication, against a
+  tolerance named in `thresholds.rs` that both neighbours fail.
 
 The known-order scheme needs no power function either: at the k-th resolution (k = 0, 1, 2 for
 N = 32, 64, 128) it adds c q^k g, a product of k factors q, with q = ½ for order 1 and q = 0.6
@@ -306,7 +307,7 @@ ADR-0007's `thresholds.toml`).
   - the step-count round-off factor 4ε;
   - the maximum-principle round-off margin, derived like C_mass;
   - ‖u₀″‖₁ = 64√3/9 and 2^0.9, the derived constants of "How the references plug in", with the
-    named residual tolerance of their tests, which their one-ulp neighbours must fail.
+    named residual tolerance of the 2^0.9 test, which its one-ulp neighbours must fail.
 - A test that every threshold is finite and positive, and a test that names each constant above
   and checks its value against its derivation, so that an empty file fails.
 - `reference-suite` and `m0-reference-advection` also own this file, in sequence, for any
@@ -358,18 +359,20 @@ advection checks:
   1.5 × t D ‖u₀″‖₁;
 - periodic boundaries: the pulse on [−0.075, 0.075) advanced by t = 0.3, against its exact
   periodic shift, by the moved-correctly ratio;
-- the mapping from declared boundary types to boundary checks, in `reference::checks`: periodic
-  boundaries select the periodic check, and every boundary type has a check;
+- the mapping from declared boundary types to boundary checks, in `reference::checks`: an
+  exhaustive `match` over `Boundary`, so a new variant does not compile without a check, and
+  periodic boundaries select the periodic check;
 - `check_advection(properties)`, which runs everything the properties imply.
 
 `reference` uses arithmetic and the derived constants of `thresholds.rs` only, with neither
 `libm` nor `kernels::math` (see "How the references plug in"). The self-tests: half speed,
 reversed direction and double diffusion fail; the wrong-wrap scheme fails, and the test asserts
-that the failure comes from the periodic check (the scheme also breaks conservation); the same
-wrong-wrap scheme passes `check_advection` when its properties declare no periodic boundaries,
-and fails it when they do, which proves that the declaration selects the check;
-the known-order scheme passes the order check with q = ½ and fails it with q = 0.6; the exact
-scheme passes every check except its two exemptions. Written by a reference session.
+that the failure comes from the periodic check (the scheme also breaks conservation and order);
+the checks selected for properties that declare periodic boundaries include the periodic check,
+and those for the same properties without it do not, asserted on the selected set rather than
+on a run, since M0 has no other boundary type; the known-order scheme passes the order check
+with q = ½ and fails it with q = 0.6; the exact scheme passes every check except its two
+exemptions. Written by a reference session.
 
 ### m0-rows
 

@@ -74,7 +74,7 @@
       "acceptance": [
         "reference::thresholds::tests::every_threshold_is_finite_and_positive",
         "reference::thresholds::tests::m0_constants_match_their_derivations",
-        "reference::thresholds::tests::derived_constants_pass_and_their_neighbours_fail"
+        "reference::thresholds::tests::derived_constants_are_correctly_rounded_and_their_neighbours_fail"
       ],
       "passes": false
     },
