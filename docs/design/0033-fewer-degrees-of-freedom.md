@@ -3,15 +3,15 @@
 - Status: Proposed
 - Date: 2026-11-28
 - Deciders: maintainer
-- Amends: ADR-0006, ADR-0013
+- Amends: ADR-0006, ADR-0008, ADR-0013, ADR-0019
 
 ## Context
 
 nami is written mostly by agents, and agents copy what they find. Every choice that the toolchain
 leaves open is a choice that agents make differently from one session to the next: whether to
 shadow, whether to write `std::fs::read` inline or import it, `pub` or `pub(crate)`, `1e-12` or
-`1.0e-12`. Review catches some of these and misses the rest. `docs/TIGER_STYLE.md` has 50 rules
-held by `[review]` alone.
+`1.0e-12`. Review catches some of these and misses the rest. `docs/TIGER_STYLE.md` has 50 `[review]`
+tags, and 36 of its rules are held by review alone.
 
 An audit on 2026-11-28 enabled clippy's restriction, nursery and cargo groups and 20 rustc lints
 that are allowed by default, and counted what fired (Evidence). Most lints that remove a choice
@@ -77,7 +77,9 @@ Two further gaps are specific to agents:
      `std::thread::spawn` everywhere. Threads need an ADR of their own;
    - in nami crates: `Rc`, `Arc`, `Cell`, `RefCell`, `Mutex` and `macro_rules!`. Shared mutable
      state and declarative macros hide control flow and data flow from the reader and from tidy.
-     `alloc-guard` keeps `unsafe` and nothing else from this list (ADR-0014).
+     `alloc-guard` is exempt from the `Cell` ban only: its counter is a thread-local `Cell`, the
+     one piece of shared state that a counting allocator needs, next to its `unsafe`
+     (ADR-0014).
 6. **Formatting uses the pinned nightly rustfmt.** It is the nightly that `lints/` already pins
    for dylint. The options that remove the most freedom are all unstable: `imports_granularity`,
    `group_imports`, `reorder_impl_items`, `wrap_comments`, `format_code_in_doc_comments`,
@@ -94,6 +96,29 @@ Two further gaps are specific to agents:
    or the reference is wrong, stop and file it as an issue rather than work around it.
 9. **Every `#[expect]` reason cites a record:** an ADR or a GitHub issue. A waiver then always
    points to the decision that allows it.
+10. **Checks of the source and the repository** that no lint provides. The rules of
+    `TIGER_STYLE.md` that they enforce are already written down; these are new:
+    - `target-cfg`: `cfg(target_*)` only in `kernels::math`, the one place where platform
+      differences may be handled (ADR-0005);
+    - `float-literal-form`: an exponent follows a fractional part (`1.0e-12`), so that float
+      literals have one form;
+    - `markdown-title`: a Markdown document has one H1, on its first line, so that every document
+      names itself the same way;
+    - `file-kind`, `executable`, `text-bytes` and `file-size`: an allow-list of file kinds and
+      executables, no tabs, carriage returns or trailing whitespace, and no large files, so that
+      nothing enters the tree that no check reads;
+    - `orphan-module`: every `.rs` file is reached by a `mod` item or is a root that Cargo finds,
+      because Rust silently ignores any other file;
+    - `cross-ref`: every ADR, path, style-guide section, rule id and `cargo xtask` command that a
+      file cites exists, because agents invent citations;
+    - `kernel-shape`: a kernel asserts each argument before its first loop and checks its output
+      slices for finite values after its last, as `crates/kernels/src/update.rs` does;
+    - `review-ratchet`: the number of `[review]` tags in the style guide only goes down;
+    - two dylint lints against passing a test without doing the work: `cfg!(test)` inside a
+      function that is not a test, and a hand-written `PartialEq` that returns a constant.
+
+    A file-length limit was considered and left out: eleven files of `xtask/` are longer than
+    1,000 lines today, two of them rule paths that grow by addition (ADR-0022).
 
 The tasks that build each point are in `docs/exec-plans/active/strict-rust/plan.md`.
 
@@ -108,6 +133,7 @@ The tasks that build each point are in `docs/exec-plans/active/strict-rust/plan.
 - Point 7: `cargo xtask test-integrity`, a required CI check.
 - Point 8: the fixtures of the stop hook and of each failure summary.
 - Point 9: tidy, in its existing walk over `#[expect]` attributes.
+- Point 10: the tidy rules and dylint lints it names, each with its fixtures or UI case.
 
 ## Consequences
 
