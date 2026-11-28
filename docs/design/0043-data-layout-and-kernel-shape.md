@@ -54,9 +54,11 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
   differs from today's:** `f64::sqrt` as the backend, which ADR-0005 and `clippy.toml` ban today
   (math goes through `libm`), and `debug_assert!` instead of `assert!` on each call. With
   `kernels::math::sqrt` as it is, the same layout measured 0.1× to 0.9×, below the failure line
-  of ADR-0034. The layout choice stands either way: structure of arrays was the fastest layout in
-  every configuration, the current `sqrt` included. Reaching the target needs a separate decision on `sqrt` before M2, which this ADR does
-  not make.
+  of ADR-0034. The layout choice does not rest on `sqrt`: structure of arrays was the fastest
+  layout in every configuration except A and D, the two with libm's `arch` sqrt. There the
+  hybrid was faster because it escaped the SSE/AVX transition penalty by accident, not because
+  of its layout, and no layout reached the 1.0× target. Reaching the target needs a
+  separate decision on `sqrt` before M2, which this ADR does not make.
 - Kernels are generic over named state types, so each equation system writes its fields once,
   and the rows are tied to them by one accessor per system.
 - The speed depends on LLVM vectorising the face loop. An early exit in that loop, such as an
