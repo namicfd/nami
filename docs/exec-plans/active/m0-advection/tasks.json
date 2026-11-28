@@ -74,7 +74,7 @@
       "acceptance": [
         "reference::thresholds::tests::every_threshold_is_finite_and_positive",
         "reference::thresholds::tests::m0_constants_match_their_derivations",
-        "reference::thresholds::tests::derived_constants_pass_their_arithmetic_tests"
+        "reference::thresholds::tests::derived_constants_pass_and_their_neighbours_fail"
       ],
       "passes": false
     },
@@ -102,7 +102,6 @@
         "reference::checks::tests::a_non_monotone_scheme_fails_the_maximum_principle",
         "reference::checks::tests::an_underestimated_speed_fails_the_wave_speed_bound",
         "reference::checks::tests::properties_choose_the_checks",
-        "reference::checks::tests::each_declared_boundary_has_a_check",
         "reference::combinations::tests::a_combination_without_a_row_fails",
         "reference::combinations::tests::the_m0_row_declares_order_one_monotone_periodic"
       ],
@@ -116,6 +115,7 @@
       ],
       "owner_paths": [
         "crates/reference/src/advection.rs",
+        "crates/reference/src/checks",
         "crates/reference/src/thresholds.rs"
       ],
       "acceptance": [
@@ -127,7 +127,9 @@
         "reference::advection::tests::double_diffusion_fails_the_error_ceiling",
         "reference::advection::tests::known_order_passes_with_one_half_and_fails_with_six_tenths",
         "reference::advection::tests::upwind_passes_the_periodic_check",
-        "reference::advection::tests::a_wrong_wrap_scheme_fails_the_periodic_check"
+        "reference::advection::tests::a_wrong_wrap_scheme_fails_the_periodic_check",
+        "reference::checks::tests::each_declared_boundary_has_a_check",
+        "reference::advection::tests::declaring_periodic_boundaries_selects_the_periodic_check"
       ],
       "passes": false
     },

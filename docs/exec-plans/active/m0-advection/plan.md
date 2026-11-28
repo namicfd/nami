@@ -147,14 +147,21 @@ points, so `reference` computes both with arithmetic alone.
 `thresholds.rs`, each with its derivation in the doc comment and a test that needs only
 multiplication:
 
-- ‖u₀″‖₁ = 64√3/9 ≈ 12.316805742712015 (u₀″ = 32 (6x² − 6x + 1) changes sign at ½ ± √3/6, so
-  ‖u₀″‖₁ = 4 |u₀′(½ − √3/6)|), tested by (9c/64)² = 3 to within a few ε;
-- 2^(p_formal − δ) for each formal order in use, in M0 only 2^0.9 ≈ 1.8660659830736148, tested
-  by c¹⁰ = 2⁹ to within a few ε.
+- ‖u₀″‖₁ = 64√3/9, correctly rounded 12.316805742712017 (u₀″ = 32 (6x² − 6x + 1) changes sign
+  at ½ ± √3/6, so ‖u₀″‖₁ = 4 |u₀′(½ − √3/6)|), tested through the residual (9c/64)² − 3;
+- 2^(p_formal − δ) for each formal order in use, in M0 only 2^0.9, correctly rounded
+  1.8660659830736148, tested through the residual c¹⁰ − 2⁹.
+
+Each residual must be within a tolerance named in `thresholds.rs`, and the test also asserts
+that both neighbouring `f64` values (`c.next_down()` and `c.next_up()`) fail it, so a constant
+one ulp off is caught. If plain multiplication is too noisy for that, the residual is evaluated
+with an error-free product (`mul_add`, written explicitly, as ADR-0005 allows).
 
 The known-order scheme needs no power function either: at the k-th resolution (k = 0, 1, 2 for
 N = 32, 64, 128) it adds c q^k g, a product of k factors q, with q = ½ for order 1 and q = 0.6
-for order log₂(5/3) ≈ 0.74, which is below 1 − δ.
+for order log₂(5/3) ≈ 0.74, which is below 1 − δ. The constant c is chosen so that at N = 32
+the added error c ‖g‖₁ equals t D ‖u₀″‖₁. With q = ½ it then halves with Δx exactly as the
+ceiling does, so it stays at 1/1.5 of the error ceiling and fails only checks it should.
 
 New in M0:
 
@@ -298,8 +305,8 @@ ADR-0007's `thresholds.toml`).
   - the moved-correctly ratio ½ and its absolute L1 ceiling;
   - the step-count round-off factor 4ε;
   - the maximum-principle round-off margin, derived like C_mass;
-  - ‖u₀″‖₁ = 64√3/9 and 2^0.9, the derived constants of "How the references plug in", each with
-    its arithmetic-only test.
+  - ‖u₀″‖₁ = 64√3/9 and 2^0.9, the derived constants of "How the references plug in", with the
+    named residual tolerance of their tests, which their one-ulp neighbours must fail.
 - A test that every threshold is finite and positive, and a test that names each constant above
   and checks its value against its derivation, so that an empty file fails.
 - `reference-suite` and `m0-reference-advection` also own this file, in sequence, for any
@@ -329,9 +336,11 @@ The generic checks:
 - mirror symmetry;
 - rotation across axes;
 - the maximum principle;
-- the wave-speed bound;
-- the mapping from each declared boundary type to its check. The periodic check itself compares
-  with an exact solution, so it is in `m0-reference-advection`.
+- the wave-speed bound.
+
+Boundary checks compare with an exact solution, so the periodic check and the mapping from
+declared boundary types to boundary checks are both in `m0-reference-advection`, which also owns
+`crates/reference/src/checks` after this task.
 
 Prove the suite with the bad schemes of "How the references plug in", written inside
 `reference`'s tests, each failing the check it targets, and with the shift scheme as the positive
@@ -349,11 +358,16 @@ advection checks:
   1.5 × t D ‖u₀″‖₁;
 - periodic boundaries: the pulse on [−0.075, 0.075) advanced by t = 0.3, against its exact
   periodic shift, by the moved-correctly ratio;
+- the mapping from declared boundary types to boundary checks, in `reference::checks`: periodic
+  boundaries select the periodic check, and every boundary type has a check;
 - `check_advection(properties)`, which runs everything the properties imply.
 
 `reference` uses arithmetic and the derived constants of `thresholds.rs` only, with neither
 `libm` nor `kernels::math` (see "How the references plug in"). The self-tests: half speed,
-reversed direction and double diffusion fail; the wrong-wrap scheme fails the periodic check;
+reversed direction and double diffusion fail; the wrong-wrap scheme fails, and the test asserts
+that the failure comes from the periodic check (the scheme also breaks conservation); the same
+wrong-wrap scheme passes `check_advection` when its properties declare no periodic boundaries,
+and fails it when they do, which proves that the declaration selects the check;
 the known-order scheme passes the order check with q = ½ and fails it with q = 0.6; the exact
 scheme passes every check except its two exemptions. Written by a reference session.
 
