@@ -15,11 +15,18 @@
 //!
 //! Both act on the checkout's GitHub repository as whoever `GH_TOKEN` names, and read the code
 //! owners from `.github/CODEOWNERS` on `<remote>/main` (`$NAMI_TASK_REMOTE`, or `origin`). The
-//! workflow `.github/workflows/queue.yml` runs them.
+//! workflow `.github/workflows/queue.yml` runs them. When `NAMI_FILING_TOKEN` is set, the two
+//! tokens are kept apart: creating the issue is the only call that acts as
+//! `NAMI_FILING_TOKEN`, and every read (runs, jobs, logs, pull requests, the merge queue,
+//! commits, the repository's contents and the open issues) acts as `GH_TOKEN`, with
+//! `NAMI_FILING_TOKEN` removed from gh's environment. In CI, `GH_TOKEN` is the workflow's own
+//! read-only token and `NAMI_FILING_TOKEN` the CI app's, narrowed to `issues: write`
+//! (ADR-0023, rule 2).
 
 pub mod clashes;
 pub mod failure;
 pub mod forge;
+pub mod shape;
 
 use crate::issue::github::{Gh, GitHub};
 use crate::issue::trust::{self, BOT_LOGIN, Trust};
@@ -37,6 +44,10 @@ const USAGE: &str =
 /// and the bot. A marker in anyone else's comment is ignored.
 const COMMENT_AUTHORS: [&str; 2] = ["github-actions[bot]", BOT_LOGIN];
 
+/// The variable whose token creates issues, when it is set (ADR-0023). `GH_TOKEN` then does
+/// every read.
+const FILING_TOKEN: &str = "NAMI_FILING_TOKEN";
+
 /// The branch whose ADRs every PR is compared with.
 const MAIN: &str = "main";
 
@@ -45,10 +56,11 @@ pub fn run(arguments: &[&str]) -> ExitCode {
     let root = crate::workspace_root();
     let remote = std::env::var("NAMI_TASK_REMOTE").unwrap_or_else(|_| "origin".to_owned());
     let main = format!("{remote}/{MAIN}");
-    let gh = Gh::new(&root);
     let vocabulary = || Vocabulary::load(&root, &main);
-    let result = trust::load(&root, &main)
-        .and_then(|trust| execute(&gh, &gh, &trust, &vocabulary, arguments));
+    let result = trust::load(&root, &main).and_then(|trust| {
+        let clients = clients(&root, std::env::var_os(FILING_TOKEN).is_some());
+        execute_wired(&clients, &trust, &vocabulary, arguments)
+    });
     match result {
         Ok(output) => {
             print!("{output}");
@@ -61,15 +73,39 @@ pub fn run(arguments: &[&str]) -> ExitCode {
     }
 }
 
-/// Runs one command against `forge` and `github`, trusting the authors in `trust`, and quoting
-/// only what `vocabulary` returns. Returns what the command prints, or the error to report.
+/// The client for every read, and the one that creates issues. With `separate_filing`, the
+/// second acts as [`FILING_TOKEN`] and the first never sees it; otherwise both act as
+/// `GH_TOKEN`.
+fn clients(root: &std::path::Path, separate_filing: bool) -> (Gh, Gh) {
+    if !separate_filing {
+        return (Gh::new(root), Gh::new(root));
+    }
+    (Gh::new(root).hiding(FILING_TOKEN), Gh::with_token_from(root, FILING_TOKEN))
+}
+
+/// Runs one command with `clients` as [`clients`] returns them, wired as in production: the
+/// first does every read and the clash comment, the second only creates issues (ADR-0023,
+/// rule 2).
+fn execute_wired<Client: Forge + GitHub>(
+    (workflow, filer): &(Client, Client),
+    trust: &Trust,
+    vocabulary: &dyn Fn() -> Result<Vocabulary, String>,
+    arguments: &[&str],
+) -> Result<String, String> {
+    execute(workflow, workflow, filer, trust, vocabulary, arguments)
+}
+
+/// Runs one command against `forge`, reading issues from `issues` and creating them through
+/// `filer` only, trusting the authors in `trust`, and quoting only what `vocabulary` returns.
+/// Returns what the command prints, or the error to report.
 ///
 /// # Errors
 ///
 /// Bad options, or a failure to reach GitHub or to load the vocabulary.
 pub fn execute(
     forge: &dyn Forge,
-    github: &dyn GitHub,
+    issues: &dyn GitHub,
+    filer: &dyn GitHub,
     trust: &Trust,
     vocabulary: &dyn Fn() -> Result<Vocabulary, String>,
     arguments: &[&str],
@@ -79,7 +115,9 @@ pub fn execute(
         ["clashes", "--pr", number, "--comment"] | ["clashes", "--comment", "--pr", number] => {
             check_clashes(forge, trust, parse_pull(number)?, true)
         }
-        ["failed", "--run", id] => file_failure(forge, github, trust, vocabulary, parse_run(id)?),
+        ["failed", "--run", id] => {
+            file_failure(forge, issues, filer, trust, vocabulary, parse_run(id)?)
+        }
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -169,10 +207,12 @@ fn publish(
 }
 
 /// Files the issue for failed merge-queue run `run`, unless it is not one, the PR is still in
-/// play, or a trusted open issue already records this run's failure.
+/// play, or a trusted open issue already records this run's failure. Issues are read from
+/// `issues`, and `filer` only creates the new one.
 fn file_failure(
     forge: &dyn Forge,
-    github: &dyn GitHub,
+    issues: &dyn GitHub,
+    filer: &dyn GitHub,
     trust: &Trust,
     vocabulary: &dyn Fn() -> Result<Vocabulary, String>,
     run: u64,
@@ -200,9 +240,12 @@ fn file_failure(
         return Ok(format!("{reason}; nothing to file\n"));
     }
     // One issue per failed run: a re-run of this run finds its issue; another run of the same
-    // PR is a new failure, even while the PR says `Fixes` for an earlier one.
+    // PR is a new failure, even while the PR says `Fixes` for an earlier one. That holds for a
+    // run of the other queue workflow for the same merge group too: no comment joins the two
+    // (the filing token only creates, ADR-0023), and the later issue names the earlier one
+    // among the open failures if it is filed by then.
     let title = failure::title(pull, run);
-    let open = github.open_issues()?;
+    let open = issues.open_issues()?;
     let failures_of_pull: Vec<(u64, u32)> = open
         .iter()
         .filter(|issue| issue.is_open && trust::refused(issue, trust).is_none())
@@ -217,10 +260,6 @@ fn file_failure(
         ));
     }
     let vocabulary = vocabulary()?;
-    let sibling = Sibling { forge, github, details: &details };
-    if let Some(noted) = sibling.note(&failures_of_pull, &vocabulary)? {
-        return Ok(noted);
-    }
     let report = Failure {
         pull,
         group: group_of(forge, &entry, &details)?,
@@ -234,64 +273,8 @@ fn file_failure(
     assert_eq!(draft.title, title, "the issue carries the title that re-runs look for");
     let by_bot = report.author == BOT_LOGIN;
     let options = FileOptions { kind: "bug", needs_decision: !by_bot, new: true, path: "-" };
-    let number = issue::file_number(&draft, &options, github, trust)?;
+    let number = issue::file_number(&draft, &options, &open, filer, trust)?;
     Ok(format!("filed #{number}: {title}\n"))
-}
-
-/// A failed run, and where to look for the issue of another run of its merge group.
-struct Sibling<'a> {
-    forge: &'a dyn Forge,
-    github: &'a dyn GitHub,
-    details: &'a Run,
-}
-
-impl Sibling<'_> {
-    /// One issue per merge group: when both `ci` and `guardrails` fail for one merge group, the
-    /// second run to finish finds the issue of the first among `failures_of_pull`, the open
-    /// trusted issues of the same PR by their run, and adds its failed jobs to it as a comment
-    /// instead of filing another (review of #57, round 11). A re-run of the second run finds
-    /// that comment, by the bot and naming the run, and posts nothing (round 12). Returns what
-    /// it did, or `None` if no issue records a run of the same merge group: the same queue
-    /// branch and tested commit.
-    ///
-    /// # Errors
-    ///
-    /// When GitHub cannot be asked.
-    fn note(
-        &self,
-        failures_of_pull: &[(u64, u32)],
-        vocabulary: &Vocabulary,
-    ) -> Result<Option<String>, String> {
-        let details = self.details;
-        for (its_run, number) in failures_of_pull {
-            let sibling = self.forge.run(*its_run)?;
-            let same_group =
-                sibling.head_sha == details.head_sha && sibling.head_branch == details.head_branch;
-            if sibling.id != *its_run || !same_group || sibling.path == details.path {
-                continue;
-            }
-            let repository = self.forge.repository()?;
-            let named = format!("https://github.com/{repository}/actions/runs/{}.", details.id);
-            let comments = self.github.comments(*number)?;
-            if comments
-                .iter()
-                .any(|comment| comment.author == BOT_LOGIN && comment.body.contains(&named))
-            {
-                return Ok(Some(format!(
-                    "#{number} already notes run {} of the same merge group; not noted again\n",
-                    details.id
-                )));
-            }
-            let jobs = failed_jobs(self.forge, details.id, vocabulary)?;
-            let note = failure::sibling_note(details.id, &repository, &jobs, vocabulary);
-            self.forge.post_comment(*number, &note)?;
-            return Ok(Some(format!(
-                "#{number} records run {its_run} of the same merge group; added run {} to it\n",
-                details.id
-            )));
-        }
-        Ok(None)
-    }
 }
 
 /// Why PR `entry.pull` has not left the queue for good after run `details`, or `None` if it
@@ -373,9 +356,9 @@ mod tests {
     use crate::issue::github::{
         Comment, GitHub, Issue, LabelEvent, issue_from_json, parse_lines, string_at,
     };
-    use crate::issue::trust::Trust;
+    use crate::issue::trust::{BOT_LOGIN, CI_LOGIN, Trust};
     use crate::json::{Value, parse};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -423,11 +406,29 @@ mod tests {
 
     /// One line of `gh api --jq '.[]' repos/o/r/issues?state=open`.
     fn issue_line(number: u32, title: &str, author: &str, state: &str) -> String {
+        issue_line_with_body(number, title, author, state, "")
+    }
+
+    /// Like [`issue_line`], with the body `body`.
+    fn issue_line_with_body(
+        number: u32,
+        title: &str,
+        author: &str,
+        state: &str,
+        body: &str,
+    ) -> String {
         format!(
             "{{\"number\": {number}, \"title\": \"{title}\", \"user\": {{\"login\": \
              \"{author}\"}}, \"state\": \"{state}\", \"labels\": [{{\"name\": \"bug\"}}], \
-             \"body\": \"\"}}\n"
+             \"body\": {}}}\n",
+            crate::json::quote(body)
         )
+    }
+
+    /// The CI app's open issue #`number` for run `run` of #51, as `queue failed` writes it.
+    fn ci_issue_line(number: u32, run: u64) -> String {
+        let (title, body) = super::shape::tests::queue_failure(51, run, &[]);
+        issue_line_with_body(number, &title, CI_LOGIN, "open", &body)
     }
 
     /// The open issues: an outsider's issue with the title of #51's failure, and the bot's
@@ -466,22 +467,36 @@ mod tests {
         )
     }
 
+    /// Which of the two clients a [`Fake`] stands for. A call that the other client should
+    /// have made fails the test.
+    #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+    enum Serves {
+        /// Both, as when `GH_TOKEN` is the only token.
+        #[default]
+        Both,
+        /// The client that acts as `GH_TOKEN`, the workflow's own token in CI: every read, of
+        /// issues too, and the clash comment's writes (`post_comment`, `edit_comment`), which
+        /// the `adr clashes` job makes with that token.
+        WorkflowToken,
+        /// Creating issues, and nothing else: the CI app's token in CI.
+        Filing,
+    }
+
     /// GitHub as fixed `gh api` output, recording what is written.
     #[derive(Default)]
     struct Fake {
+        serves: Serves,
         pulls: &'static str,
         main: &'static str,
         files: BTreeMap<u32, String>,
         comments: String,
         run: String,
-        /// Other runs, by ID; any other ID is answered with `run`.
-        other_runs: BTreeMap<u64, String>,
         messages: &'static str,
         state: (String, String),
         queue_runs: String,
         issues: String,
-        /// The comments of every issue, as `(author, body)`.
-        issue_comments: Vec<(&'static str, String)>,
+        /// How often the open issues were read.
+        issue_reads: Cell<u32>,
         posted: RefCell<Vec<(u32, String)>>,
         edited: RefCell<Vec<(u64, String)>>,
         filed: RefCell<Vec<(String, String, Vec<String>)>>,
@@ -495,84 +510,123 @@ mod tests {
         string_at(entry, &["name"])
     }
 
+    impl Fake {
+        /// Fails the test unless this fake stands for `client`.
+        fn serve(&self, client: Serves) {
+            assert!(
+                matches!(self.serves, Serves::Both) || self.serves == client,
+                "a {client:?} call reached the {:?} client",
+                self.serves
+            );
+        }
+    }
+
     impl Forge for Fake {
         fn adr_names_on(&self, branch: &str) -> Result<Vec<String>, String> {
+            self.serve(Serves::WorkflowToken);
             assert_eq!(branch, "main");
             Ok(lines(self.main, name_of))
         }
         fn open_pulls(&self) -> Result<Vec<Pull>, String> {
+            self.serve(Serves::WorkflowToken);
             Ok(lines(self.pulls, pull_from_json))
         }
         fn pull_files(&self, number: u32) -> Result<Vec<PullFile>, String> {
+            self.serve(Serves::WorkflowToken);
             Ok(lines(self.files.get(&number).map_or("", String::as_str), pull_file_from_json))
         }
         fn pull_comments(&self, _number: u32) -> Result<Vec<PullComment>, String> {
+            self.serve(Serves::WorkflowToken);
             Ok(lines(&self.comments, pull_comment_from_json))
         }
         fn post_comment(&self, number: u32, body: &str) -> Result<(), String> {
+            self.serve(Serves::WorkflowToken);
             self.posted.borrow_mut().push((number, body.to_owned()));
             Ok(())
         }
         fn edit_comment(&self, id: u64, body: &str) -> Result<(), String> {
+            self.serve(Serves::WorkflowToken);
             self.edited.borrow_mut().push((id, body.to_owned()));
             Ok(())
         }
-        fn run(&self, id: u64) -> Result<Run, String> {
-            let text = self.other_runs.get(&id).unwrap_or(&self.run);
-            run_from_json(&parse(text).unwrap())
+        fn run(&self, _id: u64) -> Result<Run, String> {
+            self.serve(Serves::WorkflowToken);
+            run_from_json(&parse(&self.run).unwrap())
         }
         fn jobs(&self, _id: u64) -> Result<Vec<Job>, String> {
+            self.serve(Serves::WorkflowToken);
             jobs_from_json(&parse(JOBS).unwrap())
         }
         fn job_log(&self, id: u64) -> Result<String, String> {
+            self.serve(Serves::WorkflowToken);
             if id == 11 { Ok(LOG.to_owned()) } else { Err(format!("no log for {id}")) }
         }
         fn commit_messages(&self, base: &str, head: &str) -> Result<Vec<String>, String> {
+            self.serve(Serves::WorkflowToken);
             assert_eq!((base, head), (BASE_SHA, SHA), "the group is read from its base");
             strings_from_json(&parse(self.messages).unwrap())
         }
         fn pull_state(&self, number: u32) -> Result<PullState, String> {
+            self.serve(Serves::WorkflowToken);
             assert_eq!(number, 51);
             pull_state_from_json(&parse(&self.state.0).unwrap(), &parse(&self.state.1).unwrap())
         }
         fn queue_runs_since(&self, created_at: &str) -> Result<Vec<Run>, String> {
+            self.serve(Serves::WorkflowToken);
             assert_eq!(created_at, "2026-11-26T08:24:28Z");
             Ok(lines(&self.queue_runs, run_from_json))
         }
         fn repository(&self) -> Result<String, String> {
+            self.serve(Serves::WorkflowToken);
             repository_from_text("namicfd/nami\n")
         }
     }
 
     impl GitHub for Fake {
         fn issue(&self, number: u32) -> Result<Issue, String> {
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}"))
         }
         fn open_issues(&self) -> Result<Vec<Issue>, String> {
+            self.serve(Serves::WorkflowToken);
+            self.issue_reads.set(self.issue_reads.get() + 1);
             Ok(lines(&self.issues, issue_from_json))
         }
-        fn comments(&self, _number: u32) -> Result<Vec<Comment>, String> {
-            let comment = |(author, body): &(&str, String)| Comment {
-                author: (*author).to_owned(),
-                body: body.clone(),
-            };
-            Ok(self.issue_comments.iter().map(comment).collect())
+        fn comments(&self, number: u32) -> Result<Vec<Comment>, String> {
+            self.serve(Serves::WorkflowToken);
+            Err(format!("not asked for #{number}"))
         }
         fn label_events(&self, number: u32) -> Result<Vec<LabelEvent>, String> {
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}"))
         }
         fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String> {
+            self.serve(Serves::Filing);
             let labels = labels.iter().map(|label| (*label).to_owned()).collect();
             self.filed.borrow_mut().push((title.to_owned(), body.to_owned(), labels));
             Ok(70)
         }
+        fn comment(&self, number: u32, _body: &str) -> Result<Comment, String> {
+            Err(format!("the queue commands comment on #{number} through `Forge`"))
+        }
+        fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
+            Err(format!("the queue commands never remove `{label}` from #{number}"))
+        }
+        fn repository_labels(&self) -> Result<Vec<String>, String> {
+            Err("the queue commands never list the labels".to_owned())
+        }
         fn is_queued(&self, number: u32) -> Result<bool, String> {
+            self.serve(Serves::WorkflowToken);
             Err(format!("not asked for #{number}: the queue commands use `pull_state`"))
+        }
+        fn head_is_here(&self, number: u32) -> Result<bool, String> {
+            self.serve(Serves::WorkflowToken);
+            Err(format!("not asked for #{number}: the queue commands check out no PR"))
         }
     }
 
     fn trust() -> Trust {
-        Trust::from_codeowners("/docs/design/ @owner\n")
+        Trust::from_codeowners("/docs/design/ @owner\n").with_ci(vocabulary(), "namicfd/nami")
     }
 
     fn vocabulary() -> Vocabulary {
@@ -618,7 +672,7 @@ mod tests {
     }
 
     fn run(fake: &Fake, arguments: &[&str]) -> Result<String, String> {
-        execute(fake, fake, &trust(), &|| Ok(vocabulary()), arguments)
+        execute(fake, fake, fake, &trust(), &|| Ok(vocabulary()), arguments)
     }
 
     // Goal: a number that a trusted open PR also adds is reported with that PR and the next
@@ -800,62 +854,45 @@ mod tests {
         assert_eq!(error, "GitHub answered with run 901 when asked for run 900");
     }
 
-    // Goal: review of #57, round 11: when `ci` and `guardrails` both fail for one merge group,
-    // the second run adds its failed jobs to the first run's issue as a comment and files
-    // nothing; a run of the same workflow, or of another merge group, is no sibling.
+    // Goal: when `ci` and `guardrails` both fail for one merge group, each run gets its own
+    // issue: the `guardrails` run's issue names the CI app's open issue about the `ci` run
+    // among the earlier failures, and nothing is commented, since the filing token only
+    // creates (ADR-0023, rule 2). Wired as in production, every read goes to the workflow's
+    // token and only the creation to the filing token. A re-run of the `guardrails` run finds
+    // its own issue and files nothing.
     #[test]
-    fn one_merge_group_gets_one_issue() {
+    fn both_workflows_of_one_merge_group_file_their_own_issues() {
         let guardrails = RUN
             .replace("\"id\": 900", "\"id\": 901")
+            .replace("\"workflow_id\": 42", "\"workflow_id\": 43")
             .replace(".github/workflows/ci.yml", ".github/workflows/guardrails.yml");
-        let title = "PR #51 failed in the merge queue (run 900)";
-        let recorded = issues() + &issue_line(9, title, "nami-agent[bot]", "open");
-        let sibling = Fake {
+        let workflow = Fake {
+            serves: Serves::WorkflowToken,
             run: guardrails.clone(),
-            other_runs: BTreeMap::from([(900, RUN.to_owned())]),
-            issues: recorded.clone(),
-            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
+            issues: issues() + &ci_issue_line(9, 900),
             ..dropped()
         };
-        let output = run(&sibling, &["failed", "--run", "901"]).unwrap();
-        assert_eq!(output, "#9 records run 900 of the same merge group; added run 901 to it\n");
-        assert!(sibling.filed.borrow().is_empty(), "no second issue");
-        let posted = sibling.posted.borrow();
-        let (number, note) = posted.first().expect("a comment on the first issue");
-        assert_eq!(*number, 9);
-        assert!(note.contains("https://github.com/namicfd/nami/actions/runs/901"), "{note}");
-        assert!(note.contains("Job `gate` failed"), "{note}");
-        let again = Fake {
-            run: guardrails.clone(),
-            other_runs: BTreeMap::from([(900, RUN.to_owned())]),
-            issues: recorded.clone(),
-            issue_comments: vec![("nami-agent[bot]", note.clone())],
-            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
-            ..dropped()
-        };
+        let clients = (workflow, Fake { serves: Serves::Filing, ..Fake::default() });
+        let arguments = ["failed", "--run", "901"];
+        let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
+        let title = "PR #51 failed in the merge queue (run 901)";
+        assert_eq!(output, Ok(format!("filed #70: {title}\n")));
+        let (workflow_client, filing_client) = &clients;
+        assert!(workflow_client.filed.borrow().is_empty(), "the workflow's token files nothing");
+        assert!(
+            workflow_client.posted.borrow().is_empty() && filing_client.posted.borrow().is_empty(),
+            "no comment on the `ci` run's issue"
+        );
+        let filed = filing_client.filed.borrow();
+        assert_eq!(filed.len(), 1, "the `guardrails` run gets an issue of its own");
+        let body = &filed[0].1;
+        assert!(body.contains("still open: #9."), "the `ci` run's issue is named: {body}");
+        assert!(body.contains("https://github.com/namicfd/nami/actions/runs/901\n"), "{body}");
+        let recorded = issues() + &ci_issue_line(9, 900) + &ci_issue_line(70, 901);
+        let again = Fake { run: guardrails, issues: recorded, ..dropped() };
         let rerun = run(&again, &["failed", "--run", "901"]).unwrap();
-        assert_eq!(rerun, "#9 already notes run 901 of the same merge group; not noted again\n");
-        assert!(again.posted.borrow().is_empty(), "a re-run posts nothing");
-        let forged = Fake {
-            run: guardrails.clone(),
-            other_runs: BTreeMap::from([(900, RUN.to_owned())]),
-            issues: recorded.clone(),
-            issue_comments: vec![("outsider", note.clone())],
-            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
-            ..dropped()
-        };
-        let noted = run(&forged, &["failed", "--run", "901"]).unwrap();
-        assert!(noted.starts_with("#9 records run 900"), "an outsider's copy is not the bot's");
-        let other_group = RUN.replace("0123456789abcdef", "fedcba9876543210");
-        let separate = Fake {
-            run: guardrails,
-            other_runs: BTreeMap::from([(900, other_group)]),
-            issues: recorded,
-            queue_runs: queue_run(901, 43, "2026-11-26T08:24:28Z", 51),
-            ..dropped()
-        };
-        let filed = run(&separate, &["failed", "--run", "901"]).unwrap();
-        assert!(filed.starts_with("filed #70"), "another merge group: {filed}");
+        assert_eq!(rerun, "#70 already records that run 901 of #51 failed; not filed again\n");
+        assert!(again.filed.borrow().is_empty() && again.posted.borrow().is_empty());
     }
 
     // Goal: a re-run finds the bot's open issue by its title and files nothing; runs that are
@@ -916,6 +953,103 @@ mod tests {
         let skipped = run(&rerun, &["failed", "--run", "950"]).unwrap();
         assert_eq!(skipped, "#70 already records that run 950 of #51 failed; not filed again\n");
         assert_eq!(rerun.filed.borrow().len(), 1, "only the filing before the re-run");
+    }
+
+    // Goal: wired as in production, every read, of the open issues too, goes to the first
+    // client, the workflow's token, and the second client only creates the issue: the CI
+    // app's token reads nothing, and the workflow's token files nothing (ADR-0023, rule 2).
+    // Method: `execute_wired`, which `run` calls with the clients in the order that `clients`
+    // returns them; each fake fails on the other's calls. The filing fake also holds a trusted
+    // issue for this run, which would stop the filing if it were asked for issues. The open
+    // issues are read once, for both the earlier failures and the duplicate search. An issue
+    // that the CI app filed for an earlier run of #51 is trusted and named.
+    #[test]
+    fn reads_and_writes_go_to_their_own_clients() {
+        let earlier = ci_issue_line(6, 800);
+        let workflow =
+            Fake { serves: Serves::WorkflowToken, issues: issues() + &earlier, ..dropped() };
+        let recorded =
+            issue_line(5, "PR #51 failed in the merge queue (run 900)", BOT_LOGIN, "open");
+        let filer = Fake { serves: Serves::Filing, issues: recorded, ..Fake::default() };
+        let clients = (workflow, filer);
+        let arguments = ["failed", "--run", "900"];
+        let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
+        let (workflow_client, filing_client) = &clients;
+        assert_eq!(
+            output.as_deref(),
+            Ok("filed #70: PR #51 failed in the merge queue (run 900)\n")
+        );
+        assert_eq!(
+            workflow_client.issue_reads.get(),
+            1,
+            "the workflow's token reads the issues once"
+        );
+        assert_eq!(filing_client.issue_reads.get(), 0, "the filing client reads no issue");
+        assert!(workflow_client.filed.borrow().is_empty(), "the workflow's token files nothing");
+        assert!(
+            workflow_client.posted.borrow().is_empty()
+                && workflow_client.edited.borrow().is_empty()
+        );
+        let filed = filing_client.filed.borrow();
+        assert_eq!(filed.len(), 1, "the filing client creates the issue");
+        assert!(
+            filed[0].1.contains("still open: #6."),
+            "the CI app's earlier issue: {}",
+            filed[0].1
+        );
+    }
+
+    // Goal: open issues by the CI app with a queue-failure title for #51 and a hostile body
+    // neither make `queue failed` panic nor count as earlier failures: the new issue is filed
+    // and names none of them.
+    #[test]
+    fn hostile_ci_issues_never_stop_the_filing() {
+        let hostile: String = super::shape::tests::hostile_bodies()
+            .iter()
+            .zip(80..)
+            .map(|(body, number)| {
+                let title = super::failure::title(51, 9);
+                issue_line_with_body(number, &title, CI_LOGIN, "open", body)
+            })
+            .collect();
+        let fake = Fake { issues: issues() + &hostile, ..dropped() };
+        let output = run(&fake, &["failed", "--run", "900"]).expect("filed");
+        assert_eq!(output, "filed #70: PR #51 failed in the merge queue (run 900)\n");
+        let filed = fake.filed.borrow();
+        assert!(!filed[0].1.contains("still open"), "no hostile issue counts: {}", filed[0].1);
+    }
+
+    // Goal: wired as in production, the clash comment is read and posted with the workflow's
+    // token, and the filing client is never asked.
+    #[test]
+    fn the_clash_comment_uses_the_workflow_token() {
+        let workflow = Fake { serves: Serves::WorkflowToken, ..clash_fake() };
+        let clients = (workflow, Fake { serves: Serves::Filing, ..Fake::default() });
+        let arguments = ["clashes", "--pr", "51", "--comment"];
+        let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
+        assert!(output.is_ok_and(|text| text.ends_with("commented on #51\n")), "posted");
+        assert_eq!(clients.0.posted.borrow().len(), 1, "the workflow's token posts");
+        assert!(clients.1.posted.borrow().is_empty() && clients.1.filed.borrow().is_empty());
+    }
+
+    // Goal: with `NAMI_FILING_TOKEN` set, the read client never sees it and the filing client
+    // acts as it; without it, both act as `GH_TOKEN`.
+    #[test]
+    fn the_filing_token_is_kept_apart() {
+        let root = std::path::Path::new(".");
+        let environment = |gh: &crate::issue::github::Gh| -> Vec<(String, Option<String>)> {
+            let tokens = |name: &str| (name == super::FILING_TOKEN).then(|| "write".to_owned());
+            let command = gh.command(&["x"], &tokens).expect("the token is set");
+            let text = |value: &std::ffi::OsStr| value.to_str().expect("UTF-8").to_owned();
+            command.get_envs().map(|(name, value)| (text(name), value.map(text))).collect()
+        };
+        let removed = (super::FILING_TOKEN.to_owned(), None);
+        let (reads, writes) = super::clients(root, true);
+        assert_eq!(environment(&reads), std::slice::from_ref(&removed), "GH_TOKEN is inherited");
+        let filing = ("GH_TOKEN".to_owned(), Some("write".to_owned()));
+        assert_eq!(environment(&writes), [filing, removed]);
+        let (shared_reads, shared_writes) = super::clients(root, false);
+        assert!(environment(&shared_reads).is_empty() && environment(&shared_writes).is_empty());
     }
 
     // Goal: malformed commands and numbers are errors that show the usage.

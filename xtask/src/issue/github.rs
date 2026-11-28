@@ -38,6 +38,10 @@ pub struct Comment {
     pub author: String,
     /// Its text.
     pub body: String,
+    /// When it was posted.
+    pub created_at: Timestamp,
+    /// When its text last changed: `created_at` if it never did.
+    pub updated_at: Timestamp,
 }
 
 /// A label that someone added to an issue or removed from it.
@@ -49,6 +53,48 @@ pub struct LabelEvent {
     pub actor: String,
     /// True if it was added, false if it was removed.
     pub added: bool,
+    /// When it happened.
+    pub created_at: Timestamp,
+}
+
+/// A time as GitHub's REST API writes it: `2026-11-26T08:24:28Z`, in UTC, to the second. In
+/// this one fixed-width form, the order of the text is the order of time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp(String);
+
+impl Timestamp {
+    /// Reads a time in GitHub's form.
+    ///
+    /// # Errors
+    ///
+    /// Any other form, such as one with fractions of a second or another time zone.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let bytes = text.as_bytes();
+        let is_clock = bytes.len() == 20
+            && bytes.iter().enumerate().skip(10).all(|(at, byte)| match at {
+                10 => *byte == b'T',
+                13 | 16 => *byte == b':',
+                19 => *byte == b'Z',
+                _ => byte.is_ascii_digit(),
+            });
+        let is_day = text.get(..10).is_some_and(super::decision::is_date);
+        if !(is_clock && is_day) {
+            return Err(format!("`{text}` is not a time in the form 2026-11-26T08:24:28Z"));
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The time as GitHub wrote it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The day, `YYYY-MM-DD`, in UTC.
+    #[must_use]
+    pub fn day(&self) -> &str {
+        self.0.get(..10).expect("`parse` checked that a time starts with its day")
+    }
 }
 
 /// What the issue commands need from GitHub. Every error says what failed and how to fix it.
@@ -88,12 +134,53 @@ pub trait GitHub {
     /// When GitHub refuses it or cannot be asked.
     fn create(&self, title: &str, body: &str, labels: &[&str]) -> Result<u32, String>;
 
+    /// Posts a comment on an issue and returns it as GitHub stored it: author and times.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub refuses it or cannot be asked, or answers without a comment.
+    fn comment(&self, number: u32, body: &str) -> Result<Comment, String>;
+
+    /// Removes a label from an issue.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub refuses it, the issue does not have the label, or GitHub cannot be asked.
+    fn remove_label(&self, number: u32, label: &str) -> Result<(), String>;
+
+    /// The names of the repository's labels.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or there are more than [`LIST_MAX`].
+    fn repository_labels(&self) -> Result<Vec<String>, String>;
+
     /// True while pull request `number` has an entry in the merge queue.
     ///
     /// # Errors
     ///
     /// When GitHub cannot be asked, or does not have it.
     fn is_queued(&self, number: u32) -> Result<bool, String>;
+
+    /// True if pull request `number`'s head branch is in this repository, not in a fork; false
+    /// also when its head repository is gone.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or does not have it.
+    fn head_is_here(&self, number: u32) -> Result<bool, String>;
+}
+
+/// Whether a pull request, in the shape of GitHub's pulls API, has its head branch in its base
+/// repository. A head repository that GitHub sends as `null`, because it was deleted, is not.
+///
+/// # Errors
+///
+/// When the answer has no base repository's name.
+pub fn head_is_here_from_json(pull: &Value) -> Result<bool, String> {
+    let base = string_at(pull, &["base", "repo", "full_name"])?;
+    let head = string_at(pull, &["head", "repo", "full_name"]).ok();
+    Ok(head.is_some_and(|head| head == base))
 }
 
 /// Reads an issue or pull request in the shape of GitHub's issues API.
@@ -134,10 +221,16 @@ pub fn issue_from_json(value: &Value) -> Result<Issue, String> {
 ///
 /// Names the field that is missing or has the wrong type.
 pub fn comment_from_json(value: &Value) -> Result<Comment, String> {
-    Ok(Comment {
+    let comment = Comment {
         author: string_at(value, &["user", "login"])?,
         body: optional_string(value, "body")?,
-    })
+        created_at: timestamp_at(value, "created_at")?,
+        updated_at: timestamp_at(value, "updated_at")?,
+    };
+    if comment.updated_at < comment.created_at {
+        return Err("GitHub sent a comment that changed before it was posted".to_owned());
+    }
+    Ok(comment)
 }
 
 /// Reads one entry of GitHub's issue-events API: a label event, or `None` for any other event.
@@ -156,7 +249,14 @@ pub fn label_event_from_json(value: &Value) -> Result<Option<LabelEvent>, String
         Some(Value::Null) | None => "ghost".to_owned(),
         Some(_) => string_at(value, &["actor", "login"])?,
     };
-    Ok(Some(LabelEvent { label: string_at(value, &["label", "name"])?, actor, added }))
+    let label = string_at(value, &["label", "name"])?;
+    Ok(Some(LabelEvent { label, actor, added, created_at: timestamp_at(value, "created_at")? }))
+}
+
+/// The time in the field `key` of `value`.
+fn timestamp_at(value: &Value, key: &str) -> Result<Timestamp, String> {
+    let text = string_at(value, &[key])?;
+    Timestamp::parse(&text).map_err(|error| format!("GitHub sent a bad `{key}`: {error}"))
 }
 
 /// Parses `gh api --jq '.[]'` output: one JSON value per line.
@@ -216,10 +316,20 @@ fn as_number(value: &Value) -> Option<u32> {
 /// ready` lists a queue-failure issue whose PR closes it only in that form. In CI,
 /// `actions/checkout` sets `origin` to the repository that the workflow runs in, the base
 /// repository also for a PR from a fork, so CI reads the right name.
+///
+/// The URL is the one configured for the remote, before any `url.<base>.insteadOf` rewrite:
+/// the name that the remote stands for, wherever git fetches it from. A remote with more than
+/// one URL names no single repository, so it gives `None`.
 #[must_use]
 pub fn repository_of(root: &Path, remote: &str) -> Option<String> {
-    let url = crate::task::claims::git(root, &["remote", "get-url", remote], &[], None).ok()?;
-    repository_of_url(url.trim())
+    let key = format!("remote.{remote}.url");
+    let urls = crate::task::claims::git(root, &["config", "--get-all", &key], &[], None).ok()?;
+    let mut lines = urls.lines().map(str::trim).filter(|line| !line.is_empty());
+    let url = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    repository_of_url(url)
 }
 
 /// The `owner/name` of a GitHub remote URL: `https://github.com/owner/name(.git)`,
@@ -243,19 +353,61 @@ pub fn repository_of_url(url: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct Gh {
     root: PathBuf,
+    /// The environment variable whose token gh uses instead of `GH_TOKEN`, if any. Only its
+    /// name is kept, so that no token is ever printed with the struct.
+    token_variable: Option<&'static str>,
+    /// The environment variable that gh must not see, if any: another client's token.
+    hidden: Option<&'static str>,
 }
 
 impl Gh {
-    /// Runs `gh` in the checkout at `root`, which decides the repository.
+    /// Runs `gh` in the checkout at `root`, which decides the repository, as `GH_TOKEN`.
     #[must_use]
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf() }
+        Self { root: root.to_path_buf(), token_variable: None, hidden: None }
+    }
+
+    /// Like [`Gh::new`], but gh acts as the token in the environment variable `variable`, and
+    /// the variable itself is removed from gh's environment.
+    #[must_use]
+    pub fn with_token_from(root: &Path, variable: &'static str) -> Self {
+        assert!(!variable.is_empty() && variable != "GH_TOKEN", "a variable other than GH_TOKEN");
+        assert!(!root.as_os_str().is_empty(), "gh runs in a checkout");
+        Self { root: root.to_path_buf(), token_variable: Some(variable), hidden: None }
+    }
+
+    /// This client, with `variable` removed from gh's environment, so that gh never acts as
+    /// the token it holds.
+    #[must_use]
+    pub fn hiding(self, variable: &'static str) -> Self {
+        assert!(!variable.is_empty() && variable != "GH_TOKEN", "a variable other than GH_TOKEN");
+        assert!(self.token_variable.is_none(), "a client with its own token hides it already");
+        Self { hidden: Some(variable), ..self }
+    }
+
+    /// The `gh api` command for `arguments`, with the token that `lookup` gives for this
+    /// client's variable, or the inherited `GH_TOKEN`.
+    pub(crate) fn command(
+        &self,
+        arguments: &[&str],
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Command, String> {
+        let mut command = Command::new("gh");
+        let _ = command.arg("api").args(arguments).current_dir(&self.root);
+        if let Some(variable) = self.token_variable {
+            let token = lookup(variable).filter(|token| !token.trim().is_empty());
+            let token = token.ok_or_else(|| format!("`{variable}` holds no token for gh"))?;
+            let _ = command.env("GH_TOKEN", token).env_remove(variable);
+        }
+        if let Some(variable) = self.hidden {
+            let _ = command.env_remove(variable);
+        }
+        Ok(command)
     }
 
     /// Runs `gh api` with `arguments`, and `input` on stdin; returns what gh printed.
     pub(crate) fn api(&self, arguments: &[&str], input: Option<&str>) -> Result<String, String> {
-        let mut command = Command::new("gh");
-        let _ = command.arg("api").args(arguments).current_dir(&self.root);
+        let mut command = self.command(arguments, &|name| std::env::var(name).ok())?;
         let _ = command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
         let _ = command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
@@ -325,8 +477,34 @@ impl GitHub for Gh {
         Ok(issue_from_json(&self.one(&arguments, Some(&request))?)?.number)
     }
 
+    fn comment(&self, number: u32, body: &str) -> Result<Comment, String> {
+        let request = format!("{{\"body\": {}}}", json::quote(body));
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
+        let posted = self.one(&["--method", "POST", &path, "--input", "-"], Some(&request))?;
+        comment_from_json(&posted)
+            .map_err(|error| format!("GitHub posted the comment on #{number}, but {error}"))
+    }
+
+    fn remove_label(&self, number: u32, label: &str) -> Result<(), String> {
+        let is_plain = label.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-');
+        assert!(is_plain, "the label `{label}` needs no escaping in a URL");
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/labels/{label}");
+        let _ = self.api(&["--method", "DELETE", &path], None)?;
+        Ok(())
+    }
+
+    fn repository_labels(&self) -> Result<Vec<String>, String> {
+        let labels = self.list("repos/{owner}/{repo}/labels?per_page=100")?;
+        labels.iter().map(|label| string_at(label, &["name"])).collect()
+    }
+
     fn is_queued(&self, number: u32) -> Result<bool, String> {
         is_queued_from_json(&self.queue_entry(number)?)
+    }
+
+    fn head_is_here(&self, number: u32) -> Result<bool, String> {
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
+        head_is_here_from_json(&self.one(&[&path], None)?)
     }
 }
 
@@ -362,10 +540,30 @@ pub fn is_queued_from_json(graphql: &Value) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Comment, Issue, LabelEvent, comment_from_json, issue_from_json, label_event_from_json,
-        parse_lines,
+        Comment, Issue, LabelEvent, Timestamp, comment_from_json, issue_from_json,
+        label_event_from_json, parse_lines,
     };
     use crate::json::parse;
+
+    // Goal: a PR's head is here only when its head repository is its base repository; a
+    // fork's head or a deleted one is not, and an answer without a base is an error.
+    #[test]
+    fn heads_are_here_only_in_the_base_repository() {
+        let pull = |head: &str| {
+            let base = r#""base": {"repo": {"full_name": "namicfd/nami"}}"#;
+            parse(&format!(r#"{{{base}, "head": {{"repo": {head}}}}}"#)).unwrap()
+        };
+        assert_eq!(
+            super::head_is_here_from_json(&pull(r#"{"full_name": "namicfd/nami"}"#)),
+            Ok(true)
+        );
+        assert_eq!(
+            super::head_is_here_from_json(&pull(r#"{"full_name": "outsider/nami"}"#)),
+            Ok(false)
+        );
+        assert_eq!(super::head_is_here_from_json(&pull("null")), Ok(false), "a deleted fork");
+        assert!(super::head_is_here_from_json(&parse("{}").unwrap()).is_err(), "no base");
+    }
 
     /// An issue as GitHub's API returns it, with the fields that are not read left out.
     const ISSUE: &str = r#"{"number": 12, "title": "Loop rule misses cycle()",
@@ -415,30 +613,79 @@ mod tests {
         }
     }
 
-    // Goal: comments and label events are read; other events are skipped, and a deleted
-    // account is the actor `ghost`.
+    // Goal: comments and label events are read with their times; other events are skipped,
+    // and a deleted account is the actor `ghost`.
     #[test]
     fn comments_and_label_events_are_read() {
-        let comment = parse(r#"{"user": {"login": "someone"}, "body": "Hi"}"#).unwrap();
-        let expected = Comment { author: "someone".to_owned(), body: "Hi".to_owned() };
-        assert_eq!(comment_from_json(&comment), Ok(expected));
-        assert!(comment_from_json(&parse(r#"{"body": "Hi"}"#).unwrap()).is_err(), "no author");
+        let at = |text: &str| Timestamp::parse(text).expect("a time");
+        let comment = |times: &str| {
+            let text = format!(r#"{{"user": {{"login": "someone"}}, "body": "Hi"{times}}}"#);
+            comment_from_json(&parse(&text).unwrap())
+        };
+        let times =
+            r#", "created_at": "2026-11-26T08:00:00Z", "updated_at": "2026-11-26T09:00:00Z""#;
+        let expected = Comment {
+            author: "someone".to_owned(),
+            body: "Hi".to_owned(),
+            created_at: at("2026-11-26T08:00:00Z"),
+            updated_at: at("2026-11-26T09:00:00Z"),
+        };
+        assert_eq!(comment(times), Ok(expected));
+        let unedited = times.replace("T09", "T08");
+        assert!(comment(&unedited).is_ok(), "a comment never edited has one time");
+        let backwards = times.replace("T09", "T07");
+        assert!(comment(&backwards).expect_err("edited first").contains("before it was posted"));
+        assert!(comment("").expect_err("no times").contains("`created_at`"));
+        let late = times.replace("09:00:00Z", "09:00:00.5Z");
+        assert!(comment(&late).expect_err("bad time").contains("bad `updated_at`"));
+        let no_author = r#"{"body": "Hi", "created_at": "2026-11-26T08:00:00Z"}"#;
+        assert!(comment_from_json(&parse(no_author).unwrap()).is_err(), "no author");
 
         let event = |kind: &str, actor: &str| {
-            let text =
-                format!(r#"{{"event": "{kind}", "actor": {actor}, "label": {{"name": "x"}}}}"#);
+            let text = format!(
+                r#"{{"event": "{kind}", "actor": {actor}, "label": {{"name": "x"}},
+                "created_at": "2026-11-26T08:00:00Z"}}"#
+            );
             label_event_from_json(&parse(&text).unwrap())
         };
         let label = |actor: &str, added| LabelEvent {
             label: "x".to_owned(),
             actor: actor.to_owned(),
             added,
+            created_at: at("2026-11-26T08:00:00Z"),
         };
         assert_eq!(event("labeled", r#"{"login": "a"}"#), Ok(Some(label("a", true))));
         assert_eq!(event("unlabeled", r#"{"login": "a"}"#), Ok(Some(label("a", false))));
         assert_eq!(event("unlabeled", "null"), Ok(Some(label("ghost", false))));
         assert_eq!(event("closed", r#"{"login": "a"}"#), Ok(None));
         assert!(event("labeled", "{}").is_err(), "an actor without a login");
+        let untimed = r#"{"event": "labeled", "actor": null, "label": {"name": "x"}}"#;
+        assert!(label_event_from_json(&parse(untimed).unwrap()).is_err(), "an event has a time");
+    }
+
+    // Goal: only GitHub's own form of a time is read, and times order as text does.
+    #[test]
+    fn timestamps_have_one_form() {
+        let early = Timestamp::parse("2026-11-26T08:24:28Z").expect("GitHub's form");
+        let late = Timestamp::parse("2026-11-26T10:00:00Z").expect("GitHub's form");
+        assert!(early < late, "the order of time");
+        assert!(late > early, "and back");
+        for bad in [
+            "2026-11-26T08:24:28",
+            "2026-11-26T08:24:28.000Z",
+            "2026-11-26T08:24:28+00:00",
+            "2026-11-26 08:24:28Z",
+            "2026-11-26T08-24:28Z",
+            "2026-11-26T08:24-28Z",
+            "2026-11-26T08:24:2aZ",
+            "2026-11-26T08:24:280",
+            "2026-02-30T08:24:28Z",
+            "2026-11-26t08:24:28Z",
+            "",
+        ] {
+            let error = Timestamp::parse(bad).expect_err(bad);
+            assert!(error.contains("not a time"), "{bad}: {error}");
+        }
     }
 
     // Goal: a GitHub remote URL in each of git's forms names its `owner/name`; another host or
@@ -474,6 +721,12 @@ mod tests {
         assert_eq!(super::repository_of(scratch.root(), "origin").as_deref(), Some("namicfd/nami"));
         assert_eq!(super::repository_of(scratch.root(), "elsewhere"), None, "not on GitHub");
         assert_eq!(super::repository_of(scratch.root(), "no-such-remote"), None);
+        let rewritten = "url./elsewhere/mirror.git.insteadOf";
+        let _ = git(&["config", rewritten, "git@github.com:namicfd/nami.git"]);
+        let name = super::repository_of(scratch.root(), "origin");
+        assert_eq!(name.as_deref(), Some("namicfd/nami"), "the name before any rewrite");
+        let _ = git(&["config", "--add", "remote.origin.url", "https://github.com/attacker/evil"]);
+        assert_eq!(super::repository_of(scratch.root(), "origin"), None, "two URLs name none");
     }
 
     // Goal: `gh --jq '.[]'` output becomes one value per line; blank lines are skipped, and a
@@ -491,5 +744,38 @@ mod tests {
             parse_lines(&"{}\n".repeat(super::LIST_MAX)).map(|v| v.len()),
             Ok(super::LIST_MAX)
         );
+    }
+
+    /// The environment that `gh` gets: each variable set to `Some` value or removed (`None`).
+    fn environment_of(gh: &super::Gh) -> Vec<(String, Option<String>)> {
+        let tokens = |name: &str| match name {
+            "GH_TOKEN" => Some("read".to_owned()),
+            "NAMI_FILING_TOKEN" => Some("write".to_owned()),
+            _ => None,
+        };
+        let command = gh.command(&["x"], &tokens).expect("the token is set");
+        let text = |value: &std::ffi::OsStr| value.to_str().expect("UTF-8").to_owned();
+        command.get_envs().map(|(name, value)| (text(name), value.map(text))).collect()
+    }
+
+    // Goal: a client with its own token acts only as that token, and the client that hides it
+    // never sees it, so a write never uses the read token and a read never uses the write
+    // token (ADR-0023). An empty or unset token is an error, never a fallback to GH_TOKEN.
+    #[test]
+    fn each_client_takes_only_its_own_token() {
+        let root = std::path::Path::new(".");
+        let writes = super::Gh::with_token_from(root, "NAMI_FILING_TOKEN");
+        let reads = super::Gh::new(root).hiding("NAMI_FILING_TOKEN");
+        let removed = ("NAMI_FILING_TOKEN".to_owned(), None);
+        assert_eq!(
+            environment_of(&writes),
+            [("GH_TOKEN".to_owned(), Some("write".to_owned())), removed.clone()]
+        );
+        assert_eq!(environment_of(&reads), [removed], "GH_TOKEN, the read token, is inherited");
+        assert!(environment_of(&super::Gh::new(root)).is_empty(), "plain gh inherits all");
+        for empty in [None, Some(" ".to_owned())] {
+            let error = writes.command(&["x"], &|_| empty.clone()).expect_err("no token");
+            assert!(error.contains("`NAMI_FILING_TOKEN` holds no token"), "{error}");
+        }
     }
 }
