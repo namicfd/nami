@@ -1,0 +1,267 @@
+# The CI-hosted AI review, and the reviewer app's approval of a pull request's head (#59;
+# ADR-0008, ADR-0022, ADR-0023). It runs after `ci` passes on a pull request from this
+# repository. The logic is in `cargo xtask review` (xtask/src/review.rs); these jobs only call
+# it. None of them is a required check: what they produce is a review by `nami-reviewer[bot]`.
+#
+# - `review (select)` decides what the head gets: the model's review for a PR by
+#   nami-agent[bot] or a code owner, a mechanical approval for the nami-ci bot's `bot/passes`
+#   PR, whose review is `check-pr` in `ci`'s `gate` (ADR-0017), and nothing for anyone else.
+# - `review (model)` runs Claude Code on the PR with read-only tools and writes its answer as
+#   data. It holds the Anthropic API key, never an app's key.
+# - `review (post)` holds the reviewer app's key, runs no PR code, reads the answer as data,
+#   and posts one review on the head: APPROVE when nothing blocks, otherwise COMMENT with each
+#   blocking finding as a thread. A push dismisses the approval (the ruleset's "dismiss stale
+#   approvals"), and the new head's `ci` starts this workflow again. Because the reviewer is
+#   never the last pusher, its approval satisfies the ruleset's "approve the last push".
+#
+# The jobs follow ADR-0023's rules for a job that holds a key:
+# - `workflow_run` runs main's version of this file and of xtask, never a PR's; the `if:` checks
+#   the event and the triggering workflow's path; the checkouts have no `ref:` (rule 4);
+# - each key is a secret of an environment that only main may use: ANTHROPIC_API_KEY of
+#   `claude-review`, NAMI_REVIEWER_PRIVATE_KEY of `nami-reviewer` (rule 1;
+#   docs/operations/github-setup.md, step 11). Both environments must exist before this file
+#   reaches main: a job that names a missing environment makes GitHub create it with no branch
+#   rule;
+# - one step has each secret in its environment (rule 3);
+# - two tokens, each narrow (rule 2): every read uses the workflow's own token, GH_TOKEN; the
+#   reviewer app's token, NAMI_REVIEW_TOKEN, is narrowed to `pull_requests: write` and only
+#   resolves threads and posts the review;
+# - no cache is restored (rule 5): each job builds xtask from a clean checkout, and Claude Code
+#   is installed at the pinned version below.
+#
+# The model job reads the PR's files, but executes none of them. Claude Code runs with
+# `--bare` (no hooks, no CLAUDE.md discovery, no keychain), `--restricted` (no tool that runs
+# commands or code, no settings file of the user or the project, file tools confined to the
+# context and tree directories), `--strict-mcp-config` (no MCP server) and
+# `--disable-slash-commands` (no skills), with only Read, Grep, Glob and Agent. Its working
+# directory is the context directory, not the tree, and the tree is an export of the head
+# commit, not a checkout. The key never reaches the model's tools, and the job fails rather
+# than upload an answer that contains it.
+name: review
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions: {}
+
+# A newer run for the same branch replaces an older one: an older head is never approved
+# after a newer one, and a review of a head that moved on costs nothing more.
+concurrency:
+  group: >-
+    review-${{ github.event.workflow_run.head_repository.full_name }}-${{
+    github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pinned Claude Code release, the model and the budget of one review run. The decision
+  # on #59 caps a run at 2 USD; Claude Code checks the cap after each turn, so the cap here
+  # leaves one turn's margin. A run over it is no verdict, and the PR falls back to a code
+  # owner.
+  CLAUDE_CODE_VERSION: 2.1.332
+  REVIEW_MODEL: claude-opus-5-5
+  REVIEW_EFFORT: high
+  REVIEW_BUDGET_USD: "1.60"
+
+jobs:
+  select:
+    name: review (select)
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      kind: ${{ steps.select.outputs.kind }}
+      pr: ${{ steps.select.outputs.pr }}
+      head: ${{ steps.select.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build xtask
+        run: cargo build --quiet --locked --package xtask
+      - name: cargo xtask review select
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          {
+            echo "pr=${PR_NUMBER}"
+            echo "head=${HEAD_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "kind=none" >> "${GITHUB_OUTPUT}"
+            echo "No pull request of this repository has head ${HEAD_SHA}; nothing to review."
+            exit 0
+          fi
+          cargo xtask review select --pr "${PR_NUMBER}" --head "${HEAD_SHA}" |
+            tee -a "${GITHUB_OUTPUT}"
+
+  review:
+    name: review (model)
+    needs: select
+    if: needs.select.outputs.kind == 'ai'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: claude-review
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      PR_NUMBER: ${{ needs.select.outputs.pr }}
+      HEAD_SHA: ${{ needs.select.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build xtask
+        run: cargo build --quiet --locked --package xtask
+      - name: Install Claude Code
+        run: |
+          npm install --prefix "${RUNNER_TEMP}/claude" --no-save --no-fund --no-audit \
+            "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          "${RUNNER_TEMP}/claude/node_modules/.bin/claude" --version
+      # The head as files, not as a checkout: no `.git` of the PR's, and nothing in it runs.
+      - name: Export the head and its diff
+        run: |
+          git fetch --quiet --no-tags origin main:refs/remotes/origin/main
+          git fetch --quiet --no-tags origin "${HEAD_SHA}"
+          mkdir -p "${RUNNER_TEMP}/review/tree" "${RUNNER_TEMP}/review/context"
+          git archive "${HEAD_SHA}" | tar -x -C "${RUNNER_TEMP}/review/tree"
+          base=$(git merge-base origin/main "${HEAD_SHA}")
+          git diff "${base}" "${HEAD_SHA}" > "${RUNNER_TEMP}/review/context/diff.patch"
+      - name: cargo xtask review context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAMI_REVIEWER_LOGIN: ${{ vars.NAMI_REVIEWER_LOGIN }}
+        run: |
+          cargo xtask review context --pr "${PR_NUMBER}" --tree "${RUNNER_TEMP}/review/tree" \
+            --out "${RUNNER_TEMP}/review/context"
+      # The secret is in this step's environment only.
+      - name: Review with Claude Code
+        working-directory: ${{ runner.temp }}/review/context
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -z "${ANTHROPIC_API_KEY}" ]]; then
+            echo "::error::The claude-review environment has no ANTHROPIC_API_KEY secret; see" \
+              "docs/operations/github-setup.md, step 11"
+            exit 1
+          fi
+          status=0
+          "${RUNNER_TEMP}/claude/node_modules/.bin/claude" -p --bare --restricted \
+            --strict-mcp-config --disable-slash-commands --tools Read,Grep,Glob,Agent \
+            --permission-prompts none --no-session-persistence \
+            --add-dir "${RUNNER_TEMP}/review/tree" --agents agents.json \
+            --model "${REVIEW_MODEL}" --effort "${REVIEW_EFFORT}" \
+            --max-budget-usd "${REVIEW_BUDGET_USD}" \
+            --output-format json --json-schema "$(cat schema.json)" \
+            "$(cat prompt.md)" > "${RUNNER_TEMP}/review/result.json" || status=$?
+          echo "Claude Code exited with ${status}; the post job reads its result."
+          if grep -qF -- "${ANTHROPIC_API_KEY}" "${RUNNER_TEMP}/review/result.json"; then
+            : > "${RUNNER_TEMP}/review/result.json"
+            echo "::error::The review's answer contains the API key; nothing is uploaded." \
+              "Rotate the key (docs/operations/github-setup.md, step 11)."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: review-result
+          path: ${{ runner.temp }}/review/result.json
+          retention-days: 7
+          if-no-files-found: error
+
+  post:
+    name: review (post)
+    needs: [select, review]
+    # Also when the model job failed: then the post says that there is no verdict. Never
+    # after a cancellation: a newer run handles the newer head.
+    if: >-
+      !cancelled() &&
+      (needs.select.outputs.kind == 'ai' || needs.select.outputs.kind == 'passes')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: nami-reviewer
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      PR_NUMBER: ${{ needs.select.outputs.pr }}
+      HEAD_SHA: ${{ needs.select.outputs.head }}
+      KIND: ${{ needs.select.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build xtask
+        run: cargo build --quiet --locked --package xtask
+      - uses: actions/download-artifact@v8
+        if: env.KIND == 'ai'
+        continue-on-error: true
+        with:
+          name: review-result
+          path: ${{ runner.temp }}/result
+      # A missing result is read as no verdict, never as a review.
+      - name: Check the model's result
+        if: env.KIND == 'ai'
+        run: |
+          result="${RUNNER_TEMP}/result/result.json"
+          if [[ ! -s "${result}" ]]; then
+            mkdir -p "${RUNNER_TEMP}/result"
+            printf '{"subtype": "missing", "is_error": true}\n' > "${result}"
+          fi
+      # The secret is in this step's environment only. Later steps' processes never have it in
+      # theirs: they get the file, which is deleted as soon as the token is minted.
+      - name: Write the reviewer app's key
+        env:
+          NAMI_REVIEWER_PRIVATE_KEY: ${{ secrets.NAMI_REVIEWER_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${NAMI_REVIEWER_PRIVATE_KEY}" ]]; then
+            echo "::error::The nami-reviewer environment has no NAMI_REVIEWER_PRIVATE_KEY" \
+              "secret; see docs/operations/github-setup.md, step 11"
+            exit 1
+          fi
+          (umask 077 &&
+            printf '%s\n' "${NAMI_REVIEWER_PRIVATE_KEY}" > "${RUNNER_TEMP}/reviewer.pem")
+      - name: cargo xtask review post
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAMI_AGENT_APP: reviewer
+          NAMI_REVIEWER_CLIENT_ID: ${{ vars.NAMI_REVIEWER_CLIENT_ID }}
+          NAMI_REVIEWER_LOGIN: ${{ vars.NAMI_REVIEWER_LOGIN }}
+          NAMI_AGENT_PERMISSIONS: '{"pull_requests":"write"}'
+        run: |
+          key="${RUNNER_TEMP}/reviewer.pem"
+          trap 'rm -f "${key}"' EXIT
+          NAMI_REVIEW_TOKEN=$(NAMI_REVIEWER_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
+            xtask/agent-token.sh)
+          # The key file is gone before xtask starts.
+          rm -f "${key}"
+          echo "::add-mask::${NAMI_REVIEW_TOKEN}"
+          export NAMI_REVIEW_TOKEN
+          if [[ "${KIND}" == passes ]]; then
+            cargo xtask review approve-passes --pr "${PR_NUMBER}" --head "${HEAD_SHA}"
+          else
+            cargo xtask review post --pr "${PR_NUMBER}" --head "${HEAD_SHA}" \
+              --result "${RUNNER_TEMP}/result/result.json"
+          fi
+      - name: Delete the reviewer app's key
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/reviewer.pem"

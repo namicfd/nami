@@ -3,7 +3,10 @@
 name: ci
 
 on:
+  # `ready_for_review` too: the CI-hosted review (`review.yml`, #59) starts after `ci`, and a
+  # draft is not reviewed, so a draft marked ready would otherwise wait for its next push.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
   push:
     branches: [main]
