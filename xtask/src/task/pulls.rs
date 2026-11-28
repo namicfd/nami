@@ -1,15 +1,17 @@
 //! GitHub's pull requests for `passes` and `check-pr` (ADR-0017), through `gh`, with the two
 //! tokens kept apart (ADR-0023, rule 2).
 //!
-//! - **Reads** (a PR's head, whether a branch's PR merged, the open PR from a branch) act as
-//!   `GH_TOKEN`, in CI the workflow's own read-only token, and gh never sees [`WRITE_TOKEN`].
+//! - **Reads** (a PR's head, whether a branch's PR merged, the open PR from a branch, the
+//!   checks that `main` requires and where they stand on a commit, and whether a commit is on
+//!   `main`) act as `GH_TOKEN`, in CI the workflow's own read-only token, and gh never sees
+//!   [`WRITE_TOKEN`].
 //! - **Writes** (opening, editing and closing the PR, and turning on auto-merge) act as
 //!   [`WRITE_TOKEN`], in CI the `nami-ci` app's token, and nothing else does.
 //!
 //! What GitHub's answers mean is decided by plain functions of its JSON, tested without gh.
 //! [`GhProcess`] only runs the program.
 
-use super::passes::{PullHead, PullState, Pulls};
+use super::passes::{Checks, PullHead, PullState, Pulls};
 use crate::issue::github::{optional_string, parse_lines, string_at};
 use crate::json::{self, Value};
 use std::path::{Path, PathBuf};
@@ -142,12 +144,9 @@ impl<'api> GitHubPulls<'api> {
         json::parse(&text).map_err(|error| format!("gh printed invalid JSON: {}", error.message))
     }
 
-    fn read_list(&self, path: &str) -> Result<Vec<Value>, String> {
-        parse_lines(&self.api.call(
-            Token::Read,
-            &["api", "--paginate", path, "--jq", ".[]"],
-            None,
-        )?)
+    /// The entries that `jq` picks from each page at `path`, such as `.[]`.
+    fn read_list(&self, path: &str, jq: &str) -> Result<Vec<Value>, String> {
+        parse_lines(&self.api.call(Token::Read, &["api", "--paginate", path, "--jq", jq], None)?)
     }
 
     fn write(&self, method: &str, path: &str, request: &str) -> Result<String, String> {
@@ -166,14 +165,14 @@ impl Pulls for GitHubPulls<'_> {
             "repos/{{owner}}/{{repo}}/pulls?state=closed&base={BASE_BRANCH}&head={{owner}}:\
              {branch}&per_page=100"
         );
-        Ok(merged_from_json(&self.read_list(&path)?))
+        Ok(merged_from_json(&self.read_list(&path, ".[]")?))
     }
 
     fn open_from(&self, branch: &str) -> Result<Option<u32>, String> {
         let path = format!(
             "repos/{{owner}}/{{repo}}/pulls?state=open&head={{owner}}:{branch}&per_page=100"
         );
-        one_open(&self.read_list(&path)?, branch)
+        one_open(&self.read_list(&path, ".[]")?, branch)
     }
 
     fn open(&self, branch: &str, title: &str, body: &str) -> Result<u32, String> {
@@ -211,6 +210,153 @@ impl Pulls for GitHubPulls<'_> {
         result
             .map(|_| ())
             .map_err(|error| format!("{error}; add #{number} to the merge queue by hand"))
+    }
+
+    fn required_checks(&self, commit: &str) -> Result<Checks, String> {
+        assert!(is_commit(commit), "the checks of a commit: {commit}");
+        let rules = format!("repos/{{owner}}/{{repo}}/rules/branches/{BASE_BRANCH}?per_page=100");
+        let required = required_from_json(&self.read_list(&rules, ".[]")?)?;
+        let runs = format!("repos/{{owner}}/{{repo}}/commits/{commit}/check-runs?per_page=100");
+        checks_from_json(&required, &self.read_list(&runs, ".check_runs[]")?)
+    }
+
+    fn is_ancestor(&self, ancestor: &str, commit: &str) -> Result<bool, String> {
+        assert!(is_commit(ancestor) && is_commit(commit), "two commits: {ancestor} {commit}");
+        // One commit per page: only the status is read, not the commits between.
+        let path = format!("repos/{{owner}}/{{repo}}/compare/{ancestor}...{commit}?per_page=1");
+        ancestry_from_json(&self.read_one(&path)?)
+    }
+}
+
+/// True for a full hexadecimal object name, so that it cannot change the path it is put in.
+fn is_commit(name: &str) -> bool {
+    name.len() >= 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A check that `main`'s rules require: its name, and the app that must report it, if the
+/// rule names one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Required {
+    /// The check run's name: a job's name in `ci.yml`, such as `gate`.
+    pub context: String,
+    /// The ID of the GitHub App that must report it, as GitHub writes it.
+    pub app: Option<String>,
+}
+
+/// The checks that the rules in `rules`, GitHub's rules for a branch, require, each once.
+/// Rules of other types are skipped.
+///
+/// # Errors
+///
+/// Names the field that is missing or has the wrong type.
+pub fn required_from_json(rules: &[Value]) -> Result<Vec<Required>, String> {
+    let mut required = Vec::new();
+    for rule in rules {
+        if string_at(rule, &["type"])? != "required_status_checks" {
+            continue;
+        }
+        let checks = rule.get("parameters").and_then(|it| it.get("required_status_checks"));
+        let checks = checks.and_then(Value::as_array);
+        let checks = checks.ok_or("GitHub sent a required_status_checks rule with no checks")?;
+        for check in checks {
+            let app = match check.get("integration_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(digits)) => Some(digits.clone()),
+                Some(other) => {
+                    return Err(format!("GitHub sent {} as `integration_id`", other.kind()));
+                }
+            };
+            required.push(Required { context: string_at(check, &["context"])?, app });
+        }
+    }
+    required.sort();
+    required.dedup();
+    assert!(required.is_sorted_by(|one, next| one < next), "each check once: {required:?}");
+    Ok(required)
+}
+
+/// Where the checks `required` stand, given `runs`, GitHub's check runs on one commit. For
+/// each, only its newest run counts, the one with the highest ID, as it does for merging. A
+/// check with no run yet is pending: CI may not have started, and a check that is reported
+/// only as a commit status is never seen, so it never makes a push. Success, neutral and
+/// skipped pass, as GitHub counts them.
+///
+/// # Errors
+///
+/// When a run lacks its name, ID or status, or has a conclusion this code does not know.
+pub fn checks_from_json(required: &[Required], runs: &[Value]) -> Result<Checks, String> {
+    let mut failed = Vec::new();
+    let mut pending = false;
+    for check in required {
+        let Some(run) = newest_run(check, runs)? else {
+            pending = true;
+            continue;
+        };
+        if string_at(run, &["status"])? != "completed" {
+            pending = true;
+            continue;
+        }
+        match string_at(run, &["conclusion"])?.as_str() {
+            "success" | "neutral" | "skipped" => {}
+            conclusion @ ("failure" | "cancelled" | "timed_out" | "action_required" | "stale"
+            | "startup_failure") => failed.push(format!("{} ({conclusion})", check.context)),
+            other => {
+                let context = &check.context;
+                return Err(format!("GitHub sent the conclusion `{other}` for `{context}`"));
+            }
+        }
+    }
+    assert!(failed.len() <= required.len(), "at most one failure per check");
+    Ok(match (failed.is_empty(), pending) {
+        (false, _) => Checks::Failed(failed),
+        (true, true) => Checks::Pending,
+        (true, false) => Checks::Passed,
+    })
+}
+
+/// The newest of `runs` that reports `check`: its name, from its app if the rule names one,
+/// with the highest ID.
+///
+/// # Errors
+///
+/// When a run has no name, or a run of `check` has no ID.
+fn newest_run<'runs>(
+    check: &Required,
+    runs: &'runs [Value],
+) -> Result<Option<&'runs Value>, String> {
+    let digits = |value: Option<&Value>| match value {
+        Some(Value::Number(digits)) => Some(digits.clone()),
+        _ => None,
+    };
+    let mut newest: Option<(u64, &Value)> = None;
+    for run in runs {
+        let app = digits(run.get("app").and_then(|app| app.get("id")));
+        let by_app = check.app.is_none() || app == check.app;
+        if string_at(run, &["name"])? != check.context || !by_app {
+            continue;
+        }
+        let id = digits(run.get("id")).and_then(|id| id.parse::<u64>().ok());
+        let id = id.ok_or_else(|| format!("GitHub sent a `{}` run with no ID", check.context))?;
+        if newest.is_none_or(|(highest, _)| id > highest) {
+            newest = Some((id, run));
+        }
+    }
+    let found = newest.map(|(_, run)| run);
+    assert!(found.is_none_or(|run| run.get("name").is_some()), "a run of the check is named");
+    Ok(found)
+}
+
+/// True if GitHub's comparison `ancestor...commit` says that `ancestor` is `commit` or one of
+/// its ancestors: `commit` is ahead of it, or identical.
+///
+/// # Errors
+///
+/// When the status is missing or unknown.
+pub fn ancestry_from_json(comparison: &Value) -> Result<bool, String> {
+    match string_at(comparison, &["status"])?.as_str() {
+        "ahead" | "identical" => Ok(true),
+        "behind" | "diverged" => Ok(false),
+        other => Err(format!("GitHub sent the comparison status `{other}`")),
     }
 }
 
@@ -298,11 +444,12 @@ pub fn number_of(pull: &Value) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Api, GhProcess, GitHubPulls, Token, WRITE_TOKEN, head_from_json, merged_from_json,
-        number_of, one_open, printed, pull_from_json,
+        Api, GhProcess, GitHubPulls, Required, Token, WRITE_TOKEN, ancestry_from_json,
+        checks_from_json, head_from_json, merged_from_json, number_of, one_open, printed,
+        pull_from_json, required_from_json,
     };
     use crate::json::{self, Value};
-    use crate::task::passes::{PullHead, Pulls};
+    use crate::task::passes::{Checks, PullHead, Pulls};
     use std::cell::RefCell;
 
     /// gh with fixed answers, which logs each call with its token.
@@ -363,6 +510,114 @@ mod tests {
         assert!(calls[1].1.starts_with("api --method POST repos/{owner}/{repo}/pulls"), "open");
         assert_eq!(calls[4].1, "pr merge 9 --auto --squash");
         assert!(lines.calls.borrow()[0].1.contains("state=closed&base=main&head={owner}:task/a"));
+    }
+
+    // Goal: the checks and `main`'s history are read as the read token too, from the paths
+    // that name the commit, and the write token is never asked.
+    #[test]
+    fn checks_and_history_are_read_as_the_read_token() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let run = r#"{"type": "other", "name": "x", "id": 1, "status": "queued"}"#;
+        let gh = fake(&format!("{run}\n"));
+        assert_eq!(GitHubPulls::new(&gh).required_checks(commit), Ok(Checks::Passed));
+        let compare = fake(r#"{"status": "behind"}"#);
+        let parent = "fedcba9876543210fedcba9876543210fedcba98";
+        assert_eq!(GitHubPulls::new(&compare).is_ancestor(parent, commit), Ok(false));
+        let calls: Vec<(Token, String)> =
+            gh.calls.borrow().iter().chain(compare.calls.borrow().iter()).cloned().collect();
+        assert!(calls.iter().all(|(token, _)| *token == Token::Read), "{calls:?}");
+        assert_eq!(calls.len(), 3, "the rules, the runs and the comparison: {calls:?}");
+        assert!(calls[0].1.contains("repos/{owner}/{repo}/rules/branches/main"), "{calls:?}");
+        assert!(calls[1].1.contains(&format!("commits/{commit}/check-runs")), "{calls:?}");
+        assert!(calls[1].1.ends_with("--jq .check_runs[]"), "{calls:?}");
+        assert!(calls[2].1.contains(&format!("compare/{parent}...{commit}")), "{calls:?}");
+    }
+
+    // Goal: only `required_status_checks` rules count, each check once, with its app when the
+    // rule names one; a rule without its checks, or a bad app ID, is an error.
+    #[test]
+    fn required_checks_come_from_main_s_rules() {
+        let rules = values(
+            r#"[{"type": "pull_request", "parameters": {}},
+            {"type": "required_status_checks", "parameters": {"required_status_checks": [
+              {"context": "lints (UI tests)"}, {"context": "gate", "integration_id": 15368}]}},
+            {"type": "required_status_checks", "parameters": {"required_status_checks": [
+              {"context": "gate", "integration_id": 15368}]}}]"#,
+        );
+        let required = required_from_json(&rules).expect("valid");
+        let check = |context: &str, app: Option<&str>| Required {
+            context: context.to_owned(),
+            app: app.map(str::to_owned),
+        };
+        assert_eq!(required, [check("gate", Some("15368")), check("lints (UI tests)", None)]);
+        assert_eq!(required_from_json(&[]), Ok(Vec::new()), "no rule, nothing required");
+        let empty = values(r#"[{"type": "required_status_checks", "parameters": {}}]"#);
+        assert!(required_from_json(&empty).is_err(), "a rule with no checks");
+        let odd = values(
+            r#"[{"type": "required_status_checks", "parameters": {"required_status_checks":
+            [{"context": "gate", "integration_id": "x"}]}}]"#,
+        );
+        assert!(required_from_json(&odd).expect_err("a string").contains("`integration_id`"));
+    }
+
+    fn run(id: u32, name: &str, status: &str, conclusion: Option<&str>) -> String {
+        let conclusion = conclusion.map_or("null".to_owned(), |text| format!("\"{text}\""));
+        format!(
+            r#"{{"id": {id}, "name": "{name}", "status": "{status}", "conclusion": {conclusion},
+            "app": {{"id": 15368}}}}"#
+        )
+    }
+
+    // Goal: a required check fails only when its newest run completed without passing; one
+    // that runs, or has no run yet, is pending; a failure wins over pending, other checks and
+    // other apps are ignored, and an unknown conclusion is an error.
+    #[test]
+    fn checks_fail_pass_or_wait_on_their_newest_run() {
+        let gate = Required { context: "gate".to_owned(), app: Some("15368".to_owned()) };
+        let lints = Required { context: "lints".to_owned(), app: None };
+        let required = [gate.clone(), lints.clone()];
+        let state = |runs: &[String]| {
+            checks_from_json(&required, &values(&format!("[{}]", runs.join(","))))
+        };
+        let passed = run(3, "lints", "completed", Some("skipped"));
+        let gate_ok = run(2, "gate", "completed", Some("success"));
+        assert_eq!(state(&[gate_ok.clone(), passed.clone()]), Ok(Checks::Passed));
+        assert_eq!(state(std::slice::from_ref(&passed)), Ok(Checks::Pending), "no gate run yet");
+        let running = run(4, "gate", "in_progress", None);
+        assert_eq!(state(&[gate_ok.clone(), running, passed.clone()]), Ok(Checks::Pending));
+        for conclusion in ["failure", "cancelled", "timed_out", "action_required", "stale"] {
+            let failed = run(5, "gate", "completed", Some(conclusion));
+            let found = state(&[gate_ok.clone(), failed, run(6, "lints", "queued", None)]);
+            assert_eq!(found, Ok(Checks::Failed(vec![format!("gate ({conclusion})")])));
+        }
+        let old_failure = run(1, "gate", "completed", Some("failure"));
+        assert_eq!(state(&[old_failure, gate_ok.clone(), passed.clone()]), Ok(Checks::Passed));
+        let elsewhere = run(9, "gate", "completed", Some("failure")).replace("15368", "1");
+        assert_eq!(state(&[elsewhere, gate_ok.clone(), passed.clone()]), Ok(Checks::Passed));
+        let advisory = run(9, "mutants", "completed", Some("failure"));
+        assert_eq!(state(&[advisory, gate_ok, passed.clone()]), Ok(Checks::Passed));
+        let unknown = run(7, "gate", "completed", Some("exploded"));
+        assert!(state(&[unknown, passed]).expect_err("unknown").contains("`exploded`"));
+        assert_eq!(checks_from_json(&[], &[]), Ok(Checks::Passed), "nothing required");
+        let unnumbered = checks_from_json(&[lints], &values(r#"[{"name": "lints"}]"#));
+        assert!(unnumbered.expect_err("no ID").contains("no ID"));
+        let other_app = run(8, "gate", "completed", Some("success")).replace("15368", "1");
+        assert_eq!(
+            checks_from_json(&[gate], &values(&format!("[{other_app}]"))),
+            Ok(Checks::Pending)
+        );
+    }
+
+    // Goal: a commit counts as on `main` only when `main` is ahead of it or is it.
+    #[test]
+    fn ancestry_comes_from_the_comparison() {
+        let status = |text: &str| {
+            ancestry_from_json(&json::parse(&format!(r#"{{"status": "{text}"}}"#)).expect("JSON"))
+        };
+        assert_eq!((status("ahead"), status("identical")), (Ok(true), Ok(true)));
+        assert_eq!((status("behind"), status("diverged")), (Ok(false), Ok(false)));
+        assert!(status("sideways").expect_err("unknown").contains("`sideways`"));
+        assert!(ancestry_from_json(&json::parse("{}").expect("JSON")).is_err(), "no status");
     }
 
     // Goal: the read client never sees the write token, and the write client passes it to gh

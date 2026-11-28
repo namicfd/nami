@@ -21,8 +21,9 @@ permissions: {}
 
 # One run at a time, in order, and never cancelled halfway: a run either finishes, or waits
 # while an older one does. GitHub keeps only the newest waiting run, so an older one never
-# runs after a newer one. Each run rebuilds `bot/passes` from its own main, and reconciles the
-# PR, so whatever the last run leaves is right.
+# runs after a newer one. Each run builds the commit that `bot/passes` should hold on its own
+# main, pushes it only when the branch does not hold it already or the required checks failed
+# on the branch, and reconciles the PR, so whatever the last run leaves is right.
 concurrency:
   group: passes-${{ github.ref }}
   cancel-in-progress: false
@@ -62,8 +63,10 @@ jobs:
     timeout-minutes: 20
     # The key is a secret of this environment, which only main may use (ADR-0023, rule 1).
     environment: nami-ci
-    # The workflow token does every read: whether each task's PR merged, and the open PR.
+    # The workflow token does every read: whether each task's PR merged, the open PR, main's
+    # rules and history, and the checks on the branch's tip.
     permissions:
+      checks: read
       contents: read
       pull-requests: read
     steps:

@@ -10,14 +10,16 @@
 //!   the tasks that may be set: active, not passing, every dependency passing, and a merged PR
 //!   from `task/<id>`. It builds the commit that [`BOT_BRANCH`] should hold, those flips on
 //!   top of `HEAD`, and force-pushes it only when the branch's own change is not those flips,
-//!   or no longer applies cleanly to `HEAD`; a branch on an older `main` is left alone. Then
-//!   it opens the PR if there is none, and reconciles it every run: the title and
-//!   description match the flips, and auto-merge is on. When no task is left, it closes the
-//!   open PR, if there is one. An open PR from [`BOT_BRANCH`] that [`CI_LOGIN`] did not open
-//!   is never adopted: the job fails and changes nothing. It runs no tests, so the bot's token
-//!   never meets a test binary. Only the push and the PR writes act as the app's token,
-//!   [`WRITE_TOKEN`]; every read acts as `GH_TOKEN` (`super::pulls`), and no other git command
-//!   sees the token.
+//!   no longer applies cleanly to `HEAD`, or sits on a parent that is not on `main`; a branch
+//!   on an older `main` is left alone, unless the checks that `main` requires failed on it,
+//!   and then a new commit is pushed so that they run again. Then it opens the PR if there is
+//!   none, and reconciles it every run: the title and description match the flips, and
+//!   auto-merge is on. When no task is left, it closes the open PR, if there is one. An open
+//!   PR from [`BOT_BRANCH`] that [`CI_LOGIN`] did not open is never adopted: the job fails and
+//!   changes nothing. It runs no tests, so the bot's token never meets a test binary. Only the
+//!   push and the PR writes act as the app's token, [`WRITE_TOKEN`]; every read, of the checks
+//!   and of `main`'s history too, acts as `GH_TOKEN` (`super::pulls`), and no other git
+//!   command sees the token.
 //! - `check-pr` lets a change set `passes` only when [`flip_problems`] finds nothing, and
 //!   rejects a PR from [`BOT_BRANCH`] or by [`CI_LOGIN`] that sets none ([`no_flip_problems`]).
 //!   On `pull_request` events CI passes the PR's head from the event, so a change that sets no
@@ -106,7 +108,20 @@ pub struct PullState {
     pub merged: bool,
 }
 
-/// What setting `passes` needs from GitHub's pull requests. Every error says what failed.
+/// Where the checks that `main` requires stand on a commit, as GitHub shows them now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checks {
+    /// Every one of them completed and passed, or none is required.
+    Passed,
+    /// None failed, and at least one has not completed, or has not reported on the commit yet.
+    Pending,
+    /// These completed without passing, each named with its conclusion, such as `gate
+    /// (failure)`. Never empty.
+    Failed(Vec<String>),
+}
+
+/// What setting `passes` needs from GitHub: its pull requests, the checks on their heads, and
+/// `main`'s history. Every error says what failed.
 pub trait Pulls {
     /// Pull request `number`: its head, title, description and auto-merge.
     ///
@@ -157,6 +172,20 @@ pub trait Pulls {
     ///
     /// When GitHub refuses it or cannot be asked.
     fn auto_merge(&self, number: u32) -> Result<(), String>;
+
+    /// Where the checks that `main`'s rules require stand on `commit`.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or sends a check in a state this code does not know.
+    fn required_checks(&self, commit: &str) -> Result<Checks, String>;
+
+    /// True if `ancestor` is `commit` or one of its ancestors, in this repository on GitHub.
+    ///
+    /// # Errors
+    ///
+    /// When GitHub cannot be asked, or does not know one of the two.
+    fn is_ancestor(&self, ancestor: &str, commit: &str) -> Result<bool, String>;
 }
 
 /// What `passes` and `check-pr` need from outside the checkout.
@@ -487,8 +516,7 @@ pub fn own_base(root: &Path, base: &str, branch: &str) -> Result<String, String>
         return Ok(base.to_owned());
     }
     let parent = run(&["rev-parse", "--verify", "HEAD^1"])?.trim().to_owned();
-    let is_object_name = parent.len() >= 40 && parent.bytes().all(|byte| byte.is_ascii_hexdigit());
-    assert!(is_object_name, "rev-parse --verify names one commit: {parent}");
+    assert!(is_object_name(&parent), "rev-parse --verify names one commit: {parent}");
     Ok(parent)
 }
 
@@ -718,10 +746,12 @@ fn open_pr(
 }
 
 /// Builds the commit that [`BOT_BRANCH`] should hold, the flips in the working tree on top of
-/// `HEAD`, and force-pushes it only when `remote`'s branch does not hold it ([`branch_holds`]):
+/// `HEAD`, and force-pushes it only when `remote`'s branch does not hold it ([`held_tip`]):
 /// an unchanged set of flips that still applies cleanly leaves the PR's place in the merge
 /// queue alone, however far `main` moved, and other flips or a conflict rebuild the branch.
-/// Then it opens the PR if `open` is none, and reconciles it ([`reconcile`]).
+/// A held tip is pushed again, as a new commit, when its required checks failed
+/// ([`failed_checks`]), so that they run again. Then it opens the PR if `open` is none, and
+/// reconciles it ([`reconcile`]).
 fn publish(
     (root, remote, token): (&Path, &str, &str),
     pulls: &dyn Pulls,
@@ -731,21 +761,87 @@ fn publish(
     assert!(!flipped.is_empty(), "a PR sets passes on at least one task");
     let head = git(root, &["rev-parse", "HEAD"], &[], None).map_err(|error| error.to_string())?;
     let (title, body) = pull_text(tasks, flipped, head.trim());
-    let commit = commit_working_tree(root, &title)?;
+    let commit = commit_working_tree(root, &title, None)?;
     let mut done = Vec::new();
-    if !branch_holds(root, remote, &commit)? {
-        push(root, remote, &commit, token)?;
-        done.push("pushed");
+    match held_tip(root, remote, pulls, &commit)? {
+        None => {
+            push(root, remote, &commit, token)?;
+            done.push("pushed".to_owned());
+        }
+        Some(tip) => {
+            if let Some(failed) = failed_checks(pulls, open, &tip)? {
+                let fresh = distinct_commit(root, &title, &commit, &tip)?;
+                assert_ne!(fresh, tip, "only a new commit makes GitHub run the checks again");
+                push(root, remote, &fresh, token)?;
+                done.push(format!("pushed again, as {failed} did not pass"));
+            }
+        }
     }
     let number = if let Some(number) = open {
         number
     } else {
-        done.push("opened");
+        done.push("opened".to_owned());
         pulls.open(BOT_BRANCH, &title, &body)?
     };
-    done.extend(reconcile(pulls, number, &title, &body)?);
+    done.extend(reconcile(pulls, number, &title, &body)?.into_iter().map(str::to_owned));
     let changes = if done.is_empty() { "nothing to change".to_owned() } else { done.join(", ") };
     Ok(format!("#{number} sets `passes` on {}: {changes}\n", flipped.join(", ")))
+}
+
+/// The required checks that did not pass on `tip`, the head of the open PR `open`, named for
+/// the log; none while they pass or are pending, or when no PR is open, since opening one
+/// starts its checks.
+///
+/// The checks that count are those that `main`'s rules require (`gate` and `lints (UI tests)`
+/// today), not every check on the head: advisory checks, such as `mutants (diff, advisory)`,
+/// may fail without keeping the PR out of the queue, and a push for each of them would take
+/// it out of the queue on every run until it starves (#62). Nothing reruns a failed check by
+/// itself: `ci.yml` starts on a push or on opening, and [`reconcile`]'s writes start nothing.
+///
+/// # Errors
+///
+/// When GitHub cannot be asked. The run then fails before it changes anything, as for every
+/// other read, and the next run asks again.
+fn failed_checks(
+    pulls: &dyn Pulls,
+    open: Option<u32>,
+    tip: &str,
+) -> Result<Option<String>, String> {
+    assert!(is_object_name(tip), "a held tip is a commit: {tip}");
+    if open.is_none() {
+        return Ok(None);
+    }
+    match pulls.required_checks(tip)? {
+        Checks::Passed | Checks::Pending => Ok(None),
+        Checks::Failed(failed) => {
+            assert!(!failed.is_empty(), "a failure names the checks that failed");
+            let named: Vec<String> = failed.iter().map(|check| format!("`{check}`")).collect();
+            Ok(Some(named.join(", ")))
+        }
+    }
+}
+
+/// `commit`, or, when it is `tip` itself, the same change committed one second after `tip`.
+/// A push of the commit that the branch already holds changes nothing, so GitHub would run no
+/// check again. The two are equal only when `main` has not moved and both were built in the
+/// same second.
+///
+/// # Errors
+///
+/// When git cannot read `tip`'s time or build the commit.
+fn distinct_commit(root: &Path, title: &str, commit: &str, tip: &str) -> Result<String, String> {
+    assert!(is_object_name(commit) && is_object_name(tip), "two commits: {commit} {tip}");
+    if commit != tip {
+        return Ok(commit.to_owned());
+    }
+    let time = git(root, &["log", "-1", "--format=%ct", tip], &[], None);
+    let time = time.map_err(|error| format!("cannot read the time of {tip}: {error}"))?;
+    let seconds = time.trim().parse::<u64>();
+    let seconds = seconds.map_err(|_| format!("git printed `{}` as {tip}'s time", time.trim()))?;
+    let later = format!("@{} +0000", seconds + 1);
+    let fresh = commit_working_tree(root, title, Some(&later))?;
+    assert_ne!(fresh, tip, "a later committer time makes another commit");
+    Ok(fresh)
 }
 
 /// Force-pushes `commit` as `remote`'s [`BOT_BRANCH`], as `token`. This is the one git command
@@ -767,13 +863,20 @@ fn push(root: &Path, remote: &str, commit: &str, token: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// True if `remote`'s [`BOT_BRANCH`] already does what `commit`, the wanted flips on top of
-/// `HEAD`, would do: the tip has one parent, and its own change, its diff against that parent,
-/// replays cleanly onto `HEAD` and gives `commit`'s tree. A tip on an older `main` holds, so
-/// `main` moving on pushes nothing: the job runs on every push to `main`, and a push for each
-/// would take the PR out of the merge queue every time, until it starves (#62). Other flips,
-/// any other change, a conflict with `HEAD`, or a tip without exactly one parent do not hold.
-fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String> {
+/// The tip of `remote`'s [`BOT_BRANCH`] if it already does what `commit`, the wanted flips on
+/// top of `HEAD`, would do: the tip has one parent, that parent is on `main` (GitHub says it
+/// is an ancestor of `HEAD`), and the tip's own change, its diff against that parent, replays
+/// cleanly onto `HEAD` and gives `commit`'s tree. A tip on an older `main` holds, so `main`
+/// moving on pushes nothing: the job runs on every push to `main`, and a push for each would
+/// take the PR out of the merge queue every time, until it starves (#62). Other flips, any
+/// other change, a conflict with `HEAD`, a parent that is not on `main`, or a tip without
+/// exactly one parent do not hold.
+fn held_tip(
+    root: &Path,
+    remote: &str,
+    pulls: &dyn Pulls,
+    commit: &str,
+) -> Result<Option<String>, String> {
     let run = |arguments: &[&str]| {
         git(root, arguments, &[], None)
             .map_err(|error| format!("cannot read `{BOT_BRANCH}`: {error}"))
@@ -781,8 +884,9 @@ fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String>
     let reference = format!("refs/heads/{BOT_BRANCH}");
     let listed = run(&["ls-remote", remote, &reference])?;
     let Some(tip) = listed.split_whitespace().next() else {
-        return Ok(false);
+        return Ok(None);
     };
+    assert!(is_object_name(tip), "ls-remote names the tip: {listed}");
     // Depth 2: the tip and its parent, whose trees the replay needs, and none of `main`'s
     // history.
     let local = format!("+{reference}:refs/nami/bot-passes");
@@ -793,10 +897,16 @@ fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String>
     assert_eq!(base, head.trim(), "the bot's commit sits on HEAD");
     let theirs = run(&["cat-file", "commit", tip])?;
     let Some((_, parent)) = one_parent(&theirs) else {
-        return Ok(false);
+        return Ok(None);
     };
     let replayed = replayed_tree(root, (parent, base, tip))?;
-    Ok(replayed.as_deref() == Some(tree))
+    if replayed.as_deref() != Some(tree) {
+        return Ok(None);
+    }
+    // Asked last, and only of a tip that holds otherwise: the checkout has none of `main`'s
+    // history, and GitHub has all of it.
+    let on_main = pulls.is_ancestor(parent, base)?;
+    Ok(on_main.then(|| tip.to_owned()))
 }
 
 /// The tree that `tip`'s own change, its diff against `parent`, gives once replayed onto
@@ -809,8 +919,8 @@ fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String>
 /// elsewhere. The merge base is named, not searched for, so the replay needs only the tip and
 /// its parent, not `main`'s history, which the job's depth-1 checkout lacks. While only this
 /// job writes the branch, that parent is a commit of `main`, and so the base GitHub merges
-/// from too; a tip on any other parent carries that parent's changes into the PR, which
-/// `check-pr` rejects, and the next change of flips rebuilds it.
+/// from too. A tip on any other parent would carry that parent's changes into the PR, so
+/// [`held_tip`] keeps a tip only when GitHub says its parent is on `main`.
 ///
 /// # Errors
 ///
@@ -900,14 +1010,21 @@ fn reconcile(
 }
 
 /// Commits the working tree's changes to the plans on top of `HEAD`, through a private index,
-/// so that neither the branch nor the index of the checkout moves. Returns the commit.
-fn commit_working_tree(root: &Path, title: &str) -> Result<String, String> {
+/// so that neither the branch nor the index of the checkout moves, and at the committer time
+/// `committed`, in git's date format, if one is given. Returns the commit.
+fn commit_working_tree(
+    root: &Path,
+    title: &str,
+    committed: Option<&str>,
+) -> Result<String, String> {
+    assert!(committed.is_none_or(|time| time.starts_with('@')), "a time in seconds: {committed:?}");
     let git_directory = git(root, &["rev-parse", "--absolute-git-dir"], &[], None);
     let git_directory = git_directory.map_err(|error| error.to_string())?;
     let index =
         Path::new(git_directory.trim()).join(format!("nami-passes-{}.index", std::process::id()));
     let index_text = index.to_string_lossy().into_owned();
-    let environment = [("GIT_INDEX_FILE", index_text.as_str())];
+    let mut environment = vec![("GIT_INDEX_FILE", index_text.as_str())];
+    environment.extend(committed.map(|time| ("GIT_COMMITTER_DATE", time)));
     let build = || -> Result<String, String> {
         let run = |arguments: &[&str]| {
             git(root, arguments, &environment, None).map_err(|error| error.to_string())

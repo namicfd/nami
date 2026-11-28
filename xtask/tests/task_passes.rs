@@ -6,18 +6,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::task::acceptance::{Acceptance, Nextest};
-use xtask::task::passes::{self, PullHead, PullState, Pulls, Services};
+use xtask::task::passes::{self, Checks, PullHead, PullState, Pulls, Services};
 use xtask::task::plan::Task;
 
 /// GitHub's pull requests: fixed heads and merged branches; each PR's title, description and
-/// auto-merge, which the writes change; the PRs that merged since `open_from` listed them; and
-/// a log of the writes.
+/// auto-merge, which the writes change; the PRs that merged since `open_from` listed them; the
+/// required checks on some commits, pending on any other; the commits that are not on `main`,
+/// every other being on it; and a log of the writes.
 #[derive(Default)]
 struct FakePulls {
     heads: BTreeMap<u32, PullHead>,
     merged: Vec<String>,
     open: Option<u32>,
     merged_pulls: Vec<u32>,
+    checks: BTreeMap<String, Result<Checks, String>>,
+    off_main: Vec<String>,
     states: RefCell<BTreeMap<u32, (String, String, bool)>>,
     log: RefCell<Vec<String>>,
 }
@@ -63,6 +66,12 @@ impl Pulls for FakePulls {
         self.record(format!("auto-merge #{number}"));
         self.states.borrow_mut().entry(number).or_default().2 = true;
         Ok(())
+    }
+    fn required_checks(&self, commit: &str) -> Result<Checks, String> {
+        self.checks.get(commit).cloned().unwrap_or(Ok(Checks::Pending))
+    }
+    fn is_ancestor(&self, ancestor: &str, _commit: &str) -> Result<bool, String> {
+        Ok(!self.off_main.iter().any(|commit| commit == ancestor))
     }
 }
 
@@ -136,6 +145,19 @@ fn setup(name: &str) -> (PathBuf, PathBuf) {
     let _ = commit(&clone, "plan");
     let _ = git(&clone, &["push", "--quiet", "origin", "HEAD:refs/heads/main"]);
     (root, clone)
+}
+
+/// Deletes a test's temporary directory when dropped, also while a test panics on purpose.
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        // A failure to delete scratch space changes no result, so it is reported, not raised:
+        // a panic while unwinding would abort the test binary.
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("cannot delete {}: {error}", self.0.display());
+        }
+    }
 }
 
 fn commit(clone: &Path, message: &str) -> String {
@@ -223,7 +245,8 @@ fn check_pr_lets_only_the_bots_flip_through() {
 #[test]
 #[should_panic(expected = "one verdict per flipped task")]
 fn check_pr_panics_on_too_few_verdicts() {
-    let (_root, clone) = setup("short");
+    let (root, clone) = setup("short");
+    let _cleanup = Cleanup(root);
     let base = git(&clone, &["rev-parse", "HEAD"]);
     std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
     let _ = commit(&clone, "Set passes: a");
@@ -523,6 +546,102 @@ fn open_pr_keeps_a_stale_tip_until_it_conflicts_or_its_flips_differ() {
     let fixed = tip(&clone);
     assert_eq!(git(&clone, &["diff", "--name-only", &rebuilt, &fixed]), "", "a's flip again");
     assert_eq!(parent(&fixed), conflicting, "on today's main");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a held tip is pushed again only when the checks that main requires failed on it, as a
+// new commit with the same change, so that GitHub runs them again: on the same main, and on
+// today's main when the tip sits on an older one. Pending or passed checks push nothing, and
+// a check read that fails stops the run before it changes anything.
+#[test]
+fn open_pr_pushes_a_held_tip_again_only_when_its_checks_failed() {
+    let (root, clone) = setup("rerun");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let mut github = FakePulls { open: Some(70), ..bots_pull() };
+    let tests = FakeTests::default();
+    let run = |pulls: &FakePulls| {
+        let output = check(&clone, pulls, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let parent = |commit: &str| git(&clone, &["rev-parse", &format!("{commit}^")]);
+    let main = git(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed, edited, auto-merge on\n");
+    let first = tip(&clone);
+    for (state, why) in [(Checks::Pending, "pending"), (Checks::Passed, "passed")] {
+        let _ = github.checks.insert(first.clone(), Ok(state));
+        assert_eq!(run(&github), "ok: #70 sets `passes` on a: nothing to change\n", "{why}");
+        assert_eq!(tip(&clone), first, "{why}: nothing pushed");
+    }
+    let failed = Checks::Failed(vec!["gate (failure)".to_owned()]);
+    let _ = github.checks.insert(first.clone(), Ok(failed.clone()));
+    let again = "pushed again, as `gate (failure)` did not pass";
+    assert_eq!(run(&github), format!("ok: #70 sets `passes` on a: {again}\n"));
+    let second = tip(&clone);
+    assert_ne!(second, first, "a new commit, so that GitHub runs the checks again");
+    assert_eq!(parent(&second), main, "on the same main");
+    assert_eq!(git(&clone, &["diff", "--name-only", &first, &second]), "", "the same change");
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: nothing to change\n", "no run yet");
+    assert_eq!(tip(&clone), second, "the new tip's checks are pending");
+
+    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nMore.\n")
+        .expect("written");
+    let today = commit(&clone, "main moves on");
+    let _ = github.checks.insert(second.clone(), Ok(failed));
+    assert_eq!(run(&github), format!("ok: #70 sets `passes` on a: {again}, edited\n"));
+    let third = tip(&clone);
+    assert_eq!(parent(&third), today, "rebuilt on today's main");
+
+    let _ = github.checks.insert(third.clone(), Err("HTTP 502".to_owned()));
+    let writes = github.log.borrow().len();
+    assert_eq!(run(&github), "error: HTTP 502", "the read's failure fails the run");
+    assert_eq!(tip(&clone), third, "nothing is pushed");
+    assert_eq!(github.log.borrow().len(), writes, "nothing is written");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a foreign push of exactly the wanted flips, on a parent that is not on main, is
+// rebuilt on main, because its PR would carry that parent's changes; the same tip with its
+// parent on main would be kept, so the parent alone decides.
+#[test]
+fn open_pr_rebuilds_a_tip_whose_parent_is_not_on_main() {
+    let (root, clone) = setup("off-main");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let tests = FakeTests::default();
+    let run = |pulls: &FakePulls| {
+        let output = check(&clone, pulls, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let main = git(&clone, &["rev-parse", "HEAD"]);
+    let _ = git(&clone, &["checkout", "--quiet", "--detach"]);
+    std::fs::write(clone.join("extra.txt"), "x").expect("written");
+    let side = commit(&clone, "a commit that is not on main");
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let foreign = commit(&clone, "Set passes: a");
+    let target = format!("{foreign}:refs/heads/bot/passes");
+    let _ = git(&clone, &["push", "--quiet", "--force", "origin", &target]);
+    let _ = git(&clone, &["checkout", "--quiet", "-"]);
+    let ancestry = Command::new("git")
+        .args(["merge-base", "--is-ancestor", side.as_str(), main.as_str()])
+        .current_dir(&clone)
+        .status()
+        .expect("git runs");
+    assert_eq!(ancestry.code(), Some(1), "the fixture's parent is not on main");
+
+    let trusting = FakePulls { open: Some(70), ..bots_pull() };
+    assert_eq!(run(&trusting), "ok: #70 sets `passes` on a: edited, auto-merge on\n");
+    assert_eq!(tip(&clone), foreign, "kept if GitHub said its parent is on main");
+
+    let github = FakePulls { open: Some(70), off_main: vec![side], ..bots_pull() };
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed, edited, auto-merge on\n");
+    let rebuilt = tip(&clone);
+    assert_eq!(git(&clone, &["rev-parse", &format!("{rebuilt}^")]), main, "on main");
+    assert_eq!(git(&clone, &["diff", "--name-only", &foreign, &rebuilt]), "extra.txt");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

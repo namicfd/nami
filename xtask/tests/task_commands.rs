@@ -7,7 +7,7 @@ use std::process::Command;
 use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent, Timestamp};
 use xtask::task::acceptance::Acceptance;
 use xtask::task::execute;
-use xtask::task::passes::{self, PullState, Pulls, Services};
+use xtask::task::passes::{self, Checks, PullState, Pulls, Services};
 use xtask::task::plan::Task;
 
 /// GitHub with fixed issues, label events, comments and merge-queue entries, or unreachable.
@@ -107,6 +107,12 @@ impl Pulls for Unasked {
     }
     fn auto_merge(&self, _number: u32) -> Result<(), String> {
         Err("check-pr merges nothing".to_owned())
+    }
+    fn required_checks(&self, _commit: &str) -> Result<Checks, String> {
+        Err("check-pr reads no checks".to_owned())
+    }
+    fn is_ancestor(&self, _ancestor: &str, _commit: &str) -> Result<bool, String> {
+        Err("check-pr reads no history".to_owned())
     }
 }
 
