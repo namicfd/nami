@@ -151,8 +151,8 @@ The protected paths are:
   fixtures and UI cases, and `docs/RULES.md`. A PR that changes only rule paths is either:
   - **additive** (new functions and types beside the old code, a new lint at `Deny`, new
     fixtures and UI cases, new rule and ban rows): it merges on the required `ratchet` check's
-    proof alone, with no approval needed, even before the reviewer app exists (the AI review of
-    "Done means" still runs). The check proves
+    proof, with no code owner's approval needed (the AI review of "Done means" still runs,
+    and its approval is what satisfies the ruleset's last-push rule). The check proves
     that every case `main` writes down still holds, the rule tables only tighten, and mutation
     testing misses nothing; an open request for changes or thread by the reviewer app
     (`NAMI_REVIEWER_LOGIN`, not the agents' bot) still blocks it;
@@ -164,7 +164,8 @@ The protected paths are:
     until the app exists, and for a manifest always, only the latter. Findings fail it even with
     an approval: fix them.
     GitHub does not ask the owner, because the rule paths have no owner: when the `ratchet`
-    summary says `(edit)`, request the code owner's review yourself, with
+    summary says `(edit)` and the reviewer app gives no verdict on the head, or the edit is a
+    manifest, request the code owner's review yourself, with
     `GH_TOKEN=$(xtask/agent-token.sh) gh pr edit <n> --add-reviewer cxkoda` (the login in
     `.github/CODEOWNERS`), and say in the description why the edit is needed.
 
@@ -188,6 +189,7 @@ The authoritative list is `.github/CODEOWNERS`.
   human's credentials (`docs/operations/github-setup.md`, step 6).
 - **Actions write is for re-runs only** (ADR-0023). You may re-run the latest run of a workflow
   when its failure's cause is gone. For `passes`, dispatch it rather than re-run an old run.
+  A `review` run costs model time: re-run it at most once per head.
   Never delete, cancel or disable anything in Actions, and never approve a fork's run.
 - **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
   `docs/exec-plans/README.md`).
@@ -212,6 +214,14 @@ The authoritative list is `.github/CODEOWNERS`.
   - `just check-full` passes;
   - the task's acceptance tests pass;
   - no new `#[expect]` without a real reason;
-  - the AI review has run, and its blocking threads are resolved. The review is `/review-pr <n>`,
-    run in a fresh session, never the one that wrote the PR. Fix each finding, or reply with why
-    it is wrong; the reviewer resolves its threads when it re-reviews.
+  - the AI review has approved the PR's head. It runs by itself in CI after `ci` passes
+    (`.github/workflows/review.yml`, #59) and posts as `nami-reviewer[bot]`: an approval when
+    nothing blocks, otherwise a thread per blocking finding. Every PR needs that approval or a
+    code owner's to merge, because `main`'s ruleset asks for an approval of the last push.
+    - Fix each finding and push, or reply on the thread with why it is wrong. Each push
+      dismisses the approval and is reviewed again; that run resolves the threads that the new
+      head fixes.
+    - A review that says **No verdict** (over its budget, or an answer it could not read)
+      approves nothing. Re-run its latest run once. If that gives no verdict either, run
+      `/review-pr <n>` in a fresh session, never the one that wrote the PR, and request the
+      code owner's review.
