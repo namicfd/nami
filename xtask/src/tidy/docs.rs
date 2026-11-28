@@ -37,7 +37,8 @@ pub fn check_adr(relative: &Path, text: &str, index: &str) -> Vec<Violation> {
     assert!(is_adr_file_name(&name), "check_adr is called on ADR files only");
     let mut violations = Vec::new();
     if !index.contains(&format!("({name})")) {
-        let message = "ADR is missing from docs/design/README.md; add it to the index (ADR-0000)";
+        let message = "ADR is missing from docs/design/README.md; run `cargo xtask adr index \
+                       --write`, which generates the index (ADR-0000, ADR-20261128-1856)";
         violations.push(Violation::new(relative, 0, "adr-index", message));
     }
     let has_status =
@@ -66,30 +67,33 @@ pub fn adr_file_names(root: &Path) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Checks that an ADR's number is its own (ADR-0000): no other ADR file starts with the same
-/// four digits, and the title repeats the number.
+/// Checks that an ADR's ID is its own (ADR-0000, ADR-20261128-1856): no other ADR file has the
+/// same ID, and the title repeats the ID of the file name.
 ///
-/// Two branches that each add "the next" ADR merge without a conflict, because the file names
-/// differ. Only this rule sees the clash, in the merge queue at the latest. The title check
-/// catches an ADR that was renumbered by renaming its file alone.
+/// Two branches that each start an ADR in the same UTC minute merge without a conflict,
+/// because the slugs differ. This rule sees the clash, in the merge queue at the latest. The
+/// title check catches an ADR that was moved by renaming its file alone.
 pub fn check_adr_number(relative: &Path, text: &str, adr_names: &[String]) -> Vec<Violation> {
     let name = relative.file_name().map_or_default(|name| name.to_string_lossy());
-    assert!(is_adr_file_name(&name), "check_adr_number is called on ADR files only");
-    let number = name.get(..4).expect("an ADR file name starts with four digits");
+    let id = crate::adr::id::AdrId::of_file_name(&name);
+    let id = id.expect("check_adr_number is called on ADR files only");
     let mut violations = Vec::new();
-    for other in adr_names.iter().filter(|other| other.starts_with(number) && **other != name) {
+    let is_same =
+        |other: &&String| **other != name && crate::adr::id::AdrId::of_file_name(other) == Some(id);
+    for other in adr_names.iter().filter(is_same) {
         let message = format!(
-            "ADR number {number} is also used by `{other}`; give the newer ADR the next free \
-             number: rename its file, title, index row and references (ADR-0000)"
+            "ADR ID {id} is also used by `{other}`; move the newer ADR to a free UTC minute: \
+             rename its file, change its title and every reference, then run `cargo xtask adr \
+             index --write` (ADR-20261128-1856)"
         );
         violations.push(Violation::new(relative, 0, "adr-number", message));
     }
-    let title = format!("# ADR-{number}: ");
+    let title = format!("# ADR-{id}: ");
     let heading = text.lines().find(|line| line.starts_with("# "));
     if !heading.is_some_and(|line| line.starts_with(&title)) {
         let message = format!(
-            "ADR title must be `{title}<title>`, with the number of the file name; fix the \
-             title, or the file name if the title is right (ADR-0000)"
+            "ADR title must be `{title}<title>`, with the ID of the file name; fix the title, \
+             or the file name if the title is right (ADR-0000)"
         );
         violations.push(Violation::new(relative, 0, "adr-number", message));
     }
@@ -135,6 +139,29 @@ mod tests {
         assert_eq!(fired("# ADR-0003 without a colon\n"), ["adr-number"]);
         assert_eq!(fired("## ADR-0003: Not the title\n"), ["adr-number"]);
         assert_eq!(fired("- Status: Accepted\n"), ["adr-number"]);
+    }
+
+    // Goal: a stamp clashes only with the same minute, never with a legacy number that shares its
+    // first digits, and the title repeats the whole stamp.
+    #[test]
+    fn adr_stamps_are_unique() {
+        let names =
+            ["2026-old.md", "20261128-1903-a.md", "20261128-1903-b.md", "20261128-1904-c.md"]
+                .map(str::to_owned);
+        // The titles are built at run time, so that this file cites no missing ADR itself.
+        let check = |name: &str, id: &str| {
+            let text = format!("# ADR-{id}: A title\n");
+            check_adr_number(&Path::new("docs/design").join(name), &text, &names)
+        };
+        assert_eq!(check("2026-old.md", "2026"), Vec::new(), "no prefix match");
+        let clash = check("20261128-1903-a.md", "20261128-1903");
+        assert_eq!(rules(&clash), ["adr-number"]);
+        assert!(clash[0].to_string().contains("`20261128-1903-b.md`"), "{}", clash[0]);
+        assert_eq!(check("20261128-1904-c.md", "20261128-1904"), Vec::new());
+        let moved = check("20261128-1904-c.md", "20261128-1903");
+        assert_eq!(rules(&moved), ["adr-number"], "the title has another minute");
+        let short = check("20261128-1904-c.md", "20261128");
+        assert_eq!(rules(&short), ["adr-number"], "the title has no time");
     }
 
     // Goal: the ADR names come from the tree, sorted, without the index.

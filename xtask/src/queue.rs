@@ -1,9 +1,10 @@
 //! `cargo xtask queue`: the merge queue's two blind spots (issue #51).
 //!
-//! - `clashes --pr <n> [--comment]` lists the ADR numbers that PR `<n>` adds while `main` or
+//! - `clashes --pr <n> [--comment]` lists the ADR IDs that PR `<n>` adds while `main` or
 //!   another open PR by a trusted author also uses them. With `--comment` it posts one comment
-//!   on the PR, or updates the one it posted before, saying who holds each number and that
-//!   whoever lands second renumbers (ADR-0000). Advisory: it never fails on a clash.
+//!   on the PR, or updates the one it posted before, saying who holds each ID and who moves.
+//!   It fails when PR `<n>` must move its ADR: the clash is with `main`, or with an older open
+//!   PR (ADR-20261128-1856).
 //! - `failed --run <id>` files an issue of kind `bug` for the PR whose merge-queue run `<id>`
 //!   failed, through the path of `cargo xtask issue file`, so that `cargo xtask task ready`
 //!   lists it and the next session rebases or renumbers the PR on its own branch (ADR-0021,
@@ -29,6 +30,7 @@ pub mod failure;
 pub mod forge;
 pub mod shape;
 
+use crate::adr::id::AdrId;
 use crate::issue::github::{Gh, GitHub};
 use crate::issue::trust::{self, BOT_LOGIN, Trust};
 use crate::issue::{self, Draft, FileOptions};
@@ -152,31 +154,43 @@ fn check_clashes(
         }
     }
     let found = clashes::clashes(&own, &main, &clashes::removed_adrs(&files)?, &others);
-    let next = clashes::next_free(
+    let taken = clashes::ids_of(
         main.iter().chain(own.iter()).chain(others.iter().flat_map(|(_, names)| names.iter())),
     );
-    let mut output = summary(pull, &found, next);
+    let mut output = summary(pull, &found, &taken);
     if comment {
-        output.push_str(&publish(forge, pull, &found, next)?);
+        output.push_str(&publish(forge, pull, &found, &taken)?);
+    }
+    if found.iter().any(|clash| clash.moves(pull)) {
+        return Err(format!(
+            "{output}#{pull} must move its ADR to a free UTC minute (ADR-20261128-1856)"
+        ));
     }
     Ok(output)
 }
 
-/// What `clashes` prints: one line per clash, or that there is none.
-fn summary(pull: u32, found: &BTreeSet<Clash>, next: u32) -> String {
+/// What `clashes` prints: one line per clash, or that there is none. A clash that this PR must
+/// fix is an error; one that the other, newer PR fixes is a note.
+fn summary(pull: u32, found: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> String {
     if found.is_empty() {
-        return format!("#{pull} adds no ADR number that is in use elsewhere\n");
+        return format!("#{pull} adds no ADR ID that is in use elsewhere\n");
     }
     let lines: Vec<String> = found
         .iter()
-        .map(|clash| match clash.holder {
-            clashes::Holder::Main => format!("warning: ADR-{:04} is already on main", clash.number),
-            clashes::Holder::Pull(other) => {
-                format!("warning: ADR-{:04} is also added by #{other}", clash.number)
+        .map(|clash| {
+            let place = match clash.holder {
+                clashes::Holder::Main => "is already on main".to_owned(),
+                clashes::Holder::Pull(other) => format!("is also added by #{other}"),
+            };
+            if clash.moves(pull) {
+                let destination = clashes::destination(*clash, taken);
+                format!("error: ADR-{} {place}; move this PR's ADR to {destination}", clash.id)
+            } else {
+                format!("note: ADR-{} {place}, which is newer and moves its ADR", clash.id)
             }
         })
         .collect();
-    format!("{}\nthe next free number is ADR-{next:04}\n", lines.join("\n"))
+    format!("{}\n", lines.join("\n"))
 }
 
 /// Posts the clash comment on PR `pull`, or updates the one posted before. With no clash,
@@ -185,13 +199,14 @@ fn publish(
     forge: &dyn Forge,
     pull: u32,
     found: &BTreeSet<Clash>,
-    next: u32,
+    taken: &BTreeSet<AdrId>,
 ) -> Result<String, String> {
     let comments = forge.pull_comments(pull)?;
     let earlier = comments.iter().find(|comment| {
         COMMENT_AUTHORS.contains(&comment.author.as_str()) && comment.body.starts_with(MARKER)
     });
-    let body = if found.is_empty() { clashes::resolved() } else { clashes::render(found, next) };
+    let body =
+        if found.is_empty() { clashes::resolved() } else { clashes::render(pull, found, taken) };
     assert!(body.starts_with(MARKER), "the comment can be found again");
     match earlier {
         Some(earlier) if earlier.body == body => Ok("the comment is up to date\n".to_owned()),
@@ -741,34 +756,58 @@ mod tests {
         execute(fake, fake, fake, &trust(), &|| Ok(vocabulary()), arguments)
     }
 
-    // Goal: a number that a trusted open PR also adds is reported with that PR and the next
-    // free number; an outsider's PR is not read, and without `--comment` nothing is posted.
+    // Goal: an ID that an older trusted open PR also adds fails the newer PR and says where to
+    // move; the older PR passes with a note; an outsider's PR is not read, and without
+    // `--comment` nothing is posted.
     #[test]
     fn clashes_with_open_pull_requests_are_reported() {
         let fake = clash_fake();
-        let output = run(&fake, &["clashes", "--pr", "51"]).expect("advisory, never an error");
+        let error = run(&fake, &["clashes", "--pr", "51"]).expect_err("#51 is newer, so it moves");
         assert_eq!(
-            output,
-            "warning: ADR-0022 is also added by #45\nthe next free number is ADR-0024\n"
+            error,
+            "error: ADR-0022 is also added by #45; move this PR's ADR to a new ID from `cargo \
+             xtask adr new <slug>`\n#51 must move its ADR to a free UTC minute \
+             (ADR-20261128-1856)"
         );
         assert!(fake.posted.borrow().is_empty(), "no comment without --comment");
+        let older = run(&fake, &["clashes", "--pr", "45"]).expect("#45 is older and keeps its ID");
+        assert_eq!(
+            older,
+            "note: ADR-0022 is also added by #51, which is newer and moves its ADR\n"
+        );
         let on_main = Fake { main: "{\"name\": \"0022-main.md\"}\n", ..clash_fake() };
-        let main_output = run(&on_main, &["clashes", "--pr", "51"]).unwrap();
-        assert!(main_output.starts_with("warning: ADR-0022 is already on main\n"), "{main_output}");
+        let main_error = run(&on_main, &["clashes", "--pr", "45"]).unwrap_err();
+        assert!(main_error.starts_with("error: ADR-0022 is already on main; move"), "{main_error}");
         let quiet = without_adrs(clash_fake());
         let quiet_output = run(&quiet, &["clashes", "--pr", "#51", "--comment"]).unwrap();
-        assert_eq!(quiet_output, "#51 adds no ADR number that is in use elsewhere\n");
+        assert_eq!(quiet_output, "#51 adds no ADR ID that is in use elsewhere\n");
         assert!(quiet.posted.borrow().is_empty() && quiet.edited.borrow().is_empty());
     }
 
-    // Goal: `--comment` posts one comment, then updates that one; a marker in someone else's
-    // comment is not ours, and a fixed clash is marked so.
+    // Goal: a stamp that main already has moves to the first minute after it that nobody has.
+    #[test]
+    fn a_stamp_on_main_moves_to_the_next_free_minute() {
+        let files = BTreeMap::from([(51, files(&[("20261128-1856-ids.md", "added")]))]);
+        let main = "{\"name\": \"20261128-1856-a.md\"}\n{\"name\": \"20261128-1857-b.md\"}\n";
+        let fake = Fake { pulls: PULLS, main, files, ..Fake::default() };
+        let error = run(&fake, &["clashes", "--pr", "51"]).unwrap_err();
+        // Built at run time, so that this file cites no missing ADR itself.
+        let expected = format!(
+            "error: ADR-20261128-1856 is already on main; move this PR's ADR to ADR-{}, the next \
+             free minute\n",
+            "20261128-1858"
+        );
+        assert!(error.starts_with(&expected), "{error}");
+    }
+
+    // Goal: `--comment` posts one comment, then updates that one, also when the check fails; a
+    // marker in someone else's comment is not ours, and a fixed clash is marked so.
     #[test]
     fn the_clash_comment_is_posted_once_and_then_updated() {
         let marker = super::MARKER;
         let fake = Fake { comments: comment(5, "outsider", marker), ..clash_fake() };
-        let output = run(&fake, &["clashes", "--comment", "--pr", "51"]).unwrap();
-        assert!(output.ends_with("commented on #51\n"), "{output}");
+        let output = run(&fake, &["clashes", "--comment", "--pr", "51"]).unwrap_err();
+        assert!(output.contains("\ncommented on #51\n#51 must move its ADR"), "{output}");
         let posted = fake.posted.borrow();
         assert_eq!(posted.len(), 1);
         assert_eq!(posted[0].0, 51);
@@ -778,8 +817,8 @@ mod tests {
 
         let old = format!("{marker}\nold");
         let earlier = Fake { comments: comment(8, "github-actions[bot]", &old), ..clash_fake() };
-        let updated = run(&earlier, &["clashes", "--pr", "51", "--comment"]).unwrap();
-        assert!(updated.ends_with("updated comment 8\n"), "{updated}");
+        let updated = run(&earlier, &["clashes", "--pr", "51", "--comment"]).unwrap_err();
+        assert!(updated.contains("\nupdated comment 8\n"), "{updated}");
         assert_eq!(earlier.edited.borrow()[0].0, 8);
         assert!(earlier.edited.borrow()[0].1.contains("#45"));
         assert!(earlier.posted.borrow().is_empty(), "one comment per PR");
@@ -1166,7 +1205,8 @@ mod tests {
         let clients = (workflow, Fake { serves: Serves::Filing, ..Fake::default() });
         let arguments = ["clashes", "--pr", "51", "--comment"];
         let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
-        assert!(output.is_ok_and(|text| text.ends_with("commented on #51\n")), "posted");
+        let failed = output.expect_err("#51 is newer than #45, so it moves and fails");
+        assert!(failed.contains("\ncommented on #51\n"), "posted: {failed}");
         assert_eq!(clients.0.posted.borrow().len(), 1, "the workflow's token posts");
         assert!(clients.1.posted.borrow().is_empty() && clients.1.filed.borrow().is_empty());
     }

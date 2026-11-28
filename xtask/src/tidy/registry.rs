@@ -54,6 +54,17 @@ pub struct Rule {
 /// it (ADR-0022).
 pub const RULES: &[Rule] = &[
     Rule {
+        id: "adr-id",
+        kind: RuleKind::Workspace,
+        summary: "Every file in `docs/design/` but the index is named `YYYYMMDD-HHMM-<slug>.md`, \
+                  after a UTC minute, or carries the number of an ADR written before IDs were \
+                  minutes.",
+        detail: "The minute must exist in the calendar, from 2026 on. The legacy numbers are \
+                 0000 to 0043 without the gaps 0016 and 0024 to 0031. The slug is lower-case \
+                 words joined by single dashes.",
+        reference: "ADR-20261128-1856",
+    },
+    Rule {
         id: "adr-index",
         kind: RuleKind::Source,
         summary: "Every ADR is listed in `docs/design/README.md`.",
@@ -61,12 +72,31 @@ pub const RULES: &[Rule] = &[
         reference: "ADR-0000",
     },
     Rule {
+        id: "adr-index-doc",
+        kind: RuleKind::Workspace,
+        summary: "`docs/design/README.md` is what `cargo xtask adr index --write` generates from \
+                  the ADRs.",
+        detail: "Skipped by a foreign gate, like `rules-doc`: another revision's generator \
+                 writes another index.",
+        reference: "ADR-20261128-1856",
+    },
+    Rule {
         id: "adr-number",
         kind: RuleKind::Source,
-        summary: "No two ADR files share a number, and an ADR's title repeats the number of its \
-                  file name.",
-        detail: "",
+        summary: "No two ADR files share an ID, and an ADR's title repeats the ID of its file \
+                  name.",
+        detail: "Same-minute clashes between branches show here once both are merged; the \
+                 merge queue's `adr clashes` check fails them earlier.",
         reference: "ADR-0000",
+    },
+    Rule {
+        id: "adr-reference",
+        kind: RuleKind::Workspace,
+        summary: "Every `ADR-` followed by a digit names an ADR in `docs/design/`.",
+        detail: "Reads every UTF-8 file that tidy walks, everything below `docs/` and the root \
+                 `.claude/` without its worktrees. Tidy's fixtures are not read. `ADR-NNNN` and \
+                 other placeholders without a digit are no reference.",
+        reference: "ADR-20261128-1856",
     },
     Rule {
         id: "adr-section",
@@ -81,6 +111,14 @@ pub const RULES: &[Rule] = &[
         summary: "Every ADR has a valid status line.",
         detail: "",
         reference: "ADR-0000",
+    },
+    Rule {
+        id: "adr-summary",
+        kind: RuleKind::Workspace,
+        summary: "Every ADR has a `- Summary:` line in its header: the one line its index row \
+                  shows.",
+        detail: "",
+        reference: "ADR-20261128-1856",
     },
     Rule {
         id: "assertion-density",
@@ -519,10 +557,12 @@ pub const PLANNED: &[Planned] = &[
     ),
 ];
 
-/// The tidy rules that compare the tree's documents with this binary's own registry. A tree
-/// from another revision, whose registry differs, fails them by construction, so they are
-/// skipped when tidy judges such a tree (`cargo xtask tidy --root <dir> --policy <dir>`).
-pub const REGISTRY_BOUND_RULES: [&str; 3] = ["doc-tag", "planned-task", "rules-doc"];
+/// The tidy rules that compare the tree's documents with this binary's own registry, or with
+/// what this binary generates. A tree from another revision, whose registry or generator
+/// differs, fails them by construction, so they are skipped when tidy judges such a tree
+/// (`cargo xtask tidy --root <dir> --policy <dir>`).
+pub const REGISTRY_BOUND_RULES: [&str; 4] =
+    ["adr-index-doc", "doc-tag", "planned-task", "rules-doc"];
 
 /// True if `relative` is one of the `allowed` files or lies inside one of the directories.
 #[must_use]

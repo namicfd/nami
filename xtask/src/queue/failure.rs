@@ -343,10 +343,11 @@ fn proposed_fix(pull: u32, by_bot: bool) -> String {
         "\n## Proposed fix\n\nRebase or renumber, then re-queue, on #{pull}'s own branch \
          (ADR-0021, point 6). Claim this issue as usual, then check out #{pull}'s branch, rebase \
          it onto `main` and run `just check-full`: a clash that git merged without a conflict \
-         shows up there. Two ADRs with one number are the usual case; renumber #{pull}'s ADR: \
-         its file name, its `# ADR-NNNN:` title, its row in `docs/design/README.md` and every \
-         reference (ADR-0000). Push to #{pull}'s branch, add `Fixes #<this issue>` to #{pull}'s \
-         description, and add #{pull} to the merge queue again. If #{pull} passes as it is, \
+         shows up there. Two ADRs with one ID are the usual case; move #{pull}'s ADR to a free \
+         UTC minute: its file name, its `# ADR-…:` title and every reference, then run `cargo \
+         xtask adr index --write` (ADR-20261128-1856). Push to #{pull}'s branch, add \
+         `Fixes #<this issue>` to #{pull}'s description, and add #{pull} to the merge queue \
+         again. If #{pull} passes as it is, \
          re-queue it the same way. If the `ratchet` job gave no verdict because its carried \
          mutation evidence observed another rule-path diff, another rule PR changed the same \
          files first: the rebase and push are the fix, since they make the ratchet observe \
