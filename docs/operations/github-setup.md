@@ -189,7 +189,7 @@ ADR-0023 sets the rules for every CI job that holds an app's key. Read it before
 - it runs on `workflow_run`, which takes the workflow file and xtask from `main`, never from a PR, and its checkout has no `ref:`;
 - the key is in an environment that only `main` may use, so a PR that edits a workflow to read it is refused;
 - the key is in the environment of one step only, which writes it to a file. The next step mints the token from the file and deletes it before xtask starts, and a last step that always runs deletes it if anything failed in between;
-- it files only for runs of `.github/workflows/ci.yml`, so a workflow that a PR adds under the name `ci` triggers nothing;
+- it files only for runs of `.github/workflows/ci.yml` and `.github/workflows/guardrails.yml`, which holds the `ratchet` check, so a workflow that a PR adds under the name `ci` or `guardrails` triggers nothing. Each failed run gets its own issue, also when both workflows fail for one merge group;
 - every read, of the open issues too, uses the workflow's own token, with `actions`, `contents`, `issues` and `pull-requests` read. The `nami-ci` token is narrowed to `issues: write`, only creates the issue, and expires within an hour;
 - it restores no cache, and builds xtask from a clean checkout.
 
