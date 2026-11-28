@@ -87,7 +87,7 @@ The workflow `queue` files an issue `PR #<n> failed in the merge queue (run <id>
 - **If #n is closed, or merged without closing the issue,** or the number is no PR, nobody can push a fix there. The issue is not work for agents, and a human closes it.
 - **While #n is in the merge queue,** no agent pushes to it: a push would take it out again. The issue waits. If #n fails again, that run gets its own issue.
 - **If anyone else opened #n,** agents do not push to it. The issue says that a human rebases it, and it carries `needs-decision`, so `cargo xtask task ready` does not list it.
-- **The issue quotes only checked text.** The queue ran the PRs' own code and workflow files, so the run's logs and its job and step names are untrusted (point 2). The issue names jobs and steps only by names that `main`'s `.github/workflows/ci.yml` and `.github/workflows/guardrails.yml` (which holds the `ratchet` check) define, reports codes only as tidy's rule IDs and the dylint lints' names, and builds its links from the repository name and IDs. The fixer reads the log through the link.
+- **The issue quotes only checked text.** The queue ran the PRs' own code and workflow files, so the run's logs and its job and step names are untrusted (point 2). The issue names jobs and steps only by names that `main`'s `.github/workflows/ci.yml` defines, reports codes only as tidy's rule IDs and the dylint lints' names, and builds its links from the repository name and IDs. The fixer reads the log through the link.
 
 ### 7. Amendment (Proposed, 2026-11-26): the bot removes its own `needs-decision` after it records a code owner's decision
 
