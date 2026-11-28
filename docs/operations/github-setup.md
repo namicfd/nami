@@ -97,7 +97,8 @@ Agents act as `nami-agent[bot]`, never as the maintainer. GitHub does not let an
    | Pull requests | read and write | Open and update PRs. |
    | Workflows | read and write | Pushes that touch `.github/workflows/` need it. Agents may change protected paths (ADR-0015). |
    | Issues | read and write | Read and answer intake issues. |
-   | Actions, Checks | read | Read CI results. |
+   | Actions | read and write | Read CI results, and re-run or dispatch a workflow run that failed for a passing reason, such as the `passes` job (granted 2026-11-28, ADR-0023). |
+   | Checks | read | Read CI results. |
    | Metadata | read | Set automatically. |
 
 4. **Where can this app be installed:** only on this account. Then **Create GitHub App**.
