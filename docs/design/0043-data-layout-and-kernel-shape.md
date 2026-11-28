@@ -52,12 +52,13 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
 - The Riemann solver, which takes about half the time, vectorises in all three directions. The
   prototype measured 1.9× Athena++ at 64³ and 1.86× at 128³, **but only with a `math::sqrt` that
   differs from today's:** `f64::sqrt` as the backend, which ADR-0005 and `clippy.toml` ban today
-  (math goes through `libm`), and `debug_assert!` instead of `assert!` on each call. With
-  `kernels::math::sqrt` as it is, the same layout measured 0.1× to 0.9×, below the failure line
-  of ADR-0034. The layout choice does not rest on `sqrt`: structure of arrays was the fastest
-  layout in every configuration except A and D, the two with libm's `arch` sqrt. There the
-  hybrid was faster because it escaped the SSE/AVX transition penalty by accident, not because
-  of its layout, and no layout reached the 1.0× target. Reaching the target needs a
+  (math goes through `libm`), and `debug_assert!` instead of `assert!` on each call. With a copy
+  of today's `kernels::math::sqrt`, the same layout measured 0.1× (below ADR-0034's 0.8× failure
+  line) to 0.9× (below the 1.0× target), depending on inlining. The real cross-crate function
+  was not measured. The layout choice does not rest on `sqrt`: structure of arrays was the
+  fastest layout in every configuration except A and D, the two with libm's `arch` sqrt. There
+  the hybrid was faster because it escaped the SSE/AVX transition penalty by accident, not
+  because of its layout, and no layout reached the 1.0× target. Reaching the target needs a
   separate decision on `sqrt` before M2, which this ADR does not make.
 - Kernels are generic over named state types, so each equation system writes its fields once,
   and the rows are tied to them by one accessor per system.
@@ -81,6 +82,6 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
   `research/layout-prototype`: 64³ and 128³, five interleaved repetitions, bitwise-identical
   output across layouts, and L1 errors equal to Athena++'s to seven digits. The 1.9× is the
   prototype's configuration C (`f64::sqrt` backend, `debug_assert!` in `math::sqrt`);
-  configuration A, a copy of today's `math::sqrt`, gave 0.10× (SoA) or 0.9×, depending on
-  inlining.
+  configuration A, a copy of today's `math::sqrt`, gave structure of arrays 0.10× in the main
+  campaign and 0.91× to 0.93× in a rebuild that differs only in inlining.
 - Athena++ v24.0 (commit `209a9258`), built with `g++-simd` (`-O3 -ffast-math -march=native`).

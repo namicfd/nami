@@ -45,13 +45,17 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
      Δt) and the Cartesian update is written per direction as (Δt/Δxₐ) times the flux
      difference, so that it reduces exactly to the 1D form. This covers cell-centred schemes.
      With constrained transport (M5), By and Bz come from corner electric fields that average
-     face fields, and that average does not round to the 1D field. M5's plan either writes the
-     corner formula as the 1D field plus terms that are exactly zero for y-uniform data, or
-     leaves CT combinations out of this test;
-   - rotation along x, y and z, by a cyclic permutation of the axes. It holds only if the face
-     frame orders the transverse components cyclically (for a y face: z, then x) and cell-level
-     norms such as |v|² and |B|² add their squared components in an order that no permutation
-     changes, such as smallest first;
+     face fields, and that average does not round to the 1D field;
+   - rotation along x, y and z, by a cyclic permutation of the axes. It holds for cell-centred
+     schemes only if the face frame orders the transverse components cyclically (for a y face:
+     z, then x) and cell-level norms such as |v|² and |B|² add their squared components in an
+     order that no permutation changes, such as smallest first;
+   - constrained-transport combinations are left out of these two tests until M5's plan shows
+     how they hold. Writing the corner formula as the 1D field plus terms that are exactly zero
+     needs data uniform in y and z, and a Riemann solver whose electric field for equal left and
+     right states is bitwise the cell-centred one, which HLL's is not. Rotation also needs the
+     corner sums written in cyclic axis order. ADR-0007 asks for the rotation test to be bitwise,
+     so M5's plan either makes it hold for constrained transport or proposes an amendment;
    - full refinement against a uniform mesh;
    - decomposition (ADR-0039) and restart (ADR-0041);
    - conservation across levels with the exact accumulator.

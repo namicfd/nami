@@ -279,9 +279,9 @@ The topic has three parts:
   - every layout gave bitwise-identical output, with Athena++'s L1 error to seven digits;
   - block sizes known at compile time changed neither the code nor the speed.
 
-  It also found that `kernels::math::sqrt` as written today (libm's legacy-SSE `sqrtsd`, with an
-  `assert!` on every call) drops nami to 0.1× or 0.9× of Athena++, depending on inlining. That
-  needs its own decision before M2.
+  It also found that a copy of `kernels::math::sqrt` as written today (libm's legacy-SSE `sqrtsd`,
+  with an `assert!` on every call) drops nami to 0.1× of Athena++ (below the 0.8× failure line)
+  or 0.9× (below the 1.0× target), depending on inlining. That needs its own decision before M2.
 
 ### 4(b) Extension points and how they compose (agreed)
 
@@ -633,13 +633,18 @@ regenerate it, as for PyClaw.
 
   That covers cell-centred schemes. With constrained transport (M5), By and Bz are updated from
   corner electric fields that average face fields, and that average does not round to the 1D
-  field even for y-uniform data. M5's plan either writes the corner formula as the 1D field plus
-  terms that are exactly zero for y-uniform data, or leaves CT combinations out of this test.
+  field even for y-uniform data.
 - **Rotation:** the same problem along x, y and z, rotated by a cyclic permutation of the axes,
-  gives identical bits. The face frame is an exact permutation with the transverse components in
-  cyclic order (§ 4(b)), and cell-level norms such as |v|² and |B|² add their squared components
-  in an order that no permutation changes, such as smallest first. Without that, `(u²+v²)+w²` and
-  `(w²+u²)+v²` round differently.
+  gives identical bits for cell-centred schemes. The face frame is an exact permutation with the
+  transverse components in cyclic order (§ 4(b)), and cell-level norms such as |v|² and |B|² add
+  their squared components in an order that no permutation changes, such as smallest first.
+  Without that, `(u²+v²)+w²` and `(w²+u²)+v²` round differently.
+- **Constrained transport** is left out of these two tests until M5's plan shows how they hold.
+  Writing the corner formula as the 1D field plus terms that are exactly zero needs data uniform
+  in y and z, and a Riemann solver whose electric field for equal left and right states is
+  bitwise the cell-centred one, which HLL's is not. Rotation also needs the corner sums written
+  in cyclic axis order. ADR-0007 asks for the rotation test to be bitwise, so M5's plan either
+  makes it hold for constrained transport or proposes an amendment.
 - **Full refinement:** a mesh refined everywhere to level L gives the bits of a uniform mesh at
   level L.
 - **Decomposition and restart** (§ 5.4, § 6.6).
