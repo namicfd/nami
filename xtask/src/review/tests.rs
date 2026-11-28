@@ -260,7 +260,10 @@ fn findings_off_the_diff_are_moved_or_give_no_verdict() {
 }
 
 fn post(fake: &Fake, answer: &str) -> String {
-    let path = std::env::temp_dir().join(format!("nami-review-{}-{answer:.8}", std::process::id()));
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("nami-review-{}-{call}", std::process::id());
+    let path = std::env::temp_dir().join(name);
     std::fs::write(&path, answer).unwrap();
     let file = path.display().to_string();
     let arguments = ["post", "--pr", "1", "--head", HEAD, "--result", &file];

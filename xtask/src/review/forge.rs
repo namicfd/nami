@@ -280,7 +280,8 @@ pub fn file_from_json(value: &Value) -> Result<ChangedFile, String> {
 ///
 /// # Errors
 ///
-/// When the answer has another shape, or more threads or comments than one page holds.
+/// When the answer has another shape, or more threads than one page holds. A thread with
+/// more comments than one page is not an error: [`OpenThread::more_replies`] says so.
 pub fn threads_from_json(answer: &Value, reviewer: &str) -> Result<Vec<OpenThread>, String> {
     let bare = reviewer.strip_suffix("[bot]").ok_or("the reviewer is an app's login with [bot]")?;
     let path = ["data", "repository", "pullRequest", "reviewThreads"];
@@ -331,7 +332,6 @@ fn open_thread(node: &Value, bare: &str, reviewer: &str) -> Result<Option<OpenTh
             Ok(Reply { author: name, body: optional_string(reply, "body")? })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    assert!(replies.len() < comments.len(), "the finding itself is no reply");
     Ok(Some(OpenThread {
         id: string_at(node, &["id"])?,
         path: string_at(node, &["path"])?,

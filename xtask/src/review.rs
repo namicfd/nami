@@ -325,7 +325,7 @@ fn describe_threads(threads: &[OpenThread], trust: &Trust) -> String {
             thread.replies.iter().filter(|reply| trust.is_trusted(&reply.author)).collect();
         for reply in &trusted {
             parts.push(format!(
-                "\n### Reply by `{}`, the pull request's author\n\n{}\n",
+                "\n### Reply by `{}`, a trusted account\n\n{}\n",
                 reply.author, reply.body
             ));
         }
