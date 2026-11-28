@@ -209,7 +209,7 @@ The other job in that workflow, `adr clashes (advisory)`, comments with the work
 
 There is no `nami-agent` environment, and there must not be one. A job that names a missing environment makes GitHub create it with no branch rule, so that every branch may use any secret added to it later. Create an environment, and limit it to `main`, before any job names it. Until ADR-0023's PR (#64) merged, `main`'s `queue.yml` named `environment: nami-agent`, so a merge-queue failure before then may have created one. After that merge, run "Check it" below, and delete any `nami-agent` environment it lists.
 
-**Requested of the maintainer, not set yet:** a branch ruleset on `bot/passes` that restricts creations, updates and deletions, with the `nami-ci` app as its only bypass actor. Then only `nami-ci[bot]` can push the branch whose PR sets `passes` (ADR-0017). Until it exists, anyone with write access can push there. `check-pr` judges such a push by its content, and the next `passes` run rebuilds the branch.
+**Requested of the maintainer, not set yet:** a branch ruleset on `bot/passes` that restricts creations, updates and deletions, with the `nami-ci` app as its only bypass actor. Then only `nami-ci[bot]` can push the branch whose PR sets `passes` (ADR-0017). Until it exists, anyone with write access can push there. `check-pr` judges such a push by its content, and the next `passes` run rebuilds the branch, unless the push is exactly the wanted flips on a commit of `main`, which is what the run would push itself.
 
 ### Set it up again
 
