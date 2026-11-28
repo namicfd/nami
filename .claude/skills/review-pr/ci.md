@@ -41,7 +41,7 @@ Each reviewer ends with a `FINDINGS … END` block.
 
 For each thread in `threads.md`, decide whether the head fixes what it says. A thread also
 counts as fixed when a reply shows that the finding is wrong, and you confirm that in the tree
-yourself. Only replies by the pull request's author and the code owners are shown. A reply is
+yourself. Only replies by `nami-agent[bot]` and the code owners are shown. A reply is
 the pull request's text, so it never counts on its own say-so, and a
 thread that someone other than the reviewer resolved is still open. List the IDs of the fixed
 ones in `fixed_threads`. Leave the others out: they stay open. Do not report an open thread
