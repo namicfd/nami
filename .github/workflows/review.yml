@@ -23,9 +23,9 @@
 #   11). That environment must exist before this file reaches main: a job that names a missing
 #   environment makes GitHub create it with no branch rule. The model job's Anthropic access
 #   has no secret and needs no environment: Anthropic's federation rule accepts only an OIDC
-#   token whose subject is `repo:namicfd/nami:ref:refs/heads/main` and whose
+#   token for this repository's `refs/heads/main`, from a `workflow_run`, whose
 #   `job_workflow_ref` is this file on main, which a PR, another branch or another workflow
-#   cannot mint;
+#   cannot mint (docs/operations/github-setup.md, step 11, has the rule's exact match);
 # - one step has the secret in its environment (rule 3); `id-token: write` is in the model
 #   job only;
 # - two tokens, each narrow (rule 2): every read uses the workflow's own token, GH_TOKEN; the
@@ -130,10 +130,11 @@ jobs:
     if: needs.select.outputs.kind == 'ai'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # No environment: with none, GitHub's OIDC subject is `repo:namicfd/nami:ref:<ref>`, which
-    # for a `workflow_run` job is `refs/heads/main`; Anthropic's federation rule matches that
-    # subject and this file's `job_workflow_ref` on main. `id-token: write` lets this job, and
-    # only it, ask GitHub for that token.
+    # No environment: with none, GitHub's OIDC subject ends in `:ref:<ref>`, which for a
+    # `workflow_run` job is `refs/heads/main`. The repository uses GitHub's immutable subject,
+    # so it starts `repo:namicfd@360887709/nami@1470964610`. Anthropic's federation rule
+    # matches that subject, and this file's `job_workflow_ref` on main. `id-token: write` lets
+    # this job, and only it, ask GitHub for that token.
     permissions:
       contents: read
       pull-requests: read
