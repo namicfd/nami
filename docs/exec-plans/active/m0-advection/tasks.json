@@ -35,6 +35,7 @@
         "crates/reference/src/thresholds.rs",
         "crates/reference/src/contract.rs",
         "crates/reference/src/checks/mod.rs",
+        "crates/reference/src/combinations.rs",
         "crates/reference/src/advection.rs",
         "xtask/tests/crate_graph.rs"
       ],
@@ -72,19 +73,21 @@
       ],
       "acceptance": [
         "reference::thresholds::tests::every_threshold_is_finite_and_positive",
-        "reference::thresholds::tests::m0_constants_match_their_derivations"
+        "reference::thresholds::tests::m0_constants_match_their_derivations",
+        "reference::thresholds::tests::derived_constants_pass_their_arithmetic_tests"
       ],
       "passes": false
     },
     {
       "id": "reference-suite",
-      "title": "The scheme contract, declared properties and the generic checks they select, proven on bad schemes (ADR-0007, ADR-0042)",
+      "title": "The scheme contract, declared properties, the table of combinations and the generic checks they select, proven on bad schemes (ADR-0007, ADR-0042)",
       "depends_on": [
         "thresholds-file"
       ],
       "owner_paths": [
         "crates/reference/src/contract.rs",
         "crates/reference/src/checks",
+        "crates/reference/src/combinations.rs",
         "crates/reference/src/thresholds.rs"
       ],
       "acceptance": [
@@ -97,10 +100,11 @@
         "reference::checks::tests::a_nondeterministic_scheme_fails",
         "reference::checks::tests::a_large_step_scheme_fails_the_step_count",
         "reference::checks::tests::a_non_monotone_scheme_fails_the_maximum_principle",
-        "reference::checks::tests::a_wrong_wrap_scheme_fails_the_periodic_check",
         "reference::checks::tests::an_underestimated_speed_fails_the_wave_speed_bound",
         "reference::checks::tests::properties_choose_the_checks",
-        "reference::checks::tests::each_declared_boundary_has_a_check"
+        "reference::checks::tests::each_declared_boundary_has_a_check",
+        "reference::combinations::tests::a_combination_without_a_row_fails",
+        "reference::combinations::tests::the_m0_row_declares_order_one_monotone_periodic"
       ],
       "passes": false
     },
@@ -121,7 +125,9 @@
         "reference::advection::tests::a_half_speed_scheme_fails",
         "reference::advection::tests::a_reversed_scheme_fails",
         "reference::advection::tests::double_diffusion_fails_the_error_ceiling",
-        "reference::advection::tests::known_order_one_passes_and_below_one_minus_delta_fails"
+        "reference::advection::tests::known_order_passes_with_one_half_and_fails_with_six_tenths",
+        "reference::advection::tests::upwind_passes_the_periodic_check",
+        "reference::advection::tests::a_wrong_wrap_scheme_fails_the_periodic_check"
       ],
       "passes": false
     },
@@ -323,7 +329,8 @@
         "solver::time_loop::tests::a_constant_state_is_preserved_bitwise",
         "solver::time_loop::tests::the_time_step_is_the_cfl_limit",
         "solver::time_loop::tests::the_last_step_ends_exactly_at_the_end_time",
-        "solver::time_loop::tests::one_step_matches_a_hand_computed_upwind_step"
+        "solver::time_loop::tests::one_step_matches_a_hand_computed_upwind_step",
+        "solver::time_loop::tests::the_backstop_rejects_a_non_finite_block"
       ],
       "passes": false
     },
@@ -375,7 +382,7 @@
         "crates/solver/tests/advection_reference.rs"
       ],
       "acceptance": [
-        "solver::advection_reference::donor_cell_llf_forward_euler_passes_its_checks"
+        "solver::advection_reference::donor_cell_llf_forward_euler_passes_the_checks_of_its_row"
       ],
       "passes": false
     },

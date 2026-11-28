@@ -129,7 +129,7 @@ Out of scope: checking that the code uses each word in its one meaning. That sta
 
 Also retag the style guide's `[planned:thresholds-file]` and `[planned:reference-suite]` tags to
 the mechanisms that `m0-advection` built, and change the rule on magic tolerances from
-`reference/thresholds.toml` to `crates/reference/src/thresholds.rs` (ADR-0030).
+`reference/thresholds.toml` to `crates/reference/src/thresholds.rs` (ADR-0042).
 
 Every reference test names its tier (ADR-0007). Add a tidy rule that requires the tier in the
 goal comment of each test under a `tests/` directory of `crates/reference`, and fix the tests
@@ -138,7 +138,7 @@ that exist by then.
 ### floor-activation-count
 
 Not before the first scheme with a floor or a positivity limiter: the first-order flux correction
-of M2 (ADR-0024). M0 and M0b have none. It waits at the end of the chain until then.
+of M2 (ADR-0036). M0 and M0b have none. It waits at the end of the chain until then.
 
 A floor or limiter that is part of a scheme counts each activation and reports the count per
 step (`TIGER_STYLE.md`, Physical admissibility). Add the counter to the first scheme that has

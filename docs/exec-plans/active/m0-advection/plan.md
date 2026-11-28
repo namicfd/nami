@@ -120,26 +120,41 @@ calls the suite once per combination, with one line each.
 - **Moved correctly.** The pulse on [0.3, 0.45) advanced by 0.3. The L1 distance to the exact
   solution must be at most half the distance from the initial data, and below an absolute L1
   ceiling.
-- **Order.** The smooth profile, t = 0.25, N = 32, 64, 128: p ≥ p_formal − δ with δ = 0.1 on the
-  finest pair, plus an error ceiling derived from theory. For upwind, the modified equation
-  gives the diffusion D = |a| Δx (1 − ν)/2, so the leading error is t D u₀″ shifted by a t, and
-  the ceiling is 1.5 × t D ‖u₀″‖₁.
+- **Order.** The smooth profile, t = 0.25, N = 32, 64, 128: on the finest pair,
+  e_coarse / e_fine ≥ 2^(p_formal − δ) with δ = 0.1, which is p ≥ p_formal − δ written without a
+  logarithm. Plus an error ceiling derived from theory: for upwind, the modified equation gives
+  the diffusion D = |a| Δx (1 − ν)/2, so the leading error is t D u₀″ shifted by a t, and the
+  ceiling is 1.5 × t D ‖u₀″‖₁.
 - **Maximum principle** for monotone schemes, on the pulse.
 - **Mirror symmetry,** bitwise.
 - **Determinism,** bitwise.
 - **Step count.** At least ⌈(t|a| / (νΔx)) (1 − 4ε)⌉ steps.
 - **The exact scheme is exempt from two checks,** as in PR #4: from the order check, because its
-  error is exactly 0 and log₂(0/0) is NaN, and from bitwise mirror symmetry, because the exact
-  averages of the mirrored problem agree only to rounding (3.6e-15 on the pulse at t = 0.3,
-  N = 32). The known-order and shift schemes below are the positive controls for those two checks.
+  error is exactly 0 and the error ratio 0/0 is NaN, and from bitwise mirror symmetry, because
+  the exact averages of the mirrored problem agree only to rounding (3.6e-15 on the pulse at
+  t = 0.3, N = 32). The known-order and shift schemes below are the positive controls for those
+  two checks.
 
 **One change from PR #4: the smooth profile is a polynomial, not a sine.** It is
 u₀(x) = 16 x² (1 − x)² on [0, 1), extended periodically. It is C² (u₀, u₀′ and u₀″ match at the
-wrap), which is ample for first and second order. Its exact cell averages and ‖u₀″‖₁ are
-polynomial expressions, so `reference` computes them without any transcendental function. That
-keeps `libm` out of `reference` (tidy's `direct-libm` ban allows it only in `kernels::math`, and
-`reference` must not depend on `kernels`), with no rule change. Exact cell averages of the
-square pulse are piecewise linear in its end points.
+wrap), which is ample for first and second order. Its exact cell averages are polynomial in the
+cell edges, and the exact cell averages of the square pulse are piecewise linear in its end
+points, so `reference` computes both with arithmetic alone.
+
+**`reference` uses arithmetic only.** Tidy's `direct-libm` ban allows `libm` only in
+`kernels::math`, clippy bans `f64::sqrt`, `log2` and `powf`, and `reference` must not depend on
+`kernels`. So the few irrational values the checks need are derived constants in
+`thresholds.rs`, each with its derivation in the doc comment and a test that needs only
+multiplication:
+
+- ‖u₀″‖₁ = 64√3/9 ≈ 12.316805742712015 (u₀″ = 32 (6x² − 6x + 1) changes sign at ½ ± √3/6, so
+  ‖u₀″‖₁ = 4 |u₀′(½ − √3/6)|), tested by (9c/64)² = 3 to within a few ε;
+- 2^(p_formal − δ) for each formal order in use, in M0 only 2^0.9 ≈ 1.8660659830736148, tested
+  by c¹⁰ = 2⁹ to within a few ε.
+
+The known-order scheme needs no power function either: at the k-th resolution (k = 0, 1, 2 for
+N = 32, 64, 128) it adds c q^k g, a product of k factors q, with q = ½ for order 1 and q = 0.6
+for order log₂(5/3) ≈ 0.74, which is below 1 − δ.
 
 New in M0:
 
@@ -148,8 +163,11 @@ New in M0:
 - **Wave-speed bound:** the scheme's `max_signal_speed` is at least |a|, which `reference`
   computes from the problem it set up, not from the scheme's system. This replaces the old
   invariant test `wave_speed_bounds_the_maximum_eigenvalue`.
-- **Periodic boundaries:** a pulse that straddles x = 0, advanced by exactly one period
-  (t = 1/|a|), must come back within the moved-correctly ratio of its initial data. Every
+- **Periodic boundaries:** the pulse on [−0.075, 0.075), which straddles x = 0 (it covers
+  [0.925, 1) and [0, 0.075)), advanced by t = 0.3 and compared with its exact periodic shift by
+  the moved-correctly ratio. The numerics verifier measured upwind at 0.36, 0.25 and 0.19 of
+  the initial distance for N = 32, 64, 128, and the zero-gradient wrong-wrap scheme at 0.94,
+  0.89 and 0.85, so the ratio ½ separates them. Every
   unwritten ghost cell is NaN in checked builds (`m0-block`), so a scheme that reads one fails
   "finite first". Together these replace the old invariant test
   `ghost_cells_are_written_before_they_are_read`.
@@ -170,7 +188,7 @@ New in M0:
   | underestimated speed (reports \|a\|/2) | wave-speed bound | |
   | half speed, reversed | moved correctly | |
   | twice the diffusion | error ceiling | |
-  | known order p: exact + c Δx^p g | order, for p below 1 − δ | order, for p = 1 |
+  | known order: exact + c q^k g | order, for q = 0.6 | order, for q = ½ |
   | shift (upwind at ν = 1, exact on whole cells) | | mirror symmetry, rotation, determinism, conservation, maximum principle |
   | exact | | every check except the two exemptions |
 
@@ -241,7 +259,7 @@ Create the crate structure, so that later tasks own disjoint files.
   - `base::rows`;
   - `kernels::{system, advection, riemann, reconstruct, coordinates, integrator}`;
   - `solver::{config, output, build_info, diagnostics, problem, time_loop, cli, restart}`;
-  - `reference::{thresholds, contract, checks, advection}`.
+  - `reference::{thresholds, contract, checks, combinations, advection}`.
 - Dependencies: `kernels` → `base`, `libm`; `mesh` → `base`; `solver` → `base`, `kernels`,
   `mesh`; `solver` dev-dependencies → `reference`, `alloc-guard`; `reference` → `base` only (it
   needs no `libm`: see "How the references plug in").
@@ -279,7 +297,9 @@ ADR-0007's `thresholds.toml`).
   - the Courant number ν = 0.45 of the reference runs;
   - the moved-correctly ratio ½ and its absolute L1 ceiling;
   - the step-count round-off factor 4ε;
-  - the maximum-principle round-off margin, derived like C_mass.
+  - the maximum-principle round-off margin, derived like C_mass;
+  - ‖u₀″‖₁ = 64√3/9 and 2^0.9, the derived constants of "How the references plug in", each with
+    its arithmetic-only test.
 - A test that every threshold is finite and positive, and a test that names each constant above
   and checks its value against its derivation, so that an empty file fails.
 - `reference-suite` and `m0-reference-advection` also own this file, in sequence, for any
@@ -290,8 +310,17 @@ Written by a reference session (see "Sessions").
 
 ### reference-suite
 
-`reference::contract` and `reference::checks`: the contract, the declared properties, the
-mapping from properties to checks, and the generic checks:
+`reference::contract`, `reference::checks` and `reference::combinations`: the contract, the
+declared properties, the mapping from properties to checks, the table of combinations, and the
+generic checks.
+
+The **table of combinations** (ADR-0042, point 1) has one row per supported combination: its
+name and its declared properties. M0 has one row: advection, donor cell, LLF, forward Euler,
+Cartesian, periodic; formal order 1, monotone, periodic boundaries. A lookup of a combination
+with no row fails with an `ERROR` line, so the implementer names the combination and
+`reference` decides what it claims.
+
+The generic checks:
 
 - finite first;
 - conservation;
@@ -301,13 +330,13 @@ mapping from properties to checks, and the generic checks:
 - rotation across axes;
 - the maximum principle;
 - the wave-speed bound;
-- one check per declared boundary type. For periodic boundaries: a pulse straddling x = 0,
-  advanced by one whole period, returns within the moved-correctly ratio of its initial data.
+- the mapping from each declared boundary type to its check. The periodic check itself compares
+  with an exact solution, so it is in `m0-reference-advection`.
 
 Prove the suite with the bad schemes of "How the references plug in", written inside
 `reference`'s tests, each failing the check it targets, and with the shift scheme as the positive
-control (one whole period needs no exact solution beyond the initial data). Each check prints one
-`ERROR` line on failure (ADR-0007). Written by a reference session.
+control. Each check prints one `ERROR` line on failure (ADR-0007). Written by a reference
+session.
 
 ### m0-reference-advection
 
@@ -316,13 +345,17 @@ profile u₀(x) = 16 x² (1 − x)² and the square pulse, shifted by a t, perio
 advection checks:
 
 - moved correctly;
-- observed order with its error ceiling 1.5 × t D ‖u₀″‖₁;
+- observed order, as the error ratio against 2^(p_formal − δ), with its error ceiling
+  1.5 × t D ‖u₀″‖₁;
+- periodic boundaries: the pulse on [−0.075, 0.075) advanced by t = 0.3, against its exact
+  periodic shift, by the moved-correctly ratio;
 - `check_advection(properties)`, which runs everything the properties imply.
 
-No transcendental function is needed, so `reference` uses neither `libm` nor `kernels::math`. The
-self-tests: half speed, reversed direction and double diffusion fail; the known-order scheme
-passes the order check at p = 1 and fails it below 1 − δ; the exact scheme passes every check
-except its two exemptions. Written by a reference session.
+`reference` uses arithmetic and the derived constants of `thresholds.rs` only, with neither
+`libm` nor `kernels::math` (see "How the references plug in"). The self-tests: half speed,
+reversed direction and double diffusion fail; the wrong-wrap scheme fails the periodic check;
+the known-order scheme passes the order check with q = ½ and fails it with q = 0.6; the exact
+scheme passes every check except its two exemptions. Written by a reference session.
 
 ### m0-rows
 
@@ -427,6 +460,10 @@ are allocated at init, and writing a step does not allocate.
   - `step`, which runs the integrator table over the phases of ADR-0038: ghost fill, fluxes per
     active direction, update, then the per-block backstop;
   - the CFL time step, with the last step shortened to end exactly.
+- The per-block backstop is the only check on the state that stays on in release builds
+  (ADR-0004), so it has its own test: a block with one non-finite cell makes the step fail with
+  a message that names the block. The test also runs in the `release-checked` profile, which
+  `just check-full` uses.
 
 ### m0-cli
 
@@ -446,8 +483,9 @@ checkpoint and restarts gives the same bits as one that does not stop.
 
 `crates/solver/tests/advection_reference.rs`: an adapter from the solver to `reference::Scheme`,
 and one line per combination. M0 has one combination: advection, donor cell, LLF, forward Euler,
-Cartesian, periodic. Its declared properties are formal order 1, monotone, and periodic
-boundaries.
+Cartesian, periodic. Each line names its combination and looks up that combination's row in
+`reference::combinations`, which declares its properties (formal order 1, monotone, periodic
+boundaries for M0); this file declares none. A combination with no row fails the test.
 
 ### m0-style-guide
 
