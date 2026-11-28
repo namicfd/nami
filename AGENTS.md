@@ -57,6 +57,28 @@ Claude Code hooks (`.claude/settings.json`) give you feedback as you work (ADR-0
 | `docs/exec-plans/` | Plans and `tasks.json` task lists (ADR-0011). |
 | `docs/research/` | Background research. |
 
+## Be pragmatic
+
+The aim is a project where the maintainer approves only the critical PRs and agents do the rest.
+This section covers how you plan and what you ask the human. It does not relax the
+non-negotiables or the rules in "When a check fails": those hold in full.
+
+- **Take the simplest path to the goal.** Do not build machinery, checklists or experiments for
+  problems that have not happened. When one does happen, fix it then.
+- **A short, known gap in a safeguard is acceptable during a migration** when its fix is already
+  filed as an issue or task and comes soon. Name that issue or task in the PR, and do not build a
+  workaround to close the gap meanwhile. This is about the order in which safeguards are built
+  or switched on. It never lets you silence a check that fires.
+- **Keep the maintainer's work small.** Their approval is for PRs that could loosen a safeguard:
+  the protected paths. A few extra easy approvals for a short while are fine if they make a
+  change simpler, as long as they do not become permanent.
+- **Decide the order of work yourself.** Do not ask the maintainer about sequencing: choose, and
+  report what you did.
+- **Ask the maintainer only what only they can answer:** an approval, a setting only they can
+  change, or a real policy call.
+- **Lead with the outcome when you report.** Say what happened and what the human must do, in
+  plain words, with an example if it helps. Leave the mechanism to the PR.
+
 ## Non-negotiables
 
 Each rule is checked mechanically or in review; the tags in `docs/TIGER_STYLE.md` say which. The
