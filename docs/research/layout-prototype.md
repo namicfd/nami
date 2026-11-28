@@ -9,8 +9,9 @@ reproduce the campaigns). That branch is not merged.
 ## Result in short
 
 - **Structure of arrays with row stencils is confirmed.** It is the fastest layout in every
-  configuration except A, where the hybrid escapes libm's legacy-SSE `sqrtsd` penalty by accident
-  (finding 2), and the only one whose kernels LLVM vectorises in all three sweep directions.
+  configuration except A and D, the two with libm's `arch` sqrt, where the hybrid escapes the
+  SSE/AVX transition penalty by accident (finding 2). It is the only layout whose kernels LLVM
+  vectorises in all three sweep directions.
   Once the Riemann loop can vectorise, SoA runs at 14.1 Mzc/s at 64³ and 12.3 Mzc/s at 128³: 1.9×
   Athena++'s fastest build (which uses `-ffast-math`), with nami's determinism rules intact. AoS and
   the hybrid reach 1.1× to 1.2×.
@@ -377,10 +378,11 @@ is small (12.3 against 14.1 Mzc/s).
 
 1. **Adopt the hypothesis of § 4(a):** structure of arrays `[var][k][j][i]`, kernels on row
    stencils, per-face physics over named-field state structs called in a loop over i. It is
-   fastest at both sizes in every configuration except A, where the hybrid's 6 Mzc/s against
-   SoA's 0.7 comes from escaping the SSE/AVX transition penalty by accident (finding 2), not from
-   its layout; in the `f25084c` build, which differs only in inlining, SoA under A reaches
-   6.65 Mzc/s ("Side finding"). It is the only layout whose hot loops all
+   fastest at both sizes in every configuration except A and D, the two with libm's `arch` sqrt.
+   There the hybrid's 6 Mzc/s against SoA's 0.7 to 0.9 comes from escaping the SSE/AVX
+   transition penalty by accident (finding 2), not from its layout. In the `f25084c` build,
+   which differs only in inlining, SoA under A reaches 6.65 Mzc/s ("Side finding"); D was not
+   measured in that build. It is the only layout whose hot loops all
    vectorise without help, and it needs no transposition or repacking. Raw indexing stays
    banned: the whole prototype is written with `chunks_exact`, `array_windows`, zipped rows and
    typed row accessors, and loses nothing for it. Do not pursue AoS or AoSoA.
