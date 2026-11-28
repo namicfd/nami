@@ -64,12 +64,25 @@ pub struct OpenThread {
     pub line: Option<u32>,
     /// Its first comment's text: the finding.
     pub body: String,
-    /// The later comments, with their authors' logins: the author's answers, for example why
-    /// the finding is wrong.
-    pub replies: Vec<(String, String)>,
+    /// The later comments: the author's answers, for example why the finding is wrong. Anyone
+    /// can reply on a public repository, so the commands keep only trusted authors' replies
+    /// before the model sees them.
+    pub replies: Vec<Reply>,
+    /// True when the thread has more comments than were read ([`COMMENTS_MAX`]).
+    pub more_replies: bool,
     /// True when someone other than the reviewer resolved it: the reviewer opens it again,
     /// or resolves it itself if the head fixes it.
     pub resolved_by_other: bool,
+}
+
+/// A reply on a review thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    /// Its author's login, with `[bot]` for an app, so that an app and a user whose login
+    /// looks the same are never confused.
+    pub author: String,
+    /// Its text.
+    pub body: String,
 }
 
 /// What the review commands read from GitHub. Every error says what failed.
@@ -130,10 +143,18 @@ const COMMENTS_MAX: u32 = 30;
 
 /// The open threads query: the first [`THREADS_MAX`] threads, each with who resolved it and
 /// its first [`COMMENTS_MAX`] comments.
-const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(\
-     owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){pageInfo{\
-     hasNextPage}nodes{id isResolved resolvedBy{__typename login} path line comments(first:30)\
-     {nodes{author{__typename login} body}}}}}}}";
+fn threads_query() -> String {
+    let comments = format!(
+        "comments(first:{COMMENTS_MAX}){{pageInfo{{hasNextPage}}nodes{{author{{__typename \
+         login}} body}}}}"
+    );
+    let thread = format!("id isResolved resolvedBy{{__typename login}} path line {comments}");
+    format!(
+        "query($owner:String!,$name:String!,$number:Int!){{repository(owner:$owner,name:$name)\
+         {{pullRequest(number:$number){{reviewThreads(first:{THREADS_MAX}){{pageInfo\
+         {{hasNextPage}}nodes{{{thread}}}}}}}}}}}"
+    )
+}
 
 /// Resolves one thread.
 const RESOLVE_MUTATION: &str =
@@ -155,7 +176,7 @@ impl Forge for Gh {
     }
 
     fn open_threads(&self, number: u32, reviewer: &str) -> Result<Vec<OpenThread>, String> {
-        let query = format!("query={THREADS_QUERY}");
+        let query = format!("query={}", threads_query());
         let number = format!("number={number}");
         let arguments =
             ["graphql", "-f", &query, "-F", "owner={owner}", "-F", "name={repo}", "-F", &number];
@@ -299,19 +320,25 @@ fn open_thread(node: &Value, bare: &str, reviewer: &str) -> Result<Option<OpenTh
     if resolved && resolver == Some(reviewer) {
         return Ok(None);
     }
-    if comments.len() >= usize::try_from(COMMENTS_MAX).unwrap_or(usize::MAX) {
-        return Err(format!("a review thread has {COMMENTS_MAX} comments or more"));
-    }
+    let more = node.get("comments").and_then(|listing| listing.get("pageInfo"));
+    let more_replies = more.and_then(|info| info.get("hasNextPage")).and_then(Value::as_bool);
     let replies = later
         .iter()
-        .map(|reply| Ok((author(reply, "login"), optional_string(reply, "body")?)))
+        .map(|reply| {
+            let login = author(reply, "login");
+            let is_app = author(reply, "__typename") == "Bot";
+            let name = if is_app { format!("{login}[bot]") } else { login };
+            Ok(Reply { author: name, body: optional_string(reply, "body")? })
+        })
         .collect::<Result<Vec<_>, String>>()?;
+    assert!(replies.len() < comments.len(), "the finding itself is no reply");
     Ok(Some(OpenThread {
         id: string_at(node, &["id"])?,
         path: string_at(node, &["path"])?,
         line: node.get("line").and_then(line_of),
         body: optional_string(first, "body")?,
         replies,
+        more_replies: more_replies != Some(false),
         resolved_by_other: resolved,
     }))
 }
@@ -356,7 +383,7 @@ pub fn review_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_from_json, pull_from_json, review_request, threads_from_json};
+    use super::{Reply, file_from_json, pull_from_json, review_request, threads_from_json};
     use crate::json::parse;
 
     // Goal: a pull request is read with its author's kind, its draft state and both
@@ -400,8 +427,9 @@ mod tests {
             };
             format!(
                 r#"{{"id": "{id}", "isResolved": {resolved}, "resolvedBy": {by}, "path": "a.rs",
-                "line": 3, "comments": {{"nodes": [{{"author": {{"__typename": "{kind}",
-                "login": "{login}"}}, "body": "**Blocking** x"}}, {{"author": {{"__typename":
+                "line": 3, "comments": {{"pageInfo": {{"hasNextPage": false}}, "nodes": [{{
+                "author": {{"__typename": "{kind}", "login": "{login}"}},
+                "body": "**Blocking** x"}}, {{"author": {{"__typename":
                 "Bot", "login": "nami-agent"}}, "body": "Not a bug: see a.rs:9"}}]}}}}"#
             )
         };
@@ -425,8 +453,14 @@ mod tests {
             open.iter().map(|found| (found.id.as_str(), found.resolved_by_other)).collect();
         assert_eq!(ids, [("T1", false), ("T5", true)]);
         assert_eq!(open[0].line, Some(3));
-        let reply = ("nami-agent".to_owned(), "Not a bug: see a.rs:9".to_owned());
+        let reply = Reply {
+            author: "nami-agent[bot]".to_owned(),
+            body: "Not a bug: see a.rs:9".to_owned(),
+        };
         assert_eq!(open[1].replies, [reply]);
+        assert!(!open[1].more_replies, "every comment was read");
+        assert!(super::threads_query().contains("reviewThreads(first:100)"));
+        assert!(super::threads_query().contains("comments(first:30)"));
         assert!(threads_from_json(&answer(true, &nodes), "nami-reviewer[bot]").is_err());
         assert!(threads_from_json(&answer(false, &nodes), "nami-reviewer").is_err());
     }

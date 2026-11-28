@@ -257,7 +257,7 @@ fn context(
     let agents = agents_json(root)?;
     let written = [
         ("pr.md", describe(number, &pull, &files)),
-        ("threads.md", describe_threads(&threads)),
+        ("threads.md", describe_threads(&threads, &trust(root)?)),
         ("agents.json", agents),
         ("schema.json", findings::SCHEMA.to_owned()),
         ("prompt.md", prompt),
@@ -301,8 +301,11 @@ fn describe(number: u32, pull: &PullFacts, files: &[ChangedFile]) -> String {
     text
 }
 
-/// The reviewer's open threads, for the lead to mark as fixed or not.
-fn describe_threads(threads: &[OpenThread]) -> String {
+/// The reviewer's open threads, for the lead to mark as fixed or not, with the replies of
+/// trusted authors only: `nami-agent[bot]` and the code owners. Anyone can reply on a public
+/// repository, and a stranger's reply must not steer a run that approves (#98's review; the
+/// same rule as `cargo xtask issue show`).
+fn describe_threads(threads: &[OpenThread], trust: &Trust) -> String {
     if threads.is_empty() {
         return "The reviewer app has no open threads on this pull request.\n".to_owned();
     }
@@ -318,8 +321,18 @@ fn describe_threads(threads: &[OpenThread]) -> String {
             "\n## Thread `{}`, `{}`, {line}{resolved}\n\n{}\n",
             thread.id, thread.path, thread.body
         ));
-        for (author, reply) in &thread.replies {
-            parts.push(format!("\n### Reply by `{author}`, the pull request's text\n\n{reply}\n"));
+        let trusted: Vec<_> =
+            thread.replies.iter().filter(|reply| trust.is_trusted(&reply.author)).collect();
+        for reply in &trusted {
+            parts.push(format!(
+                "\n### Reply by `{}`, the pull request's author\n\n{}\n",
+                reply.author, reply.body
+            ));
+        }
+        let left_out = thread.replies.len() - trusted.len();
+        if left_out > 0 || thread.more_replies {
+            let more = if thread.more_replies { ", and later comments were not read" } else { "" };
+            parts.push(format!("\n({left_out} replies by other accounts were left out{more}.)\n"));
         }
     }
     let text = parts.concat();
@@ -401,9 +414,15 @@ fn post(
     let url = poster.review(number, &request)?;
     assert!(!url.is_empty(), "GitHub names the review it posted");
     // A push between the first read and the review leaves a review of an older commit, which
-    // dismiss-stale and the newer head's run take care of; say so rather than stay silent.
-    let moved = forge.pull(number)?.head_sha != head;
-    let note = if moved { "; the head moved on meanwhile, and its own run reviews it" } else { "" };
+    // dismiss-stale and the newer head's run take care of; say so rather than stay silent. The
+    // review is posted by now, so a failed read is reported, not an error of the job.
+    let note = match forge.pull(number) {
+        Ok(now) if now.head_sha != head => {
+            "; the head moved on meanwhile, and its own run reviews it".to_owned()
+        }
+        Ok(_) => String::new(),
+        Err(error) => format!("; the head could not be read again: {error}"),
+    };
     Ok(format!("{} on #{number} at {head}: {url}{note}\n", decision.event))
 }
 
