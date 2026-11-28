@@ -219,7 +219,8 @@ The authoritative list is `.github/CODEOWNERS`.
     nothing blocks, otherwise a thread per blocking finding. Every PR needs that approval or a
     code owner's to merge, because `main`'s ruleset asks for an approval of the last push.
     - Fix each finding and push, or reply on the thread with why it is wrong. Each push
-      dismisses the approval and is reviewed again. That run reads the replies, and resolves
+      dismisses the approval and is reviewed again. That run reads the replies by
+      `nami-agent[bot]` and the code owners (nobody else's), and resolves
       the threads that the new head fixes or that a reply shows to be wrong. A reply alone
       starts no run: push, or re-run the latest `review` run. Never resolve the reviewer's
       threads yourself; it opens them again.
