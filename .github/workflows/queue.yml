@@ -53,8 +53,8 @@ jobs:
   # PR has really left the queue, file an issue of kind `bug` for it, as nami-ci[bot], so that
   # `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on its
   # own branch (ADR-0021, point 6). Agents trust nami-ci[bot] for exactly this issue title
-  # (ADR-0023). A failed merge-queue run of `ci` or of `guardrails`, which holds the `ratchet`
-  # check (ADR-0022, required once the flip lands), is filed. One issue per failed merge group:
+  # (ADR-0023). A failed merge-queue run of `ci` or of `guardrails`, which holds the required
+  # `ratchet` check (ADR-0022), is filed. One issue per failed merge group:
   # the title names the run, so a re-run of it finds its open issue and files nothing. When
   # both workflows fail for one merge group, the run handled second reads the run of the
   # first one's open issue, sees the same queue branch and commit, and files nothing. If both
