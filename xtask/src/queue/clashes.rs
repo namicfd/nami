@@ -180,6 +180,7 @@ pub fn destinations(
     taken: &BTreeSet<AdrId>,
 ) -> BTreeMap<AdrId, String> {
     let mut handed = taken.clone();
+    let mut chosen: Vec<AdrId> = Vec::new();
     let mut found = BTreeMap::new();
     for clash in clashes.iter().filter(|clash| clash.moves(pull)) {
         if found.contains_key(&clash.id) {
@@ -188,13 +189,18 @@ pub fn destinations(
         let text = match free_after(clash.id, &handed) {
             Some(free) => {
                 let _ = handed.insert(free);
+                chosen.push(free);
                 format!("ADR-{free}, the next free minute")
             }
             None => "a new ID from `cargo xtask adr new <slug>`".to_owned(),
         };
         let _ = found.insert(clash.id, text);
     }
-    assert!(handed.len() <= taken.len() + found.len(), "one minute at most for each ADR");
+    let distinct: BTreeSet<&AdrId> = chosen.iter().collect();
+    assert!(
+        distinct.len() == chosen.len() && chosen.iter().all(|free| !taken.contains(free)),
+        "every destination is a free minute, and no two ADRs share one"
+    );
     found
 }
 
@@ -203,7 +209,9 @@ pub fn destinations(
 pub fn render(pull: u32, clashes: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> String {
     assert!(!clashes.is_empty(), "a comment without clashes is `resolved`");
     let moves = destinations(pull, clashes, taken);
-    let to = |clash: &Clash| moves.get(&clash.id).cloned().unwrap_or_default();
+    let to = |clash: &Clash| {
+        moves.get(&clash.id).cloned().expect("every clash that moves has a destination")
+    };
     let lines: Vec<String> = clashes
         .iter()
         .map(|clash| match clash.holder {

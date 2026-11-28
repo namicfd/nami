@@ -2,7 +2,7 @@
 //! an ADR written before IDs were minutes, `0000` to `0043`.
 //!
 //! Every parser of ADR IDs reads them here: tidy's ADR rules, the index, the references check
-//! and the merge queue's clash check.
+//! and the `adr clashes` check on each pull request.
 
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -81,9 +81,7 @@ impl Stamp {
         let of_day = seconds % SECONDS_PER_DAY;
         let hour = u32::try_from(of_day / 3600).expect("an hour of the day fits in u32");
         let minute = u32::try_from(of_day % 3600 / 60).expect("a minute fits in u32");
-        let stamp = Self::new(year, month, day, hour, minute);
-        assert!(stamp.is_none_or(|stamp| stamp.year == year), "the stamp keeps the year");
-        stamp
+        Self::new(year, month, day, hour, minute)
     }
 
     /// The minute after this one.

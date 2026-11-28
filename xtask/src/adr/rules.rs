@@ -19,14 +19,12 @@ const AGENT_DIRECTORY: &str = ".claude";
 /// Claude Code's worktrees, inside [`AGENT_DIRECTORY`].
 const WORKTREES: &str = "worktrees";
 
-/// The extensions of the files whose references are checked: sources, documents, configuration
-/// and the expected output of the lint UI tests. A scratch file such as the `pr.diff` that CI
-/// writes for cargo-mutants quotes old text, and is not the repository's.
-const REFERENCE_EXTENSIONS: [&str; 9] =
-    ["json", "md", "rs", "sh", "stderr", "toml", "txt", "yaml", "yml"];
+/// The extensions of scratch files that quote old text, such as the `pr.diff` that CI writes
+/// for cargo-mutants. They are not the repository's, so their references are not checked.
+const SCRATCH_EXTENSIONS: [&str; 4] = ["diff", "orig", "patch", "rej"];
 
-/// Files without one of those extensions whose references are checked.
-const REFERENCE_NAMES: [&str; 2] = ["CODEOWNERS", "justfile"];
+/// The directories that cargo-mutants writes its output and logs to, which quote old text too.
+const SCRATCH_DIRECTORIES: [&str; 2] = ["mutants.out", "mutants.out.old"];
 
 /// The rule `adr-id`: every file in [`ADR_DIRECTORY`] but the index is named
 /// `YYYYMMDD-HHMM-<slug>.md`, after a valid UTC minute, or carries one of the legacy numbers.
@@ -59,12 +57,6 @@ pub fn check_file_names(root: &Path) -> io::Result<Vec<Violation>> {
         );
         violations.push(Violation::new(&path, 0, "adr-id", message));
     }
-    assert!(
-        violations
-            .iter()
-            .all(|violation| violation.path.parent() == Some(Path::new(ADR_DIRECTORY))),
-        "only files directly in the ADR directory are judged"
-    );
     Ok(violations)
 }
 
@@ -118,11 +110,6 @@ pub fn references_in(relative: &Path, text: &str, ids: &BTreeSet<AdrId>) -> Vec<
             violations.push(Violation::new(relative, number, "adr-reference", message));
         }
     }
-    let lines = u32::try_from(text.lines().count()).expect("a file has < 2^32 lines");
-    assert!(
-        violations.iter().all(|violation| (1..=lines).contains(&violation.line)),
-        "every violation is on a line of the file"
-    );
     violations
 }
 
@@ -151,12 +138,14 @@ fn reference_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// True for a file whose kind holds references: [`REFERENCE_EXTENSIONS`] or
-/// [`REFERENCE_NAMES`].
+/// True for a file of the repository, as opposed to a scratch file: its extension is none of
+/// [`SCRATCH_EXTENSIONS`], and it lies in none of [`SCRATCH_DIRECTORIES`].
 fn is_reference_source(file: &Path) -> bool {
-    let name = file.file_name().map_or_default(|name| name.to_string_lossy());
     let extension = file.extension().map_or_default(|extension| extension.to_string_lossy());
-    REFERENCE_EXTENSIONS.contains(&extension.as_ref()) || REFERENCE_NAMES.contains(&name.as_ref())
+    let in_scratch = file
+        .components()
+        .any(|part| SCRATCH_DIRECTORIES.contains(&part.as_os_str().to_string_lossy().as_ref()));
+    !SCRATCH_EXTENSIONS.contains(&extension.as_ref()) && !in_scratch
 }
 
 #[cfg(test)]
@@ -220,12 +209,12 @@ mod tests {
         let scratch = Scratch::new("adr-references");
         let missing = format!("See ADR-{}.\n", "0044");
         let checked = ["AGENTS.md", "docs/plan.md", "docs/design/x.md", ".claude/agents/r.md"];
-        let more = [".claude/settings.json", "xtask/src/a.rs", "justfile", "lints/ui/a.stderr"];
+        let more = [".claude/settings.json", "xtask/src/a.rs", "justfile", "tools/a.py", "notes"];
         for file in checked.iter().chain(&more) {
             scratch.write(file, &missing);
         }
         let skipped = ["xtask/fixtures/tidy/a.fixture", "target/a.md", ".claude/worktrees/w/a.md"];
-        for file in skipped.iter().chain(&["pr.diff", "notes"]) {
+        for file in skipped.iter().chain(&["pr.diff", "a.patch", "mutants.out/log/a.md"]) {
             scratch.write(file, &missing);
         }
         std::fs::write(scratch.root().join("docs/binary.md"), [0xff, 0xfe]).unwrap();

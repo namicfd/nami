@@ -68,7 +68,9 @@ pub fn run(arguments: &[&str]) -> ExitCode {
 )]
 fn now() -> Result<Stamp, String> {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    let seconds = since.map_or(0, |since| since.as_secs());
+    let seconds = since
+        .map_err(|_| "the clock is before 1970, which no ADR ID names; set the clock".to_owned())?
+        .as_secs();
     Stamp::from_unix_seconds(seconds).ok_or_else(|| {
         format!("the clock says {seconds} s after 1970, which no ADR ID names; set the clock")
     })

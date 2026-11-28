@@ -183,7 +183,9 @@ fn summary(pull: u32, found: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> Strin
                 clashes::Holder::Main => "is already on main".to_owned(),
                 clashes::Holder::Pull(other) => format!("is also added by #{other}"),
             };
-            if let Some(destination) = moves.get(&clash.id).filter(|_| clash.moves(pull)) {
+            if clash.moves(pull) {
+                let destination = moves.get(&clash.id);
+                let destination = destination.expect("every clash that moves has a destination");
                 format!("error: ADR-{} {place}; move this PR's ADR to {destination}", clash.id)
             } else {
                 format!("note: ADR-{} {place}, which is newer and moves its ADR", clash.id)

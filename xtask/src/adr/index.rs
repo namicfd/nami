@@ -55,10 +55,6 @@ pub fn entries(root: &Path) -> io::Result<Vec<Entry>> {
         }
     }
     entries.sort_by(|a, b| (a.id, &a.file).cmp(&(b.id, &b.file)));
-    assert!(
-        entries.iter().all(|entry| AdrId::of_file_name(&entry.file) == Some(entry.id)),
-        "each entry has the ID of its file name"
-    );
     Ok(entries)
 }
 
@@ -139,7 +135,6 @@ pub fn references(text: &str) -> Vec<Reference> {
 #[must_use]
 pub fn render(entries: &[Entry]) -> String {
     let mut lines = header();
-    let table_start = lines.len();
     lines.push(row(&["ADR", "Title", "Status", "Amended by", "Summary"]));
     lines.push(row(&["---"; 5]));
     for entry in entries {
@@ -158,7 +153,6 @@ pub fn render(entries: &[Entry]) -> String {
         let summary = entry.summary.as_deref().unwrap_or_default();
         lines.push(row(&[&link, &entry.title, &entry.status, &amenders.join(", "), summary]));
     }
-    assert_eq!(lines.len(), table_start + 2 + entries.len(), "one row for each ADR");
     lines.push(String::new());
     lines.push(
         "Research behind these decisions: [the report]\
@@ -244,10 +238,6 @@ pub fn check_summaries(entries: &[Entry]) -> Vec<Violation> {
         );
         violations.push(Violation::new(&path, 0, "adr-summary", message));
     }
-    assert!(
-        violations.iter().all(|violation| violation.path.starts_with(ADR_DIRECTORY)),
-        "every violation is on an ADR"
-    );
     violations
 }
 
