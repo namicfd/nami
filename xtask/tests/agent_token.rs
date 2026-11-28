@@ -1,6 +1,7 @@
 //! `agent-token.sh` signs a well-formed GitHub App JWT for the agents' app (ADR-0008) and the
-//! CI app (ADR-0023), refuses an unnarrowed token and a bare JWT in CI and for the CI app, and
-//! never acts as the agents' app in CI.
+//! CI apps, `nami-ci` and `nami-reviewer` (ADR-0023), refuses an unnarrowed token and a bare JWT
+//! in CI and for the CI apps, never acts as the agents' app in CI, and never signs with another
+//! app's key.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -203,12 +204,28 @@ fn an_empty_permission_object_is_an_error() {
     }
 }
 
-/// The CI app's settings, with a key path that the commands under test never read.
-fn ci_app() -> Vec<(&'static str, &'static OsStr)> {
+/// A CI app (ADR-0023): its `NAMI_AGENT_APP` value, and the variables that name its key file
+/// and its client ID.
+#[derive(Debug, Clone, Copy)]
+struct CiApp {
+    name: &'static str,
+    key: &'static str,
+    client: &'static str,
+}
+
+/// The CI apps: `nami-ci`, and the CI-hosted reviewer `nami-reviewer` (#59). Each test of a CI
+/// app runs for both.
+const CI_APPS: [CiApp; 2] = [
+    CiApp { name: "ci", key: "NAMI_CI_KEY", client: "NAMI_CI_CLIENT_ID" },
+    CiApp { name: "reviewer", key: "NAMI_REVIEWER_KEY", client: "NAMI_REVIEWER_CLIENT_ID" },
+];
+
+/// `app`'s settings, with a key path that the commands under test never read.
+fn ci_app(app: CiApp) -> Vec<(&'static str, &'static OsStr)> {
     vec![
-        ("NAMI_AGENT_APP", OsStr::new("ci")),
-        ("NAMI_CI_KEY", OsStr::new("/the/key/is/not/read")),
-        ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci")),
+        ("NAMI_AGENT_APP", OsStr::new(app.name)),
+        (app.key, OsStr::new("/the/key/is/not/read")),
+        (app.client, OsStr::new("Iv-ci")),
     ]
 }
 
@@ -234,14 +251,20 @@ fn the_agents_app_never_acts_in_ci() {
     }
 }
 
-// Goal: a token request without permissions, or with `{}`, is refused for the CI app, in CI
+// Goal: a token request without permissions, or with `{}`, is refused for each CI app, in CI
 // and outside it (ADR-0023, rule 2). A narrowed request is printed.
 #[test]
-fn the_ci_app_must_narrow_the_token() {
+fn the_ci_apps_must_narrow_the_token() {
+    for app in CI_APPS {
+        a_ci_app_must_narrow_the_token(app);
+    }
+}
+
+fn a_ci_app_must_narrow_the_token(app: CiApp) {
     let narrowed = "{\"repositories\":[\"name\"],\"permissions\":{\"issues\":\"write\"}}\n";
     let repository = ("NAMI_AGENT_REPO", OsStr::new("owner/name"));
     for marker in [None, Some("CI"), Some("GITHUB_ACTIONS")] {
-        let mut base = ci_app();
+        let mut base = ci_app(app);
         base.push(repository);
         base.extend(marker.map(|marker| (marker, OsStr::new("true"))));
         for (permissions, expected) in [
@@ -253,46 +276,66 @@ fn the_ci_app_must_narrow_the_token() {
             environment
                 .extend(permissions.map(|value| ("NAMI_AGENT_PERMISSIONS", OsStr::new(value))));
             let (ok, body, error) = run_script(&["request"], &environment);
-            assert!(!ok && body.is_empty(), "{marker:?}, {permissions:?}: refused: {body}");
-            assert!(error.contains(expected), "{marker:?}, {permissions:?}: {error}");
+            assert!(
+                !ok && body.is_empty(),
+                "{app:?}, {marker:?}, {permissions:?}: refused: {body}"
+            );
+            assert!(error.contains(expected), "{app:?}, {marker:?}, {permissions:?}: {error}");
         }
         let mut environment = base;
         environment.push(("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#)));
         let (ok, body, error) = run_script(&["request"], &environment);
-        assert!(ok && error.is_empty(), "{marker:?}: a narrowed token is asked for: {error}");
-        assert_eq!(body, narrowed, "{marker:?}");
+        assert!(
+            ok && error.is_empty(),
+            "{app:?}, {marker:?}: a narrowed token is asked for: {error}"
+        );
+        assert_eq!(body, narrowed, "{app:?}, {marker:?}");
     }
 }
 
-// Goal: `jwt` is refused in CI and for the CI app, because a JWT mints tokens with every
+// Goal: `jwt` is refused in CI and for each CI app, because a JWT mints tokens with every
 // permission of the app (ADR-0023, rule 2). Nothing is printed and no key is read.
 #[test]
-fn jwt_is_refused_in_ci_and_for_the_ci_app() {
-    for marker in [None, Some("CI"), Some("GITHUB_ACTIONS")] {
-        let mut environment = ci_app();
-        environment.extend(marker.map(|marker| (marker, OsStr::new("true"))));
-        let (ok, body, error) = run_script(&["jwt"], &environment);
-        assert!(!ok && body.is_empty(), "{marker:?}: refused: {body}");
-        assert!(error.contains("'jwt' is refused in CI and for the CI app"), "{error}");
+fn jwt_is_refused_in_ci_and_for_the_ci_apps() {
+    for app in CI_APPS {
+        for marker in [None, Some("CI"), Some("GITHUB_ACTIONS")] {
+            let mut environment = ci_app(app);
+            environment.extend(marker.map(|marker| (marker, OsStr::new("true"))));
+            let (ok, body, error) = run_script(&["jwt"], &environment);
+            assert!(!ok && body.is_empty(), "{app:?}, {marker:?}: refused: {body}");
+            assert!(error.contains("'jwt' is refused in CI and for the CI apps"), "{error}");
+        }
     }
 }
 
-// Goal: `NAMI_AGENT_APP=ci` mints its token with a JWT signed by the CI app's key, with the CI
-// app's client ID as issuer, while the agents' key and client ID are valid too, and asks for
-// the narrowed permissions only. Method: curl is replaced by a fake that records the bearer
-// and the requests; the bearer is decoded and verified independently with openssl.
+// Goal: each CI app mints its token with a JWT signed by its own key, with its own client ID
+// as issuer, while the agents' key and client ID, and the other CI app's, are valid too, and
+// asks for the narrowed permissions only (ADR-0023: a role never borrows another app's key).
+// Method: curl is replaced by a fake that records the bearer and the requests; the bearer is
+// decoded and verified independently with openssl.
 #[test]
-fn the_ci_app_signs_with_its_own_key() {
+fn each_ci_app_signs_with_its_own_key() {
+    let [ci, reviewer] = CI_APPS;
+    for (app, other) in [(ci, reviewer), (reviewer, ci)] {
+        a_ci_app_signs_with_its_own_key(app, other);
+    }
+}
+
+fn a_ci_app_signs_with_its_own_key(app: CiApp, other: CiApp) {
     let directory = scratch("ci-token");
     let key = directory.join("key.pem");
     let agent_key = directory.join("agent.pem");
+    let other_key = directory.join("other.pem");
     generate_key(&key);
     generate_key(&agent_key);
+    generate_key(&other_key);
     let path = fake_github(&directory);
     let environment = [
-        ("NAMI_AGENT_APP", OsStr::new("ci")),
-        ("NAMI_CI_KEY", key.as_os_str()),
-        ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci")),
+        ("NAMI_AGENT_APP", OsStr::new(app.name)),
+        (app.key, key.as_os_str()),
+        (app.client, OsStr::new("Iv-this")),
+        (other.key, other_key.as_os_str()),
+        (other.client, OsStr::new("Iv-other")),
         ("NAMI_AGENT_KEY", agent_key.as_os_str()),
         ("NAMI_AGENT_CLIENT_ID", OsStr::new("Iv-agent")),
         ("NAMI_AGENT_REPO", OsStr::new("owner/name")),
@@ -302,58 +345,74 @@ fn the_ci_app_signs_with_its_own_key() {
         ("PATH", path.as_os_str()),
     ];
     let (ok, token, error) = run_script(&["token"], &environment);
-    assert!(ok && error.is_empty(), "a narrowed token is minted: {error}");
-    assert_eq!(token, "ghs_fake\n");
+    assert!(ok && error.is_empty(), "{app:?}: a narrowed token is minted: {error}");
+    assert_eq!(token, "ghs_fake\n", "{app:?}");
     let bearers = std::fs::read_to_string(directory.join("bearers")).expect("bearers recorded");
     let bearers: Vec<&str> = bearers.lines().collect();
-    assert_eq!(bearers.len(), 2, "one JWT for each call: {bearers:?}");
-    assert_eq!(bearers[0], bearers[1], "the same JWT for both calls");
-    let lines = verified(&directory, bearers[0]);
-    assert!(lines[1].ends_with(r#""iss":"Iv-ci"}"#), "the CI app's client ID: {}", lines[1]);
-    assert_eq!(lines[2], "Verified OK", "signed with the CI app's key");
+    let [first, second] = bearers.as_slice() else {
+        panic!("{app:?}: one JWT for each call: {bearers:?}")
+    };
+    assert_eq!(first, second, "{app:?}: the same JWT for both calls");
+    let lines = verified(&directory, first);
+    let [_, payload, verdict] = lines.as_slice() else { panic!("{app:?}: {lines:?}") };
+    assert!(payload.ends_with(r#""iss":"Iv-this"}"#), "{app:?}: its client ID: {payload}");
+    assert_eq!(verdict, "Verified OK", "{app:?}: signed with its own key");
     let requests = std::fs::read_to_string(directory.join("requests")).expect("requests");
     let expected = "https://api.github.com/repos/owner/name/installation \n\
                     https://api.github.com/app/installations/7/access_tokens \
                     {\"repositories\":[\"name\"],\"permissions\":{\"issues\":\"write\"}}\n";
-    assert_eq!(requests, expected);
+    assert_eq!(requests, expected, "{app:?}");
     std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
 }
 
-// Goal: `NAMI_AGENT_APP=ci` refuses `env` and `git-credential`, and fails without its own key
-// or client ID even when the agents' key and client ID are valid: it never falls back to
-// them. An unknown app fails.
+// Goal: each CI app refuses `env` and `git-credential`, and fails without its own key or
+// client ID even when the agents' key and client ID, and the other CI app's, are valid: it
+// never falls back to them. An unknown app fails.
 #[test]
-fn the_ci_app_never_falls_back_to_the_agents_key() {
+fn no_ci_app_falls_back_to_another_app_s_key() {
+    let [ci, reviewer] = CI_APPS;
+    for (app, other) in [(ci, reviewer), (reviewer, ci)] {
+        a_ci_app_never_falls_back(app, other);
+    }
+    let (ok, body, error) = run_script(&["token"], &[("NAMI_AGENT_APP", OsStr::new("other"))]);
+    assert!(!ok && body.is_empty(), "an unknown app is refused: {body}");
+    assert!(error.contains("unknown app 'other'"), "{error}");
+}
+
+fn a_ci_app_never_falls_back(app: CiApp, other: CiApp) {
     let directory = scratch("ci-fallback");
-    let agent_key = directory.join("agent.pem");
-    generate_key(&agent_key);
-    let nowhere = directory.join("no-ci-key.pem");
-    let app = ("NAMI_AGENT_APP", OsStr::new("ci"));
-    let ci_key = ("NAMI_CI_KEY", agent_key.as_os_str());
-    let ci_client = ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci"));
-    let agent = ("NAMI_AGENT_KEY", agent_key.as_os_str());
+    let valid_key = directory.join("valid.pem");
+    generate_key(&valid_key);
+    let nowhere = directory.join("no-key.pem");
+    let selected = ("NAMI_AGENT_APP", OsStr::new(app.name));
+    let own_key = (app.key, valid_key.as_os_str());
+    let own_client = (app.client, OsStr::new("Iv-this"));
+    let agent = ("NAMI_AGENT_KEY", valid_key.as_os_str());
     let agent_client = ("NAMI_AGENT_CLIENT_ID", OsStr::new("Iv-agent"));
+    let other_key = (other.key, valid_key.as_os_str());
+    let other_client = (other.client, OsStr::new("Iv-other"));
     let narrowed = ("NAMI_AGENT_PERMISSIONS", OsStr::new(r#"{"issues":"write"}"#));
     for command in [&["env"][..], &["git-credential", "get"]] {
-        let (exported, out, refusal) = run_script(command, &[app, ci_key, ci_client, narrowed]);
+        let environment = [selected, own_key, own_client, narrowed];
+        let (exported, out, refusal) = run_script(command, &environment);
         let refused = !exported && out.is_empty() && refusal.contains("for the agents' app only");
-        assert!(refused, "{command:?}: {refusal}");
+        assert!(refused, "{app:?}, {command:?}: {refusal}");
     }
-    let empty_key = ("NAMI_CI_KEY", OsStr::new(""));
-    let missing_key = ("NAMI_CI_KEY", nowhere.as_os_str());
-    let cases: [(Vec<(&str, &OsStr)>, &str); 5] = [
-        (vec![app, ci_client, agent, agent_client, narrowed], "NAMI_CI_KEY is not set"),
-        (vec![app, empty_key, ci_client, agent, agent_client, narrowed], "NAMI_CI_KEY is not set"),
-        (vec![app, ci_key, agent, agent_client, narrowed], "NAMI_CI_CLIENT_ID is not set"),
-        (
-            vec![app, missing_key, ci_client, agent, agent_client, narrowed],
-            "cannot read the ci app's private key",
-        ),
-        (vec![("NAMI_AGENT_APP", OsStr::new("other"))], "unknown app 'other'"),
+    let others = [agent, agent_client, other_key, other_client, narrowed];
+    let unset_key = format!("{} is not set", app.key);
+    let unset_client = format!("{} is not set", app.client);
+    let unreadable = format!("cannot read the {} app's private key", app.name);
+    let cases: [(Vec<(&str, &OsStr)>, &str); 4] = [
+        (vec![selected, own_client], &unset_key),
+        (vec![selected, (app.key, OsStr::new("")), own_client], &unset_key),
+        (vec![selected, own_key], &unset_client),
+        (vec![selected, (app.key, nowhere.as_os_str()), own_client], &unreadable),
     ];
-    for (environment, expected) in cases {
+    for (mut environment, expected) in cases {
+        environment.extend_from_slice(&others);
         let (ok, body, error) = run_script(&["token"], &environment);
-        assert!(!ok && body.is_empty() && error.contains(expected), "{expected}: {error}");
+        assert!(!ok && body.is_empty(), "{app:?}, {expected}: refused: {body}");
+        assert!(error.contains(expected), "{app:?}, {expected}: {error}");
     }
     std::fs::remove_dir_all(&directory).expect("temporary directory is removable");
 }
@@ -379,14 +438,18 @@ fn git_credential_and_env_never_skip_a_refusal() {
         ("NAMI_AGENT_KEY", key.as_os_str()),
         ("NAMI_CI_KEY", key.as_os_str()),
         ("NAMI_CI_CLIENT_ID", OsStr::new("Iv-ci")),
+        ("NAMI_REVIEWER_KEY", key.as_os_str()),
+        ("NAMI_REVIEWER_CLIENT_ID", OsStr::new("Iv-reviewer")),
     ];
-    let ci = ("NAMI_AGENT_APP", OsStr::new("ci"));
+    let ci_apps = CI_APPS.map(|app| ("NAMI_AGENT_APP", OsStr::new(app.name)));
     let in_actions = ("GITHUB_ACTIONS", OsStr::new("true"));
     let in_ci = ("CI", OsStr::new("true"));
     let unnarrowed = [None, Some(""), Some("{}")];
     for permissions in unnarrowed {
-        assert_refused(&directory, &common, &[ci], permissions);
-        assert_refused(&directory, &common, &[ci, in_actions], permissions);
+        for ci in ci_apps {
+            assert_refused(&directory, &common, &[ci], permissions);
+            assert_refused(&directory, &common, &[ci, in_actions], permissions);
+        }
         assert_refused(&directory, &common, &[in_ci], permissions);
     }
     for permissions in [Some("{}"), Some("issues=write")] {
