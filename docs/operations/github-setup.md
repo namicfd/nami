@@ -114,6 +114,15 @@ Agents act as `nami-agent[bot]`, never as the maintainer. GitHub does not let an
 
 6. **Install App** → the organisation → **Only select repositories** → this repository.
 7. Give the app **no** bypass in the ruleset, and do **not** make it a code owner.
+8. **Check it.** The installation's permissions must match the table above, and nothing more. On a machine with the key:
+
+   ```sh
+   jwt=$(xtask/agent-token.sh jwt)
+   curl -sf -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+     https://api.github.com/app/installations | jq -c '.[] | {account: .account.login, permissions}'
+   ```
+
+   On 2026-11-28 it printed `actions: write`, `checks: read`, `contents: write`, `issues: write`, `metadata: read`, `pull_requests: write` and `workflows: write`, for `namicfd`. A permission raised later takes effect only once the installation accepts it (organisation settings → GitHub Apps → the app → review the request).
 
 ### Point the script at the app
 

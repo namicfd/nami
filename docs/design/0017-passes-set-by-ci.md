@@ -56,7 +56,7 @@ Known gaps, with no mechanism yet:
 
 - **Vacuous tests.** A test that asserts nothing passes, so a task whose acceptance test is vacuous passes too. Review of the plan, and mutation testing of the PR that adds the test, are the only defence.
 - **Default nextest filters.** A `default-filter` in `.config/nextest.toml` would combine with the filter above. A test that `nextest list` reports but the default filter leaves out would then be named and not run. If all of a task's tests are filtered out, `--no-tests=fail` fails it. If only some are, the task passes on the rest. The repository sets no default filter today.
-- **Checks that never report.** A required check with no check run on the tip counts as pending, so it never makes a push. That covers a CI run that GitHub never started, and a required check that is reported as a commit status instead of a check run. Both required checks are Actions jobs today. A human reruns CI on the PR, or closes it so that the next run opens it again.
+- **Checks that never report.** A required check with no check run on the tip counts as pending, so it never makes a push. That covers a CI run that GitHub never started, and a required check that is reported as a commit status instead of a check run. Both required checks are Actions jobs today. A human or an agent reruns CI on the PR (`nami-agent` holds Actions write, ADR-0023), or closes it so that the next run opens it again.
 - **Healing waits for the next run.** A failed check is pushed again by the next `passes` run, which starts on the next push to `main`. Until something merges, the PR stays red.
 
 ## Consequences
