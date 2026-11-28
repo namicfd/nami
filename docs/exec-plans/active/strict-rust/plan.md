@@ -11,7 +11,11 @@ session. The decisions and their reasons are in ADR-0033 (Proposed). The plan do
 - adds the CI checks that test what the ADRs claim: rustdoc, a bare-metal build, Miri and a wider
   determinism matrix.
 
-Every task touches protected paths, so every PR waits for the code owner (ADR-0008, ADR-0015).
+**Who approves.** Since ADR-0022, a PR that changes only rule paths and only adds to them merges
+on the `ratchet` check's proof, without the code owner. The tidy and dylint tasks are written to
+fit that class; the rest touch the trusted core and wait for the owner (ADR-0008, ADR-0015). The
+table's last column says which. A task that turns out to be an edit says so in its PR and asks for
+the owner's review, as the playbook says.
 
 ## Rules for every task
 
@@ -20,8 +24,18 @@ Every task touches protected paths, so every PR waits for the code owner (ADR-00
 - **A new clippy lint or ban gets a planted violation** in the harness of guardrails task
   `clippy-fixtures`, and the task's acceptance test names it.
 - **A new tidy rule** follows `docs/playbooks/add-a-guardrail.md`: a row in the registry, two
-  fixtures, `docs/RULES.md` regenerated.
-- **A `[review]` tag that a task mechanises** is retagged in `docs/TIGER_STYLE.md` in the same PR.
+  fixtures (or a case in `broken_workspace()` for a workspace rule), `docs/RULES.md`
+  regenerated.
+- **A source rule is written additively** in the existing module that parses its input
+  (`rust_source.rs`, `tokens.rs`, `text.rs`, `docs.rs`): new functions beside the old code, one
+  dispatch call, no new constant and no `use` added to an existing file (ADR-0022, point 2). It
+  is not tagged in `docs/TIGER_STYLE.md`, which is core: `retag-style-guide` tags them all in one
+  owner-reviewed PR, unless #77 has moved the tags out of the style guide by then.
+- **The lint tasks touch the core anyway** (`Cargo.toml`, `clippy.toml`), so they retag the style
+  guide in the same PR.
+- **A CI task's acceptance test reads the workflow** it changes, in `xtask/tests/workflows.rs`,
+  which the first such task creates. CI sets `passes` only from tests that exist and run, so a
+  job name is never an acceptance name.
 - **A rule is stricter than the style guide's current wording only where ADR-0033 says so.**
   Anything else that a task finds it needs goes through a new ADR.
 
@@ -31,60 +45,55 @@ The tasks form one chain, inserted into the guardrails chain between `doc-exampl
 `usize-alias`. The last task, `determinism-matrix`, hangs off the end of the guardrails chain.
 
 - **Why a chain.** Nearly every task edits `Cargo.toml`, `clippy.toml`,
-  `xtask/src/tidy/registry.rs` or `docs/TIGER_STYLE.md`, and the lint tasks edit most of
-  `xtask/src`. Unfinished tasks that may run at the same time own disjoint paths (ADR-0011).
+  `xtask/src/tidy/registry.rs`, `docs/RULES.md` or `docs/TIGER_STYLE.md`, and the lint tasks edit
+  most of `xtask/src`. Unfinished tasks that may run at the same time own disjoint paths
+  (ADR-0011).
 - **Why after `doc-example-sync`.** The lint tasks need its two harnesses: planted violations for
   clippy (`clippy-fixtures`), and style-guide examples that are compiled under the lints, so that
   an example cannot drift from a new lint (`doc-example-sync`).
 - **Why before `usize-alias`.** The lints are cheap while `crates/` is small. Every line that the
   first equation-system plan writes before them is a line that a lint task has to fix. The two
   dylint gaps and the glossary cost the same whenever they land.
-- **To run tasks side by side,** the planner can take the shared files out of `owner_paths` and
-  accept small rebases on them. That is the maintainer's decision; see the guardrails plan.
+- **This plan goes before the M0 plan (#49)** (maintainer, 2026-11-28). So M0's `m0-scaffold`
+  depends on `escape-hatch-bans`, the last task that switches on lints or bans. The tidy rules
+  after it fix whatever M0 has written by the time each lands. The validator reports the
+  overlapping `owner_paths` until #49 adds that dependency.
 
-**Coordination outside the task graph:**
-
-- **Start the lint tasks after #55 and #57 merge.** The two PRs together rewrite 33 files of
-  `xtask/src`, and a tree-wide rename would conflict with all of them.
-- **This plan goes before the M0 plan (#49)** (maintainer, 2026-11-28). M0 writes most of
-  `crates/`, and every line it writes first is a line that a lint task has to fix. So M0's
-  `m0-scaffold` depends on `escape-hatch-bans`, the last task that switches on lints or bans.
-  The tidy rules after it fix whatever M0 has written by the time each lands. The validator
-  will report the overlapping `owner_paths` until #49 adds that dependency.
-
-| # | Task | Mechanism |
-|---|---|---|
-| 1 | `rustfmt-nightly` | rustfmt, hook |
-| 2 | `lints-zero-cost` | lint table |
-| 3 | `crate-header` | tidy rule |
-| 4 | `lints-shadowing` | lint table |
-| 5 | `lints-visibility` | lint table |
-| 6 | `lints-paths` | lint table |
-| 7 | `lints-docs` | lint table |
-| 8 | `lints-signatures` | lint table, `clippy.toml` |
-| 9 | `lints-integer-division` | lint table, `base` helpers |
-| 10 | `lints-ident-length` | `clippy.toml` |
-| 11 | `tidy-naming` | tidy rules |
-| 12 | `float-minmax-ban` | `clippy.toml`, `kernels::math` |
-| 13 | `escape-hatch-bans` | `clippy.toml`, tidy ban tables |
-| 14 | `kernel-shape` | tidy rule |
-| 15 | `assertion-shape` | tidy rule |
-| 16 | `cross-ref` | tidy rule |
-| 17 | `repo-hygiene` | tidy rules |
-| 18 | `orphan-modules` | tidy rule |
-| 19 | `literal-and-cfg-forms` | tidy rules |
-| 20 | `comment-and-file-forms` | tidy rules |
-| 21 | `review-tag-ratchet` | tidy rule |
-| 22 | `test-integrity` | xtask command, CI |
-| 23 | `way-out-messages` | hook, tidy output |
-| 24 | `expect-cites-record` | tidy rule |
-| 25 | `mutants-required` | CI |
-| 26 | `same-type-params` | dylint lint |
-| 27 | `test-cheat-lints` | dylint lints |
-| 28 | `rustdoc-gate` | CI, crate headers |
-| 29 | `bare-metal-build` | CI |
-| 30 | `miri` | CI |
-| 31 | `determinism-matrix` | CI (after `determinism-hash`) |
+| # | Task | Mechanism | Approval |
+|---|---|---|---|
+| 1 | `rustfmt-nightly` | rustfmt, hook | owner |
+| 2 | `lints-zero-cost` | lint table | owner |
+| 3 | `crate-header` | tidy rule | owner (its headers touch `crates/reference`) |
+| 4 | `lints-shadowing` | lint table | owner |
+| 5 | `lints-visibility` | lint table | owner |
+| 6 | `lints-paths` | lint table | owner |
+| 7 | `lints-docs` | lint table | owner |
+| 8 | `lints-signatures` | lint table, `clippy.toml` | owner |
+| 9 | `lints-integer-division` | lint table, `base` helpers | owner |
+| 10 | `lints-ident-length` | `clippy.toml` | owner |
+| 11 | `float-minmax-ban` | `clippy.toml`, `kernels::math` | owner |
+| 12 | `escape-hatch-bans` | `clippy.toml`, tidy ban tables | owner |
+| 13 | `tidy-naming` | tidy rules | ratchet |
+| 14 | `kernel-shape` | tidy rule | ratchet |
+| 15 | `assertion-shape` | tidy rule | ratchet |
+| 16 | `literal-and-cfg-forms` | tidy rules | ratchet |
+| 17 | `comment-and-file-forms` | tidy rules | ratchet |
+| 18 | `markdown-title` | tidy rule | ratchet |
+| 19 | `cross-ref` | tidy rule | owner (needs the tree as context) |
+| 20 | `repo-hygiene` | workspace rules | owner |
+| 21 | `orphan-modules` | workspace rule | owner |
+| 22 | `expect-cites-record` | workspace rule | owner |
+| 23 | `same-type-params` | dylint lint | ratchet |
+| 24 | `test-cheat-lints` | dylint lints | ratchet |
+| 25 | `retag-style-guide` | style guide | owner |
+| 26 | `review-tag-ratchet` | tidy rule | ratchet |
+| 27 | `test-integrity` | xtask command, CI | owner |
+| 28 | `way-out-messages` | hook, tidy output | owner |
+| 29 | `mutants-required` | CI | owner |
+| 30 | `rustdoc-gate` | CI, crate headers | owner |
+| 31 | `bare-metal-build` | CI | owner |
+| 32 | `miri` | CI | owner |
+| 33 | `determinism-matrix` | CI (after `determinism-hash`) | owner |
 
 ## Tasks
 
@@ -137,11 +146,12 @@ order, after the crate doc comment:
 
 The nami-only lints are `#![warn(clippy::print_stdout, clippy::print_stderr,
 clippy::std_instead_of_core, clippy::std_instead_of_alloc)]`. `extern crate alloc` anywhere in
-`base` or `kernels` is a finding. The headers live in one table in the rule, which
-`rustdoc-gate` later extends. Fix the 4 `std_instead_of_core` firings in `alloc-guard`.
+`base` or `kernels` is a finding. Write the headers inside the rule's function, not as a new
+constant, so that the rule stays additive; `rustdoc-gate` later extends them. Fix the 4
+`std_instead_of_core` firings in `alloc-guard`.
 
-The rule retags `TIGER_STYLE.md`'s `no_std` rule, which today rests on `[compiler]` alone,
-although nothing stops an agent deleting the attribute.
+`TIGER_STYLE.md`'s `no_std` rule rests on `[compiler]` alone today, although nothing stops an
+agent deleting the attribute. `retag-style-guide` adds this rule's tag.
 
 ### lints-shadowing
 
@@ -210,7 +220,7 @@ Two tidy rules for `TIGER_STYLE.md`, Naming:
   `BufWriter`-style names that `disallowed-names` cannot.
 
 Also check that a closure or `Fn` parameter is the last in its function's parameter list
-(`callbacks-last`). Retag the three rules.
+(`callbacks-last`). `retag-style-guide` tags the three rules.
 
 ### float-minmax-ban
 
@@ -272,15 +282,21 @@ citations, and this codebase cites constantly.
 
 ### repo-hygiene
 
-Tidy rules ported from TigerBeetle's `tidy.zig`:
+Workspace rules ported from TigerBeetle's `tidy.zig`. They read file modes, sizes and the whole
+file list, so they live in tidy's core (`workspace.rs`) and wait for the owner:
 
 - `file-kind`: every tracked file has an extension on an allow-list, or a name on a list
   (`justfile`, `LICENSE`, `CODEOWNERS`);
 - `executable`: only files on a list have the executable bit;
 - `text-bytes`: no tab, no carriage return and no trailing whitespace in a text file, and a
   final newline;
-- `file-size`: no tracked file over 256 KiB, unless listed;
-- `markdown-title`: a Markdown file has exactly one H1, on its first line.
+- `file-size`: no tracked file over 256 KiB, unless listed.
+
+### markdown-title
+
+Tidy rule `markdown-title`, in `docs.rs`: a Markdown file has exactly one H1, on its first line.
+Fixtures that are Markdown carry their `<!-- path: .. -->` line first, so the rule reads the H1
+after it.
 
 ### orphan-modules
 
@@ -311,11 +327,21 @@ Two tidy rules:
 - `file-length`: a Rust source file is at most 1,000 lines, tests included. A longer file is
   split into modules.
 
+### retag-style-guide
+
+One PR to the core: tag in `docs/TIGER_STYLE.md` every rule that the ratchet-merged tasks above
+now check (`crate-header`, `tidy-naming`, `kernel-shape`, `assertion-shape`,
+`literal-and-cfg-forms`, `comment-and-file-forms`, `markdown-title`, `same-type-params`,
+`test-cheat-lints`), replacing `[review]` where the check covers the whole rule. Add a style-guide
+test that names each of these rules and requires its tag. If #77 has moved the tags into the
+registry by then, tag the rows there instead, and the PR may merge on the ratchet.
+
 ### review-tag-ratchet
 
 Tidy rule `review-ratchet`: the number of `[review]` tags in `docs/TIGER_STYLE.md` is at most the
-number recorded in the registry. A PR that mechanises a rule lowers the number; a PR that adds a
-review-only rule has to raise it, in a protected file, where the code owner sees it.
+number written in the rule's function, after `retag-style-guide` has lowered it. A PR that
+mechanises a rule lowers the number. A PR that adds a review-only rule has to raise it, which is
+an edit of the rule, so the code owner sees it.
 
 ### test-integrity
 
@@ -332,6 +358,10 @@ A test is identified by its crate, module path and name, so a renamed test count
 `changes-tests` label lifts the check only if a code owner added it; reuse the trust rule of
 `xtask/src/issue/trust.rs`. CI runs it on every PR as a required check, and the failure message
 lists each finding and says how to ask for the label.
+
+This task creates `xtask/tests/workflows.rs`: tests that read `.github/workflows/` and check that
+a job runs a command, so that CI tasks have acceptance tests that CI can run. Its first test
+checks that the CI gate runs `cargo xtask test-integrity`.
 
 ### way-out-messages
 
@@ -362,7 +392,7 @@ Dylint lint `nami_same_type_params`: a function in a nami crate with two adjacen
 the same primitive type (`f64`, `u32`, `bool`) or the same newtype is reported
 (`TIGER_STYLE.md`, Naming, "make arguments impossible to mix up"). A symmetric function such as
 `minmod(a, b)` opts out with `#[expect(nami_same_type_params, reason = "symmetric: ...")]`.
-Retag the rule.
+Declare it at `Deny`, so that the PR is additive. `retag-style-guide` tags the rule.
 
 ### test-cheat-lints
 

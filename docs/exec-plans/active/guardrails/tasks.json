@@ -219,14 +219,15 @@
         "xtask/src/main.rs",
         ".github/workflows/ci.yml",
         ".github/workflows/post-merge.yml",
+        "xtask/tests/workflows.rs",
         "xtask/src/tidy/registry.rs",
         "docs/TIGER_STYLE.md",
         "docs/RULES.md"
       ],
       "acceptance": [
         "xtask::determinism::tests::same_seed_rerun_gives_the_same_hash",
-        "ci::gate::determinism_rerun",
-        "post-merge::macos::determinism_cross_platform"
+        "xtask::workflows::ci_gate_reruns_the_determinism_hash",
+        "xtask::workflows::post_merge_compares_the_macos_hash"
       ],
       "passes": false
     }
