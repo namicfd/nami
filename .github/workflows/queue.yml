@@ -54,11 +54,13 @@ jobs:
   # `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on its
   # own branch (ADR-0021, point 6). Agents trust nami-ci[bot] for exactly this issue title
   # (ADR-0023). A failed merge-queue run of `ci` or of `guardrails`, which holds the `ratchet`
-  # check (ADR-0022, required once the flip lands), is filed. One issue per failed run: the
-  # title names the run, so a re-run of it finds its open issue and files nothing. When both
-  # workflows fail for one merge group, each run gets its own issue, and the later one names
-  # the earlier among the PR's open failures if it is filed by then. No concurrency group: two
-  # runs file two different issues, and a group could cancel a pending job and lose a failure.
+  # check (ADR-0022, required once the flip lands), is filed. One issue per failed merge group:
+  # the title names the run, so a re-run of it finds its open issue and files nothing. When
+  # both workflows fail for one merge group, the run handled second reads the run of the
+  # first one's open issue, sees the same queue branch and commit, and files nothing. If both
+  # read the open issues before either files, two issues appear that name neither each other,
+  # and `cargo xtask task` lets one session at a time work them. No concurrency group: a group
+  # could cancel a pending job and lose a failure.
   #
   # The job follows ADR-0023's rules for a job that holds a bot key:
   # - `workflow_run` runs main's version of this file and of xtask, never a PR's, and the

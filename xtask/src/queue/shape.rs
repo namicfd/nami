@@ -21,9 +21,12 @@ use std::collections::BTreeSet;
 /// What the body says before the repository.
 const FOUND_IN: &str = "- Found in: merge-queue run https://github.com/";
 
-/// What the body says before the issues about earlier failures, and after them.
-const EARLIER: (&str, &str) =
-    (" failed in the queue before, and the issues about those failures are still open: ", ". #");
+/// What the body says before the issues about the PR's other failures, and after them.
+const EARLIER: (&str, &str) = (
+    " also failed in the queue in another merge group, and the issues about those failures are \
+     still open: ",
+    ". #",
+);
 
 /// What the body says before the other PRs of the merge group, and after them.
 const GROUP: (&str, &str) = (" The same merge group also held ", ", so the failure");
@@ -53,6 +56,14 @@ pub fn is_finding(title: &str, body: &str, vocabulary: &Vocabulary, repository: 
             draft.get(..ascii_end(draft)) == body.get(..ascii_end(body))
         })
     })
+}
+
+/// The issues that the queue-failure body `body` names as its PR's failures in other merge
+/// groups; none if it names none, or if the list is not in the form that [`finding`] writes.
+/// `cargo xtask task` lets a session work an issue beside those it names (ADR-0021, point 6).
+#[must_use]
+pub fn other_failures_named(body: &str) -> BTreeSet<u32> {
+    numbers_between(&body.replace("\r\n", "\n"), EARLIER).unwrap_or_default()
 }
 
 /// The failure whose finding `body` would be, read from the body; `None` if a part of it is
@@ -301,6 +312,22 @@ pub(crate) mod tests {
             let upper = here.to_ascii_uppercase();
             assert!(is_finding(&title, &body, &vocabulary(), &upper), "GitHub ignores case");
         }
+    }
+
+    // Goal: the issues that a body names as its PR's failures in other merge groups are read
+    // back as `queue failed` wrote them, also with CRLF line ends; a body that names none, or
+    // whose list is malformed, names none.
+    #[test]
+    fn the_other_failures_a_body_names_are_read_back() {
+        let (_, named) = queue_failure(51, 900, &[60, 61]);
+        let expected: BTreeSet<u32> = [60, 61].into();
+        assert_eq!(super::other_failures_named(&named), expected);
+        assert_eq!(super::other_failures_named(&named.replace('\n', "\r\n")), expected, "CRLF");
+        let (_, alone) = queue_failure(51, 900, &[]);
+        assert!(super::other_failures_named(&alone).is_empty(), "{alone}");
+        let malformed = named.replace("#60, #61", "#60, 61");
+        assert!(super::other_failures_named(&malformed).is_empty(), "{malformed}");
+        assert!(super::other_failures_named("").is_empty(), "no body names nothing");
     }
 
     // Goal: the issue about a failed `guardrails` run, which quotes the `ratchet` jobs and

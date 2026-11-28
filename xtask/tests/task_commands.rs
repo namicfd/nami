@@ -506,6 +506,18 @@ fn ci_failure(
     run: u64,
     repository: &str,
 ) -> Issue {
+    ci_failure_naming(vocabulary, number, run, repository, &[])
+}
+
+/// Like [`ci_failure`], for an issue that names the open issues `earlier` about #45's
+/// failures in other merge groups, as `queue failed` writes it when it sees them.
+fn ci_failure_naming(
+    vocabulary: &xtask::queue::failure::Vocabulary,
+    number: u32,
+    run: u64,
+    repository: &str,
+    earlier: &[u32],
+) -> Issue {
     let report = xtask::queue::failure::Failure {
         pull: 45,
         author: "nami-agent[bot]".to_owned(),
@@ -513,7 +525,7 @@ fn ci_failure(
         repository: repository.to_owned(),
         run,
         jobs: Vec::new(),
-        earlier: std::collections::BTreeSet::new(),
+        earlier: earlier.iter().copied().collect(),
     };
     let finding = xtask::queue::failure::finding(&report, vocabulary);
     let draft = xtask::issue::Draft::parse(&finding).expect("the finding parses");
@@ -651,23 +663,79 @@ fn hostile_ci_bodies_never_panic() {
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
-// Goal: a second failed run of the same PR is new work. Its issue is ready while the PR says
-// `Fixes` only for the first one, and waits too once the PR closes both (ADR-0021, point 6).
+// Goal: a second failed run of the same PR, in another merge group, is new work. Its issue,
+// which names the first as `queue failed` writes it, is ready while the PR says `Fixes` only
+// for the first one and its claim is kept, and waits too once the PR closes both (ADR-0021,
+// point 6).
 #[test]
 fn a_second_queue_failure_is_ready_while_the_first_waits() {
-    let (root, clone) = setup("queue-failures-chained");
-    push_code_owners(&clone);
-    let (first, second) = (queue_failure(3, 900), queue_failure(4, 950));
+    let (root, clone, vocabulary) = ci_setup("queue-failures-chained");
+    let named = ci_failure_naming(&vocabulary, 4, 950, "namicfd/nami", &[3]);
+    let first = queue_failure(3, 900);
+    let second = Issue { author: "nami-agent[bot]".to_owned(), ..named };
     let second_line = format!("a\tTask a\nissue-4\t{}\n", second.title);
     let mut github = Fake { issues: vec![first, second, pull_45("Fixes #3")], ..Fake::default() };
     let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
-    assert_eq!(task(&github, &["ready"]), Ok(second_line), "the second failure is new work");
+    assert_eq!(task(&github, &["ready"]), Ok(second_line.clone()), "new work");
     assert!(task(&github, &["claim", "issue-3"]).expect_err("waits").contains("in flight"));
+    let first_claim = xtask::task::claims::claim(&clone, "origin", &[], "issue-3", "first");
+    first_claim.expect("the first fixer keeps its claim");
+    assert_eq!(task(&github, &["ready"]), Ok(second_line), "the first's claim holds nothing");
     let claimed = task(&github, &["claim", "issue-4"]).expect("the new failure");
     assert!(claimed.contains("add `Fixes #4` to #45's description"), "{claimed}");
+    assert!(!claimed.contains("Open issue"), "#4 names every other issue: {claimed}");
     assert_eq!(task(&github, &["release", "issue-4"]), Ok("released issue-4\n".to_owned()));
     github.issues[2].body = "Fixes #3\nFixes #4".to_owned();
     assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "both wait now");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: when both queue workflows failed for one merge group and each run filed before it saw
+// the other's issue, two issues of one PR name neither each other. One session at a time
+// works them: once one is claimed, `ready` leaves the other out and `claim` refuses it, naming
+// the claimed issue, and `status` shows that; once the PR says `Fixes` for one, the other
+// waits too. The first claim names the other issue, for its `Fixes` line (review of #57,
+// round 18).
+#[test]
+fn two_issues_of_one_merge_group_take_one_session() {
+    let (root, clone, vocabulary) = ci_setup("queue-failures-one-group");
+    let ci = ci_failure(&vocabulary, 3, 900, "namicfd/nami");
+    let guardrails = ci_failure(&vocabulary, 4, 901, "namicfd/nami");
+    let issues = vec![ci, guardrails, pull_45("Summary."), issue(5, "nami-agent[bot]", &["bug"])];
+    let mut github = Fake { issues, ..Fake::default() };
+    let task = |fake: &Fake, arguments: &[&str]| execute(&clone, "origin", fake, arguments);
+    let both = task(&github, &["ready"]).expect("both are work while neither is claimed");
+    assert!(both.contains("issue-3\t") && both.contains("issue-4\t"), "{both}");
+    let claimed = task(&github, &["claim", "issue-3"]).expect("work for one session");
+    let note = "Open issue #4 records a failure of #45 too, which this issue does not name";
+    assert!(claimed.contains(note) && claimed.contains("also add `Fixes #4`"), "{claimed}");
+    let left = "a\tTask a\nissue-5\tIssue 5\n".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok(left.clone()), "#4 waits while #3 is claimed");
+    let refused = task(&github, &["claim", "issue-4"]).expect_err("one session per PR");
+    let reason = "cannot claim `issue-4`: issue #3 is claimed, and it records a failure of #45 \
+                  that issue #4 does not name as another merge group's: one session at a time \
+                  works #45's queue failures";
+    assert!(refused.contains(reason), "{refused}");
+    let other = task(&github, &["claim", "issue-5"]).expect("another PR's work is not held");
+    assert!(other.contains("claimed issue-5"), "{other}");
+    // A claim that raced past the check shows in `status` as held by the other.
+    let raced = xtask::task::claims::claim(&clone, "origin", &[], "issue-4", "racer");
+    raced.expect("a claim made without `task claim`");
+    let status = task(&github, &["status"]).expect("status works");
+    let line = |id: &str| status.lines().find(|line| line.starts_with(id)).unwrap_or("");
+    let held = "; issue #3 is claimed, and it records a failure of #45 that issue #4 does not";
+    assert!(line("issue-4 ").contains(held), "{status}");
+    assert!(line("issue-3 ").contains("; issue #4 is claimed"), "{status}");
+    assert!(line("issue-5 ").starts_with("issue-5 ") && !line("issue-5 ").contains(';'));
+    assert_eq!(task(&github, &["release", "issue-4"]), Ok("released issue-4\n".to_owned()));
+    assert_eq!(task(&github, &["release", "issue-3"]), Ok("released issue-3\n".to_owned()));
+    github.issues[2].body = "Fixes #3".to_owned();
+    assert_eq!(task(&github, &["ready"]), Ok("a\tTask a\n".to_owned()), "#3's fix is in flight");
+    let in_flight = task(&github, &["claim", "issue-4"]).expect_err("#3's fix may fix #4 too");
+    assert!(
+        in_flight.contains("#45 says `Fixes #3`, and it records a failure of #45"),
+        "{in_flight}"
+    );
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

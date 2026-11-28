@@ -8,10 +8,11 @@
 //!   failed, through the path of `cargo xtask issue file`, so that `cargo xtask task ready`
 //!   lists it and the next session rebases or renumbers the PR on its own branch (ADR-0021,
 //!   point 6). It files nothing unless the PR really left the queue: it is open, not merged,
-//!   not queued, and no newer merge-queue run tested it. There is one issue per failed run:
-//!   its title names the run, so a re-run of the run files nothing, while a later failed run
-//!   of the same PR gets its own issue, which names the earlier ones. A PR that the bot did
-//!   not open gets `needs-decision`, because agents do not push to it.
+//!   not queued, and no newer merge-queue run tested it. There is one issue per failed merge
+//!   group: its title names the run, so a re-run of the run files nothing, and a failed run of
+//!   the other queue workflow for the same merge group files nothing either, while a later
+//!   merge group of the same PR gets its own issue, which names the earlier ones. A PR that
+//!   the bot did not open gets `needs-decision`, because agents do not push to it.
 //!
 //! Both act on the checkout's GitHub repository as whoever `GH_TOKEN` names, and read the code
 //! owners from `.github/CODEOWNERS` on `<remote>/main` (`$NAMI_TASK_REMOTE`, or `origin`). The
@@ -207,8 +208,8 @@ fn publish(
 }
 
 /// Files the issue for failed merge-queue run `run`, unless it is not one, the PR is still in
-/// play, or a trusted open issue already records this run's failure. Issues are read from
-/// `issues`, and `filer` only creates the new one.
+/// play, or a trusted open issue already records this run's failure or its merge group's.
+/// Issues are read from `issues`, and `filer` only creates the new one.
 fn file_failure(
     forge: &dyn Forge,
     issues: &dyn GitHub,
@@ -239,24 +240,23 @@ fn file_failure(
     if let Some(reason) = still_in_play(forge, &details, &entry, &state)? {
         return Ok(format!("{reason}; nothing to file\n"));
     }
-    // One issue per failed run: a re-run of this run finds its issue; another run of the same
-    // PR is a new failure, even while the PR says `Fixes` for an earlier one. That holds for a
-    // run of the other queue workflow for the same merge group too: no comment joins the two
-    // (the filing token only creates, ADR-0023), and the later issue names the earlier one
-    // among the open failures if it is filed by then.
+    // One issue per failed merge group: a re-run of this run finds its issue, and so does a run
+    // of the other queue workflow for the same merge group, whose issue this one would only
+    // repeat: no comment joins the two (the filing token only creates, ADR-0023). Another
+    // merge group of the same PR is a new failure, even while the PR says `Fixes` for an
+    // earlier one.
     let title = failure::title(pull, run);
     let open = issues.open_issues()?;
-    let failures_of_pull: Vec<(u64, u32)> = open
-        .iter()
-        .filter(|issue| issue.is_open && trust::refused(issue, trust).is_none())
-        .filter_map(|issue| {
-            let (of, its_run) = failure::entry_of_title(&issue.title)?;
-            (of == pull).then_some((its_run, issue.number))
-        })
-        .collect();
+    let failures_of_pull = failures_of(&open, trust, pull);
     if let Some((_, recorded)) = failures_of_pull.iter().find(|(its_run, _)| *its_run == run) {
         return Ok(format!(
             "#{recorded} already records that run {run} of #{pull} failed; not filed again\n"
+        ));
+    }
+    if let Some(recorded) = same_merge_group(forge, &details, &failures_of_pull)? {
+        return Ok(format!(
+            "#{recorded} already records that #{pull}'s merge group, which run {run} tested, \
+             failed; not filed\n"
         ));
     }
     let vocabulary = vocabulary()?;
@@ -275,6 +275,50 @@ fn file_failure(
     let options = FileOptions { kind: "bug", needs_decision: !by_bot, new: true, path: "-" };
     let number = issue::file_number(&draft, &options, &open, filer, trust)?;
     Ok(format!("filed #{number}: {title}\n"))
+}
+
+/// The open issues in `open` that agents trust and that record a failed merge-queue run of PR
+/// `pull`, as (run, issue) pairs.
+fn failures_of(open: &[issue::github::Issue], trust: &Trust, pull: u32) -> Vec<(u64, u32)> {
+    let failures: Vec<(u64, u32)> = open
+        .iter()
+        .filter(|issue| issue.is_open && trust::refused(issue, trust).is_none())
+        .filter_map(|issue| {
+            let (of, its_run) = failure::entry_of_title(&issue.title)?;
+            (of == pull).then_some((its_run, issue.number))
+        })
+        .collect();
+    assert!(failures.len() <= open.len(), "each open issue records at most one run");
+    failures
+}
+
+/// The issue among `failures` whose run tested the same merge group as run `details`, the
+/// same queue branch and commit, or `None`. When `ci` and `guardrails` both fail for one merge
+/// group, the run handled second finds the first one's issue here. Each run is read with the
+/// forge's token, the workflow's own, never the filing token (ADR-0023, rule 2).
+fn same_merge_group(
+    forge: &dyn Forge,
+    details: &Run,
+    failures: &[(u64, u32)],
+) -> Result<Option<u32>, String> {
+    assert!(
+        failures.iter().all(|(its_run, _)| *its_run != details.id),
+        "the issue of run {} itself was found before",
+        details.id
+    );
+    for (its_run, number) in failures {
+        let recorded = forge.run(*its_run)?;
+        if recorded.id != *its_run {
+            return Err(format!(
+                "GitHub answered with run {} when asked for run {its_run}, which #{number} records",
+                recorded.id
+            ));
+        }
+        if recorded.head_branch == details.head_branch && recorded.head_sha == details.head_sha {
+            return Ok(Some(*number));
+        }
+    }
+    Ok(None)
 }
 
 /// Why PR `entry.pull` has not left the queue for good after run `details`, or `None` if it
@@ -387,6 +431,22 @@ mod tests {
         "created_at": "2026-11-26T08:24:28Z", "path": ".github/workflows/ci.yml",
         "html_url": "https://github.com/o/r/actions/runs/900"}"#;
 
+    /// The tested commit of a merge group of #51 other than [`RUN`]'s, on the same queue
+    /// branch: #51 queued again on the same base after a push.
+    const OTHER_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    /// The `guardrails` workflow, which holds the `ratchet` check.
+    const GUARDRAILS: &str = ".github/workflows/guardrails.yml";
+
+    /// Failed merge-queue run `id` of #51 like [`RUN`], of workflow `workflow_id` at `path`,
+    /// which tested `head_sha` on [`RUN`]'s queue branch.
+    fn run_json(id: u64, workflow_id: u64, path: &str, head_sha: &str) -> String {
+        RUN.replace("\"id\": 900", &format!("\"id\": {id}"))
+            .replace("\"workflow_id\": 42", &format!("\"workflow_id\": {workflow_id}"))
+            .replace(".github/workflows/ci.yml", path)
+            .replace(&format!("\"head_sha\": \"{SHA}\""), &format!("\"head_sha\": \"{head_sha}\""))
+    }
+
     /// `gh api repos/o/r/actions/runs/<id>/jobs`: two failed jobs, one with names that `main`
     /// does not define, one passed and one cancelled.
     const JOBS: &str = r#"{"total_count": 4, "jobs": [
@@ -491,6 +551,10 @@ mod tests {
         files: BTreeMap<u32, String>,
         comments: String,
         run: String,
+        /// Other runs by ID, such as those that open issues record; any other ID gets `run`.
+        runs: BTreeMap<u64, String>,
+        /// The IDs of the runs read, in order.
+        run_reads: RefCell<Vec<u64>>,
         messages: &'static str,
         state: (String, String),
         queue_runs: String,
@@ -549,9 +613,11 @@ mod tests {
             self.edited.borrow_mut().push((id, body.to_owned()));
             Ok(())
         }
-        fn run(&self, _id: u64) -> Result<Run, String> {
+        fn run(&self, id: u64) -> Result<Run, String> {
             self.serve(Serves::WorkflowToken);
-            run_from_json(&parse(&self.run).unwrap())
+            self.run_reads.borrow_mut().push(id);
+            let text = self.runs.get(&id).unwrap_or(&self.run);
+            run_from_json(&parse(text).unwrap())
         }
         fn jobs(&self, _id: u64) -> Result<Vec<Job>, String> {
             self.serve(Serves::WorkflowToken);
@@ -854,45 +920,111 @@ mod tests {
         assert_eq!(error, "GitHub answered with run 901 when asked for run 900");
     }
 
-    // Goal: when `ci` and `guardrails` both fail for one merge group, each run gets its own
-    // issue: the `guardrails` run's issue names the CI app's open issue about the `ci` run
-    // among the earlier failures, and nothing is commented, since the filing token only
-    // creates (ADR-0023, rule 2). Wired as in production, every read goes to the workflow's
-    // token and only the creation to the filing token. A re-run of the `guardrails` run finds
-    // its own issue and files nothing.
+    // Goal: when `ci` and `guardrails` both fail for one merge group, the run handled second
+    // finds the CI app's open issue about the first, whose run tested the same queue branch
+    // and commit, and files nothing, naming that issue: two issues would send two sessions to
+    // one branch (review of #57, round 18). Nothing is commented either, since the filing
+    // token only creates (ADR-0023, rule 2). Wired as in production, the open issues and the
+    // recorded run are read with the workflow's token, and the filing token is never asked.
     #[test]
-    fn both_workflows_of_one_merge_group_file_their_own_issues() {
-        let guardrails = RUN
-            .replace("\"id\": 900", "\"id\": 901")
-            .replace("\"workflow_id\": 42", "\"workflow_id\": 43")
-            .replace(".github/workflows/ci.yml", ".github/workflows/guardrails.yml");
+    fn the_other_workflow_of_a_recorded_merge_group_files_nothing() {
+        let guardrails = run_json(901, 43, GUARDRAILS, SHA);
         let workflow = Fake {
             serves: Serves::WorkflowToken,
-            run: guardrails.clone(),
+            run: guardrails,
+            runs: BTreeMap::from([(900, RUN.to_owned())]),
             issues: issues() + &ci_issue_line(9, 900),
             ..dropped()
         };
         let clients = (workflow, Fake { serves: Serves::Filing, ..Fake::default() });
         let arguments = ["failed", "--run", "901"];
         let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
-        let title = "PR #51 failed in the merge queue (run 901)";
-        assert_eq!(output, Ok(format!("filed #70: {title}\n")));
+        assert_eq!(
+            output.as_deref(),
+            Ok("#9 already records that #51's merge group, which run 901 tested, failed; not \
+                filed\n")
+        );
         let (workflow_client, filing_client) = &clients;
-        assert!(workflow_client.filed.borrow().is_empty(), "the workflow's token files nothing");
+        assert_eq!(*workflow_client.run_reads.borrow(), [901, 900], "the workflow's token reads");
+        assert_eq!(workflow_client.issue_reads.get(), 1, "the issues are read once");
+        assert!(filing_client.run_reads.borrow().is_empty(), "the filing token reads no run");
+        assert_eq!(filing_client.issue_reads.get(), 0, "the filing token reads no issue");
+        assert!(
+            workflow_client.filed.borrow().is_empty() && filing_client.filed.borrow().is_empty(),
+            "nothing is filed"
+        );
         assert!(
             workflow_client.posted.borrow().is_empty() && filing_client.posted.borrow().is_empty(),
             "no comment on the `ci` run's issue"
         );
-        let filed = filing_client.filed.borrow();
-        assert_eq!(filed.len(), 1, "the `guardrails` run gets an issue of its own");
-        let body = &filed[0].1;
-        assert!(body.contains("still open: #9."), "the `ci` run's issue is named: {body}");
-        assert!(body.contains("https://github.com/namicfd/nami/actions/runs/901\n"), "{body}");
-        let recorded = issues() + &ci_issue_line(9, 900) + &ci_issue_line(70, 901);
-        let again = Fake { run: guardrails, issues: recorded, ..dropped() };
+    }
+
+    // Goal: a re-run of a run finds that run's own issue by its title and files nothing, also
+    // when the other workflow's run of the same merge group has an issue too, as when both
+    // runs read the open issues before either filed; the other issue's run is not even read.
+    #[test]
+    fn a_re_run_of_the_same_workflow_finds_its_issue() {
+        let both = issues() + &ci_issue_line(9, 900) + &ci_issue_line(70, 901);
+        let runs = BTreeMap::from([(900, RUN.to_owned())]);
+        let again =
+            Fake { run: run_json(901, 43, GUARDRAILS, SHA), runs, issues: both, ..dropped() };
         let rerun = run(&again, &["failed", "--run", "901"]).unwrap();
         assert_eq!(rerun, "#70 already records that run 901 of #51 failed; not filed again\n");
+        assert_eq!(*again.run_reads.borrow(), [901], "the title is enough");
         assert!(again.filed.borrow().is_empty() && again.posted.borrow().is_empty());
+        let ci = Fake { issues: issues() + &ci_issue_line(9, 900), ..dropped() };
+        let ci_rerun = run(&ci, &["failed", "--run", "900"]).unwrap();
+        assert_eq!(ci_rerun, "#9 already records that run 900 of #51 failed; not filed again\n");
+        assert!(ci.filed.borrow().is_empty(), "the `ci` run's re-run files nothing");
+    }
+
+    // Goal: a failure of a later merge group of the same PR, whose run tested another commit
+    // on the same queue branch, is new, whichever workflow failed before: it gets its own
+    // issue, which names the open issues about the other merge groups. Wired as in
+    // production, every recorded run is read with the workflow's token, and only the creation
+    // goes to the filing token.
+    #[test]
+    fn another_merge_group_of_the_same_pull_request_files_a_new_issue() {
+        let runs = BTreeMap::from([
+            (800, run_json(800, 43, GUARDRAILS, OTHER_SHA)),
+            (850, run_json(850, 42, super::failure::CI_WORKFLOW, OTHER_SHA)),
+        ]);
+        let recorded = ci_issue_line(6, 800) + &ci_issue_line(7, 850);
+        let workflow =
+            Fake { serves: Serves::WorkflowToken, runs, issues: issues() + &recorded, ..dropped() };
+        let clients = (workflow, Fake { serves: Serves::Filing, ..Fake::default() });
+        let arguments = ["failed", "--run", "900"];
+        let output = super::execute_wired(&clients, &trust(), &|| Ok(vocabulary()), &arguments);
+        assert_eq!(
+            output.as_deref(),
+            Ok("filed #70: PR #51 failed in the merge queue (run 900)\n")
+        );
+        let (workflow_client, filing_client) = &clients;
+        let mut reads = workflow_client.run_reads.borrow().clone();
+        reads.sort_unstable();
+        assert_eq!(reads, [800, 850, 900], "the workflow's token reads every recorded run");
+        assert!(filing_client.run_reads.borrow().is_empty(), "the filing token reads no run");
+        let filed = filing_client.filed.borrow();
+        assert_eq!(filed.len(), 1, "a new merge group gets its own issue");
+        assert!(
+            filed[0].1.contains(
+                " #51 also failed in the queue in another merge group, and the issues about \
+                 those failures are still open: #6, #7. #51's description"
+            ),
+            "{}",
+            filed[0].1
+        );
+    }
+
+    // Goal: when GitHub answers about another run than the one an open issue records, nothing
+    // is filed and the error names the issue.
+    #[test]
+    fn a_wrong_answer_about_a_recorded_run_is_an_error() {
+        let runs = BTreeMap::from([(800, run_json(801, 42, GUARDRAILS, OTHER_SHA))]);
+        let fake = Fake { runs, issues: issues() + &ci_issue_line(6, 800), ..dropped() };
+        let error = run(&fake, &["failed", "--run", "900"]).expect_err("another run");
+        assert_eq!(error, "GitHub answered with run 801 when asked for run 800, which #6 records");
+        assert!(fake.filed.borrow().is_empty(), "{error}");
     }
 
     // Goal: a re-run finds the bot's open issue by its title and files nothing; runs that are
@@ -932,8 +1064,11 @@ mod tests {
         let first = issues() + &issue_line(60, first_title, "nami-agent[bot]", "open");
         let runs = queue_run(900, 42, "2026-11-26T08:24:28Z", 51)
             + &queue_run(950, 42, "2026-11-26T08:24:28Z", 51);
+        // The first run tested another merge group: #51 was queued again after a push.
+        let first_run = run_json(900, 42, super::failure::CI_WORKFLOW, OTHER_SHA);
         let second = Fake {
             run: RUN.replace("\"id\": 900", "\"id\": 950"),
+            runs: BTreeMap::from([(900, first_run)]),
             issues: first.clone(),
             queue_runs: runs,
             ..dropped()
@@ -966,8 +1101,10 @@ mod tests {
     #[test]
     fn reads_and_writes_go_to_their_own_clients() {
         let earlier = ci_issue_line(6, 800);
+        let runs =
+            BTreeMap::from([(800, run_json(800, 42, super::failure::CI_WORKFLOW, OTHER_SHA))]);
         let workflow =
-            Fake { serves: Serves::WorkflowToken, issues: issues() + &earlier, ..dropped() };
+            Fake { serves: Serves::WorkflowToken, runs, issues: issues() + &earlier, ..dropped() };
         let recorded =
             issue_line(5, "PR #51 failed in the merge queue (run 900)", BOT_LOGIN, "open");
         let filer = Fake { serves: Serves::Filing, issues: recorded, ..Fake::default() };
@@ -985,6 +1122,8 @@ mod tests {
             "the workflow's token reads the issues once"
         );
         assert_eq!(filing_client.issue_reads.get(), 0, "the filing client reads no issue");
+        assert_eq!(*workflow_client.run_reads.borrow(), [900, 800], "the run and the earlier one");
+        assert!(filing_client.run_reads.borrow().is_empty(), "the filing client reads no run");
         assert!(workflow_client.filed.borrow().is_empty(), "the workflow's token files nothing");
         assert!(
             workflow_client.posted.borrow().is_empty()

@@ -247,13 +247,19 @@ pub fn finding(failure: &Failure, vocabulary: &Vocabulary) -> String {
         title(pull, failure.run)
     )];
     if !failure.earlier.is_empty() {
+        // Only issues about another merge group of the PR get here: `queue failed` files
+        // nothing when an open issue's run tested the same queue branch and commit, as when
+        // `ci` and `guardrails` both fail for one merge group. If both runs read the open
+        // issues before either files, neither names the other, and `cargo xtask task` keeps
+        // their fixers to one session.
         let earlier: Vec<String> =
             failure.earlier.iter().map(|number| format!("#{number}")).collect();
         pieces.push(format!(
-            " #{pull} failed in the queue before, and the issues about those failures are still \
-             open: {}. #{pull}'s description may already say `Fixes` for them. This is a new \
-             failure: keep those lines, add `Fixes #<this issue>` to #{pull}'s description, and \
-             fix the new cause.",
+            " #{pull} also failed in the queue in another merge group, and the issues about \
+             those failures are still open: {}. #{pull}'s description may already say `Fixes` \
+             for them. This run tested a merge group of its own, so its failure is new: keep \
+             those lines, add `Fixes #<this issue>` to #{pull}'s description, and fix what this \
+             run reports.",
             earlier.join(", ")
         ));
     }
@@ -556,17 +562,18 @@ mod tests {
         }
         let alone = finding(&failure(Vec::new()), &vocabulary());
         assert!(!alone.contains("merge group also held"), "{alone}");
-        assert!(!alone.contains("failed in the queue before"), "{alone}");
+        assert!(!alone.contains("also failed in the queue"), "{alone}");
         assert!(alone.contains("No job of the run reports a failure"), "{alone}");
         assert!(Draft::parse(&alone).is_ok(), "{alone}");
         let again = Failure { earlier: [40, 44].into(), ..failure(Vec::new()) };
         let second = finding(&again, &vocabulary());
         assert!(
             second.contains(
-                " #51 failed in the queue before, and the issues about those failures are still \
-                 open: #40, #44. #51's description may already say `Fixes` for them. This is a \
-                 new failure: keep those lines, add `Fixes #<this issue>` to #51's description, \
-                 and fix the new cause."
+                " #51 also failed in the queue in another merge group, and the issues about those \
+                 failures are still open: #40, #44. #51's description may already say `Fixes` \
+                 for them. This run tested a merge group of its own, so its failure is new: keep \
+                 those lines, add `Fixes #<this issue>` to #51's description, and fix what this \
+                 run reports."
             ),
             "{second}"
         );
