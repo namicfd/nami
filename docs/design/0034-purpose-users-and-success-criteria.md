@@ -3,6 +3,7 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Amends, once accepted: ADR-0001 (pinned Athena++ and AthenaK added to its list of tools)
 
 ## Context
 
@@ -47,8 +48,9 @@ directions.
      changed the code, and every defect that escaped and was found later.
 
 8. **Benchmark baselines.** Athena++ and AthenaK are built from pinned commits, outside the
-   workspace and never linked into nami, only to measure the performance criterion. This adds
-   them to ADR-0001's list of tools.
+   workspace and never linked into nami, to measure the performance criterion. ADR-0042 also
+   uses the pinned Athena++ as a second source of reference data. This adds them to ADR-0001's
+   list of tools.
 
 ## Enforcement
 

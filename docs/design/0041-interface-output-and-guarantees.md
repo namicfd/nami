@@ -3,6 +3,8 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Amends, once accepted: ADR-0001 (a numpy-only output reader in `tools/`, a Python tool besides
+  reference generation)
 
 ## Context
 
@@ -32,11 +34,16 @@ has changed.
    version; a hash of `Cargo.lock`; the target and its CPU flags; the type names of the compiled
    combination; and the resolved configuration. A `std`-only build script gathers the build
    fields.
-7. **Restart compares builds.** If a field that affects bits differs, the restart is refused.
+7. **Restart compares builds.** If a field that affects bits differs, the restart is refused:
+   `format_version`, `results_version`, the `rustc` version, the `Cargo.lock` hash or the
+   compiled combination. The commit, the dirty flag and the target are recorded but do not
+   refuse a restart, since point 8 promises the same bits across them.
    `--allow-different-build` overrides this and records it in the output.
-8. **Guarantees:** with the same binary, configuration and toolchain, results are bitwise
-   reproducible across platforms, across decompositions and across restarts. Bits are not
-   guaranteed across `results_version` changes, and each such change is explained (ADR-0005).
+8. **Guarantees:** with the same source, `Cargo.lock`, toolchain and configuration, results are
+   bitwise reproducible across platforms (ADR-0005), across decompositions and across restarts.
+   Bits are not guaranteed across `results_version` changes, and each such change is explained
+   (ADR-0005). A determinism hash covers the data, not the header, whose commit and dirty flag
+   change with every commit.
 9. **No Python bindings.**
 
 ## Enforcement

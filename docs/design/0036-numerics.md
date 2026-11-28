@@ -22,7 +22,8 @@ equation systems and the milestones. This ADR fixes the numerical methods.
    - Gardiner–Stone upwind constrained transport;
    - unsplit source terms, hydrostatic reconstruction for shallow water;
    - explicit diffusion;
-   - a CFL time step from the largest signal speed;
+   - a CFL time step, Δt = C · min over cells and active directions a of Δxₐ / |λₐ|max, with
+     only directions that have more than one cell counted;
    - periodic, outflow, reflecting, user-inflow and polar boundaries.
 
    `docs/ARCHITECTURE.md` § 3.1 lists the methods that come later.

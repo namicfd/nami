@@ -1,7 +1,8 @@
 # nami architecture
 
-> Status: **all seven topics agreed** in a discussion between the maintainer and an agent
-> (2026-11-26). Each section says whether it is agreed, proposed or open. The decisions themselves are
+> Status: **all seven topics discussed** between the maintainer and an agent (2026-11-26), and
+> agreed except where the table says otherwise. Each section says whether it is agreed, proposed
+> or open. The decisions themselves are
 > ADRs in `docs/design/`, status Proposed until the maintainer accepts them. Where this file and an
 > ADR disagree, the ADR wins.
 
@@ -43,7 +44,7 @@ in.
 **nami builds its own infrastructure.** The only runtime dependency is `libm` (ADR-0001), so there
 is no MPI and no HDF5. That is deliberate: nami designs its own communication layer and output
 format and tunes them to its needs. Reaching InfiniBand and similar fabrics takes a C system
-library (libibverbs, libfabric or UCX). A small binding crate, with its `unsafe` confined the way
+library (libibverbs, libfabric or UCX). A small binding crate, with its `unsafe` confined to it as
 `alloc-guard`'s is (ADR-0014), is acceptable for that. § 5 decides its shape in its own ADR.
 
 ### Failure
@@ -79,11 +80,13 @@ The project has failed if:
 
 - **Fast interconnects (§ 5).** With `std` alone, nami reaches other nodes only over TCP, whose
   latency is about ten times higher than RDMA's. The binding crate for InfiniBand amends
-  ADR-0001 (it links a system library) and ADR-0014 (a second place with `unsafe`). § 5 writes
+  ADR-0001 (it links a system library) and ADR-0014 (a second crate with `unsafe`, a second
+  `#[expect]`, and the first `unsafe` in runtime code). § 5 writes
   that ADR, and also decides how the layer works over TCP and shared memory on the workstation.
 - **Determinism costs speed.** ADR-0005 estimates 5–15% per step, and nami pays it against the
-  performance target. In return, nami can offer what Athena++ does not: results that are
-  bitwise the same for any decomposition and thread count, if § 5 and § 6 choose to.
+  performance target. In return, nami can offer results that are bitwise the same for any
+  decomposition and thread count, if § 5 and § 6 choose to. That Athena++ does not offer this is
+  background knowledge to verify before claiming it as a difference.
 - **No allocation after init (ADR-0003) against AMR and moving meshes (§ 4).** Blocks and cells
   must come from fixed-capacity pools, sized at init from a configured memory budget.
 - **Pencils against unstructured grids (§ 4).** ADR-0003's pencils cover structured blocks. A
@@ -130,8 +133,8 @@ fixed guards against both.
 - **Equation systems, in order:** linear advection, Burgers, Euler, shallow water, ideal MHD.
   - Burgers and shallow water are not on the path to MHD. They exist to get the abstractions
     right, because an interface designed from one example is a guess.
-  - The four systems before MHD differ in their number of variables (1, 1, 3, 2), in
-    nonlinearity, and in having source terms.
+  - The four systems before MHD differ in their number of variables (1, 1, 5 and 3 in the 3D
+    data model), in nonlinearity, and in having source terms.
   - Shallow water includes bathymetry and is well-balanced (lake at rest), which tests the
     source-term interface the way a hydrostatic atmosphere will in Euler and MHD. Wet/dry fronts
     are deferred.
@@ -185,13 +188,15 @@ yardstick, not a design to copy (§ 3.3).
 | Constrained transport | Gardiner–Stone upwind CT, with face-centred magnetic field | |
 | Source terms | Added unsplit in every stage; hydrostatic reconstruction for shallow water (Audusse et al. 2004) | |
 | Diffusion | Explicit | RKL2 super-time-stepping (Meyer, Balsara & Aslam 2014) |
-| Time step | CFL number times the largest signal speed, as a global minimum, which gives the same result in any order | Per-level steps (§ 3.3) |
+| Time step | Δt = C · min over cells and active directions a of Δxₐ / \|λₐ\|max, where C is the CFL number and \|λₐ\|max the largest signal speed along a. Only directions with more than one cell count. A minimum gives the same result in any order. | Per-level steps (§ 3.3) |
 | Boundaries | Periodic, outflow, reflecting, user inflow; polar boundaries with M6 | Shearing box |
 
 ### 3.2 Positivity without silent floors
 
-Athena++ keeps density and pressure positive with fixed floors that it applies silently. nami may
-not (TIGER_STYLE.md, Physical admissibility). It uses named scheme components instead:
+As far as we know, Athena++ keeps density and pressure positive with fixed floors that it applies
+silently. That is background knowledge to verify before claiming it as a difference (ADR-0036).
+nami may not apply floors silently (TIGER_STYLE.md, Physical admissibility). It uses named scheme
+components instead:
 
 1. **First-order flux correction**, as in AthenaK. Where a high-order update would make density
    or pressure non-physical, the affected faces fall back to the first-order flux. The update
@@ -229,9 +234,9 @@ Each mechanism counts its activations and reports them per step.
 - Reconstruction works on primitive variables, so converting between conserved and primitive
   variables is part of the equation-system interface. For relativity, that conversion needs a
   root finder with a named iteration limit and an assertion that it converged (TIGER_STYLE.md).
-- VL2 with constrained transport needs fluxes and electric fields on edges. That goes beyond
-  ADR-0003's pencils. It is the CT exception that ADR-0003 already foresees, and it needs its
-  ADR in § 4.
+- VL2 with constrained transport needs fluxes on faces and electric fields on edges. The edge
+  terms go beyond ADR-0003's access forms. It is the CT exception that ADR-0003 already foresees.
+  ADR-0043 leaves it to M5's plan, which writes its ADR.
 - Positivity mechanisms work per face and per cell, and count their activations. They need an
   output channel for the counts that does not allocate.
 
@@ -309,7 +314,9 @@ combination of extension points in Rust types. The runtime configuration sets on
 - **The face frame.** Riemann solvers only see states rotated into the face's frame, normal
   component first.
   - On structured grids the rotation is an exact permutation: it decides which row is loaded as
-    the normal velocity, and costs nothing.
+    the normal velocity, and costs nothing. The transverse components follow in cyclic order
+    (for an x face y, z; for a y face z, x; for a z face x, y), so a problem rotated by a cyclic
+    permutation of the axes gives the same bits (§ 7.4).
   - Unstructured grids add a general rotation later. Every Riemann solver works there unchanged,
     but those results are not bitwise rotation-invariant.
   - For MHD, the face fills the normal magnetic field from the face-centred field; it is not
@@ -328,12 +335,20 @@ combination of extension points in Rust types. The runtime configuration sets on
   cell with half a step. Implicit-explicit methods and super-time-stepping get their own drivers
   when they come.
 - **Coordinates.** A trait for face areas, cell volumes and geometric source terms. The Cartesian
-  version returns constants, which fold away. The curvilinear versions read arrays precomputed
-  per block at init.
+  version returns constants, which fold away, and its update is written per direction as
+  (Δt/Δxₐ) times the flux difference, because the compiler does not fold A/V into 1/Δx and the
+  two round differently (§ 7.4). The curvilinear versions read arrays precomputed per block at
+  init.
 - **Source terms.** A trait, composed statically as a tuple, for example
   `(Gravity, PassiveScalars)`, and applied in a fixed order every stage.
 - **Boundary conditions.** Chosen per block face at init, and dispatched once per face per stage
   with a `match`, never per cell. User boundary conditions come from the problem crate.
+
+**How this list maps onto § 2's.** Wave-speed bounds and the eigenvector trait are parts of the
+equation-system point, split into small traits, not new extension points. The equation of state
+belongs to the equation system, and its interface is designed with M2. Refinement criteria (M9)
+and user-defined outputs (with the first plan that needs one) stay extension points whose
+interfaces come later; § 6 fixes the output format (ADR-0037).
 
 ### 4(c) Mesh, blocks, and init versus the time loop (agreed)
 
@@ -350,8 +365,10 @@ combination of extension points in Rust types. The runtime configuration sets on
 
 **The block tree is a linear octree.**
 
-- It is a sorted array of Morton keys. Each key is a level plus logical coordinates, as typed
-  newtypes (ADR-0002).
+- It is a sorted array of Morton keys, as typed newtypes (ADR-0002). A key is a `u64`: the
+  interleaved logical coordinates of the block's lowest corner at the finest level, 19 bits per
+  direction, above a 5-bit level field. So the root grid's blocks per direction times
+  2^(maximum level) must be at most 2¹⁹, which init checks (ADR-0038).
 - Finding a neighbour is arithmetic on the key followed by a binary search: iterative, with fixed
   bounds, and no recursion (ADR-0006).
 - The Morton order is also the space-filling curve that load balancing partitions, so the
@@ -373,8 +390,12 @@ combination of extension points in Rust types. The runtime configuration sets on
 1. validates the configuration;
 2. builds the initial tree, refining iteratively up to a configured maximum level;
 3. allocates every pool;
-4. calls the problem's initial conditions;
-5. sets `alloc-guard`'s flag that init is done.
+4. calls the problem's initial conditions.
+
+Nothing after init allocates. Runtime code does not link `alloc-guard` (ADR-0014), so tests prove
+this by running the steps after init inside `assert_no_allocations`. Its counters are per thread
+today, so once the thread pool exists (M4) the test must count allocations on every thread, which
+amends ADR-0014 (ADR-0038).
 
 **One step** runs the integrator's table of stages (§ 4(b)). Every stage runs a fixed list of
 phases over all blocks:
@@ -394,7 +415,8 @@ on order. AMR regrids every N steps: tag blocks, refine and coarsen within the p
 **Bulk-synchronous first.** Each phase finishes on every block before the next one starts. The
 overlap of communication with computation (interiors first, then the cells next to boundaries)
 comes in M7, without changing any kernel. Block order never changes results: a block's update
-depends only on its own data and its ghost cells, and reductions combine in block-key order.
+depends only on its own data and its ghost cells, the time step is a minimum, and diagnostic sums
+use the exact accumulator of § 5.4.
 
 **Crates.**
 
@@ -431,8 +453,10 @@ measures. A loop that does not vectorise is restructured, never rewritten with i
   - in-process: several ranks in one process, for deterministic tests on the workstation;
   - TCP, over `std::net`;
   - InfiniBand verbs, through the binding crate of ADR-0040.
-- **No new message pattern after init.** Every pair of neighbouring ranks gets a persistent channel
-  with preallocated buffers, built at init and rebuilt only when AMR rebalances.
+- **No new message pattern after init.** Every pair of neighbouring ranks gets a persistent channel.
+  Its buffers are sized at init from the memory budget, like the block pools (§ 4(c)). When AMR
+  rebalances, channels and buffer space are reassigned within that capacity, never allocated. A
+  rebalance that needs more is an operating error, like running out of pool slots.
 - **Collectives:** a barrier, a minimum (for the time step), sums for diagnostics, and an all-gather
   of tree changes under AMR.
 - **Launching:** Slurm's `srun` starts the processes, and each reads its rank from `SLURM_PROCID`
@@ -468,8 +492,9 @@ So every scaling run is also a correctness test.
   - zone-cycles per second against Athena++ on the workstation at every milestone, not in CI,
     because shared runners are too noisy;
   - scaling runs on the cluster from M7 on.
-- **Widths:** Morton keys and global cell numbers are `u64`, since 21 levels in 3D take 63 bits.
-  ADR-0002's limit of 2³² − 1 cells per rank stays.
+- **Widths:** Morton keys and global cell numbers are `u64`. A key uses 62 bits: 3 × 19 bits of
+  coordinates and 5 bits of level (§ 4(c), ADR-0038). ADR-0002's limit of 2³² − 1 cells per rank
+  stays.
 
 ## 6. Interface, output and determinism guarantees
 
@@ -532,13 +557,17 @@ Every output and checkpoint header records:
 - the resolved configuration.
 
 A build script that uses only `std` gathers the build fields at compile time. On restart, nami
-compares the checkpoint with the running build. If any of the fields that affect bits differ, the
-restart is refused and the message names the difference. `--allow-different-build` overrides
+compares the checkpoint with the running build. If any of the fields that affect bits differ
+(`format_version`, `results_version`, the `rustc` version, the `Cargo.lock` hash or the compiled
+combination), the restart is refused and the message names the difference. The commit, the dirty
+flag and the target are recorded but do not refuse a restart, since § 6.6 promises the same bits
+across them. `--allow-different-build` overrides
 this, and the output then records that the restart guarantee does not hold.
 
 ### 6.6 Guarantees users can rely on
 
-With the same binary, configuration and toolchain, a run is bitwise reproducible:
+With the same source, `Cargo.lock`, toolchain and configuration, a run is bitwise reproducible
+(a determinism hash covers the data, not the header, whose commit changes every time):
 
 1. across platforms: Linux x86_64 and macOS arm64 (ADR-0005);
 2. across decompositions: threads, ranks and the placement of blocks (ADR-0039);
@@ -561,10 +590,14 @@ combinations, multi-D, AMR and ranks.
 
 - `reference` defines one contract per equation system: a scheme is something that runs a
   problem and returns cell averages.
-- Each combination declares its properties (formal order, TVD, positivity-preserving,
-  well-balanced) and is wired in with one line.
-- `reference` maps the declared properties to the checks they imply. The implementer cannot pick
-  or skip checks. This is how every selectable combination gets verified (§ 3.3, ADR-0036).
+- Each supported combination has one row in a table in `reference`, which names it and declares
+  its properties (formal order, TVD, positivity-preserving, well-balanced, divergence-free).
+- `reference` maps the declared properties to the checks they imply; divergence-free maps to
+  ADR-0007's ∇·B invariant. The test that instantiates every combination fails for one without
+  a row. So the implementer cannot pick checks, and a change to what a combination claims is a
+  change to `reference`, which the maintainer approves. That review, not a mechanism, catches a
+  combination that claims too little. This is how every selectable combination gets verified
+  (§ 3.3, ADR-0036).
 
 ### 7.2 An outside anchor for every system
 
@@ -573,7 +606,7 @@ combinations, multi-D, AMR and ranks.
 | Advection | Exact solution |
 | Burgers | Exact Riemann solution; Rankine–Hugoniot shock speeds |
 | Euler | Toro's published star states for tests 1–5 (ADR-0007) |
-| Shallow water | Exact dam-break solution; lake at rest preserved bitwise |
+| Shallow water | Exact dam-break solution; lake at rest preserved to a few ULP, with the threshold in `reference` (ADR-0007) |
 | MHD | Published Ryu–Jones Riemann problems; linear waves with analytic eigenvectors, against Athena++'s published error thresholds |
 | Source terms, curvilinear coordinates, diffusion | Manufactured solutions generated with SymPy (ADR-0007) |
 
@@ -587,10 +620,18 @@ regenerate it, as for PyClaw.
 
 ### 7.4 Bitwise tests that come with the architecture
 
-- **1D embedded in 3D:** a 1D problem on a 3D grid that is uniform in y and z gives exactly the 1D
-  bits, because the transverse fluxes cancel exactly.
-- **Rotation:** the same problem along x, y and z gives identical bits (exact permutations,
-  § 4(b)).
+- **1D embedded in 3D:** a 1D problem on a Cartesian 3D grid that is uniform in y and z gives
+  exactly the 1D bits, because the transverse flux differences are exactly zero. Two conditions
+  make this hold:
+  - both runs use the same Δt. The 3D CFL condition also sees the transverse directions, which
+    can bind, so the test fixes Δt;
+  - the Cartesian update is written per direction as (Δt/Δxₐ) times the flux difference, not as
+    face areas over a volume, so it reduces exactly to the 1D form (§ 4(b), Coordinates).
+- **Rotation:** the same problem along x, y and z, rotated by a cyclic permutation of the axes,
+  gives identical bits. The face frame is an exact permutation with the transverse components in
+  cyclic order (§ 4(b)), and cell-level norms such as |v|² and |B|² add their squared components
+  in an order that no permutation changes, such as smallest first. Without that, `(u²+v²)+w²` and
+  `(w²+u²)+v²` round differently.
 - **Full refinement:** a mesh refined everywhere to level L gives the bits of a uniform mesh at
   level L.
 - **Decomposition and restart** (§ 5.4, § 6.6).

@@ -32,7 +32,7 @@ from getting from here to there:
    - outputs.
 
    The run configuration picks one compiled combination at init. Adding an extension point needs
-   an ADR. ADR-0036 or later (core architecture) designs the interfaces.
+   an ADR. ADR-0037 designs the interfaces.
 3. **Equation systems:** linear advection, Burgers, Euler, shallow water (with bathymetry,
    well-balanced, wet/dry deferred), ideal MHD. Burgers and shallow water are there to test the
    abstractions before MHD depends on them.

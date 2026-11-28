@@ -4,7 +4,8 @@
 - Date: 2026-11-26
 - Deciders: maintainer
 - Amends, once accepted: ADR-0007 (thresholds as Rust constants; Athena++ as a second source of
-  reference data)
+  reference data) and ADR-0001 (the pinned Athena++ of ADR-0034 point 8 becomes a
+  reference-generation tool beside SymPy and PyClaw)
 
 ## Context
 
@@ -20,9 +21,14 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
 ## Decision
 
 1. **Check suites are chosen by declared properties.** `reference` defines one contract per
-   equation system. A combination declares its properties (formal order, TVD,
-   positivity-preserving, well-balanced) and is wired in with one line. `reference` maps
-   properties to checks, and the implementer cannot pick or skip any.
+   equation system. Each supported combination has one row in a table in `reference` that names
+   it and declares its properties (formal order, TVD, positivity-preserving, well-balanced,
+   divergence-free). `reference` maps properties to checks; divergence-free maps to ADR-0007's
+   ∇·B invariant. The test that instantiates every combination (ADR-0037) looks up each
+   combination's row and fails if it has none. So an implementer cannot pick the checks, and
+   cannot change what a combination claims without a change to `reference`, which the
+   maintainer approves. A combination that claims too little, such as PLM declared first order,
+   is caught there, at review.
 2. **An outside anchor for every system:**
    - advection: the exact solution;
    - Burgers: the exact Riemann solution and Rankine–Hugoniot speeds;
@@ -34,8 +40,14 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
    transport. It is pinned, its data is committed with provenance, and only a maintainer-approved
    PR regenerates it.
 4. **The architecture's bitwise tests:**
-   - 1D embedded in 3D;
-   - rotation along x, y and z;
+   - 1D embedded in 3D, on a Cartesian grid uniform in y and z. It holds only if both runs use
+     the same Δt (the 3D CFL condition also sees the transverse directions, so the test fixes
+     Δt) and the Cartesian update is written per direction as (Δt/Δxₐ) times the flux
+     difference, so that it reduces exactly to the 1D form;
+   - rotation along x, y and z, by a cyclic permutation of the axes. It holds only if the face
+     frame orders the transverse components cyclically (for a y face: z, then x) and cell-level
+     norms such as |v|² and |B|² add their squared components in an order that no permutation
+     changes, such as smallest first;
    - full refinement against a uniform mesh;
    - decomposition (ADR-0039) and restart (ADR-0041);
    - conservation across levels with the exact accumulator.
@@ -53,8 +65,9 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
 
 - CODEOWNERS on `crates/reference/` and `tools/` (ADR-0008), which covers the suites, the
   thresholds and the reference data.
-- The mapping from properties to checks lives in `reference`, so a solver PR cannot change which
-  checks run without a protected change.
+- The table of combinations and their properties, and the mapping from properties to checks,
+  live in `reference`, so a solver PR cannot change which checks run without a protected change.
+  The combination test fails for a combination that has no row (planned with M0, ADR-0037).
 - Tidy: the planned `tier-tag` rule. A planned rule also rejects a float literal used as a
   tolerance in a test outside `thresholds.rs`.
 - The guardrails plan's task `thresholds-file` changes its target from `thresholds.toml` to
@@ -66,7 +79,8 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
 
 - Wiring a new combination costs one line, and its checks follow from what it claims.
 - Claiming a property costs the checks that come with it. A combination that claims less is
-  checked less, so review watches the declared properties.
+  checked less, so the maintainer's review of `reference` watches the declared properties. No
+  mechanism derives them from the component types yet.
 - The full matrix runs after merging. A bug that only a rare combination shows can reach `main`
   for one post-merge run, and is then reverted automatically.
 - Rust constants need a recompile to change. That is fine for values only a human may change.

@@ -9,8 +9,7 @@
 ADR-0035 asks for flexibility through a small, fixed set of extension points resolved at compile
 time, and ADR-0003 bans `dyn` in kernels. ADR-0036 requires every combination the configuration
 can select to be verified. This ADR defines the extension points and how a run is assembled from
-them. Data layout and kernel shape are decided separately (`docs/ARCHITECTURE.md` § 4(a), pending
-the layout prototype).
+them. Data layout and kernel shape are decided separately, in ADR-0043.
 
 ## Decision
 
@@ -32,12 +31,25 @@ the layout prototype).
      the type.
    - **Time integrators:** constant tables in the low-storage 3S* form, run by one generic
      driver. Implicit-explicit methods and super-time-stepping get their own drivers later.
-   - **Coordinates:** face areas, cell volumes and geometric source terms. Cartesian is constant.
+   - **Coordinates:** face areas, cell volumes and geometric source terms. Cartesian is constant,
+     and its update is written per direction as (Δt/Δxₐ) times the flux difference, so that it
+     reduces exactly to the 1D form (ADR-0042).
    - **Source terms:** composed statically as tuples, applied in a fixed order.
    - **Boundary conditions:** chosen per block face at init, dispatched once per face per stage.
+
+   This list maps onto ADR-0035's as follows:
+   - wave-speed bounds and the eigenvector trait are not new extension points. They are parts
+     of the equation-system point, split into small traits so that generic solvers ask only for
+     what they use;
+   - the equation of state belongs to the equation-system point, as in ADR-0035. Its interface is
+     designed with M2's plan, Euler being the first system that has one;
+   - refinement criteria stay an extension point, and their interface is designed with M9's plan;
+   - outputs stay an extension point; ADR-0041 fixes the format, and the interface for
+     user-defined outputs comes with the first plan that needs one.
 3. **The face frame.** Riemann solvers see states rotated into the face frame, normal component
-   first: an exact permutation on structured grids, a general rotation on unstructured grids
-   later. For MHD, the face supplies the normal magnetic field.
+   first and the transverse components in cyclic order (for a y face: z, then x). That is an
+   exact permutation on structured grids, and a general rotation on unstructured grids later.
+   For MHD, the face supplies the normal magnetic field.
 4. **Adding an extension point needs an ADR** (ADR-0035). Adding an implementation of an
    existing one does not; it needs its references (ADR-0007).
 5. **nami's test suite instantiates every supported combination,** and each one passes the
@@ -65,7 +77,8 @@ the layout prototype).
 
 - **One binary with every combination, selected at runtime.** Rejected as the default. It is just
   as fast in the hot loop, because selection happens once at init, but every build compiles the
-  whole menu, and sizes such as the ghost width cannot be compile-time constants. A problem crate can still do this for a few combinations.
+  whole menu, and sizes such as the ghost width cannot be compile-time constants. A problem
+  crate can still do this for a few combinations.
 - **Dynamic dispatch per face or per cell.** Rejected. It prevents inlining and vectorisation and
   conflicts with ADR-0003.
 - **Integrators as hand-written code per method.** Rejected. Tables read like the papers, and one

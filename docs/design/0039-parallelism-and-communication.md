@@ -3,6 +3,8 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Amends, once accepted: ADR-0005 point 4 (conservation totals across blocks and ranks use an
+  exact accumulator instead of `sum_compensated`)
 
 ## Context
 
@@ -21,8 +23,11 @@ process. ADR-0038 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
    stealing. Phases are synchronised with `std::sync::Barrier`. Each thread first-touches its own
    blocks at init.
 3. **Between nodes, a `Transport` trait** with in-process, TCP (`std::net`) and InfiniBand
-   (ADR-0040) implementations. Channels between neighbouring ranks are persistent, with buffers
-   preallocated at init and rebuilt only on rebalancing. The collectives are a barrier, a minimum,
+   (ADR-0040) implementations. Channels between neighbouring ranks are persistent. Their buffers
+   are sized at init from the memory budget, as the block pools are (ADR-0038): enough for the
+   largest boundary a rank's share of blocks can have. Rebalancing reassigns buffer space and
+   channels within that capacity and never allocates; a rebalance that needs more is an
+   operating error, like running out of pool slots. The collectives are a barrier, a minimum,
    diagnostic sums and an all-gather of tree changes.
 4. **Launching through Slurm.** `srun` starts the processes, and ranks come from `SLURM_PROCID`
    and `SLURM_NTASKS`. Rank 0 runs a TCP rendezvous for exchanging addresses. nami has no launcher.
@@ -33,8 +38,8 @@ process. ADR-0038 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
 7. **Targets:** at least 1.0× Athena++ per core and per node (ADR-0034), and at least 90%
    weak-scaling efficiency from 1 to 64 nodes as the first scaling target. Problem sizes and
    strong scaling are set with M7.
-8. **Widths:** Morton keys and global cell numbers are `u64`. Each rank still has at most 2³² − 1
-   cells (ADR-0002).
+8. **Widths:** Morton keys and global cell numbers are `u64` (the key's encoding is in
+   ADR-0038). Each rank still has at most 2³² − 1 cells (ADR-0002).
 
 ## Enforcement
 
@@ -43,8 +48,9 @@ process. ADR-0038 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
 - A decomposition test is planned with M4: the same problem with 1, 2 and an odd number of
   threads, and from M7 the same with in-process ranks, must give identical output hashes. It
   blocks merging, like the same-seed rerun of ADR-0005.
-- `alloc-guard`: the communication layer allocates only at init and at rebalancing, which runs in
-  init-like code (ADR-0038). The planned `alloc-after-init` test covers the steps in between.
+- `alloc-guard`: the communication layer allocates only at init. The planned `alloc-after-init`
+  test covers every step after it, rebalancing included, and counts allocations on every thread
+  (ADR-0038).
 - Scaling targets: none yet; scaling runs start with M7.
 
 ## Consequences

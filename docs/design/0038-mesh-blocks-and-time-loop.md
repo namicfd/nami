@@ -17,16 +17,24 @@ ADR-0037 fixes the extension points, and this ADR fixes the structure they run o
    of the same size. A block holds its cell-centred state in the layout of
    `docs/ARCHITECTURE.md` § 4(a), and for MHD its face-centred field and edge electric fields.
    Curvilinear and non-uniform blocks store their geometry, computed at init.
-2. **The block tree is a linear octree:** a sorted array of Morton keys (level plus logical
-   coordinates, typed newtypes). Neighbours are found by key arithmetic and binary search, with
-   no recursion. With 2:1 balance, neighbour tables have a fixed size of at most 56 slots in 3D.
-   The Morton order is the space-filling curve for load balancing.
+2. **The block tree is a linear octree:** a sorted array of Morton keys (typed newtypes).
+   Neighbours are found by key arithmetic and binary search, with no recursion. With 2:1
+   balance, neighbour tables have a fixed size of at most 56 slots in 3D. The Morton order is
+   the space-filling curve for load balancing.
+   - **The key is a `u64`:** the interleaved logical coordinates of the block's lowest corner,
+     expressed at the finest level, 19 bits per direction (57 bits), above a 5-bit level field.
+     62 of the 64 bits are used.
+   - So the root grid's blocks per direction times 2^(maximum level) must be at most 2¹⁹, for
+     example 19 levels above a single root block, or 16 above a root grid of 8 blocks per
+     direction. Init checks this and returns a configuration error otherwise.
 3. **Pools with a fixed capacity.** The configuration sets a memory budget, and init allocates
    every pool once: blocks, neighbour and flux-correction buffers, and scratch space per thread.
    Refinement and coarsening take and return pool slots. Running out of slots is an operating
    error: the run stops cleanly, writes a checkpoint and reports the memory it needed.
 4. **Init** validates the configuration, builds the initial tree up to a configured maximum level,
-   allocates, sets the initial conditions and then sets `alloc-guard`'s flag.
+   allocates and sets the initial conditions. Everything after init allocates nothing. Runtime
+   code does not link `alloc-guard` (ADR-0014): tests prove the claim by running the steps after
+   init inside `assert_no_allocations`.
 5. **A step runs a fixed list of phases per stage of the integrator, over all blocks:**
    1. ghost cells and their exchange;
    2. fluxes per direction;
@@ -45,7 +53,10 @@ ADR-0037 fixes the extension points, and this ADR fixes the structure they run o
 ## Enforcement
 
 - `alloc-guard`: the planned `alloc-after-init` test covers refinement and coarsening steps once
-  AMR exists.
+  AMR exists. `alloc-guard` counts per thread today (ADR-0014), so it would miss an allocation in
+  a worker thread. Once the thread pool exists (M4, ADR-0039), the test must count allocations
+  on every thread. That changes what ADR-0014 says about its counters, so M4's plan amends
+  ADR-0014 when it does it.
 - A test over the crate graph (`xtask/tests/crate_graph.rs`, added by the M0 scaffold) checks that
   `kernels` depends only on `base` and `libm`. The compiler does not: a `no_std` crate can depend
   on a `std` crate.

@@ -3,8 +3,9 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
-- Amends, once accepted: ADR-0001 (a system library besides `libm`) and ADR-0014 (`unsafe` in a
-  second crate)
+- Amends, once accepted: ADR-0001 (a system library besides `libm`) and ADR-0014 points 2 to 4
+  (`unsafe` in a second crate, an `#[expect]` budget of at least 2, and the first `unsafe` in
+  runtime code)
 
 ## Context
 
@@ -21,27 +22,35 @@ library. ADR-0034 accepted a small binding crate in principle. This ADR gives it
 2. **It holds only the binding.** It contains the `extern "C"` declarations for the verbs nami
    uses, and safe wrappers around them. It contains no communication logic, which stays in
    `Transport` (ADR-0039).
-3. **`unsafe` is confined to this crate**, as in `alloc-guard` (ADR-0014). Every `unsafe` block
-   carries a `// SAFETY:` comment that names the invariant, and each wrapper asserts its
-   preconditions before the call.
+3. **`unsafe` is confined to this crate and `alloc-guard`.** This amends ADR-0014 in three
+   places:
+   - point 2: `unsafe` is allowed in two crates, `crates/alloc-guard` and `crates/fabric`;
+   - point 3: `fabric` needs its own `#[expect(unsafe_code, reason = "...")]`, because the
+     workspace sets `unsafe_code = "deny"`, so the `#[expect]` budget becomes at least 2;
+   - point 4: unlike `alloc-guard`, `fabric` is runtime code. It is the first `unsafe` linked
+     into a nami binary, and only into builds with the `infiniband` feature.
+
+   Every `unsafe` block carries a `// SAFETY:` comment that names the invariant, and each
+   wrapper asserts its preconditions before the call.
 4. **The system library is linked only with the cargo feature `infiniband`,** which is off by
-   default. Workstation builds, CI and every test run without it. No crate is added, so the
-   dependency closure of ADR-0001 stays `{libm}`.
+   default. Workstation builds, CI and every test run without it. No external crate is added, so
+   the dependency closure of ADR-0001 stays `{libm}`.
 5. **It is built in M7.** This ADR is accepted before then, so that M7's plan can rely on it.
 
 ## Enforcement
 
-- Tidy: the `unsafe` allow-list grows from `crates/alloc-guard` to also include `crates/fabric`.
-  That is a protected change in M7.
-- Tidy: every `unsafe` block in `fabric` has a `// SAFETY:` comment (a new rule, added with the
-  crate).
-- The ADR-0001 dependency check is unchanged: no new crate.
+- Tidy: the `unsafe` allow-list grows from `crates/alloc-guard` to also include `crates/fabric`,
+  and `xtask/expect-budget.txt` goes from 1 to 2. Both are protected changes in M7.
+- Clippy: `undocumented_unsafe_blocks = "deny"` (ADR-0014) already requires the `// SAFETY:`
+  comments. No tidy rule duplicates it (ADR-0006).
+- The ADR-0001 dependency check is unchanged: no external crate.
 - CI builds without the feature. A cluster job with the feature is planned with M7.
 
 ## Consequences
 
 - RDMA latency and bandwidth become available without MPI.
-- There is a second place with `unsafe` to review, which is small and code-owned.
+- There is a second place with `unsafe` to review. It is small, but it is the first `unsafe` that
+  runs in production, so its review carries more weight than `alloc-guard`'s.
 - The InfiniBand path cannot be tested in CI. The in-process and TCP transports carry the logic
   tests, and the cluster carries the fabric tests.
 
