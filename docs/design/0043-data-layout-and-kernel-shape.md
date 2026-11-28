@@ -1,4 +1,4 @@
-# ADR-0031: Data layout and kernel shape
+# ADR-0043: Data layout and kernel shape
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -9,11 +9,11 @@
 ## Context
 
 ADR-0003 allows three ways to read data in kernels: pencils, `[f64; NVAR]` states, and typed
-gathers. Its evidence comes from a 1D stencil. nami is 3D from M0 (ADR-0023) and must be at
-least as fast as Athena++ per core (ADR-0022). Copying y- and z-pencils out of a 3D block costs
+gathers. Its evidence comes from a 1D stencil. nami is 3D from M0 (ADR-0035) and must be at
+least as fast as Athena++ per core (ADR-0034). Copying y- and z-pencils out of a 3D block costs
 memory traffic. On stable Rust, an associated constant cannot be an array length in generic code,
 so `[f64; E::NVAR]` cannot be written in kernels that are generic over the equation system
-(ADR-0025).
+(ADR-0037).
 
 The layout prototype (`docs/research/layout-prototype.md`, PR #47) measured three layouts on 3D
 Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
@@ -34,7 +34,7 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
    entirely with `chunks_exact`, `array_windows`, zipped rows and typed row accessors, and lost
    nothing for it.
 5. **Block sizes need not be compile-time constants.** The prototype found no difference in code
-   or speed. ADR-0026 may choose either for other reasons.
+   or speed. ADR-0038 may choose either for other reasons.
 6. **Constrained transport's edge terms** still need their own exception, as ADR-0003 foresaw. It
    comes with M5's plan.
 
@@ -43,9 +43,9 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
 - Clippy `indexing_slicing = "deny"` (ADR-0003), unchanged.
 - Tidy: no `dyn` and no function pointers in `kernels` (ADR-0003), unchanged.
 - The template kernel in `crates/kernels/src/update.rs` is replaced in M0 by a row kernel in the
-  area/volume form (ADR-0023). `TIGER_STYLE.md`'s "Data access in kernels" changes with it, in a
+  area/volume form (ADR-0035). `TIGER_STYLE.md`'s "Data access in kernels" changes with it, in a
   protected commit of the M0 plan.
-- Performance: the benchmark against Athena++ at every milestone (ADR-0022).
+- Performance: the benchmark against Athena++ at every milestone (ADR-0034).
 
 ## Consequences
 

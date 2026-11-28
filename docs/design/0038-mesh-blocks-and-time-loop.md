@@ -1,4 +1,4 @@
-# ADR-0026: Mesh, blocks and the time loop
+# ADR-0038: Mesh, blocks and the time loop
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,10 +6,10 @@
 
 ## Context
 
-ADR-0023 asks for one block-based data model from M0 to AMR, and ADR-0003 allows no allocation
+ADR-0035 asks for one block-based data model from M0 to AMR, and ADR-0003 allows no allocation
 after init. AMR creates and destroys blocks while a run is going. Athena++'s mesh tree is
 recursive, as far as we know, and TigerStyle bans recursion (ADR-0006).
-ADR-0025 fixes the extension points, and this ADR fixes the structure they run on.
+ADR-0037 fixes the extension points, and this ADR fixes the structure they run on.
 
 ## Decision
 

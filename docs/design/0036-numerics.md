@@ -1,4 +1,4 @@
-# ADR-0024: Numerical methods
+# ADR-0036: Numerical methods
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,9 +6,9 @@
 
 ## Context
 
-ADR-0022 asks nami to be at least as fast as Athena++/AthenaK and, eventually, to exceed AthenaK's
+ADR-0034 asks nami to be at least as fast as Athena++/AthenaK and, eventually, to exceed AthenaK's
 feature set. A speed comparison means something only between the same algorithms. TigerStyle bans
-silent floors, which is how Athena++ keeps density and pressure positive. ADR-0023 fixes the
+silent floors, which is how Athena++ keeps density and pressure positive. ADR-0035 fixes the
 equation systems and the milestones. This ADR fixes the numerical methods.
 
 ## Decision

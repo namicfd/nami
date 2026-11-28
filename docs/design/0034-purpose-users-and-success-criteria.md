@@ -1,4 +1,4 @@
-# ADR-0022: Purpose, users and success criteria
+# ADR-0034: Purpose, users and success criteria
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,7 +6,7 @@
 
 ## Context
 
-The guardrails (ADR-0001 to ADR-0021) say how nami is written, but not what it is for. Without
+The guardrails (ADR-0001 to ADR-0033) say how nami is written, but not what it is for. Without
 that, every architecture decision gets made by default. PR #4, a 1D advection plan, was closed for
 this reason: its solver parts would have quietly decided the architecture. There are three
 plausible readings: a teaching or research code, a production solver, or an experiment in

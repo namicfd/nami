@@ -1,4 +1,4 @@
-# ADR-0029: Interface, output and determinism guarantees
+# ADR-0041: Interface, output and determinism guarantees
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,9 +6,9 @@
 
 ## Context
 
-Users are researchers and their agents (ADR-0022), and they write problem crates (ADR-0025).
+Users are researchers and their agents (ADR-0034), and they write problem crates (ADR-0037).
 ADR-0001 rules out `toml`, `serde`, HDF5 and `pyo3`, and deferred the choice of output format to
-a later ADR, which is this one. ADR-0005 and ADR-0027 make results bitwise reproducible. Users
+a later ADR, which is this one. ADR-0005 and ADR-0039 make results bitwise reproducible. Users
 can rely on that only if every output says how it was made and a restart can tell when the build
 has changed.
 
@@ -57,7 +57,7 @@ has changed.
   outside users.
 - Existing tools read nami's output only through the optional sidecar, or not at all, until nami's
   own tools exist.
-- Problem authors recompile to change methods (ADR-0025), but they never recompile to change
+- Problem authors recompile to change methods (ADR-0037), but they never recompile to change
   parameters.
 
 ## Alternatives considered

@@ -1,4 +1,4 @@
-# ADR-0027: Parallelism and communication
+# ADR-0039: Parallelism and communication
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,11 +6,11 @@
 
 ## Context
 
-ADR-0022 targets CPUs: a workstation for development, and several InfiniBand nodes under Slurm
+ADR-0034 targets CPUs: a workstation for development, and several InfiniBand nodes under Slurm
 in production. Performance must be at least that of Athena++ per core and per node. ADR-0001
 rules out MPI, rayon and every other parallelism crate, and ADR-0001 deferred the choice of
 parallelism to a later ADR, which is this one. ADR-0005 makes results bitwise deterministic on one
-process. ADR-0026 fixes blocks, a Morton-ordered tree and bulk-synchronous phases.
+process. ADR-0038 fixes blocks, a Morton-ordered tree and bulk-synchronous phases.
 
 ## Decision
 
@@ -21,7 +21,7 @@ process. ADR-0026 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
    stealing. Phases are synchronised with `std::sync::Barrier`. Each thread first-touches its own
    blocks at init.
 3. **Between nodes, a `Transport` trait** with in-process, TCP (`std::net`) and InfiniBand
-   (ADR-0028) implementations. Channels between neighbouring ranks are persistent, with buffers
+   (ADR-0040) implementations. Channels between neighbouring ranks are persistent, with buffers
    preallocated at init and rebuilt only on rebalancing. The collectives are a barrier, a minimum,
    diagnostic sums and an all-gather of tree changes.
 4. **Launching through Slurm.** `srun` starts the processes, and ranks come from `SLURM_PROCID`
@@ -30,7 +30,7 @@ process. ADR-0026 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
    any placement of blocks. The time step is a minimum; diagnostic sums across blocks use an
    exact, order-independent accumulator; refinement depends only on block data.
 6. **A failed link is an operating error.** The run stops and checkpoints if it can.
-7. **Targets:** at least 1.0× Athena++ per core and per node (ADR-0022), and at least 90%
+7. **Targets:** at least 1.0× Athena++ per core and per node (ADR-0034), and at least 90%
    weak-scaling efficiency from 1 to 64 nodes as the first scaling target. Problem sizes and
    strong scaling are set with M7.
 8. **Widths:** Morton keys and global cell numbers are `u64`. Each rank still has at most 2³² − 1
@@ -44,7 +44,7 @@ process. ADR-0026 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
   threads, and from M7 the same with in-process ranks, must give identical output hashes. It
   blocks merging, like the same-seed rerun of ADR-0005.
 - `alloc-guard`: the communication layer allocates only at init and at rebalancing, which runs in
-  init-like code (ADR-0026). The planned `alloc-after-init` test covers the steps in between.
+  init-like code (ADR-0038). The planned `alloc-after-init` test covers the steps in between.
 - Scaling targets: none yet; scaling runs start with M7.
 
 ## Consequences
@@ -54,7 +54,7 @@ process. ADR-0026 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
 - A static schedule cannot absorb load imbalance within a process. The Morton partition balances
   by block count, which equal-sized blocks make adequate.
 - nami writes and maintains its own communication layer, rendezvous and collectives. That is
-  the design freedom ADR-0022 asked for, and also a body of code with no outside users to find
+  the design freedom ADR-0034 asked for, and also a body of code with no outside users to find
   its bugs. The in-process transport exists so that it can be tested deterministically.
 - The exact accumulator is slower than `sum_compensated`. It is only used for diagnostics, never
   in the hot path.

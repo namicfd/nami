@@ -1,4 +1,4 @@
-# ADR-0028: A binding crate for InfiniBand
+# ADR-0040: A binding crate for InfiniBand
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -8,10 +8,10 @@
 
 ## Context
 
-Production runs use several nodes connected by InfiniBand (ADR-0022). From `std` alone, nami can
+Production runs use several nodes connected by InfiniBand (ADR-0034). From `std` alone, nami can
 reach other nodes only over TCP, whose latency is roughly ten times that of RDMA. That figure is
 background knowledge; measure it in M7. The fabric is reachable only through a C system
-library. ADR-0022 accepted a small binding crate in principle. This ADR gives it a shape.
+library. ADR-0034 accepted a small binding crate in principle. This ADR gives it a shape.
 
 ## Decision
 
@@ -20,7 +20,7 @@ library. ADR-0022 accepted a small binding crate in principle. This ADR gives it
    not need.
 2. **It holds only the binding.** It contains the `extern "C"` declarations for the verbs nami
    uses, and safe wrappers around them. It contains no communication logic, which stays in
-   `Transport` (ADR-0027).
+   `Transport` (ADR-0039).
 3. **`unsafe` is confined to this crate**, as in `alloc-guard` (ADR-0014). Every `unsafe` block
    carries a `// SAFETY:` comment that names the invariant, and each wrapper asserts its
    preconditions before the call.
@@ -50,7 +50,7 @@ library. ADR-0022 accepted a small binding crate in principle. This ADR gives it
 - **TCP only.** Rejected for production: latency at many nodes.
 - **libfabric or UCX.** Rejected for now. They are larger, and nami needs only point-to-point RDMA
   and a few collectives. libfabric would be the choice if a cluster with Slingshot ever matters.
-- **Binding MPI after all.** Rejected by ADR-0001 and ADR-0022.
+- **Binding MPI after all.** Rejected by ADR-0001 and ADR-0034.
 
 ## Evidence
 

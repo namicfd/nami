@@ -7,13 +7,13 @@
 
 | § | Topic | State | ADR |
 |---|---|---|---|
-| 1 | Purpose, users and success criteria | Agreed | [0022](design/0022-purpose-users-and-success-criteria.md) |
-| 2 | Scope and roadmap | Agreed | [0023](design/0023-scope-and-roadmap.md) |
-| 3 | Numerics | Agreed, except § 3.3 (proposed) | [0024](design/0024-numerics.md) |
-| 4 | Core architecture | agreed; (a) confirmed by the layout prototype | [0031](design/0031-data-layout-and-kernel-shape.md), [0025](design/0025-extension-points-and-composition.md), [0026](design/0026-mesh-blocks-and-time-loop.md) |
-| 5 | Performance and parallelism | Agreed (problem sizes open until M7) | [0027](design/0027-parallelism-and-communication.md), [0028](design/0028-infiniband-binding-crate.md) |
-| 6 | Interface, output and determinism guarantees | Agreed | [0029](design/0029-interface-output-and-guarantees.md) |
-| 7 | Verification strategy | Agreed | [0030](design/0030-verification-strategy.md) |
+| 1 | Purpose, users and success criteria | Agreed | [0034](design/0034-purpose-users-and-success-criteria.md) |
+| 2 | Scope and roadmap | Agreed | [0035](design/0035-scope-and-roadmap.md) |
+| 3 | Numerics | Agreed, except § 3.3 (proposed) | [0036](design/0036-numerics.md) |
+| 4 | Core architecture | agreed; (a) confirmed by the layout prototype | [0043](design/0043-data-layout-and-kernel-shape.md), [0037](design/0037-extension-points-and-composition.md), [0038](design/0038-mesh-blocks-and-time-loop.md) |
+| 5 | Performance and parallelism | Agreed (problem sizes open until M7) | [0039](design/0039-parallelism-and-communication.md), [0040](design/0040-infiniband-binding-crate.md) |
+| 6 | Interface, output and determinism guarantees | Agreed | [0041](design/0041-interface-output-and-guarantees.md) |
+| 7 | Verification strategy | Agreed | [0042](design/0042-verification-strategy.md) |
 
 ## 1. Purpose, users and success criteria
 
@@ -264,7 +264,7 @@ The topic has three parts:
   - typed gathers stay;
   - raw indexing stays banned.
 
-  ADR-0031 records it.
+  ADR-0043 records it.
 - **The prototype** (`docs/research/layout-prototype.md`) measured 3D Euler (PLM, HLLC, SSP-RK2,
   one core):
   - structure of arrays with row stencils ran at 1.9× Athena++'s fastest build at 64³ and 1.86×
@@ -430,7 +430,7 @@ measures. A loop that does not vectorise is restructured, never rewritten with i
 - **A `Transport` trait** has three implementations:
   - in-process: several ranks in one process, for deterministic tests on the workstation;
   - TCP, over `std::net`;
-  - InfiniBand verbs, through the binding crate of ADR-0028.
+  - InfiniBand verbs, through the binding crate of ADR-0040.
 - **No new message pattern after init.** Every pair of neighbouring ranks gets a persistent channel
   with preallocated buffers, built at init and rebuilt only when AMR rebalances.
 - **Collectives:** a barrier, a minimum (for the time step), sums for diagnostics, and an all-gather
@@ -541,7 +541,7 @@ this, and the output then records that the restart guarantee does not hold.
 With the same binary, configuration and toolchain, a run is bitwise reproducible:
 
 1. across platforms: Linux x86_64 and macOS arm64 (ADR-0005);
-2. across decompositions: threads, ranks and the placement of blocks (ADR-0027);
+2. across decompositions: threads, ranks and the placement of blocks (ADR-0039);
 3. across restarts: a run that stops and restarts from a checkpoint gives the same bits as one
    that does not stop.
 
@@ -564,7 +564,7 @@ combinations, multi-D, AMR and ranks.
 - Each combination declares its properties (formal order, TVD, positivity-preserving,
   well-balanced) and is wired in with one line.
 - `reference` maps the declared properties to the checks they imply. The implementer cannot pick
-  or skip checks. This is how every selectable combination gets verified (§ 3.3, ADR-0024).
+  or skip checks. This is how every selectable combination gets verified (§ 3.3, ADR-0036).
 
 ### 7.2 An outside anchor for every system
 
@@ -579,7 +579,7 @@ combinations, multi-D, AMR and ranks.
 
 ### 7.3 Reference data from PyClaw and from Athena++
 
-Pinned Athena++ is built anyway for benchmarking (ADR-0022), and it is an independent
+Pinned Athena++ is built anyway for benchmarking (ADR-0034), and it is an independent
 implementation. For MHD and constrained transport (Orszag–Tang, rotor, field loop, MHD blast) it
 is a better source of reference data than PyClaw. Its data is committed with a provenance file
 (tool version, commit, input, command, date), and only a PR the maintainer approves may

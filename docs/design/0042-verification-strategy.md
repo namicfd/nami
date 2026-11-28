@@ -1,4 +1,4 @@
-# ADR-0030: Verification strategy
+# ADR-0042: Verification strategy
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -9,8 +9,8 @@
 ## Context
 
 ADR-0007 defines nami's references: a code-owned crate, references that land before the feature
-they test, anchors outside the swarm, and tiers. ADR-0024 adds that every combination the
-configuration can select is verified. ADR-0023 to ADR-0029 bring multi-D, AMR, ranks and restarts.
+they test, anchors outside the swarm, and tiers. ADR-0036 adds that every combination the
+configuration can select is verified. ADR-0035 to ADR-0041 bring multi-D, AMR, ranks and restarts.
 A suite that an implementer wires in by hand, check by check, would not scale to that, and an
 implementer who chooses which checks to run can leave out the one that fails.
 
@@ -37,7 +37,7 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
    - 1D embedded in 3D;
    - rotation along x, y and z;
    - full refinement against a uniform mesh;
-   - decomposition (ADR-0027) and restart (ADR-0029);
+   - decomposition (ADR-0039) and restart (ADR-0041);
    - conservation across levels with the exact accumulator.
 5. **Benchmark problems are regression references:**
    - Sod, Shu–Osher, Woodward–Colella blast, double Mach reflection, Kelvin–Helmholtz, isentropic

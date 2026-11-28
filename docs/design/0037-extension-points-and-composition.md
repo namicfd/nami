@@ -1,4 +1,4 @@
-# ADR-0025: Extension points and how a run is composed
+# ADR-0037: Extension points and how a run is composed
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,8 +6,8 @@
 
 ## Context
 
-ADR-0023 asks for flexibility through a small, fixed set of extension points resolved at compile
-time, and ADR-0003 bans `dyn` in kernels. ADR-0024 requires every combination the configuration
+ADR-0035 asks for flexibility through a small, fixed set of extension points resolved at compile
+time, and ADR-0003 bans `dyn` in kernels. ADR-0036 requires every combination the configuration
 can select to be verified. This ADR defines the extension points and how a run is assembled from
 them. Data layout and kernel shape are decided separately (`docs/ARCHITECTURE.md` § 4(a), pending
 the layout prototype).
@@ -38,7 +38,7 @@ the layout prototype).
 3. **The face frame.** Riemann solvers see states rotated into the face frame, normal component
    first: an exact permutation on structured grids, a general rotation on unstructured grids
    later. For MHD, the face supplies the normal magnetic field.
-4. **Adding an extension point needs an ADR** (ADR-0023). Adding an implementation of an
+4. **Adding an extension point needs an ADR** (ADR-0035). Adding an implementation of an
    existing one does not; it needs its references (ADR-0007).
 5. **nami's test suite instantiates every supported combination,** and each one passes the
    reference tiers that apply to it.
@@ -58,7 +58,7 @@ the layout prototype).
   crates, not just configuration files. Topic 6 designs that interface.
 - Compile time grows with the number of combinations a build includes, not with the size of the
   menu.
-- Generic code across several traits can become hard to read (ADR-0022, Failure). Each trait stays
+- Generic code across several traits can become hard to read (ADR-0034, Failure). Each trait stays
   small and is documented with its equations and sources.
 
 ## Alternatives considered

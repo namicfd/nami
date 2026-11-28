@@ -1,4 +1,4 @@
-# ADR-0023: Scope and roadmap
+# ADR-0035: Scope and roadmap
 
 - Status: Proposed
 - Date: 2026-11-26
@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-0022 sets the end state: 3D classical MHD on static and adaptive grids, flexible enough to
+ADR-0034 sets the end state: 3D classical MHD on static and adaptive grids, flexible enough to
 exceed AthenaK's feature set eventually, with Voronoi meshes as a stretch goal. Two risks follow
 from getting from here to there:
 
@@ -32,7 +32,7 @@ from getting from here to there:
    - outputs.
 
    The run configuration picks one compiled combination at init. Adding an extension point needs
-   an ADR. ADR-0024 or later (core architecture) designs the interfaces.
+   an ADR. ADR-0036 or later (core architecture) designs the interfaces.
 3. **Equation systems:** linear advection, Burgers, Euler, shallow water (with bathymetry,
    well-balanced, wet/dry deferred), ideal MHD. Burgers and shallow water are there to test the
    abstractions before MHD depends on them.
