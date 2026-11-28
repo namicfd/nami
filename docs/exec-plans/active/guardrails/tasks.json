@@ -113,50 +113,12 @@
       "passes": false
     },
     {
-      "id": "thresholds-file",
-      "title": "crates/reference/thresholds.toml: the one human-owned file that holds every test tolerance (ADR-0007)",
-      "depends_on": [
-        "glossary"
-      ],
-      "owner_paths": [
-        "crates/reference/thresholds.toml",
-        "crates/reference/src/thresholds.rs",
-        "xtask/src/tidy/registry.rs",
-        "docs/TIGER_STYLE.md",
-        "docs/RULES.md"
-      ],
-      "acceptance": [
-        "reference::thresholds::tests::every_threshold_comes_from_the_file"
-      ],
-      "passes": false
-    },
-    {
-      "id": "reference-suite",
-      "title": "Tiered reference tests in crates/reference: invariants, symmetry, convergence order, exact solutions, one reference per boundary-condition type (ADR-0007)",
-      "depends_on": [
-        "thresholds-file"
-      ],
-      "owner_paths": [
-        "crates/reference/src",
-        "crates/reference/tests",
-        "crates/reference/Cargo.toml",
-        "xtask/src/tidy/registry.rs",
-        "docs/TIGER_STYLE.md",
-        "docs/RULES.md"
-      ],
-      "acceptance": [
-        "reference::invariants::conservation_holds_to_round_off",
-        "reference::invariants::wave_speed_bounds_the_maximum_eigenvalue",
-        "reference::invariants::ghost_cells_are_written_before_they_are_read",
-        "reference::boundaries::each_boundary_type_has_a_reference"
-      ],
-      "passes": false
-    },
-    {
       "id": "tier-tag",
       "title": "Tidy rule: every test under tests/ carries its reference tier (ADR-0007)",
       "depends_on": [
-        "reference-suite"
+        "glossary",
+        "reference-suite",
+        "m0-reference-advection"
       ],
       "owner_paths": [
         "xtask/src/tidy/text.rs",
@@ -174,27 +136,11 @@
       "passes": false
     },
     {
-      "id": "floor-activation-count",
-      "title": "A floor or limiter that is part of a scheme counts its activations, and a reference test fails on an unexpected count (TIGER_STYLE.md, Physical admissibility)",
-      "depends_on": [
-        "tier-tag"
-      ],
-      "owner_paths": [
-        "crates/reference/src/invariants/floor_activations.rs",
-        "xtask/src/tidy/registry.rs",
-        "docs/TIGER_STYLE.md",
-        "docs/RULES.md"
-      ],
-      "acceptance": [
-        "reference::invariants::floor_activations::unexpected_count_fails"
-      ],
-      "passes": false
-    },
-    {
       "id": "alloc-after-init",
       "title": "Counting-allocator test around the time loop: nothing allocates after init (ADR-0003)",
       "depends_on": [
-        "floor-activation-count"
+        "tier-tag",
+        "m0-time-loop"
       ],
       "owner_paths": [
         "crates/solver/tests/no_alloc_after_init.rs",
@@ -212,7 +158,8 @@
       "id": "determinism-hash",
       "title": "CI hashes the output of a canonical problem set and compares Linux, macOS and a same-seed rerun (ADR-0005)",
       "depends_on": [
-        "alloc-after-init"
+        "alloc-after-init",
+        "m0-cli"
       ],
       "owner_paths": [
         "xtask/src/determinism.rs",
@@ -228,6 +175,23 @@
         "xtask::determinism::tests::same_seed_rerun_gives_the_same_hash",
         "xtask::workflows::ci_gate_reruns_the_determinism_hash",
         "xtask::workflows::post_merge_compares_the_macos_hash"
+      ],
+      "passes": false
+    },
+    {
+      "id": "floor-activation-count",
+      "title": "A floor or limiter that is part of a scheme counts its activations, and a reference test fails on an unexpected count (TIGER_STYLE.md, Physical admissibility)",
+      "depends_on": [
+        "m0-style-guide"
+      ],
+      "owner_paths": [
+        "crates/reference/src/invariants/floor_activations.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "reference::invariants::floor_activations::unexpected_count_fails"
       ],
       "passes": false
     }
