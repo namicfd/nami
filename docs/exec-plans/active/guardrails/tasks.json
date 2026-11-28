@@ -17,7 +17,7 @@
         "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
         "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture"
       ],
-      "passes": false
+      "passes": true
     },
     {
       "id": "clippy-fixtures",
