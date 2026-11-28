@@ -17,7 +17,7 @@ Every command below was run against `namicfd/nami` on 2026-11-25.
 | `.github/CODEOWNERS` | The ruleset (step 3) |
 | `xtask/agent-token.sh` | The GitHub App and its installation (step 5) |
 | `.claude/settings.json` (`env`): the bot's git identity (step 6) | The app's private key on each machine, at `$NAMI_AGENT_KEY` or `~/.config/nami/nami-agent.pem` |
-| `.github/workflows/queue.yml`: the job that acts as `nami-ci[bot]` in CI | The `nami-ci` app, its environment `nami-ci` with the secret `NAMI_CI_PRIVATE_KEY`, and the repository variable `NAMI_CI_CLIENT_ID` (step 8) |
+| `.github/workflows/queue.yml` and `.github/workflows/passes.yml`: the jobs that act as `nami-ci[bot]` in CI | The `nami-ci` app, its environment `nami-ci` with the secret `NAMI_CI_PRIVATE_KEY`, and the repository variable `NAMI_CI_CLIENT_ID` (step 8) |
 
 When you change a setting on GitHub, update this file.
 
@@ -64,7 +64,9 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 | Require linear history | on | Each commit on `main` is one PR that passed the gate, so bisect and `git revert` stay simple (ADR-0009). |
 | Require a pull request | approvals: 0 | PRs that touch no owned path merge without a human (ADR-0008). |
 | | code-owner review: on | Human sign-off on protected paths (ADR-0015). |
-| | dismiss stale approvals; approve the last push: on | An agent cannot push again after it has been approved. |
+| | dismiss stale approvals: on | An agent cannot push again after it has been approved: the push dismisses the approval. |
+| | approve the last push: **off** | On, it asks for one approval of every PR, whatever the count above ("at least one other authorized reviewer has approved", GitHub's docs), so no PR merges without a human. Dismissing stale approvals already covers pushes after an approval. |
+| | additional approval for unattributed Copilot PRs: on | GitHub's default. It has no effect while the count is 0. |
 | | conversation resolution: on | Blocking AI-review comments must be resolved. |
 | | merge methods: squash | |
 | Required status checks | `gate`, `lints (UI tests)`, `ratchet`; "up to date" is off | The merge queue tests the combined result anyway. `ratchet` is what lets rule paths merge without the code owner; it is added in step 10 (ADR-0022). |
@@ -72,6 +74,21 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 | Bypass | Repository admin, **pull requests only** | The maintainer can merge PRs past the rules: their own, since GitHub never allows approving your own PR, and, as an exception, a `tasks.json` flip that the `passes` workflow cannot make (ADR-0017). Nobody can push to `main` directly, not even with the maintainer's credentials. In an emergency, open a PR and merge it with the bypass. |
 
 To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
+
+**Requested of the maintainer, not set yet:** "approve the last push" off. On 2026-11-28 the live ruleset (ID 28033236) still had `require_last_push_approval: true`. It held #84, the first `passes` PR, which touches only an unowned `tasks.json`, from its green checks at 09:25 UTC until your approval at 10:48; it merged six minutes later. #47, which touches only `docs/research/`, sat the same way, green, with auto-merge on and out of the queue. Every PR so far has merged with an approval, so nothing has yet shown point 2 of step 9 working. Turn it off in Settings → Rules → Rulesets → `main` → Require a pull request before merging → clear **Require approval of the most recent reviewable push** → Save changes. The UI is the tested path. Or with `gh`, not yet run: the body holds only `rules`, so the name, target and bypass stay as they are, and every other rule is sent back unchanged. The one exception is `dismissal_restriction`, which is off; it is dropped in case the update refuses it. If GitHub answers 422, nothing has changed: use the UI.
+
+```sh
+gh api "repos/$REPO/rulesets/28033236" --jq '{rules: [.rules[] | if .type == "pull_request"
+  then (.parameters.require_last_push_approval = false | del(.parameters.dismissal_restriction))
+  else . end]}' > main-rules.json
+gh api -X PUT "repos/$REPO/rulesets/28033236" --input main-rules.json
+gh api "repos/$REPO/rules/branches/main" \
+  --jq '.[] | select(.type == "pull_request") | .parameters.require_last_push_approval'
+gh api "repos/$REPO/rulesets/28033236" --jq '.bypass_actors'
+rm main-rules.json
+```
+
+The third command must print `false`, and the fourth the one bypass of the table, the admin role with `"bypass_mode":"pull_request"`. Code-owner review still holds every owned path, and the `gate`'s `check-pr` still judges every PR that sets `passes` (ADR-0017).
 
 ## 4. CODEOWNERS
 
@@ -198,7 +215,7 @@ Which issues agents act on depends on who opened them, never on labels: only the
 
 Workflow tokens act as `github-actions[bot]`, whom agents do not trust (ADR-0021). A CI job whose output agents must act on therefore acts as a GitHub App. CI has its own app, `nami-ci`, separate from the agents' `nami-agent` (step 5): one app per role, each with the least permissions its role needs (ADR-0023). The agents' key is never in CI.
 
-Today one job uses it: `file queue failure` in `.github/workflows/queue.yml`. When the required checks fail on a merge-queue branch and the PR has really left the queue, it files an issue `PR #<n> failed in the merge queue (run <id>)` of kind `bug`, so that `cargo xtask task ready` lists it (issue #51, ADR-0021, point 6). Agents trust `nami-ci[bot]` for an issue with that title and the body that `queue failed` writes for it, linking only into this repository, and work on it only while the PR was opened by `nami-agent[bot]` with its branch here. They also trust it, once PR #70 (issue #62) lands, for the `bot/passes` PR in the shape that #70 defines and checks. That PR will be its second job. The CI-hosted reviewer (#59) gets an app of its own.
+Two jobs use it. `file queue failure` in `.github/workflows/queue.yml`: when the required checks fail on a merge-queue branch and the PR has really left the queue, it files an issue `PR #<n> failed in the merge queue (run <id>)` of kind `bug`, so that `cargo xtask task ready` lists it (issue #51, ADR-0021, point 6). Agents trust `nami-ci[bot]` for an issue with that title and the body that `queue failed` writes for it, linking only into this repository, and work on it only while the PR was opened by `nami-agent[bot]` with its branch here. `open passes PR` in `.github/workflows/passes.yml` (#70, ADR-0017) opens the one PR from `bot/passes` that sets `passes`, which `check-pr` judges in the `gate`. The CI-hosted reviewer (#59) gets an app of its own.
 
 ADR-0023 sets the rules for every CI job that holds an app's key. Read it before you add one. The queue-failure job follows them:
 
@@ -218,14 +235,46 @@ The other job in that workflow, `adr clashes (advisory)`, comments with the work
 | GitHub App | `nami-ci`, client ID `Iv23ctUmyQzRCojbV2Em`, webhooks off |
 | Bot | `nami-ci[bot]`, user ID 361707243 |
 | Installation | `namicfd/nami` only |
-| Repository permissions | Contents: read and write. Issues: read and write. Pull requests: read and write. Metadata: read. Contents and pull requests write are for the `bot/passes` PR of PR #70, granted before it lands; the queue-failure job never asks for them. No Actions permission: jobs read runs and logs with the workflow's own token. |
+| Repository permissions | Contents: read and write. Issues: read and write. Pull requests: read and write. Metadata: read. Contents and pull requests write are for the `bot/passes` PR (ADR-0017); the queue-failure job never asks for them. No Actions permission: jobs read runs and logs with the workflow's own token. |
 | Environment | `nami-ci`, deployment branches limited to `main`, no required reviewers |
 | Environment secret | `NAMI_CI_PRIVATE_KEY`: the full contents of a private key of `nami-ci` |
 | Repository variable | `NAMI_CI_CLIENT_ID`: `Iv23ctUmyQzRCojbV2Em` |
 
 There is no `nami-agent` environment, and there must not be one. A job that names a missing environment makes GitHub create it with no branch rule, so that every branch may use any secret added to it later. Create an environment, and limit it to `main`, before any job names it. Until ADR-0023's PR (#64) merged, `main`'s `queue.yml` named `environment: nami-agent`, so a merge-queue failure before then may have created one. After that merge, run "Check it" below, and delete any `nami-agent` environment it lists.
 
-**Requested of the maintainer, not set yet:** a branch ruleset on `bot/passes` that restricts creations, updates and deletions, with the `nami-ci` app as its only bypass actor. Then only `nami-ci[bot]` can push the branch whose PR sets `passes` (ADR-0017). Until it exists, anyone with write access can push there. `check-pr` judges such a push by its content, and the next `passes` run rebuilds the branch, unless the push is exactly the wanted flips on a commit of `main`, which is what the run would push itself.
+### The `bot/passes` ruleset
+
+**Requested of the maintainer, not set yet:** a branch ruleset on `bot/passes` that restricts creations, updates and deletions, with the `nami-ci` app as its only bypass actor. Then only `nami-ci[bot]` can push the branch whose PR sets `passes` (ADR-0017). Until it exists, anyone with write access can push there, agents included. `check-pr` judges such a push by its content, so safety does not depend on the ruleset, but liveness does: the next `passes` run rebuilds the branch, unless the push is exactly the wanted flips on a commit of `main`, which is what the run would push itself, and until then the PR is out of the queue.
+
+In Settings → Rules → Rulesets → New ruleset → **New branch ruleset**:
+
+- **Name:** `bot/passes`, with enforcement **Active**.
+- **Bypass list:** Add bypass → the `nami-ci` app → **Always allow**. Nothing else, not even the admin role.
+- **Target branches:** Add target → Include by pattern → `bot/passes`.
+- **Rules:** **Restrict creations**, **Restrict updates** and **Restrict deletions** on; every other rule off. In particular leave "Block force pushes" off: the job force-pushes the branch every time it rebuilds it.
+- **Create.**
+
+Or with `gh`. The bypass actor's ID is the app's ID, `gh api apps/nami-ci --jq .id`, which was 5942623 on 2026-11-28; it is neither the bot's user ID nor the installation's. Save this as `bot-passes-ruleset.json`:
+
+```json
+{"name": "bot/passes", "target": "branch", "enforcement": "active",
+ "conditions": {"ref_name": {"include": ["refs/heads/bot/passes"], "exclude": []}},
+ "rules": [{"type": "creation"},
+           {"type": "update", "parameters": {"update_allows_fetch_and_merge": false}},
+           {"type": "deletion"}],
+ "bypass_actors": [{"actor_id": 5942623, "actor_type": "Integration", "bypass_mode": "always"}]}
+```
+
+Then create the ruleset and delete the file:
+
+```sh
+gh api -X POST "repos/$REPO/rulesets" --input bot-passes-ruleset.json
+rm bot-passes-ruleset.json
+```
+
+**Check it.** As the maintainer, `gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "bot/passes") | .id'`, then `gh api "repos/$REPO/rulesets/<id>" --jq '{enforcement, conditions, rules: [.rules[].type], bypass_actors}'` must print enforcement `active`, the one include `refs/heads/bot/passes`, the rules `["creation","update","deletion"]`, and the one bypass actor `{"actor_id":5942623,"actor_type":"Integration","bypass_mode":"always"}`. An agent can check the rules without admin rights: `GH_TOKEN=$(xtask/agent-token.sh) gh api repos/$REPO/rules/branches/bot/passes --jq '[.[].type]'` must print `["creation","update","deletion"]`. The next `passes` run that pushes must still succeed; if its push is refused with `GH013`, the bypass names the wrong actor.
+
+The job never deletes the branch. If GitHub's deletion of a merged head branch is refused under this ruleset, the branch stays after the merge. That is harmless: the next run that has flips to make force-pushes over it, and a run with none changes nothing.
 
 ### Set it up again
 
