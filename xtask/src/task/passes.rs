@@ -9,8 +9,9 @@
 //! - `passes --open-pr <file>`, the `open passes PR` job: reads that file as data and keeps
 //!   the tasks that may be set: active, not passing, every dependency passing, and a merged PR
 //!   from `task/<id>`. It builds the commit that [`BOT_BRANCH`] should hold, those flips on
-//!   top of `HEAD`, and force-pushes it only when the branch differs from it in tree or
-//!   parent. Then it opens the PR if there is none, and reconciles it every run: the title and
+//!   top of `HEAD`, and force-pushes it only when the branch's own change is not those flips,
+//!   or no longer applies cleanly to `HEAD`; a branch on an older `main` is left alone. Then
+//!   it opens the PR if there is none, and reconciles it every run: the title and
 //!   description match the flips, and auto-merge is on. When no task is left, it closes the
 //!   open PR, if there is one. An open PR from [`BOT_BRANCH`] that [`CI_LOGIN`] did not open
 //!   is never adopted: the job fails and changes nothing. It runs no tests, so the bot's token
@@ -27,13 +28,14 @@
 //! that a later task wrote, or that two tasks share.
 
 use super::acceptance::Acceptance;
-use super::claims::git;
+use super::claims::{git, git_command};
 use super::plan::{self, Task};
 use super::pulls::WRITE_TOKEN;
 use crate::json::{self, Value};
 use crate::queue::failure::{pull_of_message, queue_entry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::process::Stdio;
 
 /// The git credential helper for the push to [`BOT_BRANCH`]: it answers `get` with the token
 /// in [`WRITE_TOKEN`], which git inherits, and nothing else. It is configured on the push
@@ -531,6 +533,8 @@ pub fn flip_problems(
         assert_eq!(tasks.len(), flipped.len(), "every flipped task is a task of the change");
         match services.tests.check(&tasks) {
             Ok(verdicts) => {
+                // Before the zip: a short list would let the flips past its end through.
+                assert_eq!(verdicts.len(), tasks.len(), "one verdict per flipped task");
                 let failed = tasks.iter().zip(verdicts).filter_map(|(task, verdict)| {
                     verdict.err().map(|reason| format!("`{}` does not pass: {reason}", task.id))
                 });
@@ -714,10 +718,10 @@ fn open_pr(
 }
 
 /// Builds the commit that [`BOT_BRANCH`] should hold, the flips in the working tree on top of
-/// `HEAD`, and force-pushes it only when `remote`'s branch differs from it in tree or parent:
-/// an unchanged `main` and an unchanged set of flips leave the PR's place in the merge queue
-/// alone, and any drift rebuilds the branch. Then it opens the PR if `open` is none, and
-/// reconciles it ([`reconcile`]).
+/// `HEAD`, and force-pushes it only when `remote`'s branch does not hold it ([`branch_holds`]):
+/// an unchanged set of flips that still applies cleanly leaves the PR's place in the merge
+/// queue alone, however far `main` moved, and other flips or a conflict rebuild the branch.
+/// Then it opens the PR if `open` is none, and reconciles it ([`reconcile`]).
 fn publish(
     (root, remote, token): (&Path, &str, &str),
     pulls: &dyn Pulls,
@@ -763,8 +767,12 @@ fn push(root: &Path, remote: &str, commit: &str, token: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// True if `remote`'s [`BOT_BRANCH`] exists and its tip has the tree and the parents of
-/// `commit`.
+/// True if `remote`'s [`BOT_BRANCH`] already does what `commit`, the wanted flips on top of
+/// `HEAD`, would do: the tip has one parent, and its own change, its diff against that parent,
+/// replays cleanly onto `HEAD` and gives `commit`'s tree. A tip on an older `main` holds, so
+/// `main` moving on pushes nothing: the job runs on every push to `main`, and a push for each
+/// would take the PR out of the merge queue every time, until it starves (#62). Other flips,
+/// any other change, a conflict with `HEAD`, or a tip without exactly one parent do not hold.
 fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String> {
     let run = |arguments: &[&str]| {
         git(root, arguments, &[], None)
@@ -775,13 +783,78 @@ fn branch_holds(root: &Path, remote: &str, commit: &str) -> Result<bool, String>
     let Some(tip) = listed.split_whitespace().next() else {
         return Ok(false);
     };
+    // Depth 2: the tip and its parent, whose trees the replay needs, and none of `main`'s
+    // history.
     let local = format!("+{reference}:refs/nami/bot-passes");
-    let _ = run(&["fetch", "--quiet", "--no-tags", "--depth=1", remote, &local])?;
-    let theirs = run(&["cat-file", "commit", tip])?;
+    let _ = run(&["fetch", "--quiet", "--no-tags", "--depth=2", remote, &local])?;
     let ours = run(&["cat-file", "commit", commit])?;
-    let ours_shape = tree_and_parents(&ours);
-    assert!(ours_shape.len() == 2, "the bot's commit has a tree and one parent: {ours_shape:?}");
-    Ok(tree_and_parents(&theirs) == ours_shape)
+    let (tree, base) = one_parent(&ours).expect("the bot's commit has a tree and one parent");
+    let head = run(&["rev-parse", "HEAD"])?;
+    assert_eq!(base, head.trim(), "the bot's commit sits on HEAD");
+    let theirs = run(&["cat-file", "commit", tip])?;
+    let Some((_, parent)) = one_parent(&theirs) else {
+        return Ok(false);
+    };
+    let replayed = replayed_tree(root, (parent, base, tip))?;
+    Ok(replayed.as_deref() == Some(tree))
+}
+
+/// The tree that `tip`'s own change, its diff against `parent`, gives once replayed onto
+/// `base`; none when it conflicts there.
+///
+/// This is `git merge-tree --write-tree --merge-base=<parent> <base> <tip>`: git answers
+/// whether the change still applies, and its tree, compared with the freshly built one, says
+/// whether the change is exactly the wanted flips. Comparing the two diffs instead would need
+/// their blobs and context to match, which fails whenever `main` changed a `tasks.json`
+/// elsewhere. The merge base is named, not searched for, so the replay needs only the tip and
+/// its parent, not `main`'s history, which the job's depth-1 checkout lacks. While only this
+/// job writes the branch, that parent is a commit of `main`, and so the base GitHub merges
+/// from too; a tip on any other parent carries that parent's changes into the PR, which
+/// `check-pr` rejects, and the next change of flips rebuilds it.
+///
+/// # Errors
+///
+/// When git fails for any other reason than a conflict.
+fn replayed_tree(
+    root: &Path,
+    (parent, base, tip): (&str, &str, &str),
+) -> Result<Option<String>, String> {
+    assert!([parent, base, tip].into_iter().all(is_object_name), "three commits: {tip}");
+    let merge_base = format!("--merge-base={parent}");
+    let arguments = ["merge-tree", "--write-tree", "--no-messages", &merge_base, base, tip];
+    let output = git_command(root, &arguments, &[]).stdin(Stdio::null()).output();
+    let output = output.map_err(|error| format!("cannot run git merge-tree: {error}"))?;
+    match output.status.code() {
+        Some(0) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let tree = stdout.lines().next().unwrap_or_default().to_owned();
+            assert!(is_object_name(&tree), "a clean merge-tree prints its tree: {stdout}");
+            Ok(Some(tree))
+        }
+        // git's exit status for a merge with conflicts.
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "cannot replay `{BOT_BRANCH}` onto {base}: git merge-tree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// True for a full hexadecimal object name, as git prints it.
+fn is_object_name(name: &str) -> bool {
+    name.len() >= 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The tree and the parent of a raw commit object that has exactly one parent; none for a
+/// root or a merge.
+fn one_parent(commit: &str) -> Option<(&str, &str)> {
+    let shape = tree_and_parents(commit);
+    let starts = shape.first().is_none_or(|line| line.starts_with("tree "));
+    assert!(starts, "a commit object starts with its tree: {shape:?}");
+    let [tree, parent] = shape.as_slice() else {
+        return None;
+    };
+    Some((tree.strip_prefix("tree ")?, parent.strip_prefix("parent ")?))
 }
 
 /// The `tree` and `parent` lines of a raw commit object, as `git cat-file commit` prints it:
@@ -887,8 +960,8 @@ pub fn pull_text(tasks: &[Task], flipped: &[String], head: &str) -> (String, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        is_active_tasks_file, only_passes_set, passing_from_json, passing_json, pull_number,
-        pull_text, set_passes, unblocked,
+        is_active_tasks_file, one_parent, only_passes_set, passing_from_json, passing_json,
+        pull_number, pull_text, set_passes, unblocked,
     };
     use crate::task::plan::Task;
     use std::collections::BTreeSet;
@@ -998,6 +1071,16 @@ mod tests {
             let error = passing_from_json(bad).expect_err("refused");
             assert!(error.starts_with("the file must be {\"passing\""), "{bad}: {error}");
         }
+    }
+
+    // Goal: only a commit with exactly one parent has a change of its own to replay; a root
+    // commit and a merge have none, so `bot/passes` is rebuilt from them.
+    #[test]
+    fn only_a_one_parent_commit_has_its_own_change() {
+        let commit = "tree t1\nparent p1\nauthor a\n\nparent p9 in the message\n";
+        assert_eq!(one_parent(commit), Some(("t1", "p1")));
+        assert_eq!(one_parent("tree t1\nauthor a\n\nroot\n"), None, "a root commit");
+        assert_eq!(one_parent("tree t1\nparent p1\nparent p2\n\nmerge\n"), None, "a merge");
     }
 
     // Goal: a pull request number is positive, and empty means none.

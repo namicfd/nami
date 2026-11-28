@@ -66,10 +66,12 @@ impl Pulls for FakePulls {
     }
 }
 
-/// A test runner with a fixed verdict per task, which logs the tasks it ran.
+/// A test runner with a fixed verdict per task, which logs the tasks it ran. A `short` runner
+/// drops the last verdict, as a broken runner might.
 #[derive(Default)]
 struct FakeTests {
     failing: Vec<String>,
+    short: bool,
     ran: RefCell<Vec<String>>,
 }
 
@@ -79,7 +81,11 @@ impl Acceptance for FakeTests {
             self.ran.borrow_mut().push(task.id.clone());
             if self.failing.contains(&task.id) { Err("a test failed".to_owned()) } else { Ok(()) }
         });
-        Ok(verdicts.collect())
+        let mut verdicts: Vec<Result<(), String>> = verdicts.collect();
+        if self.short {
+            let _ = verdicts.pop();
+        }
+        Ok(verdicts)
     }
 }
 
@@ -210,6 +216,20 @@ fn check_pr_lets_only_the_bots_flip_through() {
         .expect("written");
     rejected(&bots_pull(), &tests, &arguments, "`docs/exec-plans/active/p/plan.md` (M) is not");
     std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a runner that returns fewer verdicts than there are flipped tasks never lets the
+// flips past the end of its list through: `check-pr` panics on it instead.
+#[test]
+#[should_panic(expected = "one verdict per flipped task")]
+fn check_pr_panics_on_too_few_verdicts() {
+    let (_root, clone) = setup("short");
+    let base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let _ = commit(&clone, "Set passes: a");
+    let short = FakeTests { short: true, ..FakeTests::default() };
+    let output = check(&clone, &bots_pull(), &short, &["check-pr", &base, "bot/passes", "7"]);
+    assert!(output.is_empty(), "check-pr returned instead of panicking: {output}");
 }
 
 // Goal: in the merge queue, the PR comes from the queue branch's name, and each entry is
@@ -398,10 +418,10 @@ fn tip(clone: &Path) -> String {
 }
 
 // Goal: each run builds the commit that `bot/passes` should hold and pushes only when the
-// branch differs from it in tree or parent: an unchanged main and flip set push nothing, while
-// a foreign file on the tip or a change to the plan on main rebuilds the branch. Every run
-// reconciles the PR: a stale title is edited and auto-merge is turned back on, without a push.
-// A PR from `bot/passes` that the bot did not open is never touched.
+// branch's own change is not that commit's: an unchanged main and flip set push nothing,
+// while a foreign file on the tip rebuilds the branch. Every run reconciles the PR: a stale
+// title is edited and auto-merge is turned back on, without a push. A PR from `bot/passes`
+// that the bot did not open is never touched.
 #[test]
 fn open_pr_pushes_only_on_drift_and_always_reconciles() {
     let (root, clone) = setup("drift");
@@ -439,12 +459,6 @@ fn open_pr_pushes_only_on_drift_and_always_reconciles() {
     let rebuilt = tip(&clone);
     assert_eq!(git(&clone, &["diff", "--name-only", &pushed, &rebuilt]), "", "the same tree");
 
-    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nMore.\n")
-        .expect("written");
-    let moved = commit(&clone, "main changes the plan");
-    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed, edited\n", "main moved");
-    assert_eq!(git(&clone, &["rev-parse", &format!("{}^", tip(&clone))]), moved, "on new main");
-
     let before = tip(&clone);
     let mut squatted = FakePulls { open: Some(70), ..bots_pull() };
     let _ = squatted.heads.insert(70, bot_head(passes::BOT_BRANCH, "nami-agent[bot]"));
@@ -454,6 +468,61 @@ fn open_pr_pushes_only_on_drift_and_always_reconciles() {
     assert!(squat.starts_with(named), "{squat}");
     assert!(squatted.log.borrow().is_empty(), "a squatted PR is neither edited nor closed");
     assert_eq!(tip(&clone), before, "nothing is pushed");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a tip on an older main is kept while its own change, the wanted flips, still applies
+// cleanly to main (#62): main moving on, even in the same tasks.json, pushes nothing, so the
+// PR keeps its place in the merge queue, and only its text is edited. A tip whose change
+// conflicts with main, or whose flips are not the wanted ones, is rebuilt on today's main.
+#[test]
+fn open_pr_keeps_a_stale_tip_until_it_conflicts_or_its_flips_differ() {
+    let (root, clone) = setup("stale");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let github = FakePulls { open: Some(70), ..bots_pull() };
+    let tests = FakeTests::default();
+    let run = || {
+        let output = check(&clone, &github, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let parent = |commit: &str| git(&clone, &["rev-parse", &format!("{commit}^")]);
+    let old_main = git(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(run(), "ok: #70 sets `passes` on a: pushed, edited, auto-merge on\n");
+    let pushed = tip(&clone);
+
+    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nMore.\n")
+        .expect("written");
+    let retitled = tasks_json(false).replace("Task b", "Task B");
+    std::fs::write(clone.join(TASKS), retitled).expect("tasks.json is written");
+    let _ = commit(&clone, "main changes the plan, and tasks.json away from the flip");
+    assert_eq!(run(), "ok: #70 sets `passes` on a: edited\n", "only the text names a new head");
+    assert_eq!(tip(&clone), pushed, "the stale tip still applies, so nothing is pushed");
+    assert_eq!(parent(&pushed), old_main, "and it stays on the older main");
+
+    let text = std::fs::read_to_string(clone.join(TASKS)).expect("readable");
+    let next_to_flip = text.replace("[\"a::works\"]", "[\"a::works\", \"a::more\"]");
+    std::fs::write(clone.join(TASKS), next_to_flip).expect("tasks.json is written");
+    let conflicting = commit(&clone, "main changes the line next to the flip");
+    assert_eq!(run(), "ok: #70 sets `passes` on a: pushed, edited\n", "a conflict rebuilds");
+    let rebuilt = tip(&clone);
+    assert_eq!(parent(&rebuilt), conflicting, "on today's main");
+
+    let _ = git(&clone, &["checkout", "--quiet", "--detach"]);
+    let today = std::fs::read_to_string(clone.join(TASKS)).expect("readable");
+    let (a_part, b_part) = today.split_at(today.rfind("\"passes\": false").expect("b's line"));
+    let flips_b = format!("{a_part}{}", b_part.replacen("false", "true", 1));
+    std::fs::write(clone.join(TASKS), flips_b).expect("tasks.json is written");
+    let other = commit(&clone, "Set passes: b");
+    let target = format!("{other}:refs/heads/bot/passes");
+    let _ = git(&clone, &["push", "--quiet", "--force", "origin", &target]);
+    let _ = git(&clone, &["checkout", "--quiet", "-"]);
+    assert_eq!(run(), "ok: #70 sets `passes` on a: pushed\n", "other flips rebuild");
+    let fixed = tip(&clone);
+    assert_eq!(git(&clone, &["diff", "--name-only", &rebuilt, &fixed]), "", "a's flip again");
+    assert_eq!(parent(&fixed), conflicting, "on today's main");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 
