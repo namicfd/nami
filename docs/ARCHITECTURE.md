@@ -445,7 +445,9 @@ measures. A loop that does not vectorise is restructured, never rewritten with i
   no work stealing, so the schedule is the same every run.
 - Phases are synchronised with `std::sync::Barrier`.
 - Each thread writes its own blocks first at init, so their memory pages land on its NUMA node.
-- Threads share ghost cells within a process without passing messages.
+- Threads share ghost cells within a process without passing messages. Scoped threads borrow
+  disjoint ranges of blocks, so there is no `std::thread::spawn`, `Arc` or `Mutex` (ADR-0033
+  point 5 bans them, and ADR-0039 is the threads ADR it asks for).
 
 ### 5.3 Between nodes: nami's own communication layer
 

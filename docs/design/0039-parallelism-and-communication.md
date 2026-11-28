@@ -21,7 +21,9 @@ process. ADR-0038 fixes blocks, a Morton-ordered tree and bulk-synchronous phase
 2. **Within a node, one process per NUMA domain, with threads** created at init by
    `std::thread::scope`. Blocks are assigned statically, in contiguous Morton ranges, without work
    stealing. Phases are synchronised with `std::sync::Barrier`. Each thread first-touches its own
-   blocks at init.
+   blocks at init. This is the ADR on threads that ADR-0033 point 5 asks for. It keeps that
+   point's bans: no `std::thread::spawn`, and no `Arc` or `Mutex`, since scoped threads borrow
+   disjoint ranges of blocks and the barrier orders the phases.
 3. **Between nodes, a `Transport` trait** with in-process, TCP (`std::net`) and InfiniBand
    (ADR-0040) implementations. Channels between neighbouring ranks are persistent. Their buffers
    are sized at init from the memory budget, as the block pools are (ADR-0038): enough for the
