@@ -387,7 +387,7 @@ The approval satisfies "approve the last push" (step 3), because the app never p
 - **The app's key is out of the authoring machines' reach.** It is a secret of the environment `nami-reviewer`, which only `main` may use, and the one job that holds it runs no PR code. No agent can post, resolve or approve as the reviewer.
 - **The model reads the PR, and can be misled by it.** A PR written to deceive the reviewer could be approved. The review runs only for PRs by the agents' app or a code owner, its tools only read, and `post` reads its answer as data: known reviewers, places in the PR's files, bounded text, mentions broken. Protected paths still need your approval, rule-path edits still need the ratchet's checks, and the sampled audits of ADR-0008 stand behind the rest.
 - **Contents: write is a permission the role does not use.** Third-party tests report that GitHub counts an app's approval only when the app has write access to the repository's contents. The job narrows its token to `pull_requests: write`, but a leaked key can mint contents write and push to any branch that the rulesets leave open, open PR branches included. `main` stays behind the ruleset. A push by the app makes the app the last pusher, so its own approval of that head never counts.
-- **No stored Anthropic key, and no environment for it.** The model job signs in through Anthropic's workload identity federation. GitHub gives the job an OIDC token, which Anthropic exchanges for a token that lives at most ten minutes, as a Console service account. The job names no environment, so the token's subject is `repo:namicfd/nami:ref:refs/heads/main`; the rule also pins `job_workflow_ref` to `review.yml` on `main`. A PR's run has a `refs/pull/…` ref, and another workflow has another `job_workflow_ref`, so neither can use the rule. The federation's IDs are written in `review.yml`: they name things, and grant nothing.
+- **No stored Anthropic key, and no environment for it.** The model job signs in through Anthropic's workload identity federation. GitHub gives the job an OIDC token, which Anthropic exchanges for a token that lives at most ten minutes, as a Console service account. The job names no environment, and the repository uses GitHub's immutable OIDC subject, so the token's subject is `repo:namicfd@360887709/nami@1470964610:ref:refs/heads/main`; the rule also pins `repository_id`, `ref`, `event_name` and `job_workflow_ref`. A PR's run has the subject `…:pull_request`, a push to another branch or the merge queue another `ref`, and another workflow another `job_workflow_ref`, so none of them can use the rule. The federation's IDs are written in `review.yml`: they name things, and grant nothing.
 
 ### Set it up, in one sitting before #98 merges
 
@@ -401,8 +401,8 @@ A job that names a missing environment makes GitHub create it with no branch rul
    | Field | Value |
    |---|---|
    | Audience | `https://api.anthropic.com` |
-   | Subject (`subject_prefix`, with no trailing `*`, so an exact match) | `repo:namicfd/nami:ref:refs/heads/main` |
-   | Claims | `job_workflow_ref` = `namicfd/nami/.github/workflows/review.yml@refs/heads/main` |
+   | Subject (`subject_prefix`, with no trailing `*`, so an exact match) | `repo:namicfd@360887709/nami@1470964610:ref:refs/heads/main`. The repository uses GitHub's immutable subject (`gh api "repos/$REPO/actions/oidc/customization/sub"` prints `"use_immutable_subject":true`), so the owner and the repository appear with their IDs. |
+   | Claims, each an exact value | `repository_id` = `1470964610`; `ref` = `refs/heads/main`; `event_name` = `workflow_run`; `job_workflow_ref` = `namicfd/nami/.github/workflows/review.yml@refs/heads/main` |
    | Service account | one in a single workspace that has a monthly spend limit |
    | Scope | `workspace:developer` |
    | Token lifetime | 600 seconds. Set it: the job refreshes its identity token every 2 minutes, so a longer lifetime gains nothing. |
@@ -437,6 +437,7 @@ gh api "repos/$REPO/environments/nami-reviewer/deployment-branch-policies" \
   --jq '[.branch_policies[] | {name, type}]'
 gh secret list --repo "$REPO" --env nami-reviewer
 gh variable list --repo "$REPO"
+gh api "repos/$REPO/actions/oidc/customization/sub"
 ```
 
 Expect, with keys in any order:
@@ -444,7 +445,8 @@ Expect, with keys in any order:
 - the permissions `contents` and `pull_requests` `write` and `metadata` `read`, and nothing else;
 - `nami-reviewer` in the list, with `custom_branch_policies` `true` and `protected_branches` `false`, the rules `["branch_policy"]` only, and the one branch policy `{"name":"main","type":"branch"}`. An environment without that rule is open to every branch (ADR-0023): fix it before anything else;
 - the secret `NAMI_REVIEWER_PRIVATE_KEY` in `nami-reviewer`;
-- `NAMI_REVIEWER_CLIENT_ID` and `NAMI_REVIEWER_LOGIN` among the repository variables.
+- `NAMI_REVIEWER_CLIENT_ID` and `NAMI_REVIEWER_LOGIN` among the repository variables;
+- `"use_default":true`, `"use_immutable_subject":true` and the prefix `repo:namicfd@360887709/nami@1470964610`, which the rule's subject starts with. A changed subject template changes what the rule must match.
 
 Then the first PR by `nami-agent[bot]` after #98 merges is the end-to-end test. Once `ci` passes, the `review` workflow's three jobs run, and `nami-reviewer[bot]` reviews it.
 
