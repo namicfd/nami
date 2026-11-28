@@ -86,7 +86,7 @@ pub const RULES: &[Rule] = &[
         summary: "No two ADR files share an ID, and an ADR's title repeats the ID of its file \
                   name.",
         detail: "Same-minute clashes between branches show here once both are merged; the \
-                 merge queue's `adr clashes` check fails them earlier.",
+                 `adr clashes` check on each pull request fails them earlier.",
         reference: "ADR-0000",
     },
     Rule {
@@ -119,7 +119,8 @@ pub const RULES: &[Rule] = &[
         kind: RuleKind::Workspace,
         summary: "Every ADR has a `- Summary:` line in its header: the one line its index row \
                   shows.",
-        detail: "",
+        detail: "The placeholder summary that `cargo xtask adr new` writes is rejected too, so \
+                 an unedited template cannot merge.",
         reference: "ADR-20261128-1856",
     },
     Rule {

@@ -7,7 +7,7 @@
 //!   PR (ADR-20261128-1856).
 //! - `failed --run <id>` files an issue of kind `bug` for the PR whose merge-queue run `<id>`
 //!   failed, through the path of `cargo xtask issue file`, so that `cargo xtask task ready`
-//!   lists it and the next session rebases or renumbers the PR on its own branch (ADR-0021,
+//!   lists it and the next session rebases the PR or moves its ADR on its own branch (ADR-0021,
 //!   point 6). It files nothing unless the PR really left the queue: it is open, not merged,
 //!   not queued, and no newer merge-queue run tested it. There is one issue per failed merge
 //!   group: its title names the run, so a re-run of the run files nothing, and a failed run of
@@ -175,6 +175,7 @@ fn summary(pull: u32, found: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> Strin
     if found.is_empty() {
         return format!("#{pull} adds no ADR ID that is in use elsewhere\n");
     }
+    let moves = clashes::destinations(pull, found, taken);
     let lines: Vec<String> = found
         .iter()
         .map(|clash| {
@@ -182,8 +183,7 @@ fn summary(pull: u32, found: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> Strin
                 clashes::Holder::Main => "is already on main".to_owned(),
                 clashes::Holder::Pull(other) => format!("is also added by #{other}"),
             };
-            if clash.moves(pull) {
-                let destination = clashes::destination(*clash, taken);
+            if let Some(destination) = moves.get(&clash.id).filter(|_| clash.moves(pull)) {
                 format!("error: ADR-{} {place}; move this PR's ADR to {destination}", clash.id)
             } else {
                 format!("note: ADR-{} {place}, which is newer and moves its ADR", clash.id)
@@ -879,7 +879,7 @@ mod tests {
              actions/runs/900/job/11)). Tidy rules reported: `adr-number`.\n",
             "- Another job failed at another step ([log](https://github.com/namicfd/nami/actions/\
              runs/900/job/14)). Its log could not be read.\n",
-            "Rebase or renumber, then re-queue, on #51's own branch",
+            "Rebase or move the ADR, then re-queue, on #51's own branch",
         ] {
             assert!(body.contains(part), "{part}\n---\n{body}");
         }
@@ -898,7 +898,7 @@ mod tests {
         assert!(output.starts_with("filed #70"), "{output}");
         let filed = fake.filed.borrow();
         assert_eq!(filed[0].2, ["bug", "needs-decision"]);
-        assert!(filed[0].1.contains("a human rebases or renumbers it"), "{}", filed[0].1);
+        assert!(filed[0].1.contains("a human rebases it or moves its ADR"), "{}", filed[0].1);
     }
 
     // Goal: nothing is filed for a PR that merged, closed, is queued again, or that a newer run

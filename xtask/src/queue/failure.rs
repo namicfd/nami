@@ -334,13 +334,14 @@ fn proposed_fix(pull: u32, by_bot: bool) -> String {
     if !by_bot {
         return format!(
             "\n## Proposed fix\n\n#{pull} was not opened by the bot, so agents do not push to its \
-             branch: a human rebases or renumbers it, then re-queues it, and closes this issue. \
+             branch: a human rebases it or moves its ADR, then re-queues it, and closes this \
+             issue. \
              The issue carries `needs-decision`, so `cargo xtask task ready` does not list it \
              (ADR-0021, point 6).\n"
         );
     }
     format!(
-        "\n## Proposed fix\n\nRebase or renumber, then re-queue, on #{pull}'s own branch \
+        "\n## Proposed fix\n\nRebase or move the ADR, then re-queue, on #{pull}'s own branch \
          (ADR-0021, point 6). Claim this issue as usual, then check out #{pull}'s branch, rebase \
          it onto `main` and run `just check-full`: a clash that git merged without a conflict \
          shows up there. Two ADRs with one ID are the usual case; move #{pull}'s ADR to a free \
@@ -571,7 +572,7 @@ mod tests {
              900/job/7)). Read the log for the error.\n",
             "- Job `gate` failed at another step ([log]",
             "Its log could not be read.",
-            "Rebase or renumber, then re-queue, on #51's own branch (ADR-0021, point 6).",
+            "Rebase or move the ADR, then re-queue, on #51's own branch (ADR-0021, point 6).",
             "Keep the claim: this issue closes when #51 merges, or when a human closes it.",
             "While #51 is open and says `Fixes #<this issue>`, queued or not, its fix is in \
              flight",
@@ -605,7 +606,7 @@ mod tests {
         let report = Failure { author: "someone".to_owned(), ..failure(Vec::new()) };
         let text = finding(&report, &vocabulary());
         assert!(text.contains("#51 was not opened by the bot, so agents do not push"), "{text}");
-        assert!(text.contains("a human rebases or renumbers it"), "{text}");
+        assert!(text.contains("a human rebases it or moves its ADR"), "{text}");
         assert!(!text.contains("Claim this issue"), "{text}");
         assert!(Draft::parse(&text).is_ok(), "{text}");
     }

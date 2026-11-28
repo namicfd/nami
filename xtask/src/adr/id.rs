@@ -26,6 +26,9 @@ const YEAR_MIN: u32 = 2026;
 /// Seconds in a day.
 const SECONDS_PER_DAY: u64 = 86_400;
 
+/// Seconds from the Unix epoch to 10000-01-01, the first minute a stamp cannot name.
+const SECONDS_BEFORE_YEAR_10000: u64 = 253_402_300_800;
+
 /// The ID of one ADR. Legacy numbers sort before stamps, and stamps sort by time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AdrId {
@@ -67,19 +70,20 @@ impl Stamp {
         is_valid.then_some(Self { year, month, day, hour, minute })
     }
 
-    /// The minute that `seconds` after the Unix epoch falls in.
-    ///
-    /// # Panics
-    ///
-    /// If that minute lies before [`YEAR_MIN`]: the clock is wrong.
+    /// The minute that `seconds` after the Unix epoch falls in, or `None` if it lies outside the
+    /// years [`YEAR_MIN`] to 9999: the clock is wrong.
     #[must_use]
-    pub fn from_unix_seconds(seconds: u64) -> Self {
+    pub fn from_unix_seconds(seconds: u64) -> Option<Self> {
+        if seconds >= SECONDS_BEFORE_YEAR_10000 {
+            return None;
+        }
         let (year, month, day) = civil_from_days(seconds / SECONDS_PER_DAY);
         let of_day = seconds % SECONDS_PER_DAY;
         let hour = u32::try_from(of_day / 3600).expect("an hour of the day fits in u32");
         let minute = u32::try_from(of_day % 3600 / 60).expect("a minute fits in u32");
         let stamp = Self::new(year, month, day, hour, minute);
-        stamp.unwrap_or_else(|| panic!("{seconds} s after the epoch is before {YEAR_MIN}"))
+        assert!(stamp.is_none_or(|stamp| stamp.year == year), "the stamp keeps the year");
+        stamp
     }
 
     /// The minute after this one.
@@ -156,9 +160,7 @@ impl fmt::Display for AdrId {
 /// True for a slug: lower-case letters, digits and single dashes between them.
 #[must_use]
 pub fn is_slug(slug: &str) -> bool {
-    let words: Vec<&str> = slug.split('-').collect();
-    assert!(!words.is_empty(), "splitting yields at least one part");
-    words.iter().all(|word| {
+    slug.split('-').all(|word| {
         !word.is_empty()
             && word.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
     })
@@ -308,13 +310,20 @@ mod tests {
         assert!(Stamp::new(2400, 2, 29, 0, 0).is_some(), "2400 is one");
     }
 
-    // Goal: Unix time converts to the UTC minute, across days, months and leap days.
+    // Goal: Unix time converts to the UTC minute, across days, months and leap days, and a clock
+    // before 2026 or past 9999 gives no stamp instead of a panic.
     #[test]
     fn unix_seconds_give_the_utc_minute() {
-        assert_eq!(Stamp::from_unix_seconds(1_795_892_580), stamp(2026, 11, 28, 19, 3));
-        assert_eq!(Stamp::from_unix_seconds(1_795_892_639), stamp(2026, 11, 28, 19, 3));
-        assert_eq!(Stamp::from_unix_seconds(1_767_225_600), stamp(2026, 1, 1, 0, 0));
-        assert_eq!(Stamp::from_unix_seconds(1_835_395_200), stamp(2028, 2, 29, 0, 0));
+        let of = Stamp::from_unix_seconds;
+        assert_eq!(of(1_795_892_580), Some(stamp(2026, 11, 28, 19, 3)));
+        assert_eq!(of(1_795_892_639), Some(stamp(2026, 11, 28, 19, 3)));
+        assert_eq!(of(1_767_225_600), Some(stamp(2026, 1, 1, 0, 0)));
+        assert_eq!(of(1_835_395_200), Some(stamp(2028, 2, 29, 0, 0)));
+        assert_eq!(of(253_402_300_799), Some(stamp(9999, 12, 31, 23, 59)));
+        assert_eq!(of(1_767_225_599), None, "2025");
+        assert_eq!(of(0), None, "1970");
+        assert_eq!(of(253_402_300_800), None, "10000");
+        assert_eq!(of(u64::MAX), None, "far past 9999");
         assert_eq!(stamp(2026, 3, 9, 1, 2).date(), "2026-03-09");
     }
 

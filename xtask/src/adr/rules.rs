@@ -59,7 +59,12 @@ pub fn check_file_names(root: &Path) -> io::Result<Vec<Violation>> {
         );
         violations.push(Violation::new(&path, 0, "adr-id", message));
     }
-    assert!(violations.iter().all(|violation| violation.rule == "adr-id"), "one rule");
+    assert!(
+        violations
+            .iter()
+            .all(|violation| violation.path.parent() == Some(Path::new(ADR_DIRECTORY))),
+        "only files directly in the ADR directory are judged"
+    );
     Ok(violations)
 }
 
@@ -77,6 +82,10 @@ pub fn check_references(root: &Path, ids: &BTreeSet<AdrId>) -> io::Result<Vec<Vi
         };
         violations.extend(references_in(&relative, &text, ids));
     }
+    assert!(
+        violations.iter().all(|violation| !violation.path.starts_with("xtask/fixtures")),
+        "tidy's fixtures cite missing ADRs on purpose and are never judged"
+    );
     Ok(violations)
 }
 
@@ -109,6 +118,11 @@ pub fn references_in(relative: &Path, text: &str, ids: &BTreeSet<AdrId>) -> Vec<
             violations.push(Violation::new(relative, number, "adr-reference", message));
         }
     }
+    let lines = u32::try_from(text.lines().count()).expect("a file has < 2^32 lines");
+    assert!(
+        violations.iter().all(|violation| (1..=lines).contains(&violation.line)),
+        "every violation is on a line of the file"
+    );
     violations
 }
 

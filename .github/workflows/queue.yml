@@ -53,7 +53,7 @@ jobs:
 
   # Ownership of queue failures: when the required checks fail on a merge-queue branch and the
   # PR has really left the queue, file an issue of kind `bug` for it, as nami-ci[bot], so that
-  # `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on its
+  # `cargo xtask task ready` lists it and the next session rebases the PR or moves its ADR on its
   # own branch (ADR-0021, point 6). Agents trust nami-ci[bot] for exactly this issue title
   # (ADR-0023). A failed merge-queue run of `ci` or of `guardrails`, which holds the required
   # `ratchet` check (ADR-0022), is filed. One issue per failed merge group:

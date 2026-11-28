@@ -2,8 +2,8 @@
 //!
 //! - `adr new <slug>` writes `docs/design/YYYYMMDD-HHMM-<slug>.md` from the template, named
 //!   after the current UTC minute, and regenerates the index. Agents never type an ID: two
-//!   branches then clash only if they start an ADR in the same minute, and the clash check of
-//!   the merge queue fails such a pull request.
+//!   branches then clash only if they start an ADR in the same minute, and the `adr clashes`
+//!   check on each pull request fails the one that moves.
 //! - `adr index [--write]` prints or writes `docs/design/README.md`.
 //!
 //! ADRs 0000 to 0043 keep their numbers ([`id::LEGACY_NUMBERS`]).
@@ -29,7 +29,7 @@ const MINUTES_MAX: u32 = 1000;
 pub fn run(arguments: &[&str]) -> ExitCode {
     let root = crate::workspace_root();
     let result = match arguments {
-        ["new", slug] => new_adr(&root, slug, now()).map(|path| {
+        ["new", slug] => now().and_then(|stamp| new_adr(&root, slug, stamp)).map(|path| {
             format!(
                 "adr: wrote {}; write its title, summary and sections, then run `{}`\n",
                 path.display(),
@@ -57,14 +57,21 @@ pub fn run(arguments: &[&str]) -> ExitCode {
 }
 
 /// The current UTC minute.
+///
+/// # Errors
+///
+/// When the clock is before 2026 or after 9999, which makes no ID.
 #[expect(
     clippy::disallowed_methods,
     reason = "an ADR's ID is the UTC minute it is written in; nothing else in xtask reads the \
               clock (ADR-20261128-1856)"
 )]
-fn now() -> Stamp {
+fn now() -> Result<Stamp, String> {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    Stamp::from_unix_seconds(since.expect("the clock is after 1970").as_secs())
+    let seconds = since.map_or(0, |since| since.as_secs());
+    Stamp::from_unix_seconds(seconds).ok_or_else(|| {
+        format!("the clock says {seconds} s after 1970, which no ADR ID names; set the clock")
+    })
 }
 
 /// Writes a new ADR named `slug` in the tree at `root`, with the ID `now`, or the first later
@@ -110,7 +117,7 @@ fn template(id: AdrId, stamp: Stamp, slug: &str) -> String {
          - Status: Proposed\n\
          - Date: {date}\n\
          - Deciders: maintainer\n\
-         - Summary: The one line the index shows: the rule, as an agent would follow it.\n\n\
+         - Summary: {summary}\n\n\
          ## Context\n\nWhat forces the decision: the problem, what happened, what it cost.\n\n\
          ## Decision\n\nWhat is decided, as numbered rules.\n\n\
          ## Enforcement\n\nThe mechanism that makes each rule hold: a lint, a tidy rule, a \
@@ -118,7 +125,8 @@ fn template(id: AdrId, stamp: Stamp, slug: &str) -> String {
          ## Consequences\n\nWhat changes, what gets harder, and the known gaps.\n\n\
          ## Alternatives considered\n\nEach alternative and why it lost.\n\n\
          ## Evidence\n\nWhat the decision rests on: measurements, incidents, sources.\n",
-        date = stamp.date()
+        date = stamp.date(),
+        summary = index::PLACEHOLDER_SUMMARY
     );
     assert!(text.starts_with(&format!("# ADR-{id}: ")), "the title carries the ID");
     text
@@ -180,15 +188,22 @@ mod tests {
         assert_eq!(written, index::render(&index::entries(scratch.root()).unwrap()));
         assert!(written.contains("[20261128-1857](20261128-1857-second.md)"), "{written}");
         assert_eq!(index::check(scratch.root()).unwrap(), Vec::new(), "the index is current");
-        assert_eq!(check(scratch.root()).unwrap(), Vec::new(), "the template passes the rules");
+        let unedited = check(scratch.root()).unwrap();
+        let rules: Vec<&str> = unedited.iter().map(|violation| violation.rule).collect();
+        assert_eq!(rules, ["adr-summary"; 2], "an unedited summary cannot merge");
+        assert!(unedited[0].message.contains("the template's summary"), "{}", unedited[0]);
+        let edited = text.replace(index::PLACEHOLDER_SUMMARY, "A rule.");
+        scratch.write(&first.to_string_lossy(), &edited);
+        assert_eq!(check(scratch.root()).unwrap().len(), 1, "only the second is unedited");
         let error = new_adr(scratch.root(), "Bad_Slug", stamp(19, 3)).unwrap_err();
         assert!(error.contains("is no slug"), "{error}");
     }
 
-    // Goal: the template has the six sections and the header that the ADR rules ask for, so a
-    // new ADR passes them before its author writes a word.
+    // Goal: the template has the six sections and the header that the per-file ADR rules ask
+    // for, so the edit hook is quiet while the author writes; only the workspace rule
+    // `adr-summary` asks for the real summary.
     #[test]
-    fn the_template_passes_the_adr_rules() {
+    fn the_template_passes_the_per_file_adr_rules() {
         let scratch = Scratch::new("adr-template");
         scratch.write("docs/design/README.md", "");
         let path = new_adr(scratch.root(), "x", stamp(23, 59)).unwrap();

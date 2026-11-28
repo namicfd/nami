@@ -12,7 +12,7 @@
 //! never the rest of its name, because another PR's file names are not ours to repeat.
 
 use crate::adr::id::AdrId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::forge::PullFile;
 
@@ -170,31 +170,52 @@ pub fn free_after(id: AdrId, taken: &BTreeSet<AdrId>) -> Option<AdrId> {
     panic!("{MINUTES_MAX} minutes after ADR-{id} are all taken");
 }
 
-/// Where pull request `pull` moves the ADR of `clash`, in words.
+/// Where pull request `pull` moves each of its ADRs that clashes, in words: the first free
+/// minute after it, given the IDs `taken` anywhere, and never a minute already handed to
+/// another of its ADRs. A legacy number gets a new ID from `cargo xtask adr new`.
 #[must_use]
-pub fn destination(clash: Clash, taken: &BTreeSet<AdrId>) -> String {
-    match free_after(clash.id, taken) {
-        Some(free) => format!("ADR-{free}, the next free minute"),
-        None => "a new ID from `cargo xtask adr new <slug>`".to_owned(),
+pub fn destinations(
+    pull: u32,
+    clashes: &BTreeSet<Clash>,
+    taken: &BTreeSet<AdrId>,
+) -> BTreeMap<AdrId, String> {
+    let mut handed = taken.clone();
+    let mut found = BTreeMap::new();
+    for clash in clashes.iter().filter(|clash| clash.moves(pull)) {
+        if found.contains_key(&clash.id) {
+            continue;
+        }
+        let text = match free_after(clash.id, &handed) {
+            Some(free) => {
+                let _ = handed.insert(free);
+                format!("ADR-{free}, the next free minute")
+            }
+            None => "a new ID from `cargo xtask adr new <slug>`".to_owned(),
+        };
+        let _ = found.insert(clash.id, text);
     }
+    assert!(handed.len() <= taken.len() + found.len(), "one minute at most for each ADR");
+    found
 }
 
 /// The comment for pull request `pull` with `clashes`, given the IDs `taken` anywhere.
 #[must_use]
 pub fn render(pull: u32, clashes: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> String {
     assert!(!clashes.is_empty(), "a comment without clashes is `resolved`");
+    let moves = destinations(pull, clashes, taken);
+    let to = |clash: &Clash| moves.get(&clash.id).cloned().unwrap_or_default();
     let lines: Vec<String> = clashes
         .iter()
         .map(|clash| match clash.holder {
             Holder::Main => format!(
                 "- ADR-{} is already on `main`: move this PR's ADR to {}.",
                 clash.id,
-                destination(*clash, taken)
+                to(clash)
             ),
             Holder::Pull(other) if clash.moves(pull) => format!(
                 "- ADR-{} is also added by #{other}, which is older: move this PR's ADR to {}.",
                 clash.id,
-                destination(*clash, taken)
+                to(clash)
             ),
             Holder::Pull(other) => format!(
                 "- ADR-{} is also added by #{other}, which is newer and moves its ADR.",
@@ -208,7 +229,8 @@ pub fn render(pull: u32, clashes: &BTreeSet<Clash>, taken: &BTreeSet<AdrId>) -> 
          queue. This check fails the PR that moves: the one whose clash is with `main` or with \
          an older PR. To move an ADR, rename its file, change its `# ADR-…:` title and every \
          reference to it, and run `cargo xtask adr index --write` (ADR-20261128-1856). \
-         `cargo xtask queue clashes --pr <n>` checks again.\n",
+         `cargo xtask queue clashes --pr <n>` checks again, and names another minute if another \
+         PR took this one first.\n",
         lines.join("\n")
     );
     assert!(text.starts_with(MARKER), "the marker finds the comment again");
@@ -223,11 +245,11 @@ pub fn resolved() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clash, Holder, MARKER, added_adrs, adr_id, clashes, free_after, ids_of};
-    use super::{removed_adrs, render, resolved};
+    use super::{Clash, Holder, MARKER, added_adrs, adr_id, clashes, destinations, free_after};
+    use super::{ids_of, removed_adrs, render, resolved};
     use crate::adr::id::{AdrId, Stamp};
     use crate::queue::forge::PullFile;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn file(path: &str, status: &str, previous: Option<&str>) -> PullFile {
         PullFile {
@@ -337,6 +359,27 @@ mod tests {
         assert_eq!(free_after(stamp(18, 56), &taken), Some(stamp(18, 58)));
         assert_eq!(free_after(stamp(18, 57), &BTreeSet::new()), Some(stamp(18, 58)));
         assert_eq!(free_after(AdrId::Legacy(22), &taken), None);
+    }
+
+    // Goal: two ADRs of one PR that both clash are sent to two different free minutes, an ID that
+    // clashes twice gets one destination, and a clash the PR does not move gets none.
+    #[test]
+    fn each_moved_adr_gets_its_own_minute() {
+        let found: BTreeSet<Clash> = [
+            Clash { id: stamp(18, 56), holder: Holder::Main },
+            Clash { id: stamp(18, 56), holder: Holder::Pull(45) },
+            Clash { id: stamp(18, 57), holder: Holder::Main },
+            Clash { id: stamp(19, 0), holder: Holder::Pull(60) },
+        ]
+        .into();
+        let taken = BTreeSet::from([stamp(18, 56), stamp(18, 57), stamp(19, 0)]);
+        let moves = destinations(51, &found, &taken);
+        let to = |id: AdrId| format!("ADR-{id}, the next free minute");
+        let expected = BTreeMap::from([
+            (stamp(18, 56), to(stamp(18, 58))),
+            (stamp(18, 57), to(stamp(18, 59))),
+        ]);
+        assert_eq!(moves, expected, "#60 is newer and moves its own ADR");
     }
 
     // Goal: the comment starts with the marker, names each ID with its holder and says who moves

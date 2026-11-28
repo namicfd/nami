@@ -18,6 +18,11 @@ pub const INDEX: &str = "docs/design/README.md";
 /// The command that regenerates the index.
 pub const WRITE_COMMAND: &str = "cargo xtask adr index --write";
 
+/// The summary that `cargo xtask adr new` writes, which the rule `adr-summary` rejects, so that
+/// an unedited template cannot merge.
+pub const PLACEHOLDER_SUMMARY: &str =
+    "The one line the index shows: the rule, as an agent would follow it.";
+
 /// What the index shows of one ADR.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -50,7 +55,10 @@ pub fn entries(root: &Path) -> io::Result<Vec<Entry>> {
         }
     }
     entries.sort_by(|a, b| (a.id, &a.file).cmp(&(b.id, &b.file)));
-    assert!(entries.is_sorted_by(|a, b| a.id <= b.id), "the entries are sorted by ID");
+    assert!(
+        entries.iter().all(|entry| AdrId::of_file_name(&entry.file) == Some(entry.id)),
+        "each entry has the ID of its file name"
+    );
     Ok(entries)
 }
 
@@ -72,16 +80,14 @@ pub fn entry_of(id: AdrId, file: &str, text: &str) -> Entry {
             Reference::Malformed => None,
         })
         .collect();
-    let entry = Entry {
+    Entry {
         id,
         file: file.to_owned(),
         title,
         status: value_of("Status:").unwrap_or_default().to_owned(),
         summary: value_of("Summary:").map(str::to_owned),
         amends,
-    };
-    assert!(entry.summary.as_ref().is_none_or(|summary| !summary.contains('\n')), "one line");
-    entry
+    }
 }
 
 /// The items of an ADR's header: each top-level `- ` line between the title and the first
@@ -103,7 +109,6 @@ pub fn header_items(text: &str) -> Vec<String> {
             is_open = false;
         }
     }
-    assert!(items.iter().all(|item| !item.contains('\n')), "an item is one line");
     items
 }
 
@@ -121,23 +126,20 @@ pub fn outside_parentheses(text: &str) -> String {
             _ => {}
         }
     }
-    assert!(kept.len() <= text.len(), "only removes");
     kept
 }
 
 /// Every `ADR-` reference in `text`, in order.
 #[must_use]
 pub fn references(text: &str) -> Vec<Reference> {
-    let found: Vec<Reference> =
-        text.split("ADR-").skip(1).filter_map(super::id::reference_after).collect();
-    assert!(found.len() <= text.matches("ADR-").count(), "at most one reference a prefix");
-    found
+    text.split("ADR-").skip(1).filter_map(super::id::reference_after).collect()
 }
 
 /// Renders the index of `entries`.
 #[must_use]
 pub fn render(entries: &[Entry]) -> String {
     let mut lines = header();
+    let table_start = lines.len();
     lines.push(row(&["ADR", "Title", "Status", "Amended by", "Summary"]));
     lines.push(row(&["---"; 5]));
     for entry in entries {
@@ -156,6 +158,7 @@ pub fn render(entries: &[Entry]) -> String {
         let summary = entry.summary.as_deref().unwrap_or_default();
         lines.push(row(&[&link, &entry.title, &entry.status, &amenders.join(", "), summary]));
     }
+    assert_eq!(lines.len(), table_start + 2 + entries.len(), "one row for each ADR");
     lines.push(String::new());
     lines.push(
         "Research behind these decisions: [the report]\
@@ -163,7 +166,6 @@ pub fn render(entries: &[Entry]) -> String {
          (../research/ai-agent-swarm-repo-readiness-notes/)."
             .to_owned(),
     );
-    assert!(lines.iter().all(|line| !line.contains('\n')), "every element is one line");
     lines.join("\n") + "\n"
 }
 
@@ -229,15 +231,23 @@ pub fn check(root: &Path) -> io::Result<Vec<Violation>> {
 #[must_use]
 pub fn check_summaries(entries: &[Entry]) -> Vec<Violation> {
     let mut violations = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.summary.as_ref().is_none_or(String::is_empty))
-    {
+    for entry in entries {
+        let problem = match entry.summary.as_deref() {
+            None | Some("") => "ADR has no `- Summary:` line; add one at the end of its header",
+            Some(PLACEHOLDER_SUMMARY) => "ADR still has the template's summary; replace it",
+            Some(_) => continue,
+        };
         let path = Path::new(ADR_DIRECTORY).join(&entry.file);
-        let message = "ADR has no `- Summary:` line; add one at the end of its header, with the \
-                       one line the index shows, then run `cargo xtask adr index --write` \
-                       (ADR-20261128-1856)";
+        let message = format!(
+            "{problem}, with the one line the index shows, then run `{WRITE_COMMAND}` \
+             (ADR-20261128-1856)"
+        );
         violations.push(Violation::new(&path, 0, "adr-summary", message));
     }
-    assert!(violations.len() <= entries.len(), "at most one violation an ADR");
+    assert!(
+        violations.iter().all(|violation| violation.path.starts_with(ADR_DIRECTORY)),
+        "every violation is on an ADR"
+    );
     violations
 }
 

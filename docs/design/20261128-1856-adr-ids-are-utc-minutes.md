@@ -93,7 +93,8 @@ ADR merged, so that the change lands in one go.
     below `docs/` and in the root `.claude/` without its worktrees, chosen by extension. Tidy's
     fixtures are not read, because they cite missing ADRs on purpose, and neither are scratch
     files such as the `pr.diff` that CI writes for cargo-mutants, which quote old text.
-  - `adr-summary`: every ADR has a `- Summary:` line.
+  - `adr-summary`: every ADR has a `- Summary:` line, and not the template's placeholder, so an
+    unedited `adr new` cannot merge.
   - `adr-index-doc`: the index is what `cargo xtask adr index --write` generates. A foreign gate
     skips it, like `rules-doc`, because another revision's generator writes another index.
 - **The `adr clashes` job** in `.github/workflows/queue.yml` runs `cargo xtask queue clashes`
@@ -121,10 +122,14 @@ ADR merged, so that the change lands in one go.
 - **Two open PRs can clash before either check runs again.** The check runs when a PR changes.
   If the older PR's ADR appears after the newer PR's last run, the newer one learns of the clash
   only from tidy in the merge queue, where ADR-0021 point 6 has it fixed on its own branch.
+- **Two PRs that clash with one ID can be told the same free minute.** Each check hands out
+  distinct minutes to its own PR's ADRs, but not across PRs. Once one has moved, the other's
+  check names another minute.
 - **`adr clashes` gates nothing by itself.** It is not required, and a fork's PR skips it.
   Tidy's `adr-number` in the merge queue is the gate.
 - **A wrong clock gives a wrong ID.** Any free minute is a valid ID, so the ADR still works; only
-  its order in the index is off.
+  its order in the index is off. A clock before 2026 or past 9999 makes `adr new` fail with an
+  error that says so.
 - **An `Amends` line that names an ADR as context outside parentheses** lists it as amended. The
   parser cannot tell; write context in parentheses.
 - **Prose that names an ADR without the prefix**, such as the index's "0013", is not checked.
