@@ -6,15 +6,19 @@
 # - `nami-ci` (`NAMI_AGENT_APP=ci`): CI jobs file the issues that agents act on as
 #   `nami-ci[bot]` (ADR-0023). It never reads the agents' key or falls back to it, and `env`
 #   refuses it: its jobs mint one token and use it, and make no commits as the agents.
-# In CI (CI or GITHUB_ACTIONS is `true`), only the CI app may act: the agents' key never
-# reaches CI. In CI and for the CI app, every token is narrowed and `jwt` is refused.
+# - `nami-reviewer` (`NAMI_AGENT_APP=reviewer`): the CI-hosted review posts, resolves its own
+#   threads and approves a PR's head as `nami-reviewer[bot]` (#59, ADR-0023). Like `nami-ci`,
+#   it has no key on the agents' machines and no default key path, and never falls back.
+# `nami-ci` and `nami-reviewer` are the CI apps. In CI (CI or GITHUB_ACTIONS is `true`), only
+# a CI app may act: the agents' key never reaches CI. In CI and for the CI apps, every token
+# is narrowed and `jwt` is refused.
 #
 # Usage:
 #   xtask/agent-token.sh [token]             print an installation token (valid for 1 hour)
 #   xtask/agent-token.sh env                 print shell exports that make git and gh act as the bot
 #   xtask/agent-token.sh git-credential get  git credential helper (installed by `env`)
 #   xtask/agent-token.sh jwt                 print the app's own JWT (valid for 9 minutes; not
-#                                            in CI or for the CI app)
+#                                            in CI or for the CI apps)
 #   xtask/agent-token.sh request             print the token request's body; asks GitHub nothing
 #
 # In an agent runner:
@@ -28,17 +32,19 @@
 #   - gh uses GH_TOKEN, which expires after an hour. Run `env` again for longer sessions.
 #
 # Configuration, from the environment:
-#   NAMI_AGENT_APP          which app to act as: `agent` (default) or `ci`
+#   NAMI_AGENT_APP          which app to act as: `agent` (default), `ci` or `reviewer`
 #   NAMI_AGENT_KEY          the agents' app's private key
 #                           (default: ~/.config/nami/nami-agent.pem)
 #   NAMI_AGENT_CLIENT_ID    the agents' app's client ID (default: nami-agent's)
 #   NAMI_CI_KEY             the CI app's private key (no default: CI writes it to a file)
 #   NAMI_CI_CLIENT_ID       the CI app's client ID (no default: a repository variable)
+#   NAMI_REVIEWER_KEY       the reviewer app's private key (no default: CI writes it to a file)
+#   NAMI_REVIEWER_CLIENT_ID the reviewer app's client ID (no default: a repository variable)
 #   NAMI_AGENT_REPO         owner/name of the repository (default: namicfd/nami)
 #   NAMI_AGENT_PERMISSIONS  a JSON object that narrows the token to fewer permissions than the
 #                           app has, such as '{"issues":"write"}'. Unset or empty, the token
 #                           has all of the app's permissions. That is refused in CI (CI or
-#                           GITHUB_ACTIONS is `true`) and for the CI app anywhere (ADR-0023,
+#                           GITHUB_ACTIONS is `true`) and for the CI apps anywhere (ADR-0023,
 #                           rule 2). `{}` narrows nothing and is always refused.
 #
 # Needs bash, openssl, curl and jq.
@@ -66,9 +72,9 @@ in_ci() {
 }
 
 # True when the token must be narrowed and no JWT is printed: inside a CI run, and for the CI
-# app wherever it runs.
+# apps wherever they run.
 must_narrow() {
-  in_ci || [[ "$app" == "ci" ]]
+  in_ci || [[ "$app" != "agent" ]]
 }
 
 case "$app" in
@@ -85,7 +91,15 @@ case "$app" in
     [[ -n "$client_id" ]] ||
       fail "NAMI_CI_CLIENT_ID is not set; see docs/operations/github-setup.md, step 8"
     ;;
-  *) fail "unknown app '$app' in NAMI_AGENT_APP; use agent or ci" ;;
+  reviewer)
+    readonly key="${NAMI_REVIEWER_KEY:-}"
+    readonly client_id="${NAMI_REVIEWER_CLIENT_ID:-}"
+    [[ -n "$key" ]] ||
+      fail "NAMI_REVIEWER_KEY is not set; it names the file with the reviewer app's key"
+    [[ -n "$client_id" ]] ||
+      fail "NAMI_REVIEWER_CLIENT_ID is not set; see docs/operations/github-setup.md, step 11"
+    ;;
+  *) fail "unknown app '$app' in NAMI_AGENT_APP; use agent, ci or reviewer" ;;
 esac
 # The bot's user ID (not the app ID) comes from `gh api 'users/nami-agent%5Bbot%5D' --jq .id`.
 readonly bot_name="nami-agent[bot]"
@@ -129,14 +143,14 @@ github() {
 }
 
 # The body of the token request: this one repository, and the permissions if any are named.
-# CI and the CI app must name them, so that no job holds a token with all of an app's
+# CI and the CI apps must name them, so that no job holds a token with all of an app's
 # permissions.
 token_request() {
   local request
   local count
   request=$(jq -cn --arg name "${repo#*/}" '{repositories: [$name]}') || exit 1
   if [[ -z "$permissions" ]]; then
-    ! must_narrow || fail "CI and the CI app must narrow the token: set" \
+    ! must_narrow || fail "CI and the CI apps must narrow the token: set" \
       "NAMI_AGENT_PERMISSIONS to the permissions the job needs, such as" \
       "'{\"issues\":\"write\"}' (ADR-0023, rule 2)"
     printf '%s' "$request"
@@ -212,7 +226,7 @@ case "${1:-token}" in
   jwt)
     # The JWT mints tokens with every permission of the app, so it never leaves the script
     # where tokens must be narrowed.
-    ! must_narrow || fail "'jwt' is refused in CI and for the CI app: a JWT can mint a token" \
+    ! must_narrow || fail "'jwt' is refused in CI and for the CI apps: a JWT can mint a token" \
       "with every permission of the app (ADR-0023, rule 2); use 'token' with" \
       "NAMI_AGENT_PERMISSIONS"
     jwt

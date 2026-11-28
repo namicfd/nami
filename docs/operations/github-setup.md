@@ -5,7 +5,8 @@ How `namicfd/nami` is configured on GitHub, and how to set up the same thing aga
 - ADR-0008: the human review model and the agents' identity;
 - ADR-0009: hosting and the merge gate;
 - ADR-0015: protected paths gated at review;
-- ADR-0022: rule paths that merge on the ratchet's proof.
+- ADR-0022: rule paths that merge on the ratchet's proof;
+- ADR-0023: one GitHub App per role, and the rules for a CI job that holds an app's key.
 
 Every command below was run against `namicfd/nami` on 2026-11-25.
 
@@ -18,6 +19,7 @@ Every command below was run against `namicfd/nami` on 2026-11-25.
 | `xtask/agent-token.sh` | The GitHub App and its installation (step 5) |
 | `.claude/settings.json` (`env`): the bot's git identity (step 6) | The app's private key on each machine, at `$NAMI_AGENT_KEY` or `~/.config/nami/nami-agent.pem` |
 | `.github/workflows/queue.yml` and `.github/workflows/passes.yml`: the jobs that act as `nami-ci[bot]` in CI | The `nami-ci` app, its environment `nami-ci` with the secret `NAMI_CI_PRIVATE_KEY`, and the repository variable `NAMI_CI_CLIENT_ID` (step 8) |
+| `.github/workflows/review.yml`: the CI-hosted AI review, which posts and approves as `nami-reviewer[bot]` | The `nami-reviewer` app, its environment `nami-reviewer` with the secret `NAMI_REVIEWER_PRIVATE_KEY`, Anthropic's federation rule and its service account in the Claude Console, and the repository variables `NAMI_REVIEWER_CLIENT_ID` and `NAMI_REVIEWER_LOGIN` (step 11) |
 
 When you change a setting on GitHub, update this file.
 
@@ -62,10 +64,10 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 |---|---|---|
 | Restrict deletions; block force pushes | on | `main` is shared state for the whole swarm. |
 | Require linear history | on | Each commit on `main` is one PR that passed the gate, so bisect and `git revert` stay simple (ADR-0009). |
-| Require a pull request | approvals: 0 | PRs that touch no owned path merge without a human (ADR-0008). |
+| Require a pull request | approvals: 0 | PRs that touch no owned path need no human (ADR-0008): the approval that the last-push rule below asks for comes from the reviewer app (step 11). |
 | | code-owner review: on | Human sign-off on protected paths (ADR-0015). |
 | | dismiss stale approvals: on | An agent cannot push again after it has been approved: the push dismisses the approval. |
-| | approve the last push: **off** | On, it asks for one approval of every PR, whatever the count above ("at least one other authorized reviewer has approved", GitHub's docs), so no PR merges without a human. Dismissing stale approvals already covers pushes after an approval. |
+| | approve the last push: **on** | It asks for one approval of every PR by someone other than its last pusher, whatever the count above ("at least one other authorized reviewer has approved", GitHub's docs). Every PR's last push is a bot's: `nami-agent[bot]`'s, or `nami-ci[bot]`'s for `bot/passes`. The reviewer app pushes nothing, so its approval of the head satisfies the rule, and proves that the AI review ran on exactly that commit (#59). Until the app is set up, every PR needs the maintainer's approval (the maintainer's decision, 2026-11-28). |
 | | additional approval for unattributed Copilot PRs: on | GitHub's default. It has no effect while the count is 0. |
 | | conversation resolution: on | Blocking AI-review comments must be resolved. |
 | | merge methods: squash | |
@@ -75,20 +77,12 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 
 To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
 
-**Requested of the maintainer, not set yet:** "approve the last push" off. On 2026-11-28 the live ruleset (ID 28033236) still had `require_last_push_approval: true`. It held #84, the first `passes` PR, which touches only an unowned `tasks.json`, from its green checks at 09:25 UTC until your approval at 10:48; it merged six minutes later. #47, which touches only `docs/research/`, sat the same way, green, with auto-merge on and out of the queue. Every PR so far has merged with an approval, so nothing has yet shown point 2 of step 9 working. Turn it off in Settings → Rules → Rulesets → `main` → Require a pull request before merging → clear **Require approval of the most recent reviewable push** → Save changes. The UI is the tested path. Or with `gh`, not yet run: the body holds only `rules`, so the name, target and bypass stay as they are, and every other rule is sent back unchanged. The one exception is `dismissal_restriction`, which is off; it is dropped in case the update refuses it. If GitHub answers 422, nothing has changed: use the UI.
+**"Approve the last push" stays on** (the maintainer's decision, 2026-11-28). An earlier version of this step asked for it to be turned off, because it held #84, the first `passes` PR, and #47, both green and touching only unowned paths, until the maintainer approved them. Do not turn it off. The reviewer app's approval of the head is what clears it (step 11, #59). To check it, the setting must print `true`:
 
 ```sh
-gh api "repos/$REPO/rulesets/28033236" --jq '{rules: [.rules[] | if .type == "pull_request"
-  then (.parameters.require_last_push_approval = false | del(.parameters.dismissal_restriction))
-  else . end]}' > main-rules.json
-gh api -X PUT "repos/$REPO/rulesets/28033236" --input main-rules.json
 gh api "repos/$REPO/rules/branches/main" \
   --jq '.[] | select(.type == "pull_request") | .parameters.require_last_push_approval'
-gh api "repos/$REPO/rulesets/28033236" --jq '.bypass_actors'
-rm main-rules.json
 ```
-
-The third command must print `false`, and the fourth the one bypass of the table, the admin role with `"bypass_mode":"pull_request"`. Code-owner review still holds every owned path, and the `gate`'s `check-pr` still judges every PR that sets `passes` (ADR-0017).
 
 ## 4. CODEOWNERS
 
@@ -348,7 +342,7 @@ printf 'protocol=https\nhost=github.com\n\n' | git credential fill | grep '^user
 Then try the flow end to end:
 
 1. **Protected path.** As the bot, push a branch that touches a protected path (any path listed in `.github/CODEOWNERS`) and open a PR. It must show "Review required" from the code owner, and must not enter the queue until that review is given.
-2. **Unowned path.** A PR touching only unowned paths, for example `crates/kernels/src/`, must enter the queue once `gate` and `lints (UI tests)` pass, with no review.
+2. **Unowned path.** A PR touching only unowned paths, for example `crates/kernels/src/`, must enter the queue once `gate` and `lints (UI tests)` pass and the reviewer app has approved its head (step 11), with no review by you. A PR that the app has not approved shows "Review required", because "approve the last push" is on.
 3. **Direct push.** A direct `git push origin main` by the bot must be rejected.
 4. **Rule path** (only once the policy flip of step 10 has merged; before that, CODEOWNERS owns the rule paths and point 1 applies). A PR that changes only rule paths, for example a new UI case in `lints/ui/` with its `.stderr` (a new case in `xtask/fixtures/tidy/` alone cannot pass `gate`, which allows exactly the two fixtures of each source rule), must show no "Review required", must show `ratchet` as required, and must enter the queue only once `ratchet` passes. An additive PR, such as that new UI case, passes `ratchet` with no review, its summary saying `(additive)`; a request for changes or an open thread by the reviewer app that `NAMI_REVIEWER_LOGIN` names turns it red. For a PR that edits existing rule code, for example a changed fixture, the summary says `(edit)`, and `ratchet` stays red until the app approves the head commit, or you do. GitHub does not request your review for it, because the rule paths have no owner; the agent requests it (AGENTS.md, protected paths).
 
@@ -360,7 +354,7 @@ The ratchet PR (#57) adds the ratchet in shadow mode: both jobs run and show the
 2. **Merge #57** (done). On #57, `ratchet` passes with "The base branch has no ratchet yet; skipped." in its summary, because its base cannot judge yet. The PR touches the trusted core, so it waits for your review in any case.
 3. **Rebase #55 onto `main`, let its `guardrails` run, then merge it.** #57 lands as one squashed commit, so rebase only #55's own commits: `git fetch origin && git rebase --onto origin/main <#57's head SHA> task/issue-50`, then push with `--force-with-lease`. Its run is the first that `main`'s ratchet judges. #55 changes CODEOWNERS and other core files, so it waits for your review as well. From its merge on, the rule paths have no owner, and the checks of step 9, point 4, hold.
 4. **Rebase or close stale PRs.** A PR whose branch predates the ratchet has no `ratchet` job, so the required check never reports; it waits until it is rebased onto `main`.
-5. **Set up the reviewer app**, which reviews in CI (#59), and set the repository variable `NAMI_REVIEWER_LOGIN` to its login with `[bot]`. Until you do, an additive PR that only changes rule paths merges on `ratchet` alone, and an edit gets no verdict unless you approve its head commit. GitHub no longer requests that review, because the rule paths have no owner: the agent requests it with `gh pr edit --add-reviewer` when the summary says `(edit)` (AGENTS.md), and the PR waits for your approval of its head commit. Your approval of the head commit settles a "no verdict" only when each reason is unprovable though the evidence is complete: an edit without the app's approval, a hunk without a mutant, a build file, or a form the ratchet refuses (a file outside the dialect, a symbolic link, a name that is not valid UTF-8, a rule path whose name holds a `\` or a character outside printable ASCII, or two names with one key). It becomes a pass that lists the reason (ADR-0022, point 3). Missing or broken evidence (a tool that failed, a failed phase of `observe`, missing observations, a failed null-mutant run, a skipped check) is never settled, and the verdict line says "fix the PR or re-run". Neither is a merge group whose rule-path diff differs from the carried one: rebase the PR and push, so that it is observed on its new base. A mutant that timed out recurs on every re-run: make the tests that cover it finish within the timeout, or split the PR. An honest PR's remedy is a change to the PR, or a re-run; the admin bypass is for deliberate loosenings (below). Findings always fail, even with your approval: a PR the ratchet finds a loosening in is fixed, or merged as a deliberate loosening (below). A manifest or build file in a rule path needs your approval, whatever the app says. The app must be able to submit `APPROVE`: an edit to existing rule code merges only on its approval of the head commit, or yours (ADR-0022, point 2).
+5. **Set up the reviewer app** as step 11 says. It reviews in CI (#59), and the variable `NAMI_REVIEWER_LOGIN` that step 11 sets makes the ratchet count it. Until you do, an additive PR that only changes rule paths passes `ratchet` alone, but still waits for your approval of its last push (step 3), and an edit gets no verdict unless you approve its head commit. GitHub no longer requests that review, because the rule paths have no owner: the agent requests it with `gh pr edit --add-reviewer` when the summary says `(edit)` (AGENTS.md), and the PR waits for your approval of its head commit. Your approval of the head commit settles a "no verdict" only when each reason is unprovable though the evidence is complete: an edit without the app's approval, a hunk without a mutant, a build file, or a form the ratchet refuses (a file outside the dialect, a symbolic link, a name that is not valid UTF-8, a rule path whose name holds a `\` or a character outside printable ASCII, or two names with one key). It becomes a pass that lists the reason (ADR-0022, point 3). Missing or broken evidence (a tool that failed, a failed phase of `observe`, missing observations, a failed null-mutant run, a skipped check) is never settled, and the verdict line says "fix the PR or re-run". Neither is a merge group whose rule-path diff differs from the carried one: rebase the PR and push, so that it is observed on its new base. A mutant that timed out recurs on every re-run: make the tests that cover it finish within the timeout, or split the PR. An honest PR's remedy is a change to the PR, or a re-run; the admin bypass is for deliberate loosenings (below). Findings always fail, even with your approval: a PR the ratchet finds a loosening in is fixed, or merged as a deliberate loosening (below). A manifest or build file in a rule path needs your approval, whatever the app says. The app must be able to submit `APPROVE`: an edit to existing rule code merges only on its approval of the head commit, or yours (ADR-0022, point 2).
 6. **Check it** with step 9, point 4.
 
 To print what the ruleset requires:
@@ -375,3 +369,92 @@ The list must contain `gate`, `lints (UI tests)` and `ratchet`.
 **A deliberate loosening.** The ratchet cannot pass a PR that loosens a rule on purpose, approved through an ADR. Merge such a PR with the admin bypass (step 3, Bypass), as for `passes` flips (ADR-0017).
 
 **Turning it off.** Remove the owner-less lines from `.github/CODEOWNERS` first, in a PR of its own, and only then the required check. That PR must change the two tests of `xtask/src/pr.rs` that hold the file to the flip, `real_codeowners_unowns_exactly_the_rule_paths` and `the_real_codeowners_is_the_ratchets_flip`, in the same PR.
+
+## 11. The reviewer app, `nami-reviewer`
+
+**Requested of the maintainer, not set up yet** (#59). The bot cannot create apps, environments, secrets or variables, and nothing in this step has been verified by it.
+
+`.github/workflows/review.yml` runs the AI review of ADR-0008 in CI, after `ci` passes on a pull request from this repository, and posts it as `nami-reviewer[bot]` (ADR-0023, one app per role):
+
+- **A PR by `nami-agent[bot]` or a code owner** is reviewed by Claude Code, with the `tigerstyle-reviewer` and `numerics-verifier` definitions from `main`'s `.claude/agents/`, the lead's prompt from `main`'s `.claude/skills/review-pr/ci.md` and read-only tools. The app approves the head when nothing blocks and none of its earlier threads stays open. Otherwise it comments, with a thread per blocking finding. Its next run, on the next head, reads the replies by `nami-agent[bot]` and the code owners on its threads, never anyone else's, and resolves the ones that head fixes, or that a reply shows to be wrong. A thread that anyone else resolved stays open, and the app opens it again: only it resolves its threads (ADR-0022). It gives no verdict when files under `crates/` or `tools/` changed and `numerics-verifier` did not run. It reviews only PRs into `main`.
+- **The `bot/passes` PR by `nami-ci[bot]`** is approved once `ci` passed on its head, with no model run: its review is `cargo xtask task check-pr` in `ci`'s `gate`, which judges every `passes` flip (ADR-0017). `nami-ci` cannot approve it itself, because GitHub never lets a PR's author approve it.
+- **Every other PR** gets nothing: an outsider's PR never costs a model run.
+
+The approval satisfies "approve the last push" (step 3), because the app never pushes. A push dismisses it, and the new head is reviewed again. The ratchet counts the same app's reviews for rule paths (ADR-0022, `NAMI_REVIEWER_LOGIN`).
+
+### What the separate app protects, and what it does not
+
+- **The app's key is out of the authoring machines' reach.** It is a secret of the environment `nami-reviewer`, which only `main` may use, and the one job that holds it runs no PR code. No agent can post, resolve or approve as the reviewer.
+- **The model reads the PR, and can be misled by it.** A PR written to deceive the reviewer could be approved. The review runs only for PRs by the agents' app or a code owner, its tools only read, and `post` reads its answer as data: known reviewers, places in the PR's files, bounded text, mentions broken. Protected paths still need your approval, rule-path edits still need the ratchet's checks, and the sampled audits of ADR-0008 stand behind the rest.
+- **Contents: write is a permission the role does not use.** Third-party tests report that GitHub counts an app's approval only when the app has write access to the repository's contents. The job narrows its token to `pull_requests: write`, but a leaked key can mint contents write and push to any branch that the rulesets leave open, open PR branches included. `main` stays behind the ruleset. A push by the app makes the app the last pusher, so its own approval of that head never counts.
+- **No stored Anthropic key, and no environment for it.** The model job signs in through Anthropic's workload identity federation. GitHub gives the job an OIDC token, which Anthropic exchanges for a token that lives at most ten minutes, as a Console service account. The job names no environment, and the repository uses GitHub's immutable OIDC subject, so the token's subject is `repo:namicfd@360887709/nami@1470964610:ref:refs/heads/main`; the rule also pins `repository_id`, `ref`, `event_name` and `job_workflow_ref`. A PR's run has the subject `…:pull_request`, a push to another branch or the merge queue another `ref`, and another workflow another `job_workflow_ref`, so none of them can use the rule. The federation's IDs are written in `review.yml`: they name things, and grant nothing.
+
+### Set it up, in one sitting before #98 merges
+
+A job that names a missing environment makes GitHub create it with no branch rule (ADR-0023), so the environment comes before `review.yml` reaches `main`.
+
+1. **The GitHub App.** Create it as in step 5, named `nami-reviewer`: webhooks off, only on this account. Repository permissions: Pull requests read and write, to review, approve and resolve its threads; Contents read and write, without which GitHub does not count its approval (above); Metadata read. Install it on this repository only. Give it no bypass in any ruleset, and do not make it a code owner. Generate a private key.
+2. **The environment `nami-reviewer`.** Settings → Environments → New environment. Under **Deployment branches and tags**, choose **Selected branches and tags** and add `main`; no required reviewers. Add the secret `NAMI_REVIEWER_PRIVATE_KEY`: the full contents of the app's private key. Delete the downloaded file.
+3. **The repository variables.** `NAMI_REVIEWER_CLIENT_ID`, the app's client ID; and `NAMI_REVIEWER_LOGIN`, `nami-reviewer[bot]`, which also makes the ratchet count the app (step 10). Setting the login before #98 merges changes nothing until the app posts.
+4. **The Anthropic federation rule.** In the Claude Console, as an admin: Settings → Workload identity → **Connect workload** → **GitHub Actions**, or the existing rule's page. Its issuer is GitHub's, `https://token.actions.githubusercontent.com`. The rule must match exactly what the model job's token carries:
+
+   | Field | Value |
+   |---|---|
+   | Audience | `https://api.anthropic.com` |
+   | Subject (`subject_prefix`, with no trailing `*`, so an exact match) | `repo:namicfd@360887709/nami@1470964610:ref:refs/heads/main`. The repository uses GitHub's immutable subject (`gh api "repos/$REPO/actions/oidc/customization/sub"` prints `"use_immutable_subject":true`), so the owner and the repository appear with their IDs. |
+   | Claims, each an exact value | `repository_id` = `1470964610`; `ref` = `refs/heads/main`; `event_name` = `workflow_run`; `job_workflow_ref` = `namicfd/nami/.github/workflows/review.yml@refs/heads/main` |
+   | Service account | one in a single workspace that has a monthly spend limit |
+   | Scope | `workspace:developer` |
+   | Token lifetime | 600 seconds. Set it: the job refreshes its identity token every 2 minutes, so a longer lifetime gains nothing. |
+
+   The rule's ID, the service account's, the workspace's and the organization's go in the `env:` of `review.yml`'s step "Review with Claude Code", as `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`, `ANTHROPIC_WORKSPACE_ID` and `ANTHROPIC_ORGANIZATION_ID`. For a new rule, change them there, in a PR.
+5. **Approve #98.**
+
+With `gh`, as the maintainer, for points 2 and 3:
+
+```sh
+gh api -X PUT "repos/$REPO/environments/nami-reviewer" \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST "repos/$REPO/environments/nami-reviewer/deployment-branch-policies" \
+  -f name=main -f type=branch
+gh secret set NAMI_REVIEWER_PRIVATE_KEY --repo "$REPO" --env nami-reviewer < nami-reviewer.private-key.pem
+rm nami-reviewer.private-key.pem
+gh variable set NAMI_REVIEWER_CLIENT_ID --repo "$REPO" --body "$(gh api apps/nami-reviewer --jq .client_id)"
+gh variable set NAMI_REVIEWER_LOGIN --repo "$REPO" --body 'nami-reviewer[bot]'
+```
+
+### Check it
+
+As the maintainer, after the setup. These print names and settings, never a secret's value:
+
+```sh
+gh api apps/nami-reviewer --jq '{client_id, permissions}'
+gh api "repos/$REPO/environments" --jq '[.environments[].name]'
+gh api "repos/$REPO/environments/nami-reviewer" \
+  --jq '{deployment_branch_policy, rules: [.protection_rules[].type]}'
+gh api "repos/$REPO/environments/nami-reviewer/deployment-branch-policies" \
+  --jq '[.branch_policies[] | {name, type}]'
+gh secret list --repo "$REPO" --env nami-reviewer
+gh variable list --repo "$REPO"
+gh api "repos/$REPO/actions/oidc/customization/sub"
+```
+
+Expect, with keys in any order:
+
+- the permissions `contents` and `pull_requests` `write` and `metadata` `read`, and nothing else;
+- `nami-reviewer` in the list, with `custom_branch_policies` `true` and `protected_branches` `false`, the rules `["branch_policy"]` only, and the one branch policy `{"name":"main","type":"branch"}`. An environment without that rule is open to every branch (ADR-0023): fix it before anything else;
+- the secret `NAMI_REVIEWER_PRIVATE_KEY` in `nami-reviewer`;
+- `NAMI_REVIEWER_CLIENT_ID` and `NAMI_REVIEWER_LOGIN` among the repository variables;
+- `"use_default":true`, `"use_immutable_subject":true` and the prefix `repo:namicfd@360887709/nami@1470964610`, which the rule's subject starts with. A changed subject template changes what the rule must match.
+
+Then the first PR by `nami-agent[bot]` after #98 merges is the end-to-end test. Once `ci` passes, the `review` workflow's three jobs run, and `nami-reviewer[bot]` reviews it.
+
+- **If the first agent PR after setup stays BLOCKED after the reviewer approves, the app's permissions are wrong.**
+- If the review says that it could not reach the model, the log of `review (model)` shows the token's `sub`, `ref` and `job_workflow_ref`: the rule's subject and claims must equal them.
+- A missing variable or secret is named in the failed job's log, with a pointer here.
+
+### Rotate or revoke
+
+- **The app's key:** generate a new key in the app's settings, replace the secret, delete the file, then delete the old key there. If it leaks, delete it first; tokens already issued expire within an hour. Then check the reviews, approvals and pushes by `nami-reviewer[bot]`.
+- **The Anthropic access:** there is no key to rotate. To cut it off, disable the federation rule or the service account in the Console. The model job fails, and uploads nothing, if an answer contains any identity token written during the run, or GitHub's request token.

@@ -7,7 +7,9 @@ description: AI review of a nami pull request (ADR-0008). Runs the tigerstyle-re
 
 Usage: `/review-pr <number>`.
 
-This review is the AI half of ADR-0008. It never approves, merges or pushes. Only the PR's author fixes things, and only a human approves protected paths.
+This review is the AI half of ADR-0008, run locally. It never approves, merges or pushes. Only the PR's author fixes things, and only a human approves protected paths.
+
+- **The CI review comes first.** After `ci` passes, `.github/workflows/review.yml` runs the same two reviewers in CI and posts as `nami-reviewer[bot]`, whose approval of the head is what lets a PR merge (#59). Its lead follows `ci.md` in this directory, which is this skill's steps 3, 4 and 6 for CI. Use this skill when that review gives no verdict twice, or when the maintainer asks for a second opinion. Its review, by `nami-agent[bot]`, approves nothing, so the PR then also needs the code owner's approval.
 
 - **Fresh session.** Run it in a session that did not write the change. A reviewer that shares the author's context tends to agree with it.
 - **Blocking findings** become inline review threads. The `main` ruleset requires every conversation to be resolved before merge, so they block the merge queue until they are fixed.

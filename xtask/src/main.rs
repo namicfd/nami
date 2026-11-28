@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         ["task", rest @ ..] => xtask::task::run(rest),
         ["issue", rest @ ..] => xtask::issue::run(rest),
         ["queue", rest @ ..] => xtask::queue::run(rest),
+        ["review", rest @ ..] => xtask::review::run(rest),
         _ => {
             eprintln!("usage: cargo xtask tidy [--file <path> | --root <dir> [--policy <dir>]]");
             eprintln!("       | rules [--write] | adr <new <slug> | index [--write]>");
@@ -34,7 +35,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "       | hook <post-edit|stop|session-start> | task <command> | issue <command>"
             );
-            eprintln!("       | queue <command>");
+            eprintln!("       | queue <command> | review <command>");
             ExitCode::FAILURE
         }
     }

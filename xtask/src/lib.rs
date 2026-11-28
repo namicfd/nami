@@ -11,6 +11,7 @@ pub mod json;
 pub mod pr;
 pub mod queue;
 pub mod ratchet;
+pub mod review;
 pub mod task;
 pub mod tidy;
 
