@@ -7,7 +7,8 @@
 #   nami-agent[bot] or a code owner, a mechanical approval for the nami-ci bot's `bot/passes`
 #   PR, whose review is `check-pr` in `ci`'s `gate` (ADR-0017), and nothing for anyone else.
 # - `review (model)` runs Claude Code on the PR with read-only tools and writes its answer as
-#   data. It holds the Anthropic API key, never an app's key.
+#   data. It holds no stored key: it signs in to Anthropic through workload identity
+#   federation, with GitHub's OIDC token for this job, and never holds an app's key.
 # - `review (post)` holds the reviewer app's key, runs no PR code, reads the answer as data,
 #   and posts one review on the head: APPROVE when nothing blocks, otherwise COMMENT with each
 #   blocking finding as a thread. A push dismisses the approval (the ruleset's "dismiss stale
@@ -17,12 +18,15 @@
 # The jobs follow ADR-0023's rules for a job that holds a key:
 # - `workflow_run` runs main's version of this file and of xtask, never a PR's; the `if:` checks
 #   the event and the triggering workflow's path; the checkouts have no `ref:` (rule 4);
-# - each key is a secret of an environment that only main may use: ANTHROPIC_API_KEY of
-#   `claude-review`, NAMI_REVIEWER_PRIVATE_KEY of `nami-reviewer` (rule 1;
-#   docs/operations/github-setup.md, step 11). Both environments must exist before this file
-#   reaches main: a job that names a missing environment makes GitHub create it with no branch
-#   rule;
-# - one step has each secret in its environment (rule 3);
+# - the reviewer app's key is the secret NAMI_REVIEWER_PRIVATE_KEY of the environment
+#   `nami-reviewer`, which only main may use (rule 1; docs/operations/github-setup.md, step
+#   11). The model job's Anthropic access has no secret at all: Anthropic's federation rule
+#   accepts only an OIDC token whose subject is this repository's environment `claude-review`
+#   and whose `ref` and `job_workflow_ref` are main's, and `claude-review` is limited to main
+#   too. Both environments must exist before this file reaches main: a job that names a missing
+#   environment makes GitHub create it with no branch rule;
+# - one step has the secret in its environment (rule 3); `id-token: write` is in the model
+#   job only;
 # - two tokens, each narrow (rule 2): every read uses the workflow's own token, GH_TOKEN; the
 #   reviewer app's token, NAMI_REVIEW_TOKEN, is narrowed to `pull_requests: write` and only
 #   resolves threads and posts the review;
@@ -30,13 +34,15 @@
 #   is installed at the pinned version below.
 #
 # The model job reads the PR's files, but executes none of them. Claude Code runs with
-# `--bare` (no hooks, no CLAUDE.md discovery, no keychain), `--restricted` (no tool that runs
-# commands or code, no settings file of the user or the project, file tools confined to the
-# context and tree directories), `--strict-mcp-config` (no MCP server) and
-# `--disable-slash-commands` (no skills), with only Read, Grep, Glob and Agent. Its working
+# `--restricted` (no tool that runs commands or code, no settings file of the user or the
+# project, so no hooks from them, file tools confined to the context and tree directories),
+# `--settings '{"disableAllHooks":true}'`, `--strict-mcp-config` (no MCP server),
+# `--disable-slash-commands` (no skills), CLAUDE_CODE_DISABLE_CLAUDE_MDS and
+# CLAUDE_CODE_DISABLE_AUTO_MEMORY, with only Read, Grep, Glob and Agent. Not `--bare`, which
+# would do the same but signs in only with an API key, and ignores federation. Its working
 # directory is the context directory, not the tree, and the tree is an export of the head
-# commit, not a checkout. The key never reaches the model's tools, and the job fails rather
-# than upload an answer that contains it.
+# commit, not a checkout. The identity token's file is outside both directories, and the job
+# fails rather than upload an answer that contains the token or GitHub's request token.
 name: review
 
 on:
@@ -124,9 +130,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: claude-review
+    # `id-token: write` lets this job, and only it, ask GitHub for an OIDC token, which
+    # Anthropic's federation rule exchanges for a short-lived token.
     permissions:
       contents: read
       pull-requests: read
+      id-token: write
     env:
       PR_NUMBER: ${{ needs.select.outputs.pr }}
       HEAD_SHA: ${{ needs.select.outputs.head }}
@@ -162,31 +171,72 @@ jobs:
         run: |
           cargo xtask review context --pr "${PR_NUMBER}" --tree "${RUNNER_TEMP}/review/tree" \
             --out "${RUNNER_TEMP}/review/context"
-      # The secret is in this step's environment only.
+      # Workload identity federation: Claude Code reads GitHub's OIDC token from
+      # ANTHROPIC_IDENTITY_TOKEN_FILE, and exchanges it for an Anthropic token as the Console
+      # service account. A GitHub token lives about 5 minutes and is good for one exchange, and
+      # an exchanged token at most twice the GitHub token's remaining life. So a background
+      # loop writes a new token every 2 minutes; Claude Code reads the file again at each
+      # exchange. The IDs are variables of the `claude-review` environment, not secrets.
       - name: Review with Claude Code
         working-directory: ${{ runner.temp }}/review/context
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1"
+          CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1"
         run: |
-          if [[ -z "${ANTHROPIC_API_KEY}" ]]; then
-            echo "::error::The claude-review environment has no ANTHROPIC_API_KEY secret; see" \
-              "docs/operations/github-setup.md, step 11"
-            exit 1
-          fi
+          for name in ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID \
+            ANTHROPIC_SERVICE_ACCOUNT_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::The claude-review environment has no variable ${name}; see" \
+                "docs/operations/github-setup.md, step 11"
+              exit 1
+            fi
+          done
+          # A key in the environment would win over federation without a word.
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+          oidc="${RUNNER_TEMP}/oidc"
+          (umask 077 && mkdir -p "${oidc}")
+          export ANTHROPIC_IDENTITY_TOKEN_FILE="${oidc}/token"
+          # The request token goes through stdin, so it never shows in the process list.
+          fetch() {
+            printf 'Authorization: Bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" |
+              curl --silent --show-error --fail --header @- \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com" |
+              jq -re .value > "${oidc}/next"
+            mv -f "${oidc}/next" "${ANTHROPIC_IDENTITY_TOKEN_FILE}"
+          }
+          fetch
+          # The claims that the federation rule matches, for the log; never the token.
+          cut -d. -f2 < "${ANTHROPIC_IDENTITY_TOKEN_FILE}" | tr '_-' '/+' |
+            awk '{ while (length($0) % 4) $0 = $0 "="; print }' | base64 -d |
+            jq -c '{sub, ref, job_workflow_ref, environment, event_name}' ||
+            echo "::warning::the OIDC token's claims could not be shown"
+          (
+            while sleep 120; do
+              fetch || echo "::warning::refreshing the OIDC token failed"
+            done
+          ) &
+          refresher=$!
+          trap 'kill "${refresher}" 2> /dev/null || true; rm -rf "${oidc}"' EXIT
           status=0
-          "${RUNNER_TEMP}/claude/node_modules/.bin/claude" -p --bare --restricted \
-            --strict-mcp-config --disable-slash-commands --tools Read,Grep,Glob,Agent \
-            --permission-prompts none --no-session-persistence \
+          "${RUNNER_TEMP}/claude/node_modules/.bin/claude" -p --restricted \
+            --settings '{"disableAllHooks":true}' --strict-mcp-config --disable-slash-commands \
+            --tools Read,Grep,Glob,Agent --permission-prompts none --no-session-persistence \
             --add-dir "${RUNNER_TEMP}/review/tree" --agents agents.json \
             --model "${REVIEW_MODEL}" --effort "${REVIEW_EFFORT}" \
             --max-budget-usd "${REVIEW_BUDGET_USD}" \
             --output-format json --json-schema "$(cat schema.json)" \
             "$(cat prompt.md)" > "${RUNNER_TEMP}/review/result.json" || status=$?
           echo "Claude Code exited with ${status}; the post job reads its result."
-          if grep -qF -- "${ANTHROPIC_API_KEY}" "${RUNNER_TEMP}/review/result.json"; then
-            : > "${RUNNER_TEMP}/review/result.json"
-            echo "::error::The review's answer contains the API key; nothing is uploaded." \
-              "Rotate the key (docs/operations/github-setup.md, step 11)."
+          result="${RUNNER_TEMP}/review/result.json"
+          leaked=false
+          if grep -qF -- "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${result}"; then leaked=true; fi
+          if grep -qF -f "${ANTHROPIC_IDENTITY_TOKEN_FILE}" "${result}"; then leaked=true; fi
+          if [[ "${leaked}" == true ]]; then
+            : > "${result}"
+            echo "::error::The review's answer contains a token; nothing is uploaded."
             exit 1
           fi
       - uses: actions/upload-artifact@v7
