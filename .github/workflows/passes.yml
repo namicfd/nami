@@ -21,7 +21,8 @@ permissions: {}
 
 # One run at a time, in order, and never cancelled halfway: a run either finishes, or waits
 # while an older one does. GitHub keeps only the newest waiting run, so an older one never
-# runs after a newer one. Each run builds the commit that `bot/passes` should hold on its own
+# runs after a newer one, unless an old run is re-run, which uses its original commit and is
+# corrected by the next push to main (ADR-0023). Each run builds the commit that `bot/passes` should hold on its own
 # main, pushes it only when the branch does not hold it already or the required checks failed
 # on the branch, and reconciles the PR, so whatever the last run leaves is right.
 concurrency:
