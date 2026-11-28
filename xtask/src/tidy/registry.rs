@@ -93,9 +93,11 @@ pub const RULES: &[Rule] = &[
         id: "adr-reference",
         kind: RuleKind::Workspace,
         summary: "Every `ADR-` followed by a digit names an ADR in `docs/design/`.",
-        detail: "Reads every UTF-8 file that tidy walks, everything below `docs/` and the root \
-                 `.claude/` without its worktrees. Tidy's fixtures are not read. `ADR-NNNN` and \
-                 other placeholders without a digit are no reference.",
+        detail: "Reads the sources, documents and configuration (by extension, and `justfile` \
+                 and `CODEOWNERS`) that tidy walks, below `docs/` and in the root `.claude/` \
+                 without its worktrees. Tidy's fixtures and scratch files such as CI's \
+                 `pr.diff` are not read. `ADR-NNNN` and other placeholders without a digit are \
+                 no reference.",
         reference: "ADR-20261128-1856",
     },
     Rule {

@@ -89,9 +89,10 @@ ADR merged, so that the change lands in one go.
 - **Tidy, workspace rules** (`just check`, CI):
   - `adr-id`: every file in `docs/design/` but the index is named after a valid minute with a
     well-formed slug, or carries one of the legacy numbers.
-  - `adr-reference`: point 5, over every UTF-8 file that tidy walks, everything below `docs/`
-    and the root `.claude/` without its worktrees. Tidy's fixtures are not read: they cite missing
-    ADRs on purpose.
+  - `adr-reference`: point 5, over the sources, documents and configuration that tidy walks,
+    below `docs/` and in the root `.claude/` without its worktrees, chosen by extension. Tidy's
+    fixtures are not read, because they cite missing ADRs on purpose, and neither are scratch
+    files such as the `pr.diff` that CI writes for cargo-mutants, which quote old text.
   - `adr-summary`: every ADR has a `- Summary:` line.
   - `adr-index-doc`: the index is what `cargo xtask adr index --write` generates. A foreign gate
     skips it, like `rules-doc`, because another revision's generator writes another index.

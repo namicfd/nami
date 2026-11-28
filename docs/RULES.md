@@ -14,7 +14,7 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 | `adr-index` | source | Every ADR is listed in `docs/design/README.md`. |  | ADR-0000 |
 | `adr-index-doc` | workspace | `docs/design/README.md` is what `cargo xtask adr index --write` generates from the ADRs. | Skipped by a foreign gate, like `rules-doc`: another revision's generator writes another index. | ADR-20261128-1856 |
 | `adr-number` | source | No two ADR files share an ID, and an ADR's title repeats the ID of its file name. | Same-minute clashes between branches show here once both are merged; the merge queue's `adr clashes` check fails them earlier. | ADR-0000 |
-| `adr-reference` | workspace | Every `ADR-` followed by a digit names an ADR in `docs/design/`. | Reads every UTF-8 file that tidy walks, everything below `docs/` and the root `.claude/` without its worktrees. Tidy's fixtures are not read. `ADR-NNNN` and other placeholders without a digit are no reference. | ADR-20261128-1856 |
+| `adr-reference` | workspace | Every `ADR-` followed by a digit names an ADR in `docs/design/`. | Reads the sources, documents and configuration (by extension, and `justfile` and `CODEOWNERS`) that tidy walks, below `docs/` and in the root `.claude/` without its worktrees. Tidy's fixtures and scratch files such as CI's `pr.diff` are not read. `ADR-NNNN` and other placeholders without a digit are no reference. | ADR-20261128-1856 |
 | `adr-section` | source | Every ADR has the six required sections. |  | ADR-0000 |
 | `adr-status` | source | Every ADR has a valid status line. |  | ADR-0000 |
 | `adr-summary` | workspace | Every ADR has a `- Summary:` line in its header: the one line its index row shows. |  | ADR-20261128-1856 |

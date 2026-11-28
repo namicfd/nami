@@ -19,6 +19,15 @@ const AGENT_DIRECTORY: &str = ".claude";
 /// Claude Code's worktrees, inside [`AGENT_DIRECTORY`].
 const WORKTREES: &str = "worktrees";
 
+/// The extensions of the files whose references are checked: sources, documents, configuration
+/// and the expected output of the lint UI tests. A scratch file such as the `pr.diff` that CI
+/// writes for cargo-mutants quotes old text, and is not the repository's.
+const REFERENCE_EXTENSIONS: [&str; 9] =
+    ["json", "md", "rs", "sh", "stderr", "toml", "txt", "yaml", "yml"];
+
+/// Files without one of those extensions whose references are checked.
+const REFERENCE_NAMES: [&str; 2] = ["CODEOWNERS", "justfile"];
+
 /// The rule `adr-id`: every file in [`ADR_DIRECTORY`] but the index is named
 /// `YYYYMMDD-HHMM-<slug>.md`, after a valid UTC minute, or carries one of the legacy numbers.
 ///
@@ -121,10 +130,19 @@ fn reference_files(root: &Path) -> io::Result<Vec<PathBuf>> {
             }
         }
     }
+    files.retain(|file| is_reference_source(file));
     files.sort();
     files.dedup();
     assert!(files.iter().all(|file| file.is_relative()), "paths are relative to the root");
     Ok(files)
+}
+
+/// True for a file whose kind holds references: [`REFERENCE_EXTENSIONS`] or
+/// [`REFERENCE_NAMES`].
+fn is_reference_source(file: &Path) -> bool {
+    let name = file.file_name().map_or_default(|name| name.to_string_lossy());
+    let extension = file.extension().map_or_default(|extension| extension.to_string_lossy());
+    REFERENCE_EXTENSIONS.contains(&extension.as_ref()) || REFERENCE_NAMES.contains(&name.as_ref())
 }
 
 #[cfg(test)]
@@ -180,28 +198,27 @@ mod tests {
         assert!(violations[1].message.contains(&expected), "{}", violations[1]);
     }
 
-    // Goal: references are checked in sources, documents and agent files, but not in fixtures,
-    // build output or worktrees, and binary files are skipped.
+    // Goal: references are checked in sources, documents, configuration and agent files, but not
+    // in fixtures, build output, worktrees or scratch files such as CI's `pr.diff`, and a file
+    // that is not UTF-8 is skipped.
     #[test]
     fn references_are_checked_across_the_tree() {
         let scratch = Scratch::new("adr-references");
         let missing = format!("See ADR-{}.\n", "0044");
         let checked = ["AGENTS.md", "docs/plan.md", "docs/design/x.md", ".claude/agents/r.md"];
-        for file in checked.iter().chain(&[".claude/settings.json", "xtask/src/a.rs"]) {
+        let more = [".claude/settings.json", "xtask/src/a.rs", "justfile", "lints/ui/a.stderr"];
+        for file in checked.iter().chain(&more) {
             scratch.write(file, &missing);
         }
         let skipped = ["xtask/fixtures/tidy/a.fixture", "target/a.md", ".claude/worktrees/w/a.md"];
-        for file in skipped {
+        for file in skipped.iter().chain(&["pr.diff", "notes"]) {
             scratch.write(file, &missing);
         }
-        std::fs::write(scratch.root().join("docs/image.bin"), [0xff, 0xfe]).unwrap();
+        std::fs::write(scratch.root().join("docs/binary.md"), [0xff, 0xfe]).unwrap();
         let violations = check_references(scratch.root(), &BTreeSet::new()).unwrap();
         let files: BTreeSet<String> =
             violations.iter().map(|v| v.path.display().to_string()).collect();
-        let expected = [".claude/agents/r.md", ".claude/settings.json", "AGENTS.md"]
-            .into_iter()
-            .chain(["docs/design/x.md", "docs/plan.md", "xtask/src/a.rs"])
-            .map(str::to_owned);
+        let expected = checked.iter().chain(&more).map(|file| (*file).to_owned());
         assert_eq!(files, expected.collect::<BTreeSet<_>>());
     }
 }
