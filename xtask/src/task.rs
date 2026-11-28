@@ -202,8 +202,8 @@ fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Strin
     match ready_issues(root, remote, github, &current) {
         Ok((issues, left_out)) if left_out.is_empty() => Ok(ready + &issues),
         Ok((issues, left_out)) => Err(format!(
-            "{} issue(s) left out because their state is unknown, so this list is incomplete; \
-             the rest of the list:\n{ready}{issues}",
+            "{} issue(s) left out because their state is unknown or cannot be checked, so this \
+             list is incomplete; the rest of the list:\n{ready}{issues}",
             left_out.len()
         )),
         Err(error) => Err(format!(
@@ -214,8 +214,9 @@ fn ready(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Strin
 }
 
 /// The issues that agents may work on and nobody holds, oldest first, as `ready` lines, and
-/// the numbers of the issues left out because a lookup failed. Each of those is named on
-/// stderr; one failed lookup leaves out only its own issue.
+/// the numbers of the issues left out because their state is unknown (a lookup failed) or
+/// cannot be checked (a CI app's issue without the scope to check it). Each of those is named
+/// on stderr; one failed lookup leaves out only its own issue.
 fn ready_issues(
     root: &Path,
     remote: &str,
@@ -235,6 +236,17 @@ fn ready_issues(
     let mut left_out = Vec::new();
     for found in candidates {
         let id = issue::id_of(found.number);
+        // An issue by the CI app that cannot be checked here is left out loudly, not silently:
+        // it may be work, and the reason says what to fix.
+        let unchecked = (found.author == trust::CI_LOGIN).then(|| trust.ci_unavailable());
+        if let Some(Some(reason)) = unchecked.filter(|_| !held.contains(id.as_str())) {
+            eprintln!(
+                "task: {id} is left out of the list: the CI app's issues cannot be checked \
+                 here: {reason}"
+            );
+            left_out.push(found.number);
+            continue;
+        }
         // The cheap checks first: label events cost one request per issue, and comments one
         // more when the bot removed `needs-decision` last.
         if held.contains(id.as_str()) || trust::unworkable(found, &[], &[], &trust).is_some() {
@@ -333,11 +345,12 @@ fn claim_issue(
     Ok(format!("claimed {id}\nread it with `cargo xtask issue show {number}`, {work}\n"))
 }
 
-/// The PR that `found` reports as failed in the merge queue, if the bot filed it with the
-/// title that `cargo xtask queue failed` gives (ADR-0021, point 6).
+/// The PR that `found` reports as failed in the merge queue, if the bot or the CI app filed it
+/// with the title that `cargo xtask queue failed` gives (ADR-0021, point 6; ADR-0023).
 fn queue_failure_pull(found: &Issue) -> Option<u32> {
     let entry = queue::failure::entry_of_title(&found.title);
-    entry.map(|(pull, _)| pull).filter(|_| found.author == trust::BOT_LOGIN)
+    let by_filer = [trust::BOT_LOGIN, trust::CI_LOGIN].contains(&found.author.as_str());
+    entry.map(|(pull, _)| pull).filter(|_| by_filer)
 }
 
 /// Why agents may not work on the queue-failure issue `found` now, or `None` if they may or it
@@ -349,6 +362,9 @@ fn queue_failure_pull(found: &Issue) -> Option<u32> {
 ///   the PR's merge closes the issue;
 /// - the PR is closed or merged while the issue is open, or the number is no PR: nobody can
 ///   push a fix there, and a human closes the issue;
+/// - the PR's branch is not in this repository, or cannot be looked up: agents check out and
+///   push only the bot's own branches here, whatever the issue's labels say (ADR-0023), and a
+///   human handles it;
 /// - the PR is in the merge queue: a push would take it out again. If it fails there, the
 ///   new run gets its own issue.
 ///
@@ -368,9 +384,17 @@ fn queue_failure_hold(
         format!("#{pull}, which issue #{number} names, is not a pull request; a human closes it")
     } else if fix.author != trust::BOT_LOGIN {
         // Held whatever the labels say: `needs-decision` is not what keeps agents off it.
-        format!("#{pull} was not opened by the bot, so agents never push to it; a human rebases it")
+        format!(
+            "#{pull} was not opened by the bot, so agents never push to it; a human rebases or \
+             renumbers it, re-queues it and closes issue #{number}"
+        )
     } else if !fix.is_open {
         format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")
+    } else if !github.head_is_here(pull)? {
+        format!(
+            "#{pull}'s branch is not in this repository (a fork's, or deleted), so agents do not \
+             check it out or push to it; a human handles #{pull} and closes issue #{number}"
+        )
     } else if crate::pr::closes(&fix.body, number, repository) {
         format!(
             "#{pull} says `Fixes #{number}`: the fix is in flight and #{pull}'s merge closes the \

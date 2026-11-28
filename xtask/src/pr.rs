@@ -610,6 +610,9 @@ mod tests {
         fn is_queued(&self, _number: u32) -> Result<bool, String> {
             Err("not used".to_owned())
         }
+        fn head_is_here(&self, _number: u32) -> Result<bool, String> {
+            Err("not used".to_owned())
+        }
     }
 
     // Goal: the real CODEOWNERS file parses, and its patterns protect what AGENTS.md says is
