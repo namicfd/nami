@@ -3,6 +3,7 @@
 - Status: Accepted (amended by ADR-0014)
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: `assert!` at function boundaries, before loops and once per step. `debug_assert!` only for per-cell checks in kernels. Overflow checks stay on in release.
 
 ## Context
 

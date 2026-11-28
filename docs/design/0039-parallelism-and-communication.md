@@ -5,6 +5,9 @@
 - Deciders: maintainer
 - Amends, once accepted: ADR-0005 point 4 (conservation totals across blocks and ranks use an
   exact accumulator instead of `sum_compensated`)
+- Summary: Auto-vectorisation only; one process per NUMA domain with static threads; own
+  `Transport` (in-process, TCP, InfiniBand), launched by Slurm. Results are bitwise identical for
+  any decomposition.
 
 ## Context
 

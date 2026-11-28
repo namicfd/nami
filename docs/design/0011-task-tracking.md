@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Plans in `docs/exec-plans/` with a `tasks.json` whose `passes` field only CI flips. Claims are lock files on a `claims` branch, managed via `cargo xtask task`.
 
 ## Context
 

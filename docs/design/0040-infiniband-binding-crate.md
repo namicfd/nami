@@ -6,6 +6,9 @@
 - Amends, once accepted: ADR-0001 (a system library besides `libm`) and ADR-0014 points 2 to 4
   (`unsafe` in a second crate, an `#[expect]` budget of at least 2, and the first `unsafe` in
   runtime code)
+- Summary: A crate `fabric` binds `libibverbs` behind the off-by-default feature `infiniband`,
+  with `unsafe` confined to it. Amends 0001 and 0014 points 2 to 4 (a second crate with `unsafe`,
+  a second `#[expect]`, the first `unsafe` in runtime code) once accepted.
 
 ## Context
 

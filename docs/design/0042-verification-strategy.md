@@ -6,6 +6,9 @@
 - Amends, once accepted: ADR-0007 (thresholds as Rust constants; Athena++ as a second source of
   reference data) and ADR-0001 (the pinned Athena++ of ADR-0034 point 8 becomes a
   reference-generation tool beside SymPy and PyClaw)
+- Summary: Check suites chosen by declared properties, owned by `reference`. An outside anchor per
+  system, Athena++ as a second source of reference data, bitwise architecture tests, a split gate,
+  thresholds as Rust constants. Amends 0007 and 0001 once accepted.
 
 ## Context
 
@@ -16,7 +19,7 @@ A suite that an implementer wires in by hand, check by check, would not scale to
 implementer who chooses which checks to run can leave out the one that fails.
 
 ADR-0007 also puts thresholds in `reference/thresholds.toml`. Reading TOML needs a parser, and
-ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (its ADR-0016).
+ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (its ADR numbered 0016).
 
 ## Decision
 
@@ -108,5 +111,5 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
 - Toro, *Riemann Solvers and Numerical Methods for Fluid Dynamics*, 3rd ed., tables for tests 1–5.
 - Ryu & Jones 1995, ApJ 442, 228 (MHD Riemann problems).
 - Athena++'s linear-wave regression thresholds (ADR-0007, Evidence).
-- The closed PR #4 and its ADR-0016 (`git fetch origin pull/4/head`).
+- The closed PR #4 and its ADR numbered 0016 (`git fetch origin pull/4/head`).
 - The maintainer's answers in the architecture discussion of 2026-11-26.

@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0011, ADR-0020
+- Summary: A finding outside the task is filed as an issue and fixed by another session, which claims it on the `claims` branch. Agents act only on issues by the bot or a code owner, and on the CI app's queue-failure issues in the shape that ADR-0023 checks (point 2, amended by ADR-0023). A merge-queue failure is fixed on the failing PR's own branch (point 6, whose vocabulary ADR-0023 extends to `guardrails.yml`). The bot lifts its own `needs-decision` after it records a code owner's decision (point 7).
 
 Point 6 is frozen as accepted text: as for any accepted ADR (ADR-0000, point 4), only its status and links may change, and a change to its decision needs a new ADR. The rest of this ADR is still Proposed.
 

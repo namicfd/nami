@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0004 (enforcement of "no unchecked hints")
+- Summary: `unsafe_code` is `deny`, not `forbid`; `unsafe` exists only in `crates/alloc-guard`, with the repository's single `#[expect]`.
 
 ## Context
 

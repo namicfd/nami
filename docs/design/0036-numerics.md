@@ -3,6 +3,9 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Summary: Standard methods with Athena++'s menu as the yardstick. Positivity from named, counted
+  components, never silent floors. Every selectable combination is verified. Interfaces allow
+  subcycling and fourth order.
 
 ## Context
 

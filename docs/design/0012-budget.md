@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Pilot at ~$1–3k/month with per-session and daily caps. Scaling up is decided on measured cost per merged PR.
 
 ## Context
 

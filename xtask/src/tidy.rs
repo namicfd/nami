@@ -99,13 +99,15 @@ impl fmt::Display for Violation {
     }
 }
 
-/// True for `NNNN-<title>.md`, the name of an ADR file.
+/// True for the name of an ADR file: `YYYYMMDD-HHMM-<title>.md`, or `NNNN-<title>.md` for the
+/// ADRs written before IDs were minutes (ADR-20261128-1856). Which names are allowed is the rule
+/// `adr-id`'s to say; this decides only which files the ADR rules check.
 #[must_use]
 pub fn is_adr_file_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let has_number = bytes.iter().take(4).filter(|byte| byte.is_ascii_digit()).count() == 4;
+    let is_adr = crate::adr::id::AdrId::of_file_name(name).is_some();
     let is_markdown = Path::new(name).extension().is_some_and(|extension| extension == "md");
-    has_number && bytes.get(4) == Some(&b'-') && is_markdown
+    assert!(!is_adr || is_markdown, "ADRs are Markdown");
+    is_adr
 }
 
 /// Reads the virtual path from the first line of a tidy fixture: `// path: <path>`,
@@ -164,7 +166,7 @@ enum FileKind {
     CrateManifest,
     /// The root `Cargo.toml`.
     WorkspaceManifest,
-    /// `docs/design/NNNN-<title>.md`.
+    /// `docs/design/YYYYMMDD-HHMM-<title>.md` or `docs/design/NNNN-<title>.md`.
     Adr,
     /// `docs/TIGER_STYLE.md`.
     StyleGuide,
@@ -265,9 +267,11 @@ fn check_tree(root: &Path, policy_root: Option<&Path>) -> io::Result<Vec<Violati
     let budget_root = policy_root.unwrap_or(root);
     violations.extend(workspace::check_expect_budget(budget_root, tally.expect_count)?);
     violations.extend(crate::task::plan::check(root)?);
+    violations.extend(crate::adr::check(root)?);
     if !is_foreign {
         violations.extend(rules_doc::check(root)?);
         violations.extend(rules_doc::check_planned_tasks(root)?);
+        violations.extend(crate::adr::index::check(root)?);
     }
     assert!(
         !is_foreign || !violations.iter().any(|violation| is_registry_bound(violation.rule)),
@@ -360,7 +364,7 @@ pub(crate) fn entries_of(root: &Path, directory: &str) -> io::Result<Vec<PathBuf
 /// Lists every file below the directory `start` of `root` as a path relative to `root`, in
 /// sorted order. Skips build output, documents, tidy's fixtures and nested checkouts (git
 /// worktrees such as `.claude/worktrees/*`).
-fn files_below(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn files_below(root: &Path, start: &Path) -> io::Result<Vec<PathBuf>> {
     let mut pending = vec![root.join(start)];
     let mut found = Vec::new();
     for _ in 0..DIRECTORIES_MAX {
@@ -422,6 +426,9 @@ mod tests {
         scratch.write("xtask/expect-budget.txt", "1\n");
         scratch.write("docs/design/README.md", "");
         scratch.write("docs/design/0001-x.md", "- Status: Accepted\n");
+        scratch.write("docs/design/notes.md", "Not an ADR, and not the index.\n");
+        // Built at run time, so that this file cites no missing ADR itself.
+        scratch.write("docs/notes.md", &format!("See ADR-{}.\n", "0044"));
         scratch.write("crates/demo/Cargo.toml", "[dependencies]\nserde = \"1\"\n");
         let unasserted = format!("fn a() {{\n{}}}\n", "    let _x = 1;\n".repeat(9));
         scratch.write("crates/demo/src/lib.rs", &unasserted);
@@ -495,9 +502,10 @@ mod tests {
                 .chain(["snapshot-draft", "unasserted-function", "rules-doc", "doc-tag"])
                 .chain(["adr-index", "adr-number"])
                 .chain(["adr-section"; 6])
+                .chain(["adr-summary", "adr-index-doc", "adr-id"])
                 .chain(planned_tasks)
                 .chain(["plan-files", "tasks-json", "plan-section", "task-graph", "plan-stage"])
-                .chain(["expect-budget"])
+                .chain(["adr-reference", "expect-budget"])
                 .collect::<Vec<_>>()
         );
         assert_eq!(violations[0].path, Path::new("Cargo.toml"));
@@ -526,13 +534,25 @@ mod tests {
     }
 
     /// A tree on which every rule passes: one planned task per planned mechanism, a style guide
-    /// with a valid tag, the generated rules document, and a budget of zero suppressions.
+    /// with a valid tag, the generated rules document, and a budget of zero suppressions. It
+    /// holds a short ADR for each of the repository's, because the rules document cites them,
+    /// and their generated index.
     fn clean_workspace(name: &str) -> Scratch {
         let scratch = Scratch::new(name);
         scratch.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
         scratch.write("crates/demo/src/lib.rs", "//! A crate without violations.\n");
         scratch.write("xtask/expect-budget.txt", "0\n");
-        scratch.write("docs/design/README.md", "No decisions yet.\n");
+        let adr_sections = "## Context\n## Decision\n## Enforcement\n## Consequences\n\
+                            ## Alternatives considered\n## Evidence\n";
+        for entry in crate::adr::index::entries(&crate::workspace_root()).unwrap() {
+            let text = format!(
+                "# ADR-{}: A decision\n\n- Status: Accepted\n- Summary: A rule.\n\n{adr_sections}",
+                entry.id
+            );
+            scratch.write(&format!("docs/design/{}", entry.file), &text);
+        }
+        let index = crate::adr::index::render(&crate::adr::index::entries(scratch.root()).unwrap());
+        scratch.write(crate::adr::index::INDEX, &index);
         scratch.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[review]`\n");
         let tasks: Vec<String> = registry::PLANNED
             .iter()
@@ -554,8 +574,9 @@ mod tests {
     }
 
     // Goal: a foreign gate skips exactly the rules that are bound to the registry. A tree with a
-    // stale `docs/RULES.md`, a tag for a rule that this binary does not know and no tasks fails
-    // those three rules on its own, and passes when it is judged against a policy directory.
+    // stale `docs/RULES.md` and ADR index, a tag for a rule that this binary does not know and
+    // no tasks fails those four rules on its own, and passes when it is judged against a policy
+    // directory.
     #[test]
     fn foreign_gate_skips_the_registry_bound_rules() {
         let tree = clean_workspace("foreign-tree");
@@ -563,6 +584,8 @@ mod tests {
         policy.write("xtask/expect-budget.txt", "0\n");
         assert_eq!(check(tree.root()).unwrap(), Vec::new(), "the tree starts clean");
         tree.write(rules_doc::RULES_DOC, "# Rules of another revision\n");
+        let index = std::fs::read_to_string(tree.root().join(crate::adr::index::INDEX)).unwrap();
+        tree.write(crate::adr::index::INDEX, &index.replace("| A rule. |", "| Another rule. |"));
         tree.write(style_guide::STYLE_GUIDE, "## Rules\n\n- A rule. `[tidy:rule-of-the-future]`\n");
         tree.write("docs/exec-plans/active/all/tasks.json", "{\"tasks\": []}\n");
         let own = check(tree.root()).unwrap();
@@ -595,11 +618,12 @@ mod tests {
             "adr-index",
             "adr-number",
             "adr-section",
+            "adr-summary",
             "doc-tool-name",
             "runtime-dependency",
             "unbounded-loop",
         ];
-        assert_eq!(fired(&broken), BTreeSet::from(expected), "source rules still run");
+        assert_eq!(fired(&broken), BTreeSet::from(expected), "source and tree rules still run");
     }
 
     // Goal: the single-file entry point reports what the whole-tree check reports for that

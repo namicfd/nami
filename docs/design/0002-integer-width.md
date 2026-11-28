@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Use `u32` newtypes (`CellIndex`, …). `usize` is allowed only in `base::index`.
 
 ## Context
 

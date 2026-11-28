@@ -432,8 +432,8 @@ fn queue_failure_hold(
     } else if fix.author != trust::BOT_LOGIN {
         // Held whatever the labels say: `needs-decision` is not what keeps agents off it.
         format!(
-            "#{pull} was not opened by the bot, so agents never push to it; a human rebases or \
-             renumbers it, re-queues it and closes issue #{number}"
+            "#{pull} was not opened by the bot, so agents never push to it; a human rebases it \
+             or moves its ADR, re-queues it and closes issue #{number}"
         )
     } else if !fix.is_open {
         format!("#{pull} is closed or merged, but issue #{number} is still open; a human closes it")

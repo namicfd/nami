@@ -10,10 +10,14 @@ What each tool checks today, and what is only promised so far. `docs/TIGER_STYLE
 
 | Rule | Kind | What it requires | What it sees and misses | Reference |
 | --- | --- | --- | --- | --- |
+| `adr-id` | workspace | Every file in `docs/design/` but the index is named `YYYYMMDD-HHMM-<slug>.md`, after a UTC minute, or carries the number of an ADR written before IDs were minutes. | The minute must exist in the calendar, from 2026 on. The legacy numbers are 0000 to 0043 without the gaps 0016 and 0024 to 0031. The slug is lower-case words joined by single dashes. | ADR-20261128-1856 |
 | `adr-index` | source | Every ADR is listed in `docs/design/README.md`. |  | ADR-0000 |
-| `adr-number` | source | No two ADR files share a number, and an ADR's title repeats the number of its file name. |  | ADR-0000 |
+| `adr-index-doc` | workspace | `docs/design/README.md` is what `cargo xtask adr index --write` generates from the ADRs. | Skipped by a foreign gate, like `rules-doc`: another revision's generator writes another index. | ADR-20261128-1856 |
+| `adr-number` | source | No two ADR files share an ID, and an ADR's title repeats the ID of its file name. | Same-minute clashes between branches show here once both are merged; the `adr clashes` check on each pull request fails them earlier. | ADR-0000 |
+| `adr-reference` | workspace | Every `ADR-` followed by a digit names an ADR in `docs/design/`. | Reads every UTF-8 file that tidy walks, below `docs/` and in the root `.claude/` without its worktrees. Tidy's fixtures are not read, nor scratch files that quote old text: `*.diff`, `*.patch`, `*.orig`, `*.rej` (such as CI's `pr.diff`) and cargo-mutants' `mutants.out/`. `ADR-NNNN` and other placeholders without a digit are no reference. | ADR-20261128-1856 |
 | `adr-section` | source | Every ADR has the six required sections. |  | ADR-0000 |
 | `adr-status` | source | Every ADR has a valid status line. |  | ADR-0000 |
+| `adr-summary` | workspace | Every ADR has a `- Summary:` line in its header: the one line its index row shows. | The placeholder summary that `cargo xtask adr new` writes is rejected too, so an unedited template cannot merge. | ADR-20261128-1856 |
 | `assertion-density` | workspace | Each nami crate averages at least two assertions per non-trivial function. |  | ADR-0004 |
 | `async` | source | No `async` functions or blocks: functions run to completion. |  | TIGER_STYLE.md, Control flow |
 | `debt-marker` | source | No unfinished-work markers in Rust sources; unfinished work is a task. |  | TIGER_STYLE.md, Zero technical debt |
@@ -92,4 +96,4 @@ Promised in the documents and not built yet. The style guide tags the rules they
 
 ## Checking another revision's tree
 
-`cargo xtask tidy --root <dir>` checks another tree with this binary. With `--policy <dir>` it acts as a foreign gate: CI runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by weakening its own gate. In that mode the `#[expect]` budget is read from the policy directory, and the rules that compare the tree's documents with the binary's own registry are skipped, because a tree with a different registry fails them by construction: `doc-tag`, `planned-task`, `rules-doc`. Every other rule runs, `doc-tool-name` on the style guide included, because it reads only the guide's text.
+`cargo xtask tidy --root <dir>` checks another tree with this binary. With `--policy <dir>` it acts as a foreign gate: CI runs the base branch's tidy on a pull request's tree, so that a pull request cannot pass by weakening its own gate. In that mode the `#[expect]` budget is read from the policy directory, and the rules that compare the tree's documents with the binary's own registry are skipped, because a tree with a different registry fails them by construction: `adr-index-doc`, `doc-tag`, `planned-task`, `rules-doc`. Every other rule runs, `doc-tool-name` on the style guide included, because it reads only the guide's text.

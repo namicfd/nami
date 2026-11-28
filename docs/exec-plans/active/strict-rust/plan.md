@@ -288,7 +288,8 @@ files of `xtask/src` and `xtask/tests`, so this task waits for the owner.
 Tidy rule `cross-ref`: every reference in a Rust comment, a Markdown file or an error-message
 string names something that exists:
 
-- `ADR-NNNN`: a file in `docs/design/`;
+- `ADR-NNNN` or `ADR-YYYYMMDD-HHMM`: a file in `docs/design/` (tidy's `adr-reference` checks
+  this one already, in every file, ADR-20261128-1856);
 - a repository path in backticks or a link: an existing file or directory;
 - `TIGER_STYLE.md, <Section>`: a heading of the style guide;
 - `error[<id>]` and `tidy rule <id>`: a registered rule;
@@ -403,8 +404,8 @@ decision for after the sentence has been measured.
 
 ### expect-cites-record
 
-Tidy, in its existing walk over `#[expect]`: a `reason` contains `ADR-NNNN` or `#<n>`, and the
-ADR exists (ADR-0033, point 9). Fix the existing attributes.
+Tidy, in its existing walk over `#[expect]`: a `reason` contains an ADR ID (`ADR-NNNN` or
+`ADR-YYYYMMDD-HHMM`) or `#<n>`, and the ADR exists (ADR-0033, point 9). Fix the existing attributes.
 
 ### mutants-required
 

@@ -3,6 +3,7 @@
 - Status: Accepted (amended by ADR-0013)
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Kernels are `no_std` without `alloc`. No allocation after init. Data access only via pencils, `[f64; NVAR]` and typed gathers.
 
 ## Context
 

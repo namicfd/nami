@@ -1,8 +1,9 @@
 # ADR-0000: Record decisions as ADRs
 
-- Status: Accepted
+- Status: Accepted (amendment proposed in ADR-20261128-1856)
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Policy lives here, with rationale and an enforcement mechanism.
 
 ## Context
 

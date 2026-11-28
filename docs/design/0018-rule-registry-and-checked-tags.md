@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0001, ADR-0002, ADR-0004, ADR-0005, ADR-0006
+- Summary: Every tidy rule is registered and has a firing and a non-firing fixture. A tag in the style guide names a mechanism that exists. Planned mechanisms are listed and each is a task.
 
 ## Context
 

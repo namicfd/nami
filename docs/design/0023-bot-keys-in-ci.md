@@ -4,6 +4,7 @@
 - Date: 2026-11-26
 - Deciders: maintainer
 - Amends: ADR-0021, points 2 and 6
+- Summary: One GitHub App per role: `nami-agent` for authoring, `nami-reviewer` for the CI-hosted review, `nami-ci` for CI jobs, whom agents trust only for the shapes it produces. A key lives in an environment that only `main` may use. Each job narrows its tokens, one step holds the secret, and no job with a key runs PR code or restores a cache.
 
 ## Context
 

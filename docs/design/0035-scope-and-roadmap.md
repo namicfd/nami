@@ -3,6 +3,8 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Summary: One block-based, coordinate-aware data model from M0. Compile-time extension points.
+  Advection, Burgers, Euler, shallow water, then MHD, curvilinear, multiple nodes, SMR, AMR.
 
 ## Context
 

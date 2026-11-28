@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod adr;
 pub mod doctor;
 pub mod dylint;
 pub mod hook;

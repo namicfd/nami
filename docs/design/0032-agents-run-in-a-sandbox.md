@@ -4,6 +4,7 @@
 - Date: 2026-11-28
 - Deciders: maintainer
 - Amends: ADR-0010
+- Summary: On the maintainer's machine, every agent session in a nami checkout runs in a bubblewrap sandbox without the maintainer's credentials, and a tripwire hook denies sessions outside it. Nothing in the repository depends on it. It stops mistakes, not attackers. No agent sessions on macOS until it has an equivalent.
 
 ## Context
 

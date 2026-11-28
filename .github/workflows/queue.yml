@@ -1,4 +1,4 @@
-# The merge queue's two blind spots (issue #51). Git merges two ADRs with one number without a
+# The merge queue's two blind spots (issue #51). Git merges two ADRs with one ID without a
 # conflict, so the clash shows only when the second PR fails tidy in the queue; and a PR that
 # fails in the queue drops out with nobody told. Neither job is a required check. The logic is
 # in `cargo xtask queue` (xtask/src/queue.rs); these jobs only call it.
@@ -19,13 +19,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Advisory early warning: one comment on the PR, kept up to date, that names the ADR numbers
-  # it adds which `main` or another open PR also uses, and who renumbers. The clash checker
-  # (xtask/src/queue/clashes.rs) says that whichever PR lands second renumbers, and ADR-0021,
-  # point 6, that a PR the clash fails in the queue renumbers on its own branch. It posts as
-  # the workflow's own token. A fork's PR gets a read-only token, so it is skipped.
+  # Early failure: one comment on the PR, kept up to date, that names the ADR IDs it adds which
+  # `main` or another open PR also uses, and who moves. The clash checker
+  # (xtask/src/queue/clashes.rs) fails the PR that moves its ADR to a free UTC minute: the one
+  # whose clash is with `main` or with an older open PR (ADR-20261128-1856). It is not a
+  # required check, because it does not run in the merge queue; there, tidy's `adr-number`
+  # fails a clash, and ADR-0021, point 6, has the PR fixed on its own branch. It posts as the
+  # workflow's own token. A fork's PR gets a read-only token, so it is skipped.
   adr-clashes:
-    name: adr clashes (advisory)
+    name: adr clashes
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -51,7 +53,7 @@ jobs:
 
   # Ownership of queue failures: when the required checks fail on a merge-queue branch and the
   # PR has really left the queue, file an issue of kind `bug` for it, as nami-ci[bot], so that
-  # `cargo xtask task ready` lists it and the next session rebases or renumbers the PR on its
+  # `cargo xtask task ready` lists it and the next session rebases the PR or moves its ADR on its
   # own branch (ADR-0021, point 6). Agents trust nami-ci[bot] for exactly this issue title
   # (ADR-0023). A failed merge-queue run of `ci` or of `guardrails`, which holds the required
   # `ratchet` check (ADR-0022), is filed. One issue per failed merge group:

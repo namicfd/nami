@@ -4,6 +4,7 @@
 - Date: 2026-11-26
 - Deciders: maintainer
 - Amends: ADR-0011 (point 2, "Only CI may set `passes`")
+- Summary: A post-merge workflow runs each task's acceptance tests on `main`, and the `nami-ci` bot opens the one PR that sets `passes`; `check-pr` rejects every other change that does.
 
 ## Context
 

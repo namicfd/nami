@@ -3,6 +3,7 @@
 - Status: Accepted (amended by ADR-0013)
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Each rule lives in exactly one tool. Error messages name the fix. Fixture tests prove every rule still fires.
 
 ## Context
 

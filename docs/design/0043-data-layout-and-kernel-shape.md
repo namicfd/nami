@@ -5,6 +5,10 @@
 - Deciders: maintainer
 - Amends, once accepted: ADR-0003 (pencils become row stencils; `[f64; NVAR]` becomes named
   state structs)
+- Summary: Structure of arrays `[var][k][j][i]`, kernels on row stencils, per-face physics over
+  named state structs. Measured at 1.9× Athena++ only with `f64::sqrt`, which today's rules ban,
+  and `debug_assert!` in `math::sqrt` (with a copy of today's `math::sqrt`: 0.1×, below the 0.8×
+  failure line, or 0.9×, below the 1.0× target, depending on inlining). Amends 0003 once accepted.
 
 ## Context
 

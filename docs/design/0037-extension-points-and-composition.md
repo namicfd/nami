@@ -3,6 +3,9 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Summary: A run is a combination compiled in a problem crate; runtime configuration sets
+  parameters. Riemann solvers work in the face frame. Integrators are 3S* tables. Every supported
+  combination is tested.
 
 ## Context
 
