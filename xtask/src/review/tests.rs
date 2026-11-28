@@ -1,9 +1,9 @@
 //! Tests of `cargo xtask review` against a fake GitHub.
 
-use super::findings::{self, Answer, Finding, Findings, Outcome};
+use super::findings::{self, Finding, Findings};
 use super::forge::{ChangedFile, Forge, OpenThread, Poster, PullFacts};
 use super::placement::Commentable;
-use super::{Selection, decide, definition, execute, select};
+use super::{Diff, Selection, decide, definition, execute, select};
 use crate::issue::trust::Trust;
 use std::cell::RefCell;
 
@@ -37,6 +37,10 @@ impl Poster for Fake {
         self.writes.borrow_mut().push(format!("resolve {id}"));
         Ok(())
     }
+    fn unresolve(&self, id: &str) -> Result<(), String> {
+        self.writes.borrow_mut().push(format!("unresolve {id}"));
+        Ok(())
+    }
     fn review(&self, number: u32, request: &str) -> Result<String, String> {
         self.writes.borrow_mut().push(format!("review #{number} {request}"));
         Ok("https://github.com/o/n/pull/1#review".to_owned())
@@ -53,6 +57,7 @@ fn pull(author: &str, is_app: bool, head_ref: &str) -> PullFacts {
         head_ref: head_ref.to_owned(),
         head_repository: Some("o/n".to_owned()),
         base_repository: "o/n".to_owned(),
+        base_ref: "main".to_owned(),
         base_sha: "f".repeat(40),
         title: "A change".to_owned(),
         body: "Why".to_owned(),
@@ -68,7 +73,14 @@ fn fake(pull: PullFacts, threads: Vec<OpenThread>) -> Fake {
 }
 
 fn thread(id: &str) -> OpenThread {
-    OpenThread { id: id.to_owned(), path: "a.rs".to_owned(), line: Some(2), body: "x".to_owned() }
+    OpenThread {
+        id: id.to_owned(),
+        path: "a.rs".to_owned(),
+        line: Some(2),
+        body: "x".to_owned(),
+        replies: vec![],
+        resolved_by_other: false,
+    }
 }
 
 fn findings(blocking: Vec<Finding>, fixed: &[&str]) -> Findings {
@@ -95,10 +107,51 @@ fn owners() -> Trust {
     Trust::from_codeowners("/docs/ @owner\n")
 }
 
+/// A diff of `files` that needs no numerics review.
+fn diff(files: &[Commentable]) -> Diff<'_> {
+    Diff { files, needs_numerics: false }
+}
+
+// Goal: a thread that the author resolved still blocks the approval and is opened again; when
+// the head fixes it, it is opened again and resolved by the reviewer, and the review approves
+// (#98's review: only the reviewer resolves its threads).
+#[test]
+fn a_thread_resolved_by_the_author_stays_open() {
+    let files = [Commentable { path: "a.rs".to_owned(), lines: vec![1, 2, 3] }];
+    let mut cleared = thread("T1");
+    cleared.resolved_by_other = true;
+    let open = [cleared];
+    let kept = decide(&findings(vec![], &[]), &open, &diff(&files), HEAD, "1");
+    assert_eq!((kept.event, kept.reopen.clone()), ("COMMENT", vec!["T1".to_owned()]));
+    assert!(kept.resolve.is_empty(), "not fixed, so not resolved");
+    let fixed = decide(&findings(vec![], &["T1"]), &open, &diff(&files), HEAD, "1");
+    assert_eq!((fixed.event, fixed.reopen.len(), fixed.resolve.len()), ("APPROVE", 1, 1));
+}
+
+// Goal: when numerical files changed and numerics-verifier did not run, there is no verdict;
+// when it ran, the review may approve, and the body names no skip; with no numerical files,
+// the skip is named (#98's review).
+#[test]
+fn numerical_changes_need_numerics_verifier() {
+    let files = [Commentable { path: "crates/kernels/src/a.rs".to_owned(), lines: vec![1] }];
+    let numerical = Diff { files: &files, needs_numerics: true };
+    let skipped = decide(&findings(vec![], &[]), &[], &numerical, HEAD, "1");
+    assert_eq!(skipped.event, "COMMENT");
+    assert!(skipped.body.starts_with("**No verdict**"), "{}", skipped.body);
+    let mut both = findings(vec![], &[]);
+    both.reviewers_run.push("numerics-verifier".to_owned());
+    let reviewed = decide(&both, &[], &numerical, HEAD, "1");
+    assert_eq!(reviewed.event, "APPROVE");
+    assert!(!reviewed.body.contains("skipped"), "{}", reviewed.body);
+    let plain = decide(&findings(vec![], &[]), &[], &diff(&files), HEAD, "1");
+    assert!(plain.body.contains("numerics-verifier skipped"), "{}", plain.body);
+}
+
 // Goal: the model reviews only an open, non-draft PR at the run's head, from this repository,
 // by the agents' app or a code owner; the bot/passes PR by the CI app is `passes`; everything
 // else is `none`: another app or user, a look-alike user named like an app, the CI app on
-// another branch, a draft, a fork, a closed PR and a head that moved on.
+// another branch, a draft, a fork, a closed PR, a head that moved on and a base that is not
+// main.
 #[test]
 fn only_trusted_authors_are_reviewed() {
     let selected = |pull: PullFacts| select(&fake(pull, vec![]), &owners(), 1, HEAD).unwrap();
@@ -120,7 +173,9 @@ fn only_trusted_authors_are_reviewed() {
     closed.is_open = false;
     let mut moved = pull("nami-agent[bot]", true, "fix");
     moved.head_sha = "1".repeat(40);
-    cases.extend([draft, fork, closed, moved]);
+    let mut other_base = pull("nami-agent[bot]", true, "fix");
+    other_base.base_ref = "release".to_owned();
+    cases.extend([draft, fork, closed, moved, other_base]);
     for case in cases {
         let author = case.author.clone();
         assert!(matches!(selected(case), Selection::None(_)), "{author}");
@@ -134,20 +189,20 @@ fn only_trusted_authors_are_reviewed() {
 #[test]
 fn approval_needs_no_finding_and_no_open_thread() {
     let files = [Commentable { path: "a.rs".to_owned(), lines: vec![1, 2, 3] }];
-    let clean = decide(&findings(vec![], &[]), &[], &files, HEAD, "0.5");
+    let clean = decide(&findings(vec![], &[]), &[], &diff(&files), HEAD, "0.5");
     assert_eq!((clean.event, clean.comments.len()), ("APPROVE", 0));
     assert!(clean.body.starts_with("**Approved** `0123"), "{}", clean.body);
     assert!(clean.body.contains("- Rename it.") && clean.body.contains("Cost: 0.5 USD"));
-    let found = decide(&findings(vec![blocking("a.rs", 2)], &[]), &[], &files, HEAD, "1");
+    let found = decide(&findings(vec![blocking("a.rs", 2)], &[]), &[], &diff(&files), HEAD, "1");
     assert_eq!(found.event, "COMMENT");
     assert_eq!(found.comments[0].0, "a.rs");
     assert_eq!(found.comments[0].1, 2);
     let open = [thread("T1"), thread("T2")];
-    let partly = decide(&findings(vec![], &["T1", "T9"]), &open, &files, HEAD, "1");
+    let partly = decide(&findings(vec![], &["T1", "T9"]), &open, &diff(&files), HEAD, "1");
     assert_eq!((partly.event, partly.resolve.clone()), ("COMMENT", vec!["T1".to_owned()]));
     assert!(partly.body.contains("1 earlier thread(s) still open"), "{}", partly.body);
     assert!(partly.body.contains("no open thread of mine: 1"), "{}", partly.body);
-    let fixed = decide(&findings(vec![], &["T1", "T2"]), &open, &files, HEAD, "1");
+    let fixed = decide(&findings(vec![], &["T1", "T2"]), &open, &diff(&files), HEAD, "1");
     assert_eq!((fixed.event, fixed.resolve.len()), ("APPROVE", 2));
 }
 
@@ -156,11 +211,11 @@ fn approval_needs_no_finding_and_no_open_thread() {
 #[test]
 fn findings_off_the_diff_are_moved_or_give_no_verdict() {
     let files = [Commentable { path: "a.rs".to_owned(), lines: vec![10] }];
-    let moved = decide(&findings(vec![blocking("b.rs", 3)], &[]), &[], &files, HEAD, "1");
+    let moved = decide(&findings(vec![blocking("b.rs", 3)], &[]), &[], &diff(&files), HEAD, "1");
     assert_eq!((moved.comments[0].0.as_str(), moved.comments[0].1), ("a.rs", 10));
     assert!(moved.comments[0].2.starts_with("(At `b.rs`, line 3.) **Blocking**"));
     let bare = [Commentable { path: "a.bin".to_owned(), lines: vec![] }];
-    let nowhere = decide(&findings(vec![blocking("a.bin", 1)], &[]), &[], &bare, HEAD, "1");
+    let nowhere = decide(&findings(vec![blocking("a.bin", 1)], &[]), &[], &diff(&bare), HEAD, "1");
     assert_eq!((nowhere.event, nowhere.comments.len()), ("COMMENT", 0));
     assert!(nowhere.body.starts_with("**No verdict**"), "{}", nowhere.body);
 }
@@ -286,11 +341,4 @@ fn definitions_are_read_from_front_matter() {
     let text = "---\nname: x\ndescription: Reviews.\ntools: Read\n---\n\nYou review.\n";
     assert_eq!(definition(text), Some(("Reviews.".to_owned(), "You review.\n".to_owned())));
     assert_eq!(definition("You review.\n"), None);
-}
-
-// Goal: the answer type keeps the outcome and the cost apart.
-#[test]
-fn answers_carry_their_cost() {
-    let answer = Answer { outcome: Outcome::NoVerdict("x".to_owned()), cost: "1".to_owned() };
-    assert_eq!(answer.cost, "1");
 }

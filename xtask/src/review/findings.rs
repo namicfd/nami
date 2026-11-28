@@ -241,7 +241,7 @@ fn finding_from(value: &Value) -> Result<Finding, String> {
 fn is_repository_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 400
-        && !path.chars().any(char::is_control)
+        && !path.chars().any(|character| character.is_control() || "`@\\".contains(character))
         && path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
@@ -282,24 +282,15 @@ fn count(value: Option<&Value>) -> Option<u32> {
     }
 }
 
-/// `text` with every `@` outside code spans followed by a zero-width space, so that the
-/// posted review notifies nobody: GitHub links `@name` and `@org/team` only when the name
-/// follows the `@` directly. Code spans and fenced blocks are left as they are, because GitHub
-/// does not link mentions there, and code must stay as written.
+/// `text` with every `@` followed by a zero-width space, so that the posted review notifies
+/// nobody: GitHub links `@name` and `@org/team` only when the name follows the `@` directly.
+/// Code spans are no exception. Telling a code span from an unmatched backtick needs
+/// `CommonMark`'s rules for backtick runs, and a wrong guess leaves a live mention (#98's
+/// review). A zero-width space in code shown in a review costs little.
 #[must_use]
 pub fn unmention(text: &str) -> String {
-    let mut broken = String::with_capacity(text.len());
-    let mut in_code = false;
-    for character in text.chars() {
-        if character == '`' {
-            in_code = !in_code;
-        }
-        broken.push(character);
-        if character == '@' && !in_code {
-            broken.push('\u{200B}');
-        }
-    }
-    assert!(broken.len() >= text.len(), "nothing is removed");
+    let broken = text.replace('@', "@\u{200B}");
+    assert_eq!(broken.matches('@').count(), text.matches('@').count(), "only spaces are added");
     broken
 }
 
@@ -385,6 +376,8 @@ mod tests {
             result(&CLEAN.replace(r#"["tigerstyle-reviewer"]"#, r#"["numerics-verifier"]"#)),
             result(&finding("../etc/passwd", "1", "x")),
             result(&finding("/abs", "1", "x")),
+            result(&finding("a`b.rs", "1", "x")),
+            result(&finding("a@b.rs", "1", "x")),
             result(&finding("a.rs", "0", "x")),
             result(&finding("a.rs", "1", " ")),
             result(&CLEAN.replace(r#""blocking": []"#, &many)),
@@ -407,10 +400,14 @@ mod tests {
         assert_eq!(field, "the review's answer has an unknown field `other`");
     }
 
-    // Goal: mentions outside code are broken; code spans keep their `@` as written.
+    // Goal: every mention is broken, also after an unmatched backtick, inside a
+    // double-backtick span and inside a code span (#98's review).
     #[test]
-    fn mentions_are_broken_outside_code() {
-        assert_eq!(unmention("@a and `x @ 1` and @b/c"), "@\u{200B}a and `x @ 1` and @\u{200B}b/c");
+    fn every_mention_is_broken() {
+        let z = '\u{200B}';
+        assert_eq!(unmention("@a and `x @ 1`"), format!("@{z}a and `x @{z} 1`"));
+        assert_eq!(unmention("x ` @someone"), format!("x ` @{z}someone"));
+        assert_eq!(unmention("``a ` b`` @org/team"), format!("``a ` b`` @{z}org/team"));
         assert_eq!(unmention("no mention"), "no mention");
     }
 }

@@ -14,7 +14,8 @@
 //!   reviewers' definitions from `main`'s `.claude/agents/`, the answer's schema and the lead's
 //!   prompt from `main`'s `.claude/skills/review-pr/ci.md`. The PR's tree is at `<tree>`.
 //! - `post --pr <n> --head <sha> --result <file>` reads the model's answer as untrusted data
-//!   ([`findings`]), resolves the reviewer's threads that the head fixes, and posts one review
+//!   ([`findings`]), opens again the reviewer's threads that someone else resolved (only the
+//!   reviewer resolves them, ADR-0022), resolves those that the head fixes, and posts one review
 //!   on `<sha>`: `APPROVE` when nothing blocks and no earlier thread stays open, otherwise
 //!   `COMMENT` with each blocking finding as an inline thread. An answer that cannot be read,
 //!   or a review that ran over its budget, gets a `COMMENT` that says there is no verdict.
@@ -51,6 +52,13 @@ const REVIEWER_LOGIN: &str = "NAMI_REVIEWER_LOGIN";
 
 /// The branch of the PR that sets `passes` (ADR-0017).
 const PASSES_BRANCH: &str = "bot/passes";
+
+/// The only base branch whose pull requests are reviewed.
+const MAIN: &str = "main";
+
+/// The paths whose change needs `numerics-verifier` (ADR-0008, the `review-pr` skill):
+/// numerical code with its references and reference data, and the reference tools.
+const NUMERICAL_PATHS: [&str; 2] = ["crates/", "tools/"];
 
 /// The reviewers' definitions, in `main`'s checkout.
 const AGENTS_DIRECTORY: &str = ".claude/agents";
@@ -213,6 +221,10 @@ pub fn select(
     if pull.is_draft {
         return skip("drafts are not reviewed");
     }
+    // The model job diffs the head against `main`; another base would review the wrong diff.
+    if pull.base_ref != MAIN {
+        return skip("only pull requests into main are reviewed");
+    }
     if pull.author == CI_LOGIN && pull.author_is_app {
         if pull.head_ref == PASSES_BRANCH {
             return Ok(Selection::Passes);
@@ -297,10 +309,18 @@ fn describe_threads(threads: &[OpenThread]) -> String {
     let mut parts = vec![format!("The reviewer app's open threads ({}):\n", threads.len())];
     for thread in threads {
         let line = thread.line.map_or("outdated".to_owned(), |line| format!("line {line}"));
+        let resolved = if thread.resolved_by_other {
+            " (resolved by someone other than the reviewer, so still open)"
+        } else {
+            ""
+        };
         parts.push(format!(
-            "\n## Thread `{}`, `{}`, {line}\n\n{}\n",
+            "\n## Thread `{}`, `{}`, {line}{resolved}\n\n{}\n",
             thread.id, thread.path, thread.body
         ));
+        for (author, reply) in &thread.replies {
+            parts.push(format!("\n### Reply by `{author}`, the pull request's text\n\n{reply}\n"));
+        }
     }
     let text = parts.concat();
     assert!(text.contains("## Thread"), "every thread is listed");
@@ -360,20 +380,56 @@ fn post(
             lines: file.patch.as_deref().map_or_else(Vec::new, placement::head_lines),
         })
         .collect();
+    let needs_numerics =
+        files.iter().any(|file| NUMERICAL_PATHS.iter().any(|prefix| file.path.starts_with(prefix)));
     let decision = match &answer.outcome {
-        Outcome::Reviewed(found) => decide(found, &threads, &commentable, head, &answer.cost),
-        Outcome::NoVerdict(reason) => no_verdict(reason, head, &answer.cost),
+        Outcome::Reviewed(found) => {
+            let diff = Diff { files: &commentable, needs_numerics };
+            decide(found, &threads, &diff, head, &answer.cost)
+        }
+        Outcome::NoVerdict(reason) => {
+            Decision { reopen: reopened(&threads), ..no_verdict(reason, head, &answer.cost) }
+        }
     };
+    for id in &decision.reopen {
+        poster.unresolve(id)?;
+    }
     for id in &decision.resolve {
         poster.resolve(id)?;
     }
     let request = forge::review_request(head, decision.event, &decision.body, &decision.comments);
     let url = poster.review(number, &request)?;
     assert!(!url.is_empty(), "GitHub names the review it posted");
-    Ok(format!("{} on #{number} at {head}: {url}\n", decision.event))
+    // A push between the first read and the review leaves a review of an older commit, which
+    // dismiss-stale and the newer head's run take care of; say so rather than stay silent.
+    let moved = forge.pull(number)?.head_sha != head;
+    let note = if moved { "; the head moved on meanwhile, and its own run reviews it" } else { "" };
+    Ok(format!("{} on #{number} at {head}: {url}{note}\n", decision.event))
 }
 
-/// One review to post, and the threads to resolve before it.
+/// The reviewer's threads that someone else resolved: the reviewer opens them again, because
+/// only it resolves its threads (ADR-0022).
+fn reopened(threads: &[OpenThread]) -> Vec<String> {
+    let ids: Vec<String> = threads
+        .iter()
+        .filter(|thread| thread.resolved_by_other)
+        .map(|thread| thread.id.clone())
+        .collect();
+    assert!(ids.len() <= threads.len(), "only threads that are open");
+    ids
+}
+
+/// What `decide` needs of the pull request's diff.
+#[derive(Debug, Clone, Copy)]
+pub struct Diff<'f> {
+    /// The changed files, with the lines a thread can go on.
+    pub files: &'f [Commentable],
+    /// True when a file under one of [`NUMERICAL_PATHS`] changed, so `numerics-verifier` must
+    /// have run.
+    pub needs_numerics: bool,
+}
+
+/// One review to post, and the threads to open again and to resolve before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     /// `APPROVE` or `COMMENT`.
@@ -382,20 +438,29 @@ pub struct Decision {
     pub body: String,
     /// The inline threads: path, head-side line and text.
     pub comments: Vec<(String, u32, String)>,
+    /// The reviewer's threads that someone else resolved, opened again first.
+    pub reopen: Vec<String>,
     /// The reviewer's open threads that the head fixes.
     pub resolve: Vec<String>,
 }
 
 /// The review that `found` gives for `head`, with the reviewer's open `threads` and the
-/// diff's `files`: `APPROVE` only when nothing blocks and every open thread is fixed.
+/// `diff`: `APPROVE` only when nothing blocks, every open thread is fixed, and
+/// `numerics-verifier` ran if the diff needs it.
 #[must_use]
 pub fn decide(
     found: &Findings,
     threads: &[OpenThread],
-    files: &[Commentable],
+    diff: &Diff<'_>,
     head: &str,
     cost: &str,
 ) -> Decision {
+    let reopen = reopened(threads);
+    let ran_numerics = found.reviewers_run.iter().any(|name| name == "numerics-verifier");
+    if diff.needs_numerics && !ran_numerics {
+        let reason = "files under `crates/` or `tools/` changed, and numerics-verifier did not run";
+        return Decision { reopen, ..no_verdict(reason, head, cost) };
+    }
     let is_open = |id: &String| threads.iter().any(|thread| &thread.id == id);
     let resolve: Vec<String> =
         found.fixed_threads.iter().filter(|id| is_open(id)).cloned().collect();
@@ -403,10 +468,10 @@ pub fn decide(
     let still_open = threads.iter().filter(|thread| !resolve.contains(&thread.id)).count();
     let mut comments = Vec::new();
     for finding in &found.blocking {
-        let Some(placed) = placement::place(files, &finding.path, finding.line) else {
+        let Some(placed) = placement::place(diff.files, &finding.path, finding.line) else {
             let reason = "a blocking finding could not be placed on the diff, which has no \
                           line a thread can go on";
-            return Decision { resolve, ..no_verdict(reason, head, cost) };
+            return Decision { reopen, ..no_verdict(reason, head, cost) };
         };
         let place = if placed.moved {
             format!("(At `{}`, line {}.) ", finding.path, finding.line)
@@ -432,15 +497,18 @@ pub fn decide(
     };
     let body = review_body(&verdict, found, ignored, cost);
     assert!(!approve || comments.is_empty(), "an approval opens no thread");
-    Decision { event: if approve { "APPROVE" } else { "COMMENT" }, body, comments, resolve }
+    let event = if approve { "APPROVE" } else { "COMMENT" };
+    Decision { event, body, comments, reopen, resolve }
 }
 
 /// The review's body: the verdict, the reviewers, the summary, the suggestions and the counts.
+/// It is called only when `numerics-verifier` ran or was not needed ([`decide`]), so a skip
+/// it names is a true one.
 fn review_body(verdict: &str, found: &Findings, ignored: usize, cost: &str) -> String {
     let skipped = if found.reviewers_run.iter().any(|name| name == "numerics-verifier") {
         ""
     } else {
-        "; numerics-verifier skipped: no numerical code, references or tools changed"
+        "; numerics-verifier skipped: nothing under `crates/` or `tools/` changed"
     };
     let mut parts = vec![format!(
         "{verdict}\n\nReviewers: {}{skipped}.\n\n{}\n",
@@ -471,7 +539,13 @@ fn no_verdict(reason: &str, head: &str, cost: &str) -> Decision {
          workflow for this head, or ask a code owner to review it. Cost: {cost} USD."
     );
     assert!(!reason.is_empty(), "no verdict says why");
-    Decision { event: "COMMENT", body, comments: Vec::new(), resolve: Vec::new() }
+    Decision {
+        event: "COMMENT",
+        body,
+        comments: Vec::new(),
+        reopen: Vec::new(),
+        resolve: Vec::new(),
+    }
 }
 
 /// Approves the `bot/passes` PR's head, if it still has that shape and head.
