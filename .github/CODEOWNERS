@@ -1,5 +1,6 @@
-# Paths that always need maintainer review (ADR-0008).
-# Effective once the repo is on GitHub with code-owner review required (ADR-0009).
+# Paths that need maintainer review (ADR-0008, ADR-0009). The rule paths at the end have no owner:
+# the required `ratchet` check proves a change to them, and an edit to existing rule code also
+# needs the reviewer app's or a code owner's approval (ADR-0022).
 
 # Manifests, lockfile and tool configuration.
 /Cargo.toml                @cxkoda
@@ -29,3 +30,21 @@
 # Reference solutions, their generators and reference data (ADR-0007).
 /crates/reference/         @cxkoda
 /tools/                    @cxkoda
+
+# Rule paths: what a tidy rule or a dylint lint reports, its fixtures and UI cases, and the
+# generated rule list. They have no owner: a PR that changes only these merges once the
+# required `ratchet` check proves that it only tightens (ADR-0022). The last matching line
+# wins, so these lines stay last. They must be what `flipped_codeowners` in
+# `xtask/src/ratchet/scope.rs` appends; tests in `xtask/src/pr.rs` check it.
+/docs/RULES.md
+/lints/src/
+/lints/ui/
+/xtask/fixtures/tidy/
+/xtask/src/tidy/docs.rs
+/xtask/src/tidy/lints.rs
+/xtask/src/tidy/manifest.rs
+/xtask/src/tidy/registry.rs
+/xtask/src/tidy/rust_source.rs
+/xtask/src/tidy/style_guide.rs
+/xtask/src/tidy/text.rs
+/xtask/src/tidy/tokens.rs

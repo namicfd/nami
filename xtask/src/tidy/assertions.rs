@@ -1,9 +1,9 @@
 //! The assertion counts behind `assertion-density` (ADR-0004), and the count of assertions in
 //! one body that `unasserted-function` uses.
 //!
-//! This is trusted core, not a rule path (ADR-0022, pending in #55). `assertion-density` is a
-//! workspace rule with no fixture, so the ratchet (pending, #57) could not prove that a change
-//! to its threshold, its cut-off or its counting only tightens. The density walk is its own
+//! This is trusted core, not a rule path (ADR-0022). `assertion-density` is a workspace rule
+//! with no fixture, so the ratchet could not prove that a change to its threshold, its cut-off
+//! or its counting only tightens. The density walk is its own
 //! visitor, so that the source rules in `rust_source.rs` cannot change which functions it
 //! counts. A test in `tidy.rs` keeps the two walks' test-code exemptions in step.
 

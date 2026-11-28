@@ -1,8 +1,9 @@
 //! `cargo xtask ratchet`: proves that a pull request which changes rule paths only tightens
-//! the rules, so that it can merge without the code owner (proposed in ADR-0022).
+//! the rules, so that it can merge without the code owner (ADR-0022).
 //!
-//! It runs in shadow mode until that policy is accepted: CI shows its verdict on every pull
-//! request, nothing requires it, and every guardrail path keeps its code owner.
+//! It is a required check, and `.github/CODEOWNERS` leaves the rule paths without an owner: an
+//! additive change merges on its proof, and an edit to existing rule code also needs the
+//! reviewer app's or a code owner's approval of its head commit.
 //!
 //! The work is split in two, so that the judge never runs the pull request's code:
 //!
@@ -555,15 +556,16 @@ impl Verdict {
         }
     }
 
-    /// The verdict line: the last line of the summary. It is the verdict under today's
+    /// The verdict line: the last line of the summary. It is the verdict under the base's
     /// CODEOWNERS, which decides the exit code.
     #[must_use]
     pub fn line(&self) -> String {
         self.line_with(&self.unproven)
     }
 
-    /// The verdict the PR would get after the policy flip of ADR-0022, when the rule paths have
-    /// no owner, so that shadow mode shows the evidence the flip asks for.
+    /// The verdict the PR gets with the rule paths unowned, as the policy flip of ADR-0022 left
+    /// them. Once the base's CODEOWNERS is flipped, it is the verdict line; on a base that is
+    /// not, it shows what the flip would change.
     #[must_use]
     pub fn line_after(&self) -> String {
         self.line_with(&self.unproven_after)
@@ -607,7 +609,7 @@ impl Verdict {
         lines.push(format!("- Rule paths changed: {}", self.rule_paths.len()));
         lines.push(format!("- Changed outside the rule paths: {}", self.outside.len()));
         lines.push(format!("- Judged: {}", self.range));
-        lines.push(format!("- Verdict today (every guardrail path owned): `{}`", self.line()));
+        lines.push(format!("- Verdict under the base's CODEOWNERS: `{}`", self.line()));
         lines.push(format!(
             "- Verdict after ADR-0022 (rule paths unowned): `{}`",
             self.line_after()
@@ -1421,7 +1423,7 @@ mod tests {
         assert_eq!(owned.line(), "ratchet: pass");
         assert!(owned.line_after().starts_with("ratchet: no verdict, 1"), "unowned after the flip");
         let shown = owned.summary();
-        assert!(shown.contains("- Verdict today (every guardrail path owned): `ratchet: pass`"));
+        assert!(shown.contains("- Verdict under the base's CODEOWNERS: `ratchet: pass`"));
         assert!(shown.contains("after ADR-0022 (rule paths unowned): `ratchet: no verdict"));
         assert!(shown.ends_with("\nratchet: pass\n"), "the exit code follows today's verdict");
         let mut still = Verdict { owner_reviews: true, owner_reviews_after: true, ..owned };

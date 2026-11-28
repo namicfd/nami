@@ -53,7 +53,7 @@ const FIXTURE_DIRECTORY: &str = "xtask/fixtures";
 const ROOT_AGENT_DIRECTORY: &str = ".claude";
 
 /// Directory of the ADRs and their index (ADR-0000). File kinds are core: they decide which
-/// files the rules check (ADR-0022, pending in #55).
+/// files the rules check (ADR-0022).
 pub const ADR_DIRECTORY: &str = "docs/design";
 
 /// The style guide, relative to the root.

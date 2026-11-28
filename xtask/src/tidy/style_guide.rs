@@ -19,7 +19,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-// Which file is the style guide decides what `doc-tag` checks, so it is core (ADR-0022, pending).
+// Which file is the style guide decides what `doc-tag` checks, so it is core (ADR-0022).
 pub use super::STYLE_GUIDE;
 
 /// The tag of a rule that no tool checks.

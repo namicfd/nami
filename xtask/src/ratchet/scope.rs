@@ -6,8 +6,8 @@
 //! checked, how results become exit codes, or how CI and hooks run* is the trusted core, and so
 //! is the code of the workspace rules, which the corpus does not cover.
 //!
-//! ADR-0022 proposes that `.github/CODEOWNERS` leave exactly these paths without an owner. Until
-//! then they stay owned, and the ratchet runs in shadow mode.
+//! `.github/CODEOWNERS` leaves exactly these paths without an owner (ADR-0022), and a test of
+//! `pr.rs` holds the file equal to [`flipped_codeowners`] of its owned lines.
 
 use crate::pr::Pattern;
 

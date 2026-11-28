@@ -647,7 +647,8 @@ mod tests {
     }
 
     // Goal: the real CODEOWNERS file parses, and its patterns protect what AGENTS.md says is
-    // protected and nothing next to it. A pattern in a new form fails this test.
+    // protected and nothing next to it, except the rule paths. A pattern in a new form fails
+    // this test.
     #[test]
     fn real_codeowners_protects_the_documented_paths() {
         let patterns = real_codeowners();
@@ -674,21 +675,25 @@ mod tests {
             "xtask/src/tidy.rs",
             "xtask/src/tidy/registry.rs",
         ]);
-        let unprotected = paths(&["README.md", "crates/base/src/lib.rs", "docs/research/notes.md"]);
+        let unprotected = paths(&[
+            "README.md",
+            "crates/base/src/lib.rs",
+            "docs/research/notes.md",
+            "lints/src/lib.rs",
+            "lints/ui/main.rs",
+            "xtask/fixtures/tidy/usize.fires.fixture",
+            "xtask/src/tidy/registry.rs",
+        ]);
         let expected: Vec<String> =
             changed.iter().filter(|path| !unprotected.contains(path)).cloned().collect();
         assert_eq!(protected_paths(&patterns, &changed), expected);
     }
 
-    // Goal: the CODEOWNERS that the ratchet's "after ADR-0022" verdict assumes, today's file
-    // with the rule paths appended without an owner, leaves exactly the rule paths unowned, as
-    // the policy flip of ADR-0022 would, and protects everything else as today.
+    // Goal: CODEOWNERS leaves exactly the ratchet's rule paths without an owner, as the policy
+    // flip of ADR-0022 does, and protects everything else as before.
     #[test]
-    fn the_flipped_codeowners_unowns_exactly_the_rule_paths() {
-        let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))
-            .expect("CODEOWNERS is readable");
-        let lines = parse_codeowners(&crate::ratchet::scope::flipped_codeowners(&text))
-            .expect("the flipped file parses");
+    fn real_codeowners_unowns_exactly_the_rule_paths() {
+        let lines = real_codeowners();
         let unowned: Vec<&Pattern> =
             lines.iter().filter(|line| !line.is_owned).map(|line| &line.pattern).collect();
         let rule_paths = crate::ratchet::scope::rule_patterns();
@@ -707,6 +712,27 @@ mod tests {
             protected_paths(&lines, &examples),
             paths(&["lints/Cargo.toml", "xtask/src/tidy.rs"])
         );
+    }
+
+    // Goal: the real CODEOWNERS is the flip that the ratchet's verdict with the rule paths
+    // unowned assumes: its owned lines, with an owner-less line for each rule path appended,
+    // give the same lines, so that verdict is the one this file gives.
+    #[test]
+    fn the_real_codeowners_is_the_ratchets_flip() {
+        let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))
+            .expect("CODEOWNERS is readable");
+        let owned_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                let mut words = line.split_whitespace().take_while(|word| !word.starts_with('#'));
+                words.next().is_none() || words.next().is_some()
+            })
+            .collect();
+        let owned = owned_lines.join("\n");
+        let flipped = crate::ratchet::scope::flipped_codeowners(&owned);
+        let expected = parse_codeowners(&flipped).expect("the flip of the owned lines parses");
+        let real = parse_codeowners(&text).expect("the real CODEOWNERS parses");
+        assert_eq!(real, expected);
     }
 
     // Goal: each of the three supported forms parses to its own variant; comments, blank lines

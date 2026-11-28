@@ -1,8 +1,9 @@
 # Checks on what a pull request does to the guardrails themselves (ADR-0020, ADR-0022).
 # `pr body` and `base gate` are not required checks: they tell the code owner where to look
-# first. `ratchet` proves that a PR which changes only rule paths only tightens them (proposed in
-# ADR-0022). It runs in shadow mode: its verdict shows in the job summary of every PR, but it is
-# not a required check, and every guardrail path keeps its code owner, until the policy flip.
+# first. `ratchet`, a required check, proves that a PR which changes only rule paths only
+# tightens them (ADR-0022). The rule paths have no code owner: an additive change merges on that
+# proof, and an edit to existing rule code also needs the reviewer app's or a code owner's
+# approval of its head commit.
 name: guardrails
 
 on:
@@ -263,8 +264,8 @@ jobs:
   # `ratchet` judges: the base's binary, built here from the base's own checkout, reads the
   # base's corpus from that checkout, the PR's source as data, and the observations. It runs no
   # PR code, and its tools come from a pinned install here, never from a cache the PR's code
-  # could have written. It is meant to become the required check, so it already runs on every
-  # event and is never skipped: a skipped job counts as passed for a required check. The summary
+  # could have written. It is the required check, so it runs on every event and is never
+  # skipped: a skipped job counts as passed for a required check. The summary
   # names the commits judged: in a merge group, the group's parent commit, which is the entry
   # ahead in the queue or the target branch, and the group's head. The pull request and its head
   # come from `ratchet (pull request head)`; without them it gives no verdict.

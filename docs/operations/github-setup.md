@@ -4,7 +4,8 @@ How `namicfd/nami` is configured on GitHub, and how to set up the same thing aga
 
 - ADR-0008: the human review model and the agents' identity;
 - ADR-0009: hosting and the merge gate;
-- ADR-0015: protected paths gated at review.
+- ADR-0015: protected paths gated at review;
+- ADR-0022: rule paths that merge on the ratchet's proof.
 
 Every command below was run against `namicfd/nami` on 2026-11-25.
 
@@ -44,9 +45,10 @@ gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" \
 
 ## 2. Push `main` once, before the ruleset
 
-- The ruleset requires two status checks, `gate` and `lints (UI tests)`. These are job names in `.github/workflows/ci.yml`.
-- That workflow must keep its `merge_group:` trigger. Without it, the queue waits for checks that never run.
-- Push `main` and let CI run once, so that both checks exist when the ruleset refers to them. After step 3, nobody without bypass rights can push to `main` directly.
+- The ruleset requires three status checks: `gate` and `lints (UI tests)`, job names in `.github/workflows/ci.yml`, and `ratchet`, a job in `.github/workflows/guardrails.yml` (ADR-0022).
+- Both workflows must keep their `merge_group:` trigger. Without it, the queue waits for checks that never run.
+- Push `main` and let CI run once, so that `gate` and `lints (UI tests)` exist when the ruleset refers to them. After step 3, nobody without bypass rights can push to `main` directly.
+- `ratchet` runs only on pull requests and merge groups: `guardrails.yml` has no push trigger, so pushing `main` never creates it. Its name first appears with the first pull-request run of a `guardrails.yml` that has the job, which for this repository was #57's own. Add it in step 10, not here. **On a rebuild of this setup** for a repository whose `main` already has the ratchet, require `ratchet` in step 3 at once, with the other two; the name appears with the first pull request.
 
 ## 3. Ruleset on the default branch
 
@@ -65,8 +67,8 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 | | dismiss stale approvals; approve the last push: on | An agent cannot push again after it has been approved. |
 | | conversation resolution: on | Blocking AI-review comments must be resolved. |
 | | merge methods: squash | |
-| Required status checks | `gate`, `lints (UI tests)`; "up to date" is off | The merge queue tests the combined result anyway. |
-| Merge queue | squash; build 5; group of 1–5; wait 5 min; all green; timeout 30 min | ADR-0009. |
+| Required status checks | `gate`, `lints (UI tests)`, `ratchet`; "up to date" is off | The merge queue tests the combined result anyway. `ratchet` is what lets rule paths merge without the code owner; it is added in step 10 (ADR-0022). |
+| Merge queue | squash; build 5; group of 1–5; wait 5 min; all green; timeout 30 min | ADR-0009. The ratchet's two jobs fit in it: in a merge group they have 15 and 10 minutes, against about 2 each measured, which leaves time for runners to pick them up, and they carry the PR's mutation evidence over instead of mutating again (ADR-0022, point 5, which amends ADR-0009 for them). |
 | Bypass | Repository admin, **pull requests only** | The maintainer can merge PRs past the rules: their own, since GitHub never allows approving your own PR, and, as an exception, a `tasks.json` flip that the `passes` workflow cannot make (ADR-0017). Nobody can push to `main` directly, not even with the maintainer's credentials. In an emergency, open a PR and merge it with the bypass. |
 
 To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
@@ -77,6 +79,7 @@ To check the live ruleset against this table, print it with `gh api "repos/$REPO
 - **Write access.** The owner needs write access. Otherwise GitHub silently ignores the line.
 - **Syntax check.** Open the file on GitHub. Syntax errors are shown above its contents.
 - **Keep in sync.** The list must match the protected paths in `AGENTS.md`.
+- **Rule paths have no owner.** The lines without an owner after `/xtask/` and `/lints/` free the rule paths (ADR-0022); on GitHub the last matching line wins. They must equal `RULE_PATHS` in `xtask/src/ratchet/scope.rs`, which a test checks. Only those paths may be unowned: `cargo xtask pr-body` refuses any other line without an owner. Never free a path while `ratchet` is not a required check (step 10).
 
 ## 5. The agents' GitHub App
 
@@ -298,3 +301,28 @@ Then try the flow end to end:
 1. **Protected path.** As the bot, push a branch that touches a protected path (any path listed in `.github/CODEOWNERS`) and open a PR. It must show "Review required" from the code owner, and must not enter the queue until that review is given.
 2. **Unowned path.** A PR touching only unowned paths, for example `crates/kernels/src/`, must enter the queue once `gate` and `lints (UI tests)` pass, with no review.
 3. **Direct push.** A direct `git push origin main` by the bot must be rejected.
+4. **Rule path** (only once the policy flip of step 10 has merged; before that, CODEOWNERS owns the rule paths and point 1 applies). A PR that changes only rule paths, for example a new UI case in `lints/ui/` with its `.stderr` (a new case in `xtask/fixtures/tidy/` alone cannot pass `gate`, which allows exactly the two fixtures of each source rule), must show no "Review required", must show `ratchet` as required, and must enter the queue only once `ratchet` passes. An additive PR, such as that new UI case, passes `ratchet` with no review, its summary saying `(additive)`; a request for changes or an open thread by the reviewer app that `NAMI_REVIEWER_LOGIN` names turns it red. For a PR that edits existing rule code, for example a changed fixture, the summary says `(edit)`, and `ratchet` stays red until the app approves the head commit, or you do. GitHub does not request your review for it, because the rule paths have no owner; the agent requests it (AGENTS.md, protected paths).
+
+## 10. Turning on the ratchet (ADR-0022)
+
+The ratchet PR (#57) adds the ratchet in shadow mode: both jobs run and show their verdict in the job summary, and CODEOWNERS still owns every guardrail path. The policy PR (#55) then frees the rule paths in `.github/CODEOWNERS`. GitHub applies the base branch's CODEOWNERS, so the rule paths lose their owner the moment that PR merges. So `ratchet` must be required before #55 merges, and it can only be required once its name exists, which #57's own pull-request runs give it. Steps 1 and 2 are done: on 2026-11-28 `ratchet` was made a required check, and #57 merged as 3706935. Do these steps in this order:
+
+1. **Add `ratchet` as a required check, immediately before merging #57** (done). Do points 1 and 2 of this step back to back: from the moment it is required until #57 merges, every other PR is blocked, because no base has a `ratchet` job that reports. Settings → Rules → Rulesets → `main` → Require status checks to pass → Add checks → type `ratchet` → choose the GitHub Actions source → Save changes. The name is offered because #57's runs reported it. Only `ratchet` is required; `ratchet (head)` is the job that runs the PR's code, and `ratchet` judges its output. A review runs `ratchet` again from `.github/workflows/ratchet-review.yml`, under the same name. The bot cannot do this: it has no administration permission, and must not have one.
+2. **Merge #57** (done). On #57, `ratchet` passes with "The base branch has no ratchet yet; skipped." in its summary, because its base cannot judge yet. The PR touches the trusted core, so it waits for your review in any case.
+3. **Rebase #55 onto `main`, let its `guardrails` run, then merge it.** #57 lands as one squashed commit, so rebase only #55's own commits: `git fetch origin && git rebase --onto origin/main <#57's head SHA> task/issue-50`, then push with `--force-with-lease`. Its run is the first that `main`'s ratchet judges. #55 changes CODEOWNERS and other core files, so it waits for your review as well. From its merge on, the rule paths have no owner, and the checks of step 9, point 4, hold.
+4. **Rebase or close stale PRs.** A PR whose branch predates the ratchet has no `ratchet` job, so the required check never reports; it waits until it is rebased onto `main`.
+5. **Set up the reviewer app**, which reviews in CI (#59), and set the repository variable `NAMI_REVIEWER_LOGIN` to its login with `[bot]`. Until you do, an additive PR that only changes rule paths merges on `ratchet` alone, and an edit gets no verdict unless you approve its head commit. GitHub no longer requests that review, because the rule paths have no owner: the agent requests it with `gh pr edit --add-reviewer` when the summary says `(edit)` (AGENTS.md), and the PR waits for your approval of its head commit. Your approval of the head commit settles a "no verdict" only when each reason is unprovable though the evidence is complete: an edit without the app's approval, a hunk without a mutant, a build file, or a form the ratchet refuses (a file outside the dialect, a symbolic link, a name that is not valid UTF-8, a rule path whose name holds a `\` or a character outside printable ASCII, or two names with one key). It becomes a pass that lists the reason (ADR-0022, point 3). Missing or broken evidence (a tool that failed, a failed phase of `observe`, missing observations, a failed null-mutant run, a skipped check) is never settled, and the verdict line says "fix the PR or re-run". Neither is a merge group whose rule-path diff differs from the carried one: rebase the PR and push, so that it is observed on its new base. A mutant that timed out recurs on every re-run: make the tests that cover it finish within the timeout, or split the PR. An honest PR's remedy is a change to the PR, or a re-run; the admin bypass is for deliberate loosenings (below). Findings always fail, even with your approval: a PR the ratchet finds a loosening in is fixed, or merged as a deliberate loosening (below). A manifest or build file in a rule path needs your approval, whatever the app says. The app must be able to submit `APPROVE`: an edit to existing rule code merges only on its approval of the head commit, or yours (ADR-0022, point 2).
+6. **Check it** with step 9, point 4.
+
+To print what the ruleset requires:
+
+```sh
+id=$(gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "main") | .id')
+gh api "repos/$REPO/rulesets/$id" --jq '.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context'
+```
+
+The list must contain `gate`, `lints (UI tests)` and `ratchet`.
+
+**A deliberate loosening.** The ratchet cannot pass a PR that loosens a rule on purpose, approved through an ADR. Merge such a PR with the admin bypass (step 3, Bypass), as for `passes` flips (ADR-0017).
+
+**Turning it off.** Remove the owner-less lines from `.github/CODEOWNERS` first, in a PR of its own, and only then the required check. That PR must change the two tests of `xtask/src/pr.rs` that hold the file to the flip, `real_codeowners_unowns_exactly_the_rule_paths` and `the_real_codeowners_is_the_ratchets_flip`, in the same PR.
