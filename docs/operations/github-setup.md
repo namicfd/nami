@@ -403,7 +403,8 @@ A job that names a missing environment makes GitHub create it with no branch rul
    | Subject (`subject_prefix`, no trailing `*`, so an exact match) | `repo:namicfd/nami:environment:claude-review` |
    | Claims | `ref` = `refs/heads/main`, `job_workflow_ref` = `namicfd/nami/.github/workflows/review.yml@refs/heads/main` |
    | Service account | a new one, such as `nami-review`, in one workspace that has a monthly spend limit |
-   | Scope and token lifetime | the wizard's defaults, `workspace:developer` and 600 seconds |
+   | Scope | `workspace:developer` |
+   | Token lifetime | 600 seconds. Set it: the job refreshes its identity token every 2 minutes, so a longer lifetime gains nothing. |
 
    Note the rule's ID (`fdrl_…`), the service account's ID (`svac_…`) and the organization ID.
 4. **The environment `claude-review`.** Limited to `main` like the first, with no reviewers and no secrets. It holds three environment variables, which are IDs, not secrets: `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_SERVICE_ACCOUNT_ID`.
@@ -431,7 +432,30 @@ gh variable set NAMI_REVIEWER_LOGIN --repo "$REPO" --body 'nami-reviewer[bot]'
 
 ### Check it
 
-The first PR by `nami-agent[bot]` after #98 merges is the test. Once `ci` passes, the `review` workflow's three jobs run, and `nami-reviewer[bot]` reviews it.
+As the maintainer, after the setup. These print names and settings, never a secret's value:
+
+```sh
+gh api apps/nami-reviewer --jq '{client_id, permissions}'
+gh api "repos/$REPO/environments" --jq '[.environments[].name]'
+for environment in nami-reviewer claude-review; do
+  gh api "repos/$REPO/environments/$environment" \
+    --jq '{deployment_branch_policy, rules: [.protection_rules[].type]}'
+  gh api "repos/$REPO/environments/$environment/deployment-branch-policies" \
+    --jq '[.branch_policies[] | {name, type}]'
+  gh secret list --repo "$REPO" --env "$environment"
+done
+gh variable list --repo "$REPO" --env claude-review
+gh variable list --repo "$REPO"
+```
+
+Expect:
+
+- the permissions `contents` and `pull_requests` `write` and `metadata` `read`, and nothing else;
+- both environments in the list, each with `{"protected_branches":false,"custom_branch_policies":true}`, the rules `["branch_policy"]` only, and the one branch policy `{"name":"main","type":"branch"}`. An environment without that rule is open to every branch (ADR-0023): fix it before anything else;
+- the secret `NAMI_REVIEWER_PRIVATE_KEY` in `nami-reviewer`, and no secret in `claude-review`;
+- the three `ANTHROPIC_*` variables in `claude-review`, and `NAMI_REVIEWER_CLIENT_ID` and `NAMI_REVIEWER_LOGIN` among the repository variables.
+
+Then the first PR by `nami-agent[bot]` after #98 merges is the end-to-end test. Once `ci` passes, the `review` workflow's three jobs run, and `nami-reviewer[bot]` reviews it.
 
 - **If the first agent PR after setup stays BLOCKED after the reviewer approves, the app's permissions are wrong.**
 - If `review (model)` fails at the token exchange, its log prints the token's `sub`, `ref` and `job_workflow_ref`: the rule's subject and claims must equal them.
@@ -440,4 +464,4 @@ The first PR by `nami-agent[bot]` after #98 merges is the test. Once `ci` passes
 ### Rotate or revoke
 
 - **The app's key:** generate a new key in the app's settings, replace the secret, delete the file, then delete the old key there. If it leaks, delete it first; tokens already issued expire within an hour. Then check the reviews, approvals and pushes by `nami-reviewer[bot]`.
-- **The Anthropic access:** there is no key to rotate. To cut it off, disable the federation rule or the service account in the Console. The model job fails, and uploads nothing, if an answer ever contains the identity token or GitHub's request token.
+- **The Anthropic access:** there is no key to rotate. To cut it off, disable the federation rule or the service account in the Console. The model job fails, and uploads nothing, if an answer contains any identity token written during the run, or GitHub's request token.
