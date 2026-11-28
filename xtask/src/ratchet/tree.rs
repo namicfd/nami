@@ -4,6 +4,16 @@
 //! base is a `git worktree` in CI, the head a checkout, and the tests use plain directories.
 //! The walk skips only what git ignores at the root (build output, mutation-testing output)
 //! and nested checkouts, so a file committed anywhere else is seen.
+//!
+//! **Refused names.** Every path is keyed by text, and a name that is not valid UTF-8 by its
+//! bytes, escaped (`\xff`), so it has no lossy text two names could share. An escaped key is
+//! printable ASCII with a `\`, so a valid name could still spell it. The ratchet refuses the
+//! forms that can take part in such a clash wherever it vouches for the content, so that one key
+//! always means one file in every tree it judges (review of #57, rounds 15 and 16):
+//! - a name that is not valid UTF-8, anywhere;
+//! - a rule path ([`super::scope::is_rule_path`]) whose name holds a `\` or a character outside
+//!   printable ASCII, in the base as in the head;
+//! - a key that two names map to.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -26,21 +36,24 @@ pub enum Entry {
     File(Vec<u8>),
     /// A symbolic link, which is never followed.
     Link(PathBuf),
-    /// A path whose name is not valid UTF-8, or whose key another name maps to, with why and
-    /// the bytes of the file if it is one. It is keyed by its bytes, escaped, so that no lossy
-    /// text stands for it (review of #57, round 15). It is never read, copied or compared as a
-    /// changed path; the judge refuses the head that holds it ([`refused`]).
+    /// A path in one of the refused forms of the module docs, with why and the bytes of the
+    /// file if it is one. A name that is not valid UTF-8 is keyed by its bytes, escaped, so
+    /// that no lossy text stands for it (review of #57, round 15). It is never read, copied or
+    /// compared as a changed path; the judge refuses the head that holds it ([`refused`]).
     Refused {
         /// Why the path is refused.
         why: String,
-        /// The file's bytes; empty for a directory or a link, which is not entered.
+        /// The file's bytes; empty for a directory or a link, which is not entered. For a key
+        /// that two names map to, the bytes of both, the smaller first, so that the
+        /// fingerprint counts every byte whatever order the directory lists them in.
         content: Vec<u8>,
     },
 }
 
 /// Every file and link below `root`, by path relative to `root`, with `/` as separator. A name
-/// that is not valid UTF-8 is keyed by its escaped bytes and refused, and so is a key that two
-/// names map to, whatever order the directory lists them in.
+/// in a refused form (module docs) is refused, keyed by its escaped bytes if it is not valid
+/// UTF-8, and so is a key that two names map to, whatever order the directory lists them in.
+/// A refused directory is not entered.
 ///
 /// # Errors
 ///
@@ -80,9 +93,9 @@ fn visit(
         return Ok(());
     }
     let (key, named) = key_of(&relative);
-    if !named {
+    let why = if named { refused_rule_name(&key) } else { Some("is not valid UTF-8".to_owned()) };
+    if let Some(why) = why {
         let content = if kind.is_file() { fs::read(entry.path())? } else { Vec::new() };
-        let why = "is not valid UTF-8".to_owned();
         insert(found, key, Entry::Refused { why, content });
     } else if kind.is_symlink() {
         insert(found, key, Entry::Link(fs::read_link(entry.path())?));
@@ -94,7 +107,27 @@ fn visit(
     Ok(())
 }
 
-/// Records `entry` at `key`; a key that is already taken is refused, whichever came first.
+/// Why the rule path `key`, a valid UTF-8 name, is refused, if it is: a `\` or a character
+/// outside printable ASCII in it. An escaped key is printable ASCII with a `\`, so a valid name
+/// without one never spells it, and the blunter rule leaves no other text to doubt (review of
+/// #57, round 16). Names outside the rule paths are left as they are: no reader opens them by
+/// their key, and a clash there is refused in the head and dropped by [`changed_paths`].
+fn refused_rule_name(key: &str) -> Option<String> {
+    let plain = key.chars().all(|character| matches!(character, ' '..='~') && character != '\\');
+    assert!(!plain || key.is_ascii(), "a plain name is ASCII");
+    if plain || !super::scope::is_rule_path(key) {
+        return None;
+    }
+    Some(
+        "is a rule path whose name holds a `\\` or a character outside printable ASCII, as an \
+         escaped name does"
+            .to_owned(),
+    )
+}
+
+/// Records `entry` at `key`; a key that is already taken is refused, whichever came first,
+/// with the bytes of both entries. At most two names share a key, one that is valid UTF-8
+/// and one that is not, since the escape is one to one and a valid name is its own key.
 fn insert(found: &mut BTreeMap<String, Entry>, key: String, entry: Entry) {
     match found.entry(key) {
         std::collections::btree_map::Entry::Vacant(vacant) => {
@@ -102,8 +135,23 @@ fn insert(found: &mut BTreeMap<String, Entry>, key: String, entry: Entry) {
         }
         std::collections::btree_map::Entry::Occupied(mut taken) => {
             let why = format!("is the key of two names, `{}`", taken.key());
-            let _replaced = taken.insert(Entry::Refused { why, content: Vec::new() });
+            let mut both = [bytes_of(taken.get()), bytes_of(&entry)];
+            both.sort();
+            let content = both.concat();
+            assert!(
+                content.len() == both[0].len() + both[1].len(),
+                "the content keeps both entries' bytes"
+            );
+            let _replaced = taken.insert(Entry::Refused { why, content });
         }
+    }
+}
+
+/// The bytes an entry holds: a file's content, a link's target, or a refused path's content.
+fn bytes_of(entry: &Entry) -> Vec<u8> {
+    match entry {
+        Entry::File(bytes) | Entry::Refused { content: bytes, .. } => bytes.clone(),
+        Entry::Link(target) => target.as_os_str().as_encoded_bytes().to_vec(),
     }
 }
 
@@ -124,18 +172,26 @@ pub fn refused(root: &Path) -> io::Result<Vec<(String, String)>> {
 }
 
 /// The paths whose entry differs between the two trees: changed, added or removed. Sorted.
-/// Refused paths are never among them: no reader can open them by their key.
+/// Refused paths are never among them: no reader can open them by their key. A key that either
+/// tree refuses is dropped from both, so that a file the other tree holds under it is not
+/// compared against nothing (review of #57, round 16); the judge refuses the head instead.
 ///
 /// # Errors
 ///
 /// Returns an error if either tree cannot be read.
 pub fn changed_paths(base: &Path, head: &Path) -> io::Result<Vec<String>> {
-    let readable = |entry: &Entry| !matches!(entry, Entry::Refused { .. });
     let mut before = entries(base)?;
     let mut after = entries(head)?;
-    before.retain(|_, entry| readable(entry));
-    after.retain(|_, entry| readable(entry));
+    let refused: BTreeSet<String> = before
+        .iter()
+        .chain(after.iter())
+        .filter(|(_, entry)| matches!(entry, Entry::Refused { .. }))
+        .map(|(key, _)| key.clone())
+        .collect();
+    before.retain(|key, _| !refused.contains(key));
+    after.retain(|key, _| !refused.contains(key));
     let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    assert!(paths.iter().all(|path| !refused.contains(*path)), "no refused key is compared");
     let changed: Vec<String> =
         paths.into_iter().filter(|path| before.get(*path) != after.get(*path)).cloned().collect();
     assert!(
@@ -316,6 +372,7 @@ impl Planted {
 mod tests {
     use super::{Entry, Scratch, changed_paths, entries, is_plain_relative};
     use crate::tidy::scratch::Scratch as Temporary;
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     // Goal: the walk lists files and links by slashed relative path, and skips version control,
@@ -362,10 +419,101 @@ mod tests {
         let clash = super::refused(head.root()).unwrap();
         assert_eq!(clash.len(), 1, "{clash:?}");
         assert!(clash[0].1.starts_with("is the key of two names"), "{clash:?}");
+        let clashed = super::fingerprint(head.root()).unwrap().0;
+        head.write("lints/src/\\xff.rs", "spelled like the escape, edited");
+        assert_ne!(super::fingerprint(head.root()).unwrap().0, clashed, "both names' bytes count");
         let place = Temporary::new("ratchet-names-copy");
         let copy = Scratch::copy_of(head.root(), &place.root().join("tree")).unwrap();
         let copied: Vec<String> = entries(copy.root()).unwrap().into_keys().collect();
         assert_eq!(copied, ["lints/src/lib.rs"], "refused paths are not copied");
+    }
+
+    // Goal: review of #57, round 16: the base holds a valid name that spells an escape, and
+    // the head keeps it and adds the name that is not valid UTF-8 with the same key. In the
+    // rule paths the base refuses the valid name already; outside them the base holds it as a
+    // file. Either way the key is no changed path, since a key that either tree refuses is
+    // dropped from both, and the head refuses it as a clash.
+    #[test]
+    fn a_clash_against_the_base_is_no_changed_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = Temporary::new("ratchet-clash-base");
+        let head = Temporary::new("ratchet-clash-head");
+        let odd = std::ffi::OsStr::from_bytes(b"\xff.rs");
+        for tree in [&base, &head] {
+            tree.write("lints/src/lib.rs", "kept");
+            tree.write("lints/src/\\xff.rs", "spelled like the escape");
+            tree.write("crates/a/\\xff.rs", "spelled like the escape");
+        }
+        for directory in ["lints/src", "crates/a"] {
+            std::fs::write(head.root().join(directory).join(odd), "hidden").unwrap();
+        }
+        let found = entries(base.root()).unwrap();
+        let outside = found.get("crates/a/\\xff.rs");
+        assert_eq!(outside, Some(&Entry::File(b"spelled like the escape".to_vec())), "outside");
+        let refused_in_base: Vec<String> =
+            super::refused(base.root()).unwrap().into_iter().map(|(path, _)| path).collect();
+        assert_eq!(refused_in_base, ["lints/src/\\xff.rs"], "the base refuses the rule path");
+        let clashes = super::refused(head.root()).unwrap();
+        let keys: Vec<&str> = clashes.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(keys, ["crates/a/\\xff.rs", "lints/src/\\xff.rs"], "{clashes:?}");
+        assert!(clashes.iter().all(|(_, why)| why.starts_with("is the key of two names")));
+        assert_eq!(changed_paths(base.root(), head.root()).unwrap(), Vec::<String>::new());
+        assert_eq!(changed_paths(head.root(), base.root()).unwrap(), Vec::<String>::new());
+    }
+
+    // Goal: review of #57, round 16: a rule path whose name holds a `\` or a character outside
+    // printable ASCII is refused, a directory without being entered; the same names outside
+    // the rule paths, and a plain rule path with a space, are files as before.
+    #[test]
+    fn rule_path_names_that_could_spell_an_escape_are_refused() {
+        let tree = Temporary::new("ratchet-rule-names");
+        tree.write("lints/src/a\\b.rs", "backslash");
+        tree.write("lints/src/caf\u{e9}.rs", "not ASCII");
+        tree.write("xtask/fixtures/tidy/bell\u{7}.fires.fixture", "a control character");
+        tree.write("lints/ui/odd\\dir/inside.rs", "not entered");
+        tree.write("lints/src/plain name.rs", "plain");
+        tree.write("crates/a/a\\b.rs", "outside");
+        tree.write("crates/a/caf\u{e9}.rs", "outside");
+        let refused = super::refused(tree.root()).unwrap();
+        let keys: Vec<&str> = refused.iter().map(|(path, _)| path.as_str()).collect();
+        let expected = [
+            "lints/src/a\\b.rs",
+            "lints/src/caf\u{e9}.rs",
+            "lints/ui/odd\\dir",
+            "xtask/fixtures/tidy/bell\u{7}.fires.fixture",
+        ];
+        assert_eq!(keys, expected, "{refused:?}");
+        assert!(refused.iter().all(|(_, why)| why.starts_with("is a rule path whose name")));
+        let found = entries(tree.root()).unwrap();
+        let refused_file = found.get("lints/src/caf\u{e9}.rs");
+        assert!(
+            matches!(refused_file, Some(Entry::Refused { content, .. }) if content == b"not ASCII"),
+            "a refused file keeps its bytes: {refused_file:?}"
+        );
+        assert!(!found.contains_key("lints/ui/odd\\dir/inside.rs"), "a refused directory");
+        for kept in ["lints/src/plain name.rs", "crates/a/a\\b.rs", "crates/a/caf\u{e9}.rs"] {
+            assert!(matches!(found.get(kept), Some(Entry::File(_))), "{kept} is a file");
+        }
+    }
+
+    // Goal: review of #57, round 16: a key clash keeps the bytes of both entries, the same
+    // whichever the directory lists first, so the fingerprint counts every byte.
+    #[test]
+    fn a_clash_keeps_both_entries_bytes_in_any_order() {
+        let valid = Entry::File(b"valid".to_vec());
+        let other =
+            Entry::Refused { why: "is not valid UTF-8".to_owned(), content: b"other".to_vec() };
+        let mut found = [BTreeMap::new(), BTreeMap::new()];
+        super::insert(&mut found[0], "k".to_owned(), valid.clone());
+        super::insert(&mut found[0], "k".to_owned(), other.clone());
+        super::insert(&mut found[1], "k".to_owned(), other);
+        super::insert(&mut found[1], "k".to_owned(), valid);
+        assert_eq!(found[0], found[1], "the order of the listing does not count");
+        let Some(Entry::Refused { why, content }) = found[0].get("k") else {
+            panic!("a clash is refused: {found:?}");
+        };
+        assert_eq!(why, "is the key of two names, `k`");
+        assert_eq!(content, b"othervalid", "both entries' bytes, the smaller first");
     }
 
     // Goal: a path counts as changed when its content differs, when it exists on one side

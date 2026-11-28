@@ -1337,7 +1337,54 @@ fn a_name_that_is_not_utf8_is_refused() {
     assert!(passed.line().starts_with("ratchet: pass"), "{}", passed.summary());
     assert!(passed.notes.iter().any(|note| note.contains(refusal)), "{}", passed.summary());
     let diff = carry::rule_diff(&case.base(), &case.head()).expect("the trees are read");
-    assert!(diff.iter().all(|(path, _, _)| path.is_ascii()), "the refused name is not compared");
+    let paths: Vec<&str> = diff.iter().map(|(path, _, _)| path.as_str()).collect();
+    assert_eq!(paths, ["docs/RULES.md"], "the refused name is not compared");
+}
+
+// Goal: round 16 of #57's review, the reviewer's probe: the base holds a valid file named
+// `lints/src/\xff.rs`, spelled like the escape, and the head keeps it and adds the name that is
+// not valid UTF-8 with the same key. Neither the carry check nor the judge panics: the key is
+// no changed path, and the head is refused for the clash, as for a new rule path whose name is
+// not ASCII. A Rust file that `lib.rs` does not declare is outside the dialect in the base, so
+// no approval settles that probe; with a text file, a code owner's approval settles both.
+#[test]
+fn a_clash_against_the_base_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let probe = |extension: &str| {
+        let case = Case::new(&format!("round-16-clash-{extension}"));
+        let spelled = format!("lints/src/\\xff.{extension}");
+        for tree in [case.base(), case.head()] {
+            write(&tree, &spelled, "fn spelled() {}\n");
+        }
+        let odd = [b"\xff.", extension.as_bytes()].concat();
+        let odd = std::ffi::OsStr::from_bytes(&odd);
+        fs::write(case.head().join("lints/src").join(odd), "fn hidden() {}\n").expect("writable");
+        write(&case.head(), &format!("lints/src/caf\u{e9}.{extension}"), "fn accented() {}\n");
+        let diff = carry::rule_diff(&case.base(), &case.head()).expect("the trees are read");
+        let paths: Vec<&str> = diff.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert_eq!(paths, ["docs/RULES.md"], "no refused key is compared");
+        let refusals = [
+            format!("scope: the head's path `{spelled}` is the key of two names"),
+            format!(
+                "scope: the head's path `lints/src/caf\u{e9}.{extension}` is a rule path whose"
+            ),
+        ];
+        let honest = case.tools(NOTHING, "any", NOTHING, &OWNER_APPROVED);
+        let raw = check_all(&case.base(), &case.head(), &honest);
+        for refusal in &refusals {
+            assert!(raw.failed.iter().any(|why| why.starts_with(refusal)), "{:?}", raw.failed);
+        }
+        (refusals, settled(&case.base(), &honest, raw))
+    };
+    let (_, undeclared) = probe("rs");
+    let unsettled = undeclared.expect_err("no approval settles a base outside the dialect");
+    assert!(unsettled.contains("does not declare"), "{unsettled}");
+    let (refusals, text) = probe("txt");
+    let passed = text.expect("the approval settles a refused form");
+    assert!(passed.line().starts_with("ratchet: pass"), "{}", passed.summary());
+    for refusal in &refusals {
+        assert!(passed.notes.iter().any(|note| note.contains(refusal)), "{}", passed.summary());
+    }
 }
 
 // Goal: `observe` records the commits it was given, and marks a head without a tooling change

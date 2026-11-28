@@ -65,7 +65,9 @@
 //!   check, a failed null-mutant run, or a merge group whose rule-path diff is not the carried
 //!   one. The fix is a change to the PR or a re-run, never an approval;
 //! - until a code owner approves the head commit: a form the ratchet refuses, such as a file
-//!   outside the dialect, a symbolic link or a name that is not valid UTF-8;
+//!   outside the dialect, a symbolic link, a name that is not valid UTF-8, a rule path whose
+//!   name holds a `\` or a character outside printable ASCII, or two names with one key
+//!   ([`tree`]);
 //! - where no code owner reviews or has approved the head commit: something the ratchet cannot
 //!   vouch for though its evidence is complete, a hunk without a mutant, an edit without the
 //!   reviewer app's approval, or a build file.
@@ -701,14 +703,15 @@ fn scope_step(base: &Path, head: &Path, tools: &Tools<'_>, verdict: &mut Verdict
         }
         Err(error) => verdict.fail(Step::Scope, format!("cannot read the head tree: {error}")),
     }
-    // A name that is not valid UTF-8 has no text that every reader agrees on: it is refused
-    // before anything converts it, and no step reads it (review of #57, round 15).
+    // A name that is not valid UTF-8 has no text that every reader agrees on, and a rule path
+    // that spells an escape could share its key: each is refused before anything converts it,
+    // and no step reads it (review of #57, rounds 15 and 16).
     match tree::refused(head) {
         Ok(refused) => {
             for (path, why) in refused {
                 let reason = format!(
-                    "the head's path `{path}` {why}, which the ratchet cannot name soundly; \
-                     rename it"
+                    "the head's path `{path}` {why}: the ratchet cannot name it soundly; rename \
+                     it to printable ASCII without `\\`"
                 );
                 verdict.fail_for(Step::Scope, Reason::Refused, reason);
             }
@@ -1234,8 +1237,8 @@ pub fn check_all(base: &Path, head: &Path, tools: &Tools<'_>) -> Verdict {
 /// `verdict`, settled by a code owner if it can be. A code owner's approval of the head commit
 /// settles a no verdict only when each of its reasons is unprovable though the evidence is
 /// complete ([`Reason::settleable`]): a form the ratchet refuses, such as a file outside the
-/// dialect, a symbolic link or a name that is not valid UTF-8. Each becomes a note, and so does
-/// each unproven item, and the verdict passes. Evidence that is missing, unreadable or
+/// dialect, a symbolic link or a name the walk refuses ([`tree`]). Each becomes a note, and so
+/// does each unproven item, and the verdict passes. Evidence that is missing, unreadable or
 /// mismatched, a tool that failed, and a merge group whose rule-path diff is not the carried
 /// one are never settled: an honest PR's remedy is a change to the PR, or a re-run (review of
 /// #57, rounds 14 and 15). A verdict with any finding is never settled: it fails, and its
