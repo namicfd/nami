@@ -630,6 +630,11 @@ regenerate it, as for PyClaw.
     can bind, so the test fixes Δt;
   - the Cartesian update is written per direction as (Δt/Δxₐ) times the flux difference, not as
     face areas over a volume, so it reduces exactly to the 1D form (§ 4(b), Coordinates).
+
+  That covers cell-centred schemes. With constrained transport (M5), By and Bz are updated from
+  corner electric fields that average face fields, and that average does not round to the 1D
+  field even for y-uniform data. M5's plan either writes the corner formula as the 1D field plus
+  terms that are exactly zero for y-uniform data, or leaves CT combinations out of this test.
 - **Rotation:** the same problem along x, y and z, rotated by a cyclic permutation of the axes,
   gives identical bits. The face frame is an exact permutation with the transverse components in
   cyclic order (§ 4(b)), and cell-level norms such as |v|² and |B|² add their squared components

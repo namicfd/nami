@@ -77,5 +77,8 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
 
 - `docs/research/layout-prototype.md` (PR #47) and the prototype code on branch
   `research/layout-prototype`: 64³ and 128³, five interleaved repetitions, bitwise-identical
-  output across layouts, and L1 errors equal to Athena++'s to seven digits.
+  output across layouts, and L1 errors equal to Athena++'s to seven digits. The 1.9× is the
+  prototype's configuration C (`f64::sqrt` backend, `debug_assert!` in `math::sqrt`);
+  configuration A, a copy of today's `math::sqrt`, gave 0.10× (SoA) or 0.9×, depending on
+  inlining.
 - Athena++ v24.0 (commit `209a9258`), built with `g++-simd` (`-O3 -ffast-math -march=native`).

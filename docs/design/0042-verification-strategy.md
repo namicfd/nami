@@ -43,7 +43,11 @@ ADR-0001 rules out a crate. The closed PR #4 proposed Rust constants instead (it
    - 1D embedded in 3D, on a Cartesian grid uniform in y and z. It holds only if both runs use
      the same Δt (the 3D CFL condition also sees the transverse directions, so the test fixes
      Δt) and the Cartesian update is written per direction as (Δt/Δxₐ) times the flux
-     difference, so that it reduces exactly to the 1D form;
+     difference, so that it reduces exactly to the 1D form. This covers cell-centred schemes.
+     With constrained transport (M5), By and Bz come from corner electric fields that average
+     face fields, and that average does not round to the 1D field. M5's plan either writes the
+     corner formula as the 1D field plus terms that are exactly zero for y-uniform data, or
+     leaves CT combinations out of this test;
    - rotation along x, y and z, by a cyclic permutation of the axes. It holds only if the face
      frame orders the transverse components cyclically (for a y face: z, then x) and cell-level
      norms such as |v|² and |B|² add their squared components in an order that no permutation
