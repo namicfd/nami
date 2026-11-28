@@ -46,6 +46,13 @@ on:
 
 permissions: {}
 
+# Named, so that GitHub runs `bash --noprofile --norc -eo pipefail`: without `shell:`, it runs
+# `bash -e` without pipefail, and a failed `cargo xtask review select | tee` or `git archive |
+# tar` would pass (#98's review).
+defaults:
+  run:
+    shell: bash
+
 # A newer run for the same branch replaces an older one: an older head is never approved
 # after a newer one, and a review of a head that moved on costs nothing more.
 concurrency:
@@ -124,9 +131,13 @@ jobs:
       PR_NUMBER: ${{ needs.select.outputs.pr }}
       HEAD_SHA: ${{ needs.select.outputs.head }}
     steps:
+      # Main's full history: the merge base of a head on an older main is found only in it.
+      # A depth-1 checkout leaves main's tip without parents, and `git merge-base` then fails
+      # for every PR that main has moved past (#98's review).
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: Build xtask
@@ -139,7 +150,6 @@ jobs:
       # The head as files, not as a checkout: no `.git` of the PR's, and nothing in it runs.
       - name: Export the head and its diff
         run: |
-          git fetch --quiet --no-tags origin main:refs/remotes/origin/main
           git fetch --quiet --no-tags origin "${HEAD_SHA}"
           mkdir -p "${RUNNER_TEMP}/review/tree" "${RUNNER_TEMP}/review/context"
           git archive "${HEAD_SHA}" | tar -x -C "${RUNNER_TEMP}/review/tree"
