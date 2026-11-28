@@ -14,8 +14,8 @@ session. The decisions and their reasons are in ADR-0033 (Proposed). The plan do
 **Who approves.** Since ADR-0022, a PR that changes only rule paths and only adds to them merges
 on the `ratchet` check's proof, without the code owner. The tidy and dylint tasks are written to
 fit that class wherever their rule's fixes allow; the rest touch the trusted core and wait for the
-owner (ADR-0008, ADR-0015). The table's last column says which, and why. A task that turns out to be an edit says so in its PR and asks for
-the owner's review, as the playbook says.
+owner (ADR-0008, ADR-0015). The table's last column says which, and why. A task that turns out
+to be an edit says so in its PR and asks for the owner's review, as the playbook says.
 
 ## Rules for every task
 
