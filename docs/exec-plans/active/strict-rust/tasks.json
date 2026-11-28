@@ -1,0 +1,663 @@
+{
+  "tasks": [
+    {
+      "id": "rustfmt-nightly",
+      "title": "Format with the pinned nightly rustfmt and its unstable layout options; reformat the tree (ADR-0033)",
+      "depends_on": [
+        "doc-example-sync"
+      ],
+      "owner_paths": [
+        "rustfmt.toml",
+        "justfile",
+        ".git-blame-ignore-revs",
+        "xtask",
+        "crates",
+        "lints",
+        ".github/workflows",
+        ".github/actions"
+      ],
+      "acceptance": [
+        "xtask::hook::tests::edit_hook_formats_with_the_pinned_nightly",
+        "xtask::doctor::tests::missing_nightly_rustfmt_is_reported"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-zero-cost",
+      "title": "Switch on the one-form lints that fire at most a few times, and record the lints kept off and why (ADR-0033)",
+      "depends_on": [
+        "rustfmt-nightly"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "crates/alloc-guard/src/lib.rs",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::one_form_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "crate-header",
+      "title": "Tidy rule: every nami crate root starts with the fixed header for its kind: no_std and the nami-only lints (ADR-0033)",
+      "depends_on": [
+        "lints-zero-cost"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/crate_header.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md",
+        "xtask/src/tidy.rs",
+        "crates/base/src/lib.rs",
+        "crates/kernels/src/lib.rs",
+        "crates/solver/src/lib.rs",
+        "crates/reference/src/lib.rs",
+        "crates/alloc-guard/src/lib.rs",
+        "crates/alloc-guard/tests/counting.rs"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::crate_header::tests::crate_header_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-shadowing",
+      "title": "Switch on shadow_reuse and fix its firings: no name is shadowed (ADR-0033)",
+      "depends_on": [
+        "crate-header"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::shadowing_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-visibility",
+      "title": "Switch on unreachable_pub and fix its firings: crate-private items are pub(crate) (ADR-0033)",
+      "depends_on": [
+        "lints-shadowing"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::visibility_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-paths",
+      "title": "Switch on absolute_paths and fix its firings: import names instead of writing paths inline (ADR-0033)",
+      "depends_on": [
+        "lints-visibility"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::path_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-docs",
+      "title": "Switch on missing_docs_in_private_items and too_long_first_doc_paragraph, and document every item (ADR-0033)",
+      "depends_on": [
+        "lints-paths"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "crates/alloc-guard/src/lib.rs",
+        "crates/base/src/index.rs",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::doc_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-signatures",
+      "title": "No bool parameters, at most four parameters, typed let _ and trait parameter names kept (ADR-0033)",
+      "depends_on": [
+        "lints-docs"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "crates/alloc-guard/src/lib.rs",
+        "crates/base/src/index.rs",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::signature_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-integer-division",
+      "title": "Ban / and % on integers; base gains div_exact and div_ceil that state the rounding (ADR-0033)",
+      "depends_on": [
+        "lints-signatures"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "crates/base/src",
+        "xtask/src"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::integer_division_lints_fire",
+        "base::index::tests::div_exact_rejects_a_remainder"
+      ],
+      "passes": false
+    },
+    {
+      "id": "lints-ident-length",
+      "title": "min_ident_chars with only the equation symbols allowed, and the forbidden abbreviations in disallowed-names (ADR-0033)",
+      "depends_on": [
+        "lints-integer-division"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "crates/kernels/src",
+        "crates/base/src",
+        "crates/alloc-guard",
+        "xtask/src",
+        "xtask/tests"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::identifier_lints_fire"
+      ],
+      "passes": false
+    },
+    {
+      "id": "tidy-naming",
+      "title": "Tidy rules: qualifiers last, no abbreviated name segments, closures last (TIGER_STYLE.md, Naming)",
+      "depends_on": [
+        "lints-ident-length"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/naming.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::naming::tests::qualifier_last_rule_fires",
+        "xtask::tidy::naming::tests::abbreviation_rule_fires",
+        "xtask::tidy::naming::tests::callbacks_last_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "float-minmax-ban",
+      "title": "Ban f64 min, max, clamp and is_nan; kernels::math wrappers assert finite arguments and fix the sign of zero (ADR-0033)",
+      "depends_on": [
+        "tidy-naming"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "crates/kernels/src/math.rs"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::float_selection_bans_fire",
+        "kernels::math::tests::max_of_equal_zeros_is_the_first_argument"
+      ],
+      "passes": false
+    },
+    {
+      "id": "escape-hatch-bans",
+      "title": "Ban exit, abort, forget, leak and thread spawn everywhere; Rc, Cell, Mutex and macro_rules in nami crates (ADR-0033)",
+      "depends_on": [
+        "float-minmax-ban"
+      ],
+      "owner_paths": [
+        "Cargo.toml",
+        "clippy.toml",
+        "xtask/fixtures/clippy",
+        "xtask/tests/clippy_fixtures.rs",
+        "docs/TIGER_STYLE.md",
+        "xtask/src/tidy/rust_source.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::clippy_fixtures::every_configured_lint_fires",
+        "xtask::clippy_fixtures::escape_hatch_bans_fire",
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::rust_source::tests::shared_state_type_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "kernel-shape",
+      "title": "Tidy rule: kernels take no self, assert before their loops and check outputs are finite after them (TIGER_STYLE.md, Numerical code)",
+      "depends_on": [
+        "escape-hatch-bans"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/kernel_shape.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::kernel_shape::tests::kernel_shape_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "assertion-shape",
+      "title": "Tidy rule: assert_eq! over assert!(a == b), and two assertions over assert!(a && b) (TIGER_STYLE.md, Assertions)",
+      "depends_on": [
+        "kernel-shape"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/assertions.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::assertions::tests::assertion_shape_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "cross-ref",
+      "title": "Tidy rule: every ADR, path, style-guide section, rule id and xtask command that a file cites exists",
+      "depends_on": [
+        "assertion-shape"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/cross_ref.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::cross_ref::tests::cross_ref_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "repo-hygiene",
+      "title": "Tidy rules from TigerBeetle's tidy: file kinds, executable bits, tabs and CRs, file size, one H1 per Markdown file",
+      "depends_on": [
+        "cross-ref"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/hygiene.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy.rs",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::hygiene::tests::file_kind_rule_fires",
+        "xtask::tidy::hygiene::tests::text_bytes_rule_fires",
+        "xtask::tidy::hygiene::tests::markdown_title_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "orphan-modules",
+      "title": "Tidy rule: every .rs file is reached by a mod item or is a crate root that Cargo finds",
+      "depends_on": [
+        "repo-hygiene"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/workspace.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::workspace::tests::orphan_module_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "literal-and-cfg-forms",
+      "title": "Tidy rules: float literals in one form, and cfg(target_*) only in kernels::math (ADR-0005)",
+      "depends_on": [
+        "orphan-modules"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/rust_source.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::rust_source::tests::float_literal_form_rule_fires",
+        "xtask::tidy::rust_source::tests::target_cfg_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "comment-and-file-forms",
+      "title": "Tidy rules: comments are sentences, and source files have at most 1,000 lines (TIGER_STYLE.md, Comments)",
+      "depends_on": [
+        "literal-and-cfg-forms"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/text.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::text::tests::comment_sentence_rule_fires",
+        "xtask::tidy::text::tests::file_length_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "review-tag-ratchet",
+      "title": "Tidy rule: the number of [review] tags in the style guide can only go down",
+      "depends_on": [
+        "comment-and-file-forms"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/style_guide.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::style_guide::tests::review_ratchet_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "test-integrity",
+      "title": "cargo xtask test-integrity: a PR may not remove tests or assertions, ignore tests or move tolerances without a code owner's label (ADR-0033)",
+      "depends_on": [
+        "review-tag-ratchet"
+      ],
+      "owner_paths": [
+        "xtask/src/test_integrity.rs",
+        "xtask/src/test_integrity",
+        "xtask/src/main.rs",
+        "xtask/src/lib.rs",
+        "xtask/src/issue/trust.rs",
+        ".github/workflows/ci.yml",
+        "docs/operations"
+      ],
+      "acceptance": [
+        "xtask::test_integrity::tests::removed_test_fails",
+        "xtask::test_integrity::tests::weakened_tolerance_fails",
+        "xtask::test_integrity::tests::label_by_a_code_owner_lifts_the_check",
+        "ci::gate::test_integrity"
+      ],
+      "passes": false
+    },
+    {
+      "id": "way-out-messages",
+      "title": "Every gate failure ends with the sanctioned way out: stop and file an issue rather than work around the check (ADR-0033)",
+      "depends_on": [
+        "test-integrity"
+      ],
+      "owner_paths": [
+        "xtask/src/hook.rs",
+        "xtask/src/tidy/cli.rs",
+        "xtask/src/test_integrity.rs",
+        "xtask/src/lib.rs",
+        "justfile",
+        "AGENTS.md"
+      ],
+      "acceptance": [
+        "xtask::hook::tests::stop_hook_block_names_the_way_out",
+        "xtask::tidy::cli::tests::failure_summary_names_the_way_out"
+      ],
+      "passes": false
+    },
+    {
+      "id": "expect-cites-record",
+      "title": "Tidy: every #[expect] reason cites an ADR or an issue that exists (ADR-0033)",
+      "depends_on": [
+        "way-out-messages"
+      ],
+      "owner_paths": [
+        "xtask/src/tidy/workspace.rs",
+        "xtask/fixtures/tidy",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md",
+        "crates/alloc-guard/src/lib.rs"
+      ],
+      "acceptance": [
+        "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
+        "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
+        "xtask::tidy::workspace::tests::expect_cites_record_rule_fires"
+      ],
+      "passes": false
+    },
+    {
+      "id": "mutants-required",
+      "title": "Make mutants (diff) a required check once it fits the time budget, as ADR-0009 promises",
+      "depends_on": [
+        "expect-cites-record"
+      ],
+      "owner_paths": [
+        ".github/workflows/ci.yml",
+        "docs/operations",
+        "docs/exec-plans/active/strict-rust/plan.md"
+      ],
+      "acceptance": [
+        "ci::gate::mutants_diff"
+      ],
+      "passes": false
+    },
+    {
+      "id": "same-type-params",
+      "title": "Dylint lint: adjacent parameters of the same type, which a caller can swap (TIGER_STYLE.md, Naming)",
+      "depends_on": [
+        "mutants-required"
+      ],
+      "owner_paths": [
+        "lints/src/same_type_params.rs",
+        "lints/src/lib.rs",
+        "lints/ui/same_type_params.rs",
+        "lints/ui/same_type_params.stderr",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "nami_lints::ui"
+      ],
+      "passes": false
+    },
+    {
+      "id": "test-cheat-lints",
+      "title": "Dylint lints: cfg(test) inside non-test function bodies, and PartialEq that returns a constant",
+      "depends_on": [
+        "same-type-params"
+      ],
+      "owner_paths": [
+        "lints/src/cfg_test_in_body.rs",
+        "lints/src/constant_eq.rs",
+        "lints/src/lib.rs",
+        "lints/ui/cfg_test_in_body.rs",
+        "lints/ui/cfg_test_in_body.stderr",
+        "lints/ui/constant_eq.rs",
+        "lints/ui/constant_eq.stderr",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "nami_lints::ui"
+      ],
+      "passes": false
+    },
+    {
+      "id": "rustdoc-gate",
+      "title": "just check runs rustdoc with warnings denied, and doctests must compile without warnings",
+      "depends_on": [
+        "test-cheat-lints"
+      ],
+      "owner_paths": [
+        "justfile",
+        "Cargo.toml",
+        ".github/workflows/ci.yml",
+        "xtask/src/tidy/crate_header.rs",
+        "crates",
+        "xtask/src/tidy/registry.rs",
+        "docs/TIGER_STYLE.md",
+        "docs/RULES.md"
+      ],
+      "acceptance": [
+        "xtask::tidy::crate_header::tests::doctest_attribute_is_required",
+        "ci::gate::rustdoc"
+      ],
+      "passes": false
+    },
+    {
+      "id": "bare-metal-build",
+      "title": "CI builds base and kernels for x86_64-unknown-none, so that nothing can pull in std",
+      "depends_on": [
+        "rustdoc-gate"
+      ],
+      "owner_paths": [
+        "rust-toolchain.toml",
+        "justfile",
+        ".github/workflows/ci.yml",
+        ".github/actions"
+      ],
+      "acceptance": [
+        "ci::gate::bare_metal_build"
+      ],
+      "passes": false
+    },
+    {
+      "id": "miri",
+      "title": "Post-merge job: base, kernels and alloc-guard tests under Miri on the pinned nightly, with several seeds",
+      "depends_on": [
+        "bare-metal-build"
+      ],
+      "owner_paths": [
+        ".github/workflows/post-merge.yml",
+        "justfile",
+        "crates/base",
+        "crates/kernels",
+        "crates/alloc-guard"
+      ],
+      "acceptance": [
+        "post-merge::miri::tests"
+      ],
+      "passes": false
+    },
+    {
+      "id": "determinism-matrix",
+      "title": "The canonical output hash agrees across target CPUs, profiles, x86-64 and aarch64, and Miri (ADR-0005)",
+      "depends_on": [
+        "determinism-hash"
+      ],
+      "owner_paths": [
+        "xtask/src/determinism.rs",
+        ".github/workflows/post-merge.yml"
+      ],
+      "acceptance": [
+        "post-merge::determinism::target_cpu_matrix",
+        "post-merge::determinism::profile_matrix",
+        "post-merge::determinism::aarch64"
+      ],
+      "passes": false
+    }
+  ]
+}

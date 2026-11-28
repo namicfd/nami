@@ -59,7 +59,7 @@
       "id": "usize-alias",
       "title": "Dylint lint: a type-aware usize rule, so that an alias or a local variable cannot get around tidy (ADR-0002)",
       "depends_on": [
-        "doc-example-sync"
+        "miri"
       ],
       "owner_paths": [
         "lints/src/usize_alias.rs",

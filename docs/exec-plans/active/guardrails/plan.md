@@ -40,6 +40,9 @@ The tasks form one chain: each depends on the one before it.
   so the tasks cannot run side by side.
 - **Why this order.** The first six need nothing that does not exist yet. The rest need the
   reference crate or the solver's time loop, which belong to the first equation-system plan.
+- **The `strict-rust` plan runs inside this chain,** between `doc-example-sync` and
+  `usize-alias`, for the same reason: its tasks edit the same files. Its lints are cheap only
+  while `crates/` is small, so they go first; its plan says why.
 - **To relax it,** the planner can take the three shared files out of `owner_paths` and accept
   a small rebase on them. That is a decision for the maintainer.
 
@@ -48,7 +51,7 @@ The tasks form one chain: each depends on the one before it.
 | 1 | `float-eq-in-eq-fn` | tidy rule | nothing |
 | 2 | `clippy-fixtures` | test | nothing |
 | 3 | `doc-example-sync` | test | nothing |
-| 4 | `usize-alias` | dylint lint | nothing |
+| 4 | `usize-alias` | dylint lint | the `strict-rust` chain (order only) |
 | 5 | `recursion-cross-crate` | dylint lint | nothing |
 | 6 | `glossary` | document and tidy rule | nothing |
 | 7 | `thresholds-file` | code-owned file | the reference crate |
