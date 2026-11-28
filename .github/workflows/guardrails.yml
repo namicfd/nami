@@ -93,8 +93,97 @@ jobs:
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
 
-  # The ratchet (ADR-0022) in two jobs, so that the job that judges never runs the PR's code.
+  # The ratchet (ADR-0022) in three jobs, so that the two that read GitHub never run the PR's
+  # code.
   #
+  # `ratchet (pull request head)` gives the other two the pull request and its head commit. A
+  # `pull_request` event names both. A merge group names only the number: its
+  # `merge_group.head_ref` is `refs/heads/gh-readonly-queue/<base branch>/pr-<number>-<base
+  # commit>`, where the commit is the group's parent, `merge_group.base_sha` (the target branch,
+  # or the group ahead in the queue), never the PR head. Runs 46132237802 and 46132239140 show
+  # it: #55's group was `refs/heads/gh-readonly-queue/main/pr-55-3706935…` with main at 3706935,
+  # and #85's, queued behind it, `…/pr-85-200bf9e…`, #55's group commit, while #55's head was
+  # 2a7af8d…. The group commit is a squash on that parent, so no parent of it is the PR head
+  # either. So the head comes from GitHub, in one GraphQL read of the PR: its `headRefOid`,
+  # taken only while its `mergeQueueEntry` has this group's head and base commits as its
+  # `headCommit` and `baseCommit`, or once it merged with this group's head commit as its
+  # `mergeCommit`. GitHub takes a PR out of the queue when its head moves, and queues it again
+  # as a new entry with a new group commit, so that head is the one this group holds. The
+  # entry's `headCommit` is the group commit, not the PR head, so it cannot name the head
+  # itself. Any other answer fails the job, and the judge gives no verdict.
+  #
+  # A head that moves after this read is caught by the judge's review check, which reads the
+  # head again and compares it with this one ("the head of #<n> is now …, not the commit
+  # judged"). One pushed just before the read, while GitHub has not yet taken the PR out of the
+  # queue, is not: the entry still names this group, `headRefOid` is already the new head, and
+  # the review check reads that same head. The carried-evidence check guards that window: it
+  # takes mutation evidence only from a completed run of the new head whose observed commit has
+  # it as its second parent, and only if that run's rule-path diff is the group's; anything else
+  # gives no verdict. The job checks nothing out and runs no PR code.
+  pull-head:
+    name: ratchet (pull request head)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      number: ${{ steps.head.outputs.number }}
+      head: ${{ steps.head.outputs.head }}
+    steps:
+      - name: The pull request and its head commit
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          QUEUE_HEAD: ${{ github.event.merge_group.head_sha }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          fail() {
+            echo "ratchet: no verdict: $*" | tee -a "${GITHUB_STEP_SUMMARY}" >&2
+            exit 2
+          }
+          number="${PR_NUMBER}"
+          head="${PR_HEAD}"
+          if [ "${EVENT}" = merge_group ]; then
+            # The event's ref is the full one, `refs/heads/gh-readonly-queue/…`.
+            ref="${QUEUE_REF#refs/heads/}"
+            entry='^gh-readonly-queue/.+/pr-([1-9][0-9]*)-([0-9a-f]{40})$'
+            [[ "${ref}" =~ ${entry} ]] || fail "the merge group's ref \`${QUEUE_REF}\` is not" \
+              "\`refs/heads/gh-readonly-queue/<base branch>/pr-<number>-<base commit>\`"
+            number="${BASH_REMATCH[1]}"
+            [ "${BASH_REMATCH[2]}" = "${QUEUE_BASE}" ] || fail "the merge group's ref" \
+              "\`${QUEUE_REF}\` does not end in its base commit, ${QUEUE_BASE}"
+            query='query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+              state headRefOid mergeCommit { oid }
+              mergeQueueEntry { headCommit { oid } baseCommit { oid } } } } }'
+            answer=$(gh api graphql -f query="${query}" -f owner="${GH_REPO%%/*}" \
+              -f name="${GH_REPO#*/}" -F number="${number}") \
+              || fail "GitHub could not be asked for the head of #${number}"
+            fields=$(jq -r '.data.repository.pullRequest // empty | [.state, .headRefOid,
+              (.mergeQueueEntry.headCommit.oid // "none"),
+              (.mergeQueueEntry.baseCommit.oid // "none"), (.mergeCommit.oid // "none")]
+              | @tsv' <<< "${answer}") || fail "GitHub's answer for #${number} is not readable"
+            IFS=$'\t' read -r state head queued queued_base merged <<< "${fields}"
+            if { [ "${queued}" != "${QUEUE_HEAD}" ] || [ "${queued_base}" != "${QUEUE_BASE}" ]; } \
+              && { [ "${state}" != MERGED ] || [ "${merged}" != "${QUEUE_HEAD}" ]; }; then
+              fail "#${number} is no longer queued as this merge group, ${QUEUE_HEAD} on" \
+                "${QUEUE_BASE} (its state is ${state:-unknown}, its queue entry's group" \
+                "${queued:-unknown} on ${queued_base:-unknown}), so its head ${head:-unknown}" \
+                "may not be the one this group holds; the run of the group that holds it decides"
+            fi
+          fi
+          [[ "${number}" =~ ^[1-9][0-9]*$ ]] || fail "no pull request number, \`${number}\`"
+          [[ "${head}" =~ ^[0-9a-f]{40}$ ]] || fail "#${number} has no head commit, \`${head}\`"
+          echo "The pull request is #${number}, at its head ${head}." >> "${GITHUB_STEP_SUMMARY}"
+          echo "number=${number}" >> "${GITHUB_OUTPUT}"
+          echo "head=${head}" >> "${GITHUB_OUTPUT}"
+
   # `ratchet (head)` builds and runs the PR's tools on the base's cases, with the base's
   # `cargo xtask ratchet observe`, and uploads only what they printed, as JSON, with the
   # fingerprint of the head tree it copied. Its steps get no token: checkout uses a read-only one
@@ -103,11 +192,16 @@ jobs:
   #
   # In a merge group it observes without mutation testing and the null mutant: the judge reads
   # their evidence from the pull request's own observation instead, if the rule-path diff is
-  # identical (ADR-0022, amending ADR-0009). So both jobs fit in the queue's 30 minutes: 15 here
-  # and 10 for the judge, against about 2 minutes each measured on the canonical diffs, which
-  # leaves 5 for runners to pick the jobs up.
+  # identical (ADR-0022, amending ADR-0009). So the three jobs fit in the queue's 30 minutes: 2
+  # for the pull request head, 15 here and 10 for the judge, against seconds for the first and
+  # about 2 minutes each for the others, measured on the canonical diffs, which leaves 3 for
+  # runners to pick the jobs up. This job waits for the pull request head, in a merge group too:
+  # the placements' seed is drawn from it (`Tools::seed`), and the judge, given the same head,
+  # checks the observed seed and `pr_head` against it, so an observation without it gives no
+  # verdict.
   ratchet-head:
     name: ratchet (head)
+    needs: pull-head
     runs-on: ubuntu-latest
     # Mutation testing of a large lint change is the slow part (ADR-0022, Consequences).
     timeout-minutes: ${{ github.event_name == 'merge_group' && 15 || 120 }}
@@ -132,8 +226,9 @@ jobs:
         env:
           # The base's binary is built outside every cached path.
           CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          # The PR head, read by `ratchet (pull request head)`: never parsed from a merge
+          # group's ref, which names the group's base commit, not the PR head.
+          PR_HEAD: ${{ needs.pull-head.outputs.head }}
           EVENT: ${{ github.event_name }}
         run: |
           mkdir -p "${RUNNER_TEMP}/observations"
@@ -143,7 +238,7 @@ jobs:
           fi
           # The observations record the commit observed and the PR head, so that a judge run
           # after a review judges exactly this commit (ratchet-review.yml).
-          pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
+          pr_head="${PR_HEAD}"
           # A base whose judge cannot read carried evidence observes mutants in the queue too.
           no_mutants=()
           if [ "${EVENT}" = merge_group ] && grep --quiet '"--carried"' xtask/src/ratchet/cli.rs
@@ -171,10 +266,11 @@ jobs:
   # could have written. It is meant to become the required check, so it already runs on every
   # event and is never skipped: a skipped job counts as passed for a required check. The summary
   # names the commits judged: in a merge group, the group's parent commit, which is the entry
-  # ahead in the queue or the target branch, and the group's head.
+  # ahead in the queue or the target branch, and the group's head. The pull request and its head
+  # come from `ratchet (pull request head)`; without them it gives no verdict.
   ratchet:
     name: ratchet
-    needs: ratchet-head
+    needs: [pull-head, ratchet-head]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: ${{ github.event_name == 'merge_group' && 10 || 60 }}
@@ -234,14 +330,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          # Read by `ratchet (pull request head)`; empty if it failed, which leaves no evidence.
+          NUMBER: ${{ needs.pull-head.outputs.number }}
+          PR_HEAD: ${{ needs.pull-head.outputs.head }}
           QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
-          number="$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')"
-          pr_head="$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')"
+          number="${NUMBER}"
+          pr_head="${PR_HEAD}"
           carried="${RUNNER_TEMP}/carried"
           branch=""
-          if [ -n "${number}" ]; then
+          if [ -n "${number}" ] && [ -n "${pr_head}" ]; then
             branch=$(gh api "repos/${GH_REPO}/pulls/${number}" \
               --jq '[.head.repo.full_name, .head.ref] | @tsv' \
               | awk -F '\t' -v repo="${GH_REPO}" '$1 == repo { print $2 }' || true)
@@ -290,9 +388,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          # Read by `ratchet (pull request head)`: a merge group's ref names the group's base
+          # commit, never the PR head (see that job).
+          NUMBER: ${{ needs.pull-head.outputs.number }}
+          PR_HEAD: ${{ needs.pull-head.outputs.head }}
           # The reviewer app's login, once the maintainer has set it up; it reviews in CI (#59).
           REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
@@ -301,9 +400,15 @@ jobs:
             echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
-          # A merge group's ref is gh-readonly-queue/<base>/pr-<number>-<PR head commit>.
-          number="${PR_NUMBER:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')}"
-          pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
+          if [ -z "${NUMBER}" ] || [ -z "${PR_HEAD}" ]; then
+            {
+              echo "ratchet: no verdict: the pull request or its head commit is not known: the"
+              echo "job \`ratchet (pull request head)\` failed, and its summary says why."
+            } | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 2
+          fi
+          number="${NUMBER}"
+          pr_head="${PR_HEAD}"
           commits="$(git rev-parse HEAD)..$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
           # Without the carried evidence, a merge group's judge finds no mutation run and gives
           # no verdict.
