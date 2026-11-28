@@ -50,7 +50,13 @@ Euler with PLM, HLLC and SSP-RK2, against Athena++ v24.0 on the same core.
 ## Consequences
 
 - The Riemann solver, which takes about half the time, vectorises in all three directions. The
-  prototype measured 1.9× Athena++ at 64³ and 1.86× at 128³.
+  prototype measured 1.9× Athena++ at 64³ and 1.86× at 128³, **but only with a `math::sqrt` that
+  differs from today's:** `f64::sqrt` as the backend, which ADR-0005 and `clippy.toml` ban today
+  (math goes through `libm`), and `debug_assert!` instead of `assert!` on each call. With
+  `kernels::math::sqrt` as it is, the same layout measured 0.1× to 0.9×, below the failure line
+  of ADR-0034. The layout choice stands either way: structure of arrays was the fastest layout in
+  every configuration, the current `sqrt` included. Reaching the target needs a separate decision on `sqrt` before M2, which this ADR does
+  not make.
 - Kernels are generic over named state types, so each equation system writes its fields once,
   and the rows are tied to them by one accessor per system.
 - The speed depends on LLVM vectorising the face loop. An early exit in that loop, such as an

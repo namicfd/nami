@@ -273,7 +273,8 @@ The topic has three parts:
 - **The prototype** (`docs/research/layout-prototype.md`) measured 3D Euler (PLM, HLLC, SSP-RK2,
   one core):
   - structure of arrays with row stencils ran at 1.9× Athena++'s fastest build at 64³ and 1.86×
-    at 128³;
+    at 128³, with `f64::sqrt` (banned today) and `debug_assert!` in `math::sqrt`; with today's
+    `math::sqrt` it fails the target (below);
   - array of structures and the hybrid reached 1.1–1.2×;
   - every layout gave bitwise-identical output, with Athena++'s L1 error to seven digits;
   - block sizes known at compile time changed neither the code nor the speed.
