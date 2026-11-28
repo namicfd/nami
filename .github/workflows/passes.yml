@@ -1,0 +1,123 @@
+# Sets `passes` in the plans' tasks.json once a task is done on main (ADR-0011, ADR-0017):
+# its PR from `task/<id>` merged, its dependencies pass, and its acceptance tests pass. Nobody
+# can push to main, so the result is a PR from the fixed branch `bot/passes`, opened by the
+# `nami-ci` bot, that changes only those `passes` fields and merges through the queue. The
+# logic is in `cargo xtask task passes` (xtask/src/task/passes.rs); `check-pr` in ci.yml lets
+# exactly that PR through.
+#
+# The two jobs are split as ADR-0023 asks. `acceptance` runs main's tests, with caches, and
+# holds no secret. `open passes PR` holds the bot's key, restores no cache and runs no test:
+# it builds xtask from a clean checkout of the same commit, and takes from `acceptance` only a
+# file of task IDs, which xtask reads as data and checks again. Its reads act as the workflow's
+# own token, and only the push and the PR writes act as the app's (ADR-0023, rule 2).
+name: passes
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# One run at a time, in order, and never cancelled halfway: a run either finishes, or waits
+# while an older one does. GitHub keeps only the newest waiting run, so an older one never
+# runs after a newer one. Each run builds the commit that `bot/passes` should hold on its own
+# main, pushes it only when the branch does not hold it already or the required checks failed
+# on the branch, and reconciles the PR, so whatever the last run leaves is right.
+concurrency:
+  group: passes-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  acceptance:
+    name: acceptance
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      # Each unfinished, unblocked task's acceptance tests, by exact name. A name that matches
+      # no test fails the task. Prints one verdict per task; the file lists the tasks that pass.
+      - name: cargo xtask task passes
+        run: cargo xtask task passes --output "${RUNNER_TEMP}/passing.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: passing
+          path: ${{ runner.temp }}/passing.json
+          if-no-files-found: error
+          retention-days: 7
+
+  open-pr:
+    name: open passes PR
+    needs: acceptance
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The key is a secret of this environment, which only main may use (ADR-0023, rule 1).
+    environment: nami-ci
+    # The workflow token does every read: whether each task's PR merged, the open PR, main's
+    # rules and history, and the checks on the branch's tip.
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Not the setup action: it restores caches, which jobs that run tests write.
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Build xtask without a cache
+        run: cargo build --quiet --locked --package xtask
+      - uses: actions/download-artifact@v8
+        with:
+          name: passing
+          path: ${{ runner.temp }}/passing
+      # The secret is in this step's environment only. Later steps' processes never have it in
+      # theirs: they get the file, which is deleted as soon as the token is minted.
+      - name: Write the bot's key
+        env:
+          NAMI_CI_PRIVATE_KEY: ${{ secrets.NAMI_CI_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${NAMI_CI_PRIVATE_KEY}" ]]; then
+            echo "::error::The nami-ci environment has no NAMI_CI_PRIVATE_KEY secret, so" \
+              "passes cannot be set as nami-ci[bot] (ADR-0017, ADR-0023)"
+            exit 1
+          fi
+          (umask 077 && printf '%s\n' "${NAMI_CI_PRIVATE_KEY}" > "${RUNNER_TEMP}/nami-ci.pem")
+      # The app's token can push branches and write PRs, nothing else. It is in
+      # NAMI_PASSES_TOKEN, which xtask hands only to the push (through a credential helper on
+      # that one git command) and to gh's PR writes; every gh read has it removed and acts as
+      # GH_TOKEN, the workflow's own token (xtask/src/task/pulls.rs).
+      - name: cargo xtask task passes --open-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAMI_AGENT_APP: ci
+          NAMI_CI_CLIENT_ID: ${{ vars.NAMI_CI_CLIENT_ID }}
+          NAMI_AGENT_PERMISSIONS: '{"contents":"write","pull_requests":"write"}'
+          GIT_AUTHOR_NAME: nami-ci[bot]
+          GIT_AUTHOR_EMAIL: 361707243+nami-ci[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: nami-ci[bot]
+          GIT_COMMITTER_EMAIL: 361707243+nami-ci[bot]@users.noreply.github.com
+        run: |
+          key="${RUNNER_TEMP}/nami-ci.pem"
+          trap 'rm -f "${key}"' EXIT
+          NAMI_PASSES_TOKEN=$(NAMI_CI_KEY="${key}" NAMI_AGENT_REPO="${GITHUB_REPOSITORY}" \
+            xtask/agent-token.sh)
+          # The key file is gone before xtask starts.
+          rm -f "${key}"
+          echo "::add-mask::${NAMI_PASSES_TOKEN}"
+          export NAMI_PASSES_TOKEN
+          target/debug/xtask task passes --open-pr "${RUNNER_TEMP}/passing/passing.json"
+      - name: Delete the bot's key
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/nami-ci.pem"

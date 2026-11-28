@@ -1,0 +1,751 @@
+//! Setting `passes` end to end (ADR-0011, ADR-0017): the post-merge jobs and `check-pr`,
+//! against real git checkouts, with GitHub's pull requests and the test runner from fakes.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use xtask::task::acceptance::{Acceptance, Nextest};
+use xtask::task::passes::{self, Checks, PullHead, PullState, Pulls, Services};
+use xtask::task::plan::Task;
+
+/// GitHub's pull requests: fixed heads and merged branches; each PR's title, description and
+/// auto-merge, which the writes change; the PRs that merged since `open_from` listed them; the
+/// required checks on some commits, pending on any other; the commits that are not on `main`,
+/// every other being on it; and a log of the writes.
+#[derive(Default)]
+struct FakePulls {
+    heads: BTreeMap<u32, PullHead>,
+    merged: Vec<String>,
+    open: Option<u32>,
+    merged_pulls: Vec<u32>,
+    checks: BTreeMap<String, Result<Checks, String>>,
+    off_main: Vec<String>,
+    states: RefCell<BTreeMap<u32, (String, String, bool)>>,
+    log: RefCell<Vec<String>>,
+}
+
+impl FakePulls {
+    fn record(&self, entry: String) {
+        self.log.borrow_mut().push(entry);
+    }
+}
+
+impl Pulls for FakePulls {
+    fn pull(&self, number: u32) -> Result<PullState, String> {
+        let head = self.heads.get(&number).cloned();
+        let head = head.ok_or_else(|| format!("no pull request #{number}"))?;
+        let states = self.states.borrow();
+        let (title, body, auto_merge) = states.get(&number).cloned().unwrap_or_default();
+        let merged = self.merged_pulls.contains(&number);
+        Ok(PullState { head, title, body, auto_merge, open: !merged, merged })
+    }
+    fn has_merged(&self, branch: &str) -> Result<bool, String> {
+        Ok(self.merged.iter().any(|merged| merged == branch))
+    }
+    fn open_from(&self, branch: &str) -> Result<Option<u32>, String> {
+        Ok(self.open.filter(|_| branch == passes::BOT_BRANCH))
+    }
+    fn open(&self, branch: &str, title: &str, body: &str) -> Result<u32, String> {
+        self.record(format!("open {branch} {title}\n{body}"));
+        let _ = self.states.borrow_mut().insert(70, (title.to_owned(), body.to_owned(), false));
+        Ok(70)
+    }
+    fn edit(&self, number: u32, title: &str, body: &str) -> Result<(), String> {
+        self.record(format!("edit #{number} {title}"));
+        let mut states = self.states.borrow_mut();
+        let state = states.entry(number).or_default();
+        (state.0, state.1) = (title.to_owned(), body.to_owned());
+        Ok(())
+    }
+    fn close(&self, number: u32) -> Result<(), String> {
+        self.record(format!("close #{number}"));
+        Ok(())
+    }
+    fn auto_merge(&self, number: u32) -> Result<(), String> {
+        self.record(format!("auto-merge #{number}"));
+        self.states.borrow_mut().entry(number).or_default().2 = true;
+        Ok(())
+    }
+    fn required_checks(&self, commit: &str) -> Result<Checks, String> {
+        self.checks.get(commit).cloned().unwrap_or(Ok(Checks::Pending))
+    }
+    fn is_ancestor(&self, ancestor: &str, _commit: &str) -> Result<bool, String> {
+        Ok(!self.off_main.iter().any(|commit| commit == ancestor))
+    }
+}
+
+/// A test runner with a fixed verdict per task, which logs the tasks it ran. A `short` runner
+/// drops the last verdict, as a broken runner might.
+#[derive(Default)]
+struct FakeTests {
+    failing: Vec<String>,
+    short: bool,
+    ran: RefCell<Vec<String>>,
+}
+
+impl Acceptance for FakeTests {
+    fn check(&self, tasks: &[&Task]) -> Result<Vec<Result<(), String>>, String> {
+        let verdicts = tasks.iter().map(|task| {
+            self.ran.borrow_mut().push(task.id.clone());
+            if self.failing.contains(&task.id) { Err("a test failed".to_owned()) } else { Ok(()) }
+        });
+        let mut verdicts: Vec<Result<(), String>> = verdicts.collect();
+        if self.short {
+            let _ = verdicts.pop();
+        }
+        Ok(verdicts)
+    }
+}
+
+fn git(directory: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git").args(arguments).current_dir(directory).output();
+    let output = output.expect("git runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "git {arguments:?} failed: {stderr}");
+    String::from_utf8(output.stdout).expect("git prints UTF-8").trim().to_owned()
+}
+
+const TASKS: &str = "docs/exec-plans/active/p/tasks.json";
+
+/// The plan, one field per line as the plans write it: `a`, and `b`, which depends on `a`.
+fn tasks_json(a_passes: bool) -> String {
+    let task = |id: &str, depends: &str, passes: bool| {
+        format!(
+            "    {{\n      \"id\": \"{id}\",\n      \"title\": \"Task {id}\",\n      \
+             \"depends_on\": [{depends}],\n      \"owner_paths\": [\"src/{id}\"],\n      \
+             \"acceptance\": [\"{id}::works\"],\n      \"passes\": {passes}\n    }}"
+        )
+    };
+    format!(
+        "{{\n  \"tasks\": [\n{},\n{}\n  ]\n}}\n",
+        task("a", "", a_passes),
+        task("b", "\"a\"", false)
+    )
+}
+
+/// A bare remote and one clone holding the committed plan, pushed as `main`.
+fn setup(name: &str) -> (PathBuf, PathBuf) {
+    let root = std::env::temp_dir().join(format!("nami-passes-{name}-{}", std::process::id()));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("a stale temporary directory is removable");
+    }
+    std::fs::create_dir_all(&root).expect("temporary directory is writable");
+    let _ = git(&root, &["init", "--quiet", "--bare", "remote.git"]);
+    let _ = git(&root, &["clone", "--quiet", "remote.git", "clone"]);
+    let clone = root.join("clone");
+    for (key, value) in [("user.name", "tester"), ("user.email", "t@example.invalid")] {
+        let _ = git(&clone, &["config", key, value]);
+    }
+    let _ = git(&clone, &["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir_all(clone.join("docs/exec-plans/active/p")).expect("writable");
+    let plan = "docs/exec-plans/active/p/plan.md";
+    std::fs::write(clone.join(plan), "# Plan\n### a\n### b\n").expect("plan.md is written");
+    std::fs::write(clone.join(TASKS), tasks_json(false)).expect("tasks.json is written");
+    let _ = commit(&clone, "plan");
+    let _ = git(&clone, &["push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+    (root, clone)
+}
+
+/// Deletes a test's temporary directory when dropped, also while a test panics on purpose.
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        // A failure to delete scratch space changes no result, so it is reported, not raised:
+        // a panic while unwinding would abort the test binary.
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("cannot delete {}: {error}", self.0.display());
+        }
+    }
+}
+
+fn commit(clone: &Path, message: &str) -> String {
+    let _ = git(clone, &["add", "--all"]);
+    let _ = git(clone, &["commit", "--quiet", "--allow-empty", "-m", message]);
+    git(clone, &["rev-parse", "HEAD"])
+}
+
+fn bot_head(branch: &str, author: &str) -> PullHead {
+    PullHead { branch: branch.to_owned(), author: author.to_owned() }
+}
+
+/// GitHub as it is for the bot's PR #7: from `bot/passes`, by `nami-ci[bot]`, with `a`'s PR
+/// from `task/a` merged.
+fn bots_pull() -> FakePulls {
+    FakePulls {
+        heads: [7, 70]
+            .map(|number| (number, bot_head(passes::BOT_BRANCH, passes::CI_LOGIN)))
+            .into(),
+        merged: vec!["task/a".to_owned()],
+        ..FakePulls::default()
+    }
+}
+
+fn check(clone: &Path, pulls: &FakePulls, tests: &FakeTests, arguments: &[&str]) -> String {
+    let token = |name: &str| (name == "NAMI_PASSES_TOKEN").then(|| "test-token".to_owned());
+    check_with(clone, Services { pulls, tests, variables: &token }, arguments)
+}
+
+fn check_with(clone: &Path, services: Services<'_>, arguments: &[&str]) -> String {
+    match passes::execute(clone, "origin", services, arguments) {
+        Ok(output) => format!("ok: {output}"),
+        Err(error) => format!("error: {error}"),
+    }
+}
+
+// Goal: `check-pr` lets a change set `passes` only when all four conditions hold, and each
+// condition alone, broken, rejects it: the head branch, the author, the shape of the diff,
+// and the acceptance tests run in this run. A missing merged PR also rejects it, and no test
+// runs unless the rest holds.
+#[test]
+fn check_pr_lets_only_the_bots_flip_through() {
+    let (root, clone) = setup("check-pr");
+    let base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let _ = commit(&clone, "Set passes: a");
+    let arguments = ["check-pr", base.as_str(), "bot/passes", "7"];
+    let tests = FakeTests::default();
+    let accepted = check(&clone, &bots_pull(), &tests, &arguments);
+    assert!(accepted.starts_with("ok: ") && accepted.contains("on a: their"), "{accepted}");
+    assert_eq!(*tests.ran.borrow(), ["a"], "the flipped task's tests ran in this run");
+
+    let rejected = |github: &FakePulls, runner: &FakeTests, given: &[&str], reason: &str| {
+        let output = check(&clone, github, runner, given);
+        assert!(output.starts_with("error: ") && output.contains(reason), "{reason}: {output}");
+        assert!(output.contains("agents never do"), "{output}");
+    };
+    let mut pulls = bots_pull();
+    let _ = pulls.heads.insert(7, bot_head("task/a", passes::CI_LOGIN));
+    rejected(&pulls, &tests, &arguments, "#7 comes from `task/a`");
+    let _ = pulls.heads.insert(7, bot_head("fork:bot/passes", passes::CI_LOGIN));
+    rejected(&pulls, &tests, &arguments, "#7 comes from `fork:bot/passes`");
+    let _ = pulls.heads.insert(7, bot_head(passes::BOT_BRANCH, "nami-agent[bot]"));
+    rejected(&pulls, &tests, &arguments, "opened by `nami-agent[bot]`");
+    rejected(&bots_pull(), &tests, &["check-pr", &base, "bot/passes"], "no pull request was");
+    rejected(&bots_pull(), &tests, &["check-pr", &base, "bot/passes", "8"], "no pull request #8");
+    let unmerged = FakePulls { merged: Vec::new(), ..bots_pull() };
+    rejected(&unmerged, &tests, &arguments, "no PR from `task/a` has merged");
+    assert_eq!(tests.ran.borrow().len(), 1, "no test runs while another condition fails");
+    let failing = FakeTests { failing: vec!["a".to_owned()], ..FakeTests::default() };
+    rejected(&bots_pull(), &failing, &arguments, "`a` does not pass: a test failed");
+
+    let flipped = tasks_json(true);
+    std::fs::write(clone.join(TASKS), flipped.replace("Task b", "Task B")).expect("written");
+    rejected(&bots_pull(), &tests, &arguments, "line 13 changes more than a `passes` value");
+    std::fs::write(clone.join(TASKS), &flipped).expect("written");
+    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nx")
+        .expect("written");
+    rejected(&bots_pull(), &tests, &arguments, "`docs/exec-plans/active/p/plan.md` (M) is not");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a runner that returns fewer verdicts than there are flipped tasks never lets the
+// flips past the end of its list through: `check-pr` panics on it instead.
+#[test]
+#[should_panic(expected = "one verdict per flipped task")]
+fn check_pr_panics_on_too_few_verdicts() {
+    let (root, clone) = setup("short");
+    let _cleanup = Cleanup(root);
+    let base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let _ = commit(&clone, "Set passes: a");
+    let short = FakeTests { short: true, ..FakeTests::default() };
+    let output = check(&clone, &bots_pull(), &short, &["check-pr", &base, "bot/passes", "7"]);
+    assert!(output.is_empty(), "check-pr returned instead of panicking: {output}");
+}
+
+// Goal: in the merge queue, the PR comes from the queue branch's name, and each entry is
+// judged on its own squashed commit: the bot's flip passes behind another PR, and a PR behind
+// the bot's flip is not taken for one that sets `passes`.
+#[test]
+fn check_pr_judges_each_queue_entry_on_its_own_commit() {
+    let (root, clone) = setup("queue");
+    let group_base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join("other.txt"), "x").expect("written");
+    let _ = commit(&clone, "Another PR (#6)");
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let _ = commit(&clone, "Set passes: a (#7)");
+    let tests = FakeTests::default();
+    let queue = |pull: u32| format!("gh-readonly-queue/main/pr-{pull}-{group_base}");
+    let bot = check(&clone, &bots_pull(), &tests, &["check-pr", &group_base, &queue(7), ""]);
+    assert!(bot.starts_with("ok: ") && bot.contains("on a: their"), "{bot}");
+    let wrong = check(&clone, &bots_pull(), &tests, &["check-pr", &group_base, &queue(6), ""]);
+    assert!(wrong.contains("`other.txt` (A) is not"), "no own commit, so the group: {wrong}");
+
+    std::fs::write(clone.join("later.txt"), "y").expect("written");
+    let _ = commit(&clone, "A later PR (#8)");
+    let mut github = bots_pull();
+    let _ = github.heads.insert(8, bot_head("task/b", "nami-agent[bot]"));
+    let later = check(&clone, &github, &tests, &["check-pr", &group_base, &queue(8), ""]);
+    assert_eq!(later, "ok: ", "the flip ahead of #8 is not #8's");
+    let error = check(&clone, &bots_pull(), &tests, &["check-pr", &group_base, "bot/passes", "x"]);
+    assert!(error.contains("`x` is not a pull request number"), "{error}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: `bot/passes` and the nami-ci bot exist only to set `passes`, so a PR from that branch
+// or by that bot that sets none is rejected, in a PR and in the queue; any other PR that sets
+// none passes, and one that GitHub cannot show fails.
+#[test]
+fn check_pr_rejects_the_bots_pr_without_a_flip() {
+    let (root, clone) = setup("no-flip");
+    let base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join("other.txt"), "x").expect("written");
+    let _ = commit(&clone, "Something else (#9)");
+    let tests = FakeTests::default();
+    let mut github = bots_pull();
+    let _ = github.heads.insert(8, bot_head("task/a", passes::CI_LOGIN));
+    let _ = github.heads.insert(9, bot_head("task/b", "nami-agent[bot]"));
+    let queue = format!("gh-readonly-queue/main/pr-7-{base}");
+    for (arguments, reason) in [
+        (["check-pr", &base, "bot/passes", ""], "the change comes from `bot/passes`"),
+        (["check-pr", &base, "feature", "7"], "#7 comes from `bot/passes` by `nami-ci[bot]`"),
+        (["check-pr", &base, "task/a", "8"], "#8 comes from `task/a` by `nami-ci[bot]`"),
+        (["check-pr", &base, &queue, ""], "#7 comes from `bot/passes`"),
+        (["check-pr", &base, "task/c", "5"], "cannot read pull request #5"),
+    ] {
+        let output = check(&clone, &github, &tests, &arguments);
+        assert!(output.starts_with("error: ") && output.contains(reason), "{reason}: {output}");
+    }
+    let other = check(&clone, &github, &tests, &["check-pr", &base, "feature/x", "9"]);
+    assert_eq!(other, "ok: ", "an agent's PR that sets no passes");
+    assert_eq!(check(&clone, &github, &tests, &["check-pr", &base]), "ok: ", "no PR to ask about");
+    assert!(tests.ran.borrow().is_empty(), "no flip, no tests");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: on `pull_request` events, the head comes from the event, so the check of a change
+// that sets no `passes` asks GitHub nothing: the bot's branch or author is rejected, an
+// agent's PR and a fork's `bot/passes` pass, and an event without its fields is refused.
+#[test]
+fn check_pr_takes_the_head_from_the_event() {
+    let (root, clone) = setup("event");
+    let base = git(&clone, &["rev-parse", "HEAD"]);
+    std::fs::write(clone.join("other.txt"), "x").expect("written");
+    let _ = commit(&clone, "Something else");
+    let offline = FakePulls::default();
+    let tests = FakeTests::default();
+    let event = |branch: &str, author: &str, head_repository: &str| {
+        let arguments = [
+            "check-pr",
+            &base,
+            branch,
+            "12",
+            "--author",
+            author,
+            "--head-repo",
+            head_repository,
+            "--repo",
+            "o/n",
+        ];
+        check(&clone, &offline, &tests, &arguments)
+    };
+    let bots = event("bot/passes", "nami-ci[bot]", "o/n");
+    assert!(bots.contains("error: the PR comes from `bot/passes` by `nami-ci[bot]`"), "{bots}");
+    let by_bot = event("task/a", "nami-ci[bot]", "o/n");
+    assert!(by_bot.contains("comes from `task/a` by `nami-ci[bot]`"), "{by_bot}");
+    assert_eq!(event("feature/x", "nami-agent[bot]", "o/n"), "ok: ", "an agent's PR");
+    assert_eq!(event("bot/passes", "someone", "x/n"), "ok: ", "a fork's branch is not ours");
+    assert_eq!(event("bot/passes", "someone", ""), "ok: ", "a deleted fork is not ours");
+    assert!(event("feature/x", "", "o/n").contains("names no repository, author or branch"));
+    let unnumbered = [
+        "check-pr",
+        &base,
+        "feature/x",
+        "",
+        "--author",
+        "a",
+        "--head-repo",
+        "o/n",
+        "--repo",
+        "o/n",
+    ];
+    let error = check(&clone, &offline, &tests, &unnumbered);
+    assert!(error.contains("the event's PR needs its number"), "{error}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: the `acceptance` job runs only unfinished, unblocked tasks, and its file lists exactly
+// those that passed; a failing task is reported with its reason and left out.
+#[test]
+fn passes_reports_the_unblocked_tasks_that_pass() {
+    let (root, clone) = setup("found");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    let tests = FakeTests::default();
+    let pulls = FakePulls::default();
+    let output = check(&clone, &pulls, &tests, &["passes", "--output", &file_text]);
+    assert_eq!(output, "ok: passes\ta\n", "b is blocked on a");
+    assert_eq!(std::fs::read_to_string(&file).expect("written"), "{\"passing\": [\"a\"]}\n");
+    let failing = FakeTests { failing: vec!["a".to_owned()], ..FakeTests::default() };
+    let failed = check(&clone, &pulls, &failing, &["passes", "--output", &file_text]);
+    assert_eq!(failed, "ok: fails\ta\ta test failed\n");
+    assert_eq!(std::fs::read_to_string(&file).expect("written"), "{\"passing\": []}\n");
+
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let next = check(&clone, &pulls, &tests, &["passes"]);
+    assert_eq!(next, "ok: passes\tb\n", "a passes, so b runs");
+    assert!(pulls.log.borrow().is_empty(), "the acceptance job asks GitHub nothing");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: the `open passes PR` job sets `passes` only on reported tasks that may be set, pushes
+// exactly that change as `bot/passes` on top of main, opens one PR with auto-merge on, and
+// closes it when nothing is left; the pushed commit passes `check-pr`.
+#[test]
+fn open_pr_sets_only_candidates_and_opens_one_pr() {
+    let (root, clone) = setup("open-pr");
+    let main = git(&clone, &["rev-parse", "HEAD"]);
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\", \"b\", \"zz\"]}").expect("written");
+    let pulls = bots_pull();
+    let tests = FakeTests::default();
+    let output = check(&clone, &pulls, &tests, &["passes", "--open-pr", &file_text]);
+    assert!(output.contains("skipped\tb\t") && output.contains("skipped\tzz\t"), "{output}");
+    assert!(
+        output.ends_with("#70 sets `passes` on a: pushed, opened, auto-merge on\n"),
+        "{output}"
+    );
+    let log = pulls.log.borrow().clone();
+    assert!(log[0].starts_with("open bot/passes Set passes: a\n## Summary"), "{log:?}");
+    assert_eq!(log[1..], ["auto-merge #70"]);
+    assert!(tests.ran.borrow().is_empty(), "the job with the token runs no tests");
+    let pushed = tip(&clone);
+    assert_eq!(git(&clone, &["rev-parse", &format!("{pushed}^")]), main, "on top of main");
+    let diff = git(&clone, &["diff", "--numstat", &main, &pushed]);
+    assert_eq!(diff, format!("1\t1\t{TASKS}"), "one line of one file");
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]), main, "the checkout's branch stays");
+
+    let _ = git(&clone, &["checkout", "--quiet", "--force", &pushed]);
+    let checked = check(&clone, &pulls, &tests, &["check-pr", &main, "bot/passes", "7"]);
+    assert!(checked.starts_with("ok: "), "the bot's commit passes check-pr: {checked}");
+    let _ = git(&clone, &["checkout", "--quiet", "--force", &main]);
+
+    std::fs::write(&file, "{\"passing\": [\"b\"]}").expect("written");
+    let closing = FakePulls { open: Some(70), ..bots_pull() };
+    let closed = check(&clone, &closing, &tests, &["passes", "--open-pr", &file_text]);
+    assert!(closed.ends_with("closed #70: no task is newly done\n"), "{closed}");
+    assert_eq!(*closing.log.borrow(), ["close #70"]);
+    std::fs::write(&file, "{\"passing\": [\"a\"], \"x\": 1}").expect("written");
+    let refused = check(&clone, &closing, &tests, &["passes", "--open-pr", &file_text]);
+    assert!(refused.starts_with("error: the file must be {\"passing\""), "{refused}");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// The commit at the tip of the remote's `bot/passes`.
+fn tip(clone: &Path) -> String {
+    let listed = git(clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
+    listed.split('\t').next().expect("a commit").to_owned()
+}
+
+// Goal: each run builds the commit that `bot/passes` should hold and pushes only when the
+// branch's own change is not that commit's: an unchanged main and flip set push nothing,
+// while a foreign file on the tip rebuilds the branch. Every run reconciles the PR: a stale
+// title is edited and auto-merge is turned back on, without a push. A PR from `bot/passes`
+// that the bot did not open is never touched.
+#[test]
+fn open_pr_pushes_only_on_drift_and_always_reconciles() {
+    let (root, clone) = setup("drift");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let mut github = bots_pull();
+    let tests = FakeTests::default();
+    let run = |pulls: &FakePulls| {
+        let output = check(&clone, pulls, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let first = run(&github);
+    assert!(first.ends_with("pushed, opened, auto-merge on\n"), "{first}");
+    github.open = Some(70);
+    let pushed = tip(&clone);
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: nothing to change\n");
+    assert_eq!(tip(&clone), pushed, "nothing pushed");
+    github.states.borrow_mut().get_mut(&70).expect("opened").2 = false;
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: auto-merge on\n", "dropped");
+    github.states.borrow_mut().get_mut(&70).expect("opened").0 = "Set passes: old".to_owned();
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: edited\n", "a stale title");
+    assert_eq!(tip(&clone), pushed, "reconciling pushes nothing");
+
+    let _ = git(&clone, &["checkout", "--quiet", &pushed]);
+    std::fs::write(clone.join("extra.txt"), "x").expect("written");
+    let foreign = commit(&clone, "a foreign push");
+    let _ = git(
+        &clone,
+        &["push", "--quiet", "--force", "origin", &format!("{foreign}:refs/heads/bot/passes")],
+    );
+    let _ = git(&clone, &["checkout", "--quiet", "-"]);
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed\n", "a foreign file");
+    let rebuilt = tip(&clone);
+    assert_eq!(git(&clone, &["diff", "--name-only", &pushed, &rebuilt]), "", "the same tree");
+
+    let before = tip(&clone);
+    let mut squatted = FakePulls { open: Some(70), ..bots_pull() };
+    let _ = squatted.heads.insert(70, bot_head(passes::BOT_BRANCH, "nami-agent[bot]"));
+    let squat = run(&squatted);
+    let named = "error: #70, the open PR from `bot/passes`, comes from `bot/passes` by \
+                 `nami-agent[bot]`, not from nami-ci[bot]; nothing was changed. A human closes #70";
+    assert!(squat.starts_with(named), "{squat}");
+    assert!(squatted.log.borrow().is_empty(), "a squatted PR is neither edited nor closed");
+    assert_eq!(tip(&clone), before, "nothing is pushed");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a tip on an older main is kept while its own change, the wanted flips, still applies
+// cleanly to main (#62): main moving on, even in the same tasks.json, pushes nothing, so the
+// PR keeps its place in the merge queue, and only its text is edited. A tip whose change
+// conflicts with main, or whose flips are not the wanted ones, is rebuilt on today's main.
+#[test]
+fn open_pr_keeps_a_stale_tip_until_it_conflicts_or_its_flips_differ() {
+    let (root, clone) = setup("stale");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let github = FakePulls { open: Some(70), ..bots_pull() };
+    let tests = FakeTests::default();
+    let run = || {
+        let output = check(&clone, &github, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let parent = |commit: &str| git(&clone, &["rev-parse", &format!("{commit}^")]);
+    let old_main = git(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(run(), "ok: #70 sets `passes` on a: pushed, edited, auto-merge on\n");
+    let pushed = tip(&clone);
+
+    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nMore.\n")
+        .expect("written");
+    let retitled = tasks_json(false).replace("Task b", "Task B");
+    std::fs::write(clone.join(TASKS), retitled).expect("tasks.json is written");
+    let _ = commit(&clone, "main changes the plan, and tasks.json away from the flip");
+    assert_eq!(run(), "ok: #70 sets `passes` on a: edited\n", "only the text names a new head");
+    assert_eq!(tip(&clone), pushed, "the stale tip still applies, so nothing is pushed");
+    assert_eq!(parent(&pushed), old_main, "and it stays on the older main");
+
+    let text = std::fs::read_to_string(clone.join(TASKS)).expect("readable");
+    let next_to_flip = text.replace("[\"a::works\"]", "[\"a::works\", \"a::more\"]");
+    std::fs::write(clone.join(TASKS), next_to_flip).expect("tasks.json is written");
+    let conflicting = commit(&clone, "main changes the line next to the flip");
+    assert_eq!(run(), "ok: #70 sets `passes` on a: pushed, edited\n", "a conflict rebuilds");
+    let rebuilt = tip(&clone);
+    assert_eq!(parent(&rebuilt), conflicting, "on today's main");
+
+    let _ = git(&clone, &["checkout", "--quiet", "--detach"]);
+    let today = std::fs::read_to_string(clone.join(TASKS)).expect("readable");
+    let (a_part, b_part) = today.split_at(today.rfind("\"passes\": false").expect("b's line"));
+    let flips_b = format!("{a_part}{}", b_part.replacen("false", "true", 1));
+    std::fs::write(clone.join(TASKS), flips_b).expect("tasks.json is written");
+    let other = commit(&clone, "Set passes: b");
+    let target = format!("{other}:refs/heads/bot/passes");
+    let _ = git(&clone, &["push", "--quiet", "--force", "origin", &target]);
+    let _ = git(&clone, &["checkout", "--quiet", "-"]);
+    assert_eq!(run(), "ok: #70 sets `passes` on a: pushed\n", "other flips rebuild");
+    let fixed = tip(&clone);
+    assert_eq!(git(&clone, &["diff", "--name-only", &rebuilt, &fixed]), "", "a's flip again");
+    assert_eq!(parent(&fixed), conflicting, "on today's main");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a held tip is pushed again only when the checks that main requires failed on it, as a
+// new commit with the same change, so that GitHub runs them again: on the same main, and on
+// today's main when the tip sits on an older one. Pending or passed checks push nothing, and
+// a check read that fails stops the run before it changes anything.
+#[test]
+fn open_pr_pushes_a_held_tip_again_only_when_its_checks_failed() {
+    let (root, clone) = setup("rerun");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let mut github = FakePulls { open: Some(70), ..bots_pull() };
+    let tests = FakeTests::default();
+    let run = |pulls: &FakePulls| {
+        let output = check(&clone, pulls, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let parent = |commit: &str| git(&clone, &["rev-parse", &format!("{commit}^")]);
+    let main = git(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed, edited, auto-merge on\n");
+    let first = tip(&clone);
+    for (state, why) in [(Checks::Pending, "pending"), (Checks::Passed, "passed")] {
+        let _ = github.checks.insert(first.clone(), Ok(state));
+        assert_eq!(run(&github), "ok: #70 sets `passes` on a: nothing to change\n", "{why}");
+        assert_eq!(tip(&clone), first, "{why}: nothing pushed");
+    }
+    let failed = Checks::Failed(vec!["gate (failure)".to_owned()]);
+    let _ = github.checks.insert(first.clone(), Ok(failed.clone()));
+    let again = "pushed again, as `gate (failure)` did not pass";
+    assert_eq!(run(&github), format!("ok: #70 sets `passes` on a: {again}\n"));
+    let second = tip(&clone);
+    assert_ne!(second, first, "a new commit, so that GitHub runs the checks again");
+    assert_eq!(parent(&second), main, "on the same main");
+    assert_eq!(git(&clone, &["diff", "--name-only", &first, &second]), "", "the same change");
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: nothing to change\n", "no run yet");
+    assert_eq!(tip(&clone), second, "the new tip's checks are pending");
+
+    std::fs::write(clone.join("docs/exec-plans/active/p/plan.md"), "# Plan\n### a\n### b\nMore.\n")
+        .expect("written");
+    let today = commit(&clone, "main moves on");
+    let _ = github.checks.insert(second.clone(), Ok(failed));
+    assert_eq!(run(&github), format!("ok: #70 sets `passes` on a: {again}, edited\n"));
+    let third = tip(&clone);
+    assert_eq!(parent(&third), today, "rebuilt on today's main");
+
+    let _ = github.checks.insert(third.clone(), Err("HTTP 502".to_owned()));
+    let writes = github.log.borrow().len();
+    assert_eq!(run(&github), "error: HTTP 502", "the read's failure fails the run");
+    assert_eq!(tip(&clone), third, "nothing is pushed");
+    assert_eq!(github.log.borrow().len(), writes, "nothing is written");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: a foreign push of exactly the wanted flips, on a parent that is not on main, is
+// rebuilt on main, because its PR would carry that parent's changes; the same tip with its
+// parent on main would be kept, so the parent alone decides.
+#[test]
+fn open_pr_rebuilds_a_tip_whose_parent_is_not_on_main() {
+    let (root, clone) = setup("off-main");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let tests = FakeTests::default();
+    let run = |pulls: &FakePulls| {
+        let output = check(&clone, pulls, &tests, &["passes", "--open-pr", &file_text]);
+        let _ = git(&clone, &["reset", "--quiet", "--hard"]);
+        output
+    };
+    let main = git(&clone, &["rev-parse", "HEAD"]);
+    let _ = git(&clone, &["checkout", "--quiet", "--detach"]);
+    std::fs::write(clone.join("extra.txt"), "x").expect("written");
+    let side = commit(&clone, "a commit that is not on main");
+    std::fs::write(clone.join(TASKS), tasks_json(true)).expect("tasks.json is written");
+    let foreign = commit(&clone, "Set passes: a");
+    let target = format!("{foreign}:refs/heads/bot/passes");
+    let _ = git(&clone, &["push", "--quiet", "--force", "origin", &target]);
+    let _ = git(&clone, &["checkout", "--quiet", "-"]);
+    let ancestry = Command::new("git")
+        .args(["merge-base", "--is-ancestor", side.as_str(), main.as_str()])
+        .current_dir(&clone)
+        .status()
+        .expect("git runs");
+    assert_eq!(ancestry.code(), Some(1), "the fixture's parent is not on main");
+
+    let trusting = FakePulls { open: Some(70), ..bots_pull() };
+    assert_eq!(run(&trusting), "ok: #70 sets `passes` on a: edited, auto-merge on\n");
+    assert_eq!(tip(&clone), foreign, "kept if GitHub said its parent is on main");
+
+    let github = FakePulls { open: Some(70), off_main: vec![side], ..bots_pull() };
+    assert_eq!(run(&github), "ok: #70 sets `passes` on a: pushed, edited, auto-merge on\n");
+    let rebuilt = tip(&clone);
+    assert_eq!(git(&clone, &["rev-parse", &format!("{rebuilt}^")]), main, "on main");
+    assert_eq!(git(&clone, &["diff", "--name-only", &foreign, &rebuilt]), "extra.txt");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+// Goal: the open-PR job refuses to start without the token for writes, and names the
+// variable; and a PR that merged while the run worked ends the run cleanly, with no write to
+// it.
+#[test]
+fn open_pr_needs_its_token_and_stops_at_a_merged_pull() {
+    let (root, clone) = setup("token");
+    let file = root.join("passing.json");
+    let file_text = file.to_string_lossy().into_owned();
+    std::fs::write(&file, "{\"passing\": [\"a\"]}").expect("written");
+    let tests = FakeTests::default();
+    let github = FakePulls { open: Some(70), merged_pulls: vec![70], ..bots_pull() };
+    let arguments = ["passes", "--open-pr", file_text.as_str()];
+    for missing in [None, Some(" ".to_owned())] {
+        let variables = |_: &str| missing.clone();
+        let services = Services { pulls: &github, tests: &tests, variables: &variables };
+        let refused = check_with(&clone, services, &arguments);
+        let named = "error: `NAMI_PASSES_TOKEN` holds no token, so `bot/passes` cannot be pushed";
+        assert_eq!(refused, named, "{missing:?}");
+    }
+    let listed = git(&clone, &["ls-remote", "origin", "refs/heads/bot/passes"]);
+    assert!(listed.is_empty() && github.log.borrow().is_empty(), "nothing is done without it");
+
+    let merged = check(&clone, &github, &tests, &arguments);
+    assert_eq!(merged, "ok: #70 sets `passes` on a: pushed, merged, nothing to reconcile\n");
+    assert!(github.log.borrow().is_empty(), "a merged PR is neither edited nor re-queued");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// A workspace with one crate, `fixture`: a library with a passing, a failing and an ignored
+/// test, and an integration test target `outer`.
+fn fixture_workspace(root: &Path) -> PathBuf {
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).expect("writable");
+    std::fs::create_dir_all(workspace.join("tests")).expect("writable");
+    let toolchain = xtask::workspace_root().join("rust-toolchain.toml");
+    let _ = std::fs::copy(toolchain, workspace.join("rust-toolchain.toml")).expect("copied");
+    let files = [
+        (
+            "Cargo.toml",
+            "[workspace]\n\n[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \
+             \"2024\"\npublish = false\n",
+        ),
+        (
+            "Cargo.lock",
+            "# This file is automatically @generated by Cargo.\n# It is not intended for manual \
+             editing.\nversion = 4\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn good() {}\n    #[test]\n    fn bad() \
+             {\n        panic!(\"bad\");\n    }\n    #[test]\n    #[ignore = \"slow\"]\n    fn \
+             skipped() {}\n}\n",
+        ),
+        ("tests/outer.rs", "#[test]\nfn outer_good() {}\n"),
+    ];
+    for (file, text) in files {
+        std::fs::write(workspace.join(file), text).expect("written");
+    }
+    workspace
+}
+
+fn task(id: &str, acceptance: &[&str]) -> Task {
+    Task {
+        id: id.to_owned(),
+        title: id.to_owned(),
+        depends_on: Vec::new(),
+        owner_paths: Vec::new(),
+        acceptance: acceptance.iter().map(|&name| name.to_owned()).collect(),
+        passes: false,
+        file: PathBuf::from(TASKS),
+        active: true,
+    }
+}
+
+// Goal: the real runner passes a task only when every name it lists names a test that ran and
+// passed, in a library or an integration test; a failing, missing, ignored or partial name
+// fails. Method: `cargo nextest` on a one-crate workspace.
+#[test]
+fn nextest_passes_only_names_that_ran_and_passed() {
+    let root = std::env::temp_dir().join(format!("nami-passes-nextest-{}", std::process::id()));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("a stale temporary directory is removable");
+    }
+    let workspace = fixture_workspace(&root);
+    let tasks = [
+        task("both", &["fixture::tests::good", "fixture::outer::outer_good"]),
+        task("failing", &["fixture::tests::good", "fixture::tests::bad"]),
+        task("missing", &["fixture::tests::gone"]),
+        task("ignored", &["fixture::tests::skipped"]),
+        task("partial", &["fixture::tests"]),
+    ];
+    let chosen: Vec<&Task> = tasks.iter().collect();
+    let verdicts = Nextest::new(&workspace).check(&chosen).expect("nextest lists the tests");
+    assert_eq!(verdicts.len(), tasks.len(), "one verdict per task");
+    assert_eq!(verdicts[0], Ok(()), "both tests passed");
+    let failed = verdicts[1].as_ref().expect_err("bad fails");
+    assert!(failed.contains("acceptance tests of `failing` failed"), "{failed}");
+    for verdict in &verdicts[2..] {
+        let error = verdict.as_ref().expect_err("no such test runs");
+        assert!(error.contains("names no test that runs"), "{error}");
+    }
+    assert_eq!(Nextest::new(&workspace).check(&[]), Ok(Vec::new()), "nothing to run");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}

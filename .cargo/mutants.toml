@@ -9,4 +9,7 @@ exclude_re = [
     "(task|issue|queue)\\.rs.*(replace|in) run\\b",
     # `Gh` runs `gh api`; its parsing is tested on JSON, and the trait on fakes.
     "(github|forge)\\.rs.*\\bGh\\b",
+    # `GhProcess::call` only spawns gh. The command it runs, with its tokens, is tested
+    # (`GhProcess::command`), and so is every decision on gh's output (`GitHubPulls`).
+    "pulls\\.rs.*<impl Api for GhProcess>::call\\b",
 ]

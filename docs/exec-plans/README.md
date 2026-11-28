@@ -59,7 +59,7 @@ The JSON holds only what tools read. That gives agents little reason to edit it,
 - **Disjoint owner paths:** two unfinished tasks that may run at the same time own disjoint paths. Neither depends on the other, so the PRs would otherwise conflict. Make one depend on the other, or split the path. A directory overlaps everything inside it.
 - **Completed plans:** a plan under `completed/` has no unfinished task.
 
-In pull requests and the merge queue, `cargo xtask task check-pr` fails if the change sets `passes` on any task. On a branch named `task/<id>`, it also lists changed files outside that task's `owner_paths`. The task's own plan directory is exempt, so the task can note findings there. That list is advisory for now, and becomes blocking later (ADR-0011). A branch `task/issue-<n>` has no owner paths to check.
+In pull requests and the merge queue, `cargo xtask task check-pr` fails if the change sets `passes` on any task, unless it is the bot's PR described in [Setting `passes`](#setting-passes). On a branch named `task/<id>`, it also lists changed files outside that task's `owner_paths`. The task's own plan directory is exempt, so the task can note findings there. That list is advisory for now, and becomes blocking later (ADR-0011). A branch `task/issue-<n>` has no owner paths to check.
 
 ## Commands
 
@@ -142,7 +142,15 @@ The issue names only jobs, steps, tidy rules and lints that `main` defines. Read
 
 ## Setting `passes`
 
-ADR-0011 has CI set `passes` once a task's acceptance tests pass on `main`. That job does not exist yet. ADR-0017 (Proposed) covers the gap until it does: the maintainer sets `passes` by hand, and agents never do.
+CI sets `passes`, never an agent (ADR-0011, ADR-0017). The workflow `.github/workflows/passes.yml` runs after every push to `main`:
+
+1. **`acceptance`** runs `cargo xtask task passes`. For each active task that does not pass yet and whose dependencies pass, it runs the task's acceptance tests, each by its exact name. A name that matches no test fails the task, as does a test that is ignored or fails. It prints one verdict per task, `passes<TAB><id>` or `fails<TAB><id><TAB><reason>`, and hands the IDs of the tasks that passed to the next job.
+2. **`open passes PR`** runs `cargo xtask task passes --open-pr` as `nami-ci[bot]`. It keeps the tasks whose PR from `task/<id>` has merged, sets their `passes` to `true` on the branch `bot/passes`, and opens or updates one PR from it with auto-merge on. It builds the commit that `bot/passes` should hold, those flips on top of the current `main`, and pushes it only when the branch's own change is not those flips, no longer merges cleanly into `main`, or sits on a commit that is not on `main`. A branch on an older `main` is left alone, so the PR keeps its place in the merge queue, unless a check that `main` requires failed on it: then a new commit with the same flips is pushed, so that the checks run again. Pending checks push nothing. Every run reconciles the PR: its title and description match the flips, and auto-merge is on. It closes the PR when no task is left. It reads GitHub with the workflow's own token, and uses the bot's token only to push and write the PR. If someone else holds an open PR from `bot/passes`, the job fails and names it for a human to close.
+3. **`check-pr`** in the bot's PR, and again in the merge queue, runs the flipped tasks' acceptance tests once more. It lets the PR through only if it comes from `bot/passes`, `nami-ci[bot]` opened it, it changes nothing but `"passes": false` lines to `true` in active plans' `tasks.json`, each flipped task's PR has merged, and the tests pass. A PR from `bot/passes` or by `nami-ci[bot]` that sets no `passes` is rejected.
+
+So a task becomes done, and its dependants ready, one merge-queue trip after its PR merges. Nothing needs a human: a bot PR whose checks failed once, from an outage, a flaky test or a timeout, is pushed again by the next run, after the next merge to `main`. Only a check that fails on every rerun, or one that never reports, needs a human (ADR-0017). One optional maintainer step exists: the `bot/passes` ruleset in step 8 of `docs/operations/github-setup.md`, so that only the `nami-ci` app can update the branch. Without it, safety still holds, because `check-pr` judges the PR's content, but liveness depends on no one rewriting the branch. When a task's PR came from another branch than `task/<id>`, the workflow skips it; the maintainer then flips it in a PR that changes only `tasks.json` and merges it with the admin bypass. That is the only exception.
+
+An acceptance name is `<crate>::<module path>::<test>`, such as `xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture`, or `<crate>::<test file>::<test>` for a file under `tests/`, such as `xtask::task_passes::check_pr_lets_only_the_bots_flip_through`. `<crate>` is the package name with `-` written `_`. `cargo nextest list` shows each test's binary and name. To see what the workflow would find, run `cargo xtask task passes` on `main`.
 
 ## Writing a plan
 

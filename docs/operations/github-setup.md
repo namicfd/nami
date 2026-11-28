@@ -67,7 +67,7 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 | | merge methods: squash | |
 | Required status checks | `gate`, `lints (UI tests)`; "up to date" is off | The merge queue tests the combined result anyway. |
 | Merge queue | squash; build 5; group of 1–5; wait 5 min; all green; timeout 30 min | ADR-0009. |
-| Bypass | Repository admin, **pull requests only** | The maintainer can merge PRs past the rules: their own, since GitHub never allows approving your own PR, and `tasks.json` flips (ADR-0017). Nobody can push to `main` directly, not even with the maintainer's credentials. In an emergency, open a PR and merge it with the bypass. |
+| Bypass | Repository admin, **pull requests only** | The maintainer can merge PRs past the rules: their own, since GitHub never allows approving your own PR, and, as an exception, a `tasks.json` flip that the `passes` workflow cannot make (ADR-0017). Nobody can push to `main` directly, not even with the maintainer's credentials. In an emergency, open a PR and merge it with the bypass. |
 
 To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
 
@@ -208,6 +208,8 @@ The other job in that workflow, `adr clashes (advisory)`, comments with the work
 | Repository variable | `NAMI_CI_CLIENT_ID`: `Iv23ctUmyQzRCojbV2Em` |
 
 There is no `nami-agent` environment, and there must not be one. A job that names a missing environment makes GitHub create it with no branch rule, so that every branch may use any secret added to it later. Create an environment, and limit it to `main`, before any job names it. Until ADR-0023's PR (#64) merged, `main`'s `queue.yml` named `environment: nami-agent`, so a merge-queue failure before then may have created one. After that merge, run "Check it" below, and delete any `nami-agent` environment it lists.
+
+**Requested of the maintainer, not set yet:** a branch ruleset on `bot/passes` that restricts creations, updates and deletions, with the `nami-ci` app as its only bypass actor. Then only `nami-ci[bot]` can push the branch whose PR sets `passes` (ADR-0017). Until it exists, anyone with write access can push there. `check-pr` judges such a push by its content, and the next `passes` run rebuilds the branch, unless the push is exactly the wanted flips on a commit of `main`, which is what the run would push itself.
 
 ### Set it up again
 

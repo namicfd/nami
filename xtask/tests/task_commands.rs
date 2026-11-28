@@ -5,7 +5,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use xtask::issue::github::{Comment, GitHub, Issue, LabelEvent, Timestamp};
+use xtask::task::acceptance::Acceptance;
 use xtask::task::execute;
+use xtask::task::passes::{self, Checks, PullState, Pulls, Services};
+use xtask::task::plan::Task;
 
 /// GitHub with fixed issues, label events, comments and merge-queue entries, or unreachable.
 /// It records whose comments were asked for, the comments posted and the labels removed. The
@@ -77,6 +80,53 @@ impl GitHub for Fake {
             Ok(!self.forks.contains(&number))
         }
     }
+}
+
+/// GitHub's pull requests and the test runner for a `check-pr` that never needs them: a change
+/// that sets no `passes`, or one that no pull request is given for.
+struct Unasked;
+
+impl Pulls for Unasked {
+    fn pull(&self, number: u32) -> Result<PullState, String> {
+        Err(format!("no pull request #{number}"))
+    }
+    fn has_merged(&self, _branch: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn open_from(&self, _branch: &str) -> Result<Option<u32>, String> {
+        Ok(None)
+    }
+    fn open(&self, _branch: &str, _title: &str, _body: &str) -> Result<u32, String> {
+        Err("check-pr opens nothing".to_owned())
+    }
+    fn edit(&self, _number: u32, _title: &str, _body: &str) -> Result<(), String> {
+        Err("check-pr edits nothing".to_owned())
+    }
+    fn close(&self, _number: u32) -> Result<(), String> {
+        Err("check-pr closes nothing".to_owned())
+    }
+    fn auto_merge(&self, _number: u32) -> Result<(), String> {
+        Err("check-pr merges nothing".to_owned())
+    }
+    fn required_checks(&self, _commit: &str) -> Result<Checks, String> {
+        Err("check-pr reads no checks".to_owned())
+    }
+    fn is_ancestor(&self, _ancestor: &str, _commit: &str) -> Result<bool, String> {
+        Err("check-pr reads no history".to_owned())
+    }
+}
+
+impl Acceptance for Unasked {
+    fn check(&self, _tasks: &[&Task]) -> Result<Vec<Result<(), String>>, String> {
+        Err("no test runs for a change that is not the bot's".to_owned())
+    }
+}
+
+fn check_pr(clone: &Path, arguments: &[&str]) -> Result<String, String> {
+    let services = Services { pulls: &Unasked, tests: &Unasked, variables: &|_| None };
+    let mut all = vec!["check-pr"];
+    all.extend(arguments);
+    passes::execute(clone, "origin", services, &all)
 }
 
 fn issue(number: u32, author: &str, labels: &[&str]) -> Issue {
@@ -366,7 +416,7 @@ fn issues_are_claimed_like_tasks() {
     assert!(partial.contains("GitHub is down") && partial.ends_with("\na\tTask a\n"), "{partial}");
     assert_eq!(task(&github, &["release", "issue-3"]), Ok("released issue-3\n".to_owned()));
 
-    let check = task(&github, &["check-pr", "HEAD", "task/issue-3"]);
+    let check = check_pr(&clone, &["HEAD", "task/issue-3"]);
     assert_eq!(check, Ok(String::new()), "an issue has no owner paths to warn about");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
@@ -731,12 +781,15 @@ fn check_pr_rejects_passes_set_outside_ci() {
     let base = git(&clone, &["rev-parse", "HEAD"]).trim().to_owned();
     let tasks = clone.join("docs/exec-plans/active/p/tasks.json");
     std::fs::write(&tasks, tasks_json(true)).expect("tasks.json is written");
-    let error = run(&clone, &["check-pr", &base]).expect_err("setting passes is rejected");
-    assert!(error.contains("sets `passes` on `a`") && error.contains("1 task(s)"), "{error}");
+    let error = check_pr(&clone, &[&base]).expect_err("setting passes is rejected");
+    assert!(error.contains("this change sets `passes` on a;"), "{error}");
+    assert!(error.contains("no pull request was given"), "{error}");
+    let check = run(&clone, &["check-pr", &base]).expect_err("not a command of execute");
+    assert!(check.starts_with("usage: "), "{check}");
 
     let _ = git(&clone, &["commit", "--quiet", "-am", "CI marks a as passing"]);
     let marked = git(&clone, &["rev-parse", "HEAD"]).trim().to_owned();
-    assert_eq!(run(&clone, &["check-pr", &marked]), Ok(String::new()), "unchanged passes are fine");
+    assert_eq!(check_pr(&clone, &[&marked]), Ok(String::new()), "unchanged passes are fine");
 
     std::fs::create_dir_all(clone.join("src/a")).expect("source directory is writable");
     std::fs::write(clone.join("src/a/lib.rs"), "").expect("owned file is written");
@@ -746,7 +799,7 @@ fn check_pr_rejects_passes_set_outside_ci() {
     std::fs::write(&tasks, tasks_json(true).replace("\"src/a\"", "\".\"")).expect("written");
     let _ = git(&clone, &["add", "."]);
     let _ = git(&clone, &["commit", "--quiet", "-m", "work on a"]);
-    let output = run(&clone, &["check-pr", &marked, "task/a"]).expect("warnings do not fail");
+    let output = check_pr(&clone, &[&marked, "task/a"]).expect("warnings do not fail");
     let expected = [
         concat!(
             "warning: `docs/exec-plans/active/p/tasks.json` ",
@@ -755,7 +808,7 @@ fn check_pr_rejects_passes_set_outside_ci() {
         "warning: `outside.rs` is outside the owner_paths of `a` (ADR-0011)",
     ];
     assert_eq!(output.lines().collect::<Vec<_>>(), expected);
-    assert_eq!(run(&clone, &["check-pr", &marked, "feature/x"]), Ok(String::new()), "not a task");
+    assert_eq!(check_pr(&clone, &[&marked, "feature/x"]), Ok(String::new()), "not a task");
 
     std::fs::write(&tasks, "{").expect("tasks.json is written");
     let invalid = run(&clone, &["ready"]).expect_err("invalid plans block the commands");
