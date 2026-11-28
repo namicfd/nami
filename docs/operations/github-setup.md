@@ -75,11 +75,12 @@ Go to Settings → Rules → Rulesets → New ruleset → New branch ruleset, an
 
 To check the live ruleset against this table, print it with `gh api "repos/$REPO/rulesets"`, then `gh api "repos/$REPO/rulesets/<id>"`.
 
-**Requested of the maintainer, not set yet:** "approve the last push" off. On 2026-11-28 the live ruleset (ID 28033236) still had `require_last_push_approval: true`. It held #84, the first `passes` PR, which touches only an unowned `tasks.json`, from its green checks at 09:25 UTC until your approval at 10:48; it merged six minutes later. #47, which touches only `docs/research/`, sat the same way, green, with auto-merge on and out of the queue. Every PR so far has merged with an approval, so nothing has yet shown point 2 of step 9 working. Turn it off in Settings → Rules → Rulesets → `main` → Require a pull request before merging → clear **Require approval of the most recent reviewable push** → Save changes. Or with `gh`. The body holds only `rules`, so the name, target and bypass stay as they are, and every other rule is sent back unchanged:
+**Requested of the maintainer, not set yet:** "approve the last push" off. On 2026-11-28 the live ruleset (ID 28033236) still had `require_last_push_approval: true`. It held #84, the first `passes` PR, which touches only an unowned `tasks.json`, from its green checks at 09:25 UTC until your approval at 10:48; it merged six minutes later. #47, which touches only `docs/research/`, sat the same way, green, with auto-merge on and out of the queue. Every PR so far has merged with an approval, so nothing has yet shown point 2 of step 9 working. Turn it off in Settings → Rules → Rulesets → `main` → Require a pull request before merging → clear **Require approval of the most recent reviewable push** → Save changes. The UI is the tested path. Or with `gh`, not yet run: the body holds only `rules`, so the name, target and bypass stay as they are, and every other rule is sent back unchanged. The one exception is `dismissal_restriction`, which is off; it is dropped in case the update refuses it. If GitHub answers 422, nothing has changed: use the UI.
 
 ```sh
 gh api "repos/$REPO/rulesets/28033236" --jq '{rules: [.rules[] | if .type == "pull_request"
-  then .parameters.require_last_push_approval = false else . end]}' > main-rules.json
+  then (.parameters.require_last_push_approval = false | del(.parameters.dismissal_restriction))
+  else . end]}' > main-rules.json
 gh api -X PUT "repos/$REPO/rulesets/28033236" --input main-rules.json
 gh api "repos/$REPO/rules/branches/main" \
   --jq '.[] | select(.type == "pull_request") | .parameters.require_last_push_approval'
@@ -253,17 +254,22 @@ In Settings → Rules → Rulesets → New ruleset → **New branch ruleset**:
 - **Rules:** **Restrict creations**, **Restrict updates** and **Restrict deletions** on; every other rule off. In particular leave "Block force pushes" off: the job force-pushes the branch every time it rebuilds it.
 - **Create.**
 
-Or with `gh`. The bypass actor's ID is the app's ID, `gh api apps/nami-ci --jq .id`, which was 5942623 on 2026-11-28; it is neither the bot's user ID nor the installation's:
+Or with `gh`. The bypass actor's ID is the app's ID, `gh api apps/nami-ci --jq .id`, which was 5942623 on 2026-11-28; it is neither the bot's user ID nor the installation's. Save this as `bot-passes-ruleset.json`:
 
-```sh
-gh api -X POST "repos/$REPO/rulesets" --input - <<'EOF'
+```json
 {"name": "bot/passes", "target": "branch", "enforcement": "active",
  "conditions": {"ref_name": {"include": ["refs/heads/bot/passes"], "exclude": []}},
  "rules": [{"type": "creation"},
            {"type": "update", "parameters": {"update_allows_fetch_and_merge": false}},
            {"type": "deletion"}],
  "bypass_actors": [{"actor_id": 5942623, "actor_type": "Integration", "bypass_mode": "always"}]}
-EOF
+```
+
+Then create the ruleset and delete the file:
+
+```sh
+gh api -X POST "repos/$REPO/rulesets" --input bot-passes-ruleset.json
+rm bot-passes-ruleset.json
 ```
 
 **Check it.** As the maintainer, `gh api "repos/$REPO/rulesets" --jq '.[] | select(.name == "bot/passes") | .id'`, then `gh api "repos/$REPO/rulesets/<id>" --jq '{enforcement, conditions, rules: [.rules[].type], bypass_actors}'` must print enforcement `active`, the one include `refs/heads/bot/passes`, the rules `["creation","update","deletion"]`, and the one bypass actor `{"actor_id":5942623,"actor_type":"Integration","bypass_mode":"always"}`. An agent can check the rules without admin rights: `GH_TOKEN=$(xtask/agent-token.sh) gh api repos/$REPO/rules/branches/bot/passes --jq '[.[].type]'` must print `["creation","update","deletion"]`. The next `passes` run that pushes must still succeed; if its push is refused with `GH013`, the bypass names the wrong actor.
