@@ -109,9 +109,10 @@ impl Trust {
 }
 
 /// The trust list from `.github/CODEOWNERS` at `reference`, such as `origin/main`, with what
-/// the CI app's issues are checked against: the vocabulary (`ci.yml`'s names at `reference`)
-/// and the repository that `reference`'s remote names. When either cannot be loaded, the CI
-/// app's issues are not trusted, and the refusal says why: failing closed is safe.
+/// the CI app's issues are checked against: the vocabulary (the names of the queue workflows,
+/// `ci.yml` and `guardrails.yml`, at `reference`) and the repository that `reference`'s remote
+/// names. When either cannot be loaded, the CI app's issues are not trusted, and the refusal
+/// says why: failing closed is safe.
 ///
 /// # Errors
 ///

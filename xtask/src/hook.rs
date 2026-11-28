@@ -410,7 +410,8 @@ fn wait_within(
 }
 
 /// Starts the child in a process group of its own, so that a kill reaches its children too.
-fn in_own_process_group(command: &mut Command) -> &mut Command {
+/// The ratchet's null-mutant run uses it as well.
+pub(crate) fn in_own_process_group(command: &mut Command) -> &mut Command {
     #[cfg(unix)]
     let command = std::os::unix::process::CommandExt::process_group(command, 0);
     command
@@ -418,7 +419,7 @@ fn in_own_process_group(command: &mut Command) -> &mut Command {
 
 /// Kills `child`, and on Unix every process in its group: cargo's build or the gate's `just`.
 /// The child itself is killed in any case. Returns what went wrong with the group, if anything.
-fn kill_process_group(child: &mut Child) -> Result<(), String> {
+pub(crate) fn kill_process_group(child: &mut Child) -> Result<(), String> {
     #[cfg(unix)]
     let group = {
         let group = format!("-{}", child.id());

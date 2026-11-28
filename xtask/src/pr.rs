@@ -75,15 +75,26 @@ impl Pattern {
     }
 }
 
-/// Parses the patterns of a CODEOWNERS file.
+/// One line of a CODEOWNERS file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    /// The paths it covers.
+    pub pattern: Pattern,
+    /// False for a line without an owner, which takes the protection off what it covers.
+    pub is_owned: bool,
+}
+
+/// Parses the lines of a CODEOWNERS file.
 ///
 /// # Errors
 ///
 /// Returns the line and the reason if a pattern is not in one of the three supported forms, or
-/// has no owner. An unsupported form is an error, not skipped, so that no path loses its
-/// protection silently.
-pub fn parse_codeowners(text: &str) -> Result<Vec<Pattern>, String> {
-    let mut patterns = Vec::new();
+/// has no owner although it is not one of the ratchet's rule paths. An unsupported form is an
+/// error, not skipped, and only the rule paths may be unowned (ADR-0022), so that no path loses
+/// its protection silently.
+pub fn parse_codeowners(text: &str) -> Result<Vec<Line>, String> {
+    let rule_paths = crate::ratchet::scope::rule_patterns();
+    let mut lines = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let mut words = line.split_whitespace().take_while(|word| !word.starts_with('#'));
         let Some(pattern) = words.next() else {
@@ -96,18 +107,22 @@ pub fn parse_codeowners(text: &str) -> Result<Vec<Pattern>, String> {
                  `/path/file`, `/dir/` or `**/name`, or teach xtask/src/pr.rs the new form"
             ));
         };
-        if words.next().is_none() {
+        let is_owned = words.next().is_some();
+        if !is_owned && !rule_paths.contains(&parsed) {
             return Err(format!(
-                "{CODEOWNERS_FILE}:{line_number}: pattern `{pattern}` has no owner; name the \
-                 owner, or remove the line"
+                "{CODEOWNERS_FILE}:{line_number}: pattern `{pattern}` has no owner, and only \
+                 the ratchet's rule paths may be unowned (ADR-0022); name the owner, or remove \
+                 the line"
             ));
         }
-        patterns.push(parsed);
+        lines.push(Line { pattern: parsed, is_owned });
     }
-    Ok(patterns)
+    Ok(lines)
 }
 
-fn parse_pattern(pattern: &str) -> Option<Pattern> {
+/// Parses one CODEOWNERS pattern in a supported form: `/path/file`, `/dir/` or `**/name`.
+#[must_use]
+pub fn parse_pattern(pattern: &str) -> Option<Pattern> {
     if let Some(name) = pattern.strip_prefix("**/") {
         let is_name = is_plain_path(name) && !name.contains('/');
         return is_name.then(|| Pattern::AnyDepth(name.to_owned()));
@@ -129,13 +144,19 @@ fn is_plain_path(path: &str) -> bool {
         && !path.contains("//")
 }
 
-/// The paths of `changed` that a pattern covers, sorted and without duplicates.
+/// The paths of `changed` that the CODEOWNERS `lines` protect, sorted and without duplicates.
+/// As on GitHub, the last line that matches a path decides: a line without an owner after a
+/// broader owned one takes the protection off.
 #[must_use]
-pub fn protected_paths(patterns: &[Pattern], changed: &[String]) -> Vec<String> {
-    let is_protected = |path: &&String| patterns.iter().any(|pattern| pattern.matches(path));
+pub fn protected_paths(lines: &[Line], changed: &[String]) -> Vec<String> {
+    let is_protected = |path: &&String| {
+        let last = lines.iter().rev().find(|line| line.pattern.matches(path));
+        last.is_some_and(|line| line.is_owned)
+    };
     let mut protected: Vec<String> = changed.iter().filter(is_protected).cloned().collect();
     protected.sort();
     protected.dedup();
+    assert!(protected.len() <= changed.len(), "protected paths are changed paths");
     protected
 }
 
@@ -510,7 +531,7 @@ pub fn changed_protected(root: &Path, options: &[&str]) -> Result<Vec<String>, S
     let base = base_of(options)?;
     let codeowners = fs::read_to_string(root.join(CODEOWNERS_FILE))
         .map_err(|error| format!("cannot read {CODEOWNERS_FILE}: {error}; restore the file"))?;
-    let patterns = parse_codeowners(&codeowners)?;
+    let lines = parse_codeowners(&codeowners)?;
     let range = format!("{base}...HEAD");
     // Without rename detection a file moved out of a protected directory still shows its old
     // path. `-z` keeps unusual file names unquoted.
@@ -530,14 +551,14 @@ pub fn changed_protected(root: &Path, options: &[&str]) -> Result<Vec<String>, S
     let names = String::from_utf8_lossy(&output.stdout);
     let changed: Vec<String> =
         names.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect();
-    Ok(protected_paths(&patterns, &changed))
+    Ok(protected_paths(&lines, &changed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Pattern, base_of, check_body, listed_issue_problem, parse_codeowners, protected_paths,
-        section,
+        Line, Pattern, base_of, check_body, listed_issue_problem, parse_codeowners,
+        protected_paths, section,
     };
     use crate::issue::github::{Comment, GitHub, Issue, LabelEvent};
     use crate::issue::trust::Trust;
@@ -615,13 +636,21 @@ mod tests {
         }
     }
 
+    fn owned(pattern: Pattern) -> Line {
+        Line { pattern, is_owned: true }
+    }
+
+    fn real_codeowners() -> Vec<Line> {
+        let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))
+            .expect("CODEOWNERS is readable");
+        parse_codeowners(&text).expect("CODEOWNERS uses only supported forms")
+    }
+
     // Goal: the real CODEOWNERS file parses, and its patterns protect what AGENTS.md says is
     // protected and nothing next to it. A pattern in a new form fails this test.
     #[test]
     fn real_codeowners_protects_the_documented_paths() {
-        let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))
-            .expect("CODEOWNERS is readable");
-        let patterns = parse_codeowners(&text).expect("CODEOWNERS uses only supported forms");
+        let patterns = real_codeowners();
         let changed = paths(&[
             ".cargo/mutants.toml",
             ".claude/settings.json",
@@ -637,8 +666,13 @@ mod tests {
             "docs/design/0001-dependency-policy.md",
             "docs/research/notes.md",
             "justfile",
+            "lints/Cargo.toml",
             "lints/src/lib.rs",
+            "lints/ui/main.rs",
+            "xtask/fixtures/tidy/usize.fires.fixture",
             "xtask/src/hook.rs",
+            "xtask/src/tidy.rs",
+            "xtask/src/tidy/registry.rs",
         ]);
         let unprotected = paths(&["README.md", "crates/base/src/lib.rs", "docs/research/notes.md"]);
         let expected: Vec<String> =
@@ -646,23 +680,55 @@ mod tests {
         assert_eq!(protected_paths(&patterns, &changed), expected);
     }
 
+    // Goal: the CODEOWNERS that the ratchet's "after ADR-0022" verdict assumes, today's file
+    // with the rule paths appended without an owner, leaves exactly the rule paths unowned, as
+    // the policy flip of ADR-0022 would, and protects everything else as today.
+    #[test]
+    fn the_flipped_codeowners_unowns_exactly_the_rule_paths() {
+        let text = std::fs::read_to_string(crate::workspace_root().join(super::CODEOWNERS_FILE))
+            .expect("CODEOWNERS is readable");
+        let lines = parse_codeowners(&crate::ratchet::scope::flipped_codeowners(&text))
+            .expect("the flipped file parses");
+        let unowned: Vec<&Pattern> =
+            lines.iter().filter(|line| !line.is_owned).map(|line| &line.pattern).collect();
+        let rule_paths = crate::ratchet::scope::rule_patterns();
+        assert_eq!(unowned, rule_paths.iter().collect::<Vec<_>>(), "unowned lines, in order");
+        let examples = paths(&[
+            "docs/RULES.md",
+            "lints/Cargo.toml",
+            "lints/src/lib.rs",
+            "lints/ui/main.stderr",
+            "xtask/fixtures/tidy/usize.fires.fixture",
+            "xtask/src/tidy.rs",
+            "xtask/src/tidy/registry.rs",
+            "xtask/src/tidy/rust_source.rs",
+        ]);
+        assert_eq!(
+            protected_paths(&lines, &examples),
+            paths(&["lints/Cargo.toml", "xtask/src/tidy.rs"])
+        );
+    }
+
     // Goal: each of the three supported forms parses to its own variant; comments, blank lines
-    // and trailing comments are skipped.
+    // and trailing comments are skipped, and a rule path may have no owner.
     #[test]
     fn supported_patterns_are_parsed() {
-        let text = "# Comment.\n\n/Cargo.lock @a\n/docs/design/  @a @b # why\n**/Cargo.toml\t@a\n";
+        let text = "# Comment.\n\n/Cargo.lock @a\n/docs/design/  @a @b # why\n**/Cargo.toml\t@a\n\
+                    /lints/ui/ # merges on the ratchet's proof\n";
+        let unowned = Line { pattern: Pattern::Directory("lints/ui/".to_owned()), is_owned: false };
         assert_eq!(
             parse_codeowners(text),
             Ok(vec![
-                Pattern::File("Cargo.lock".to_owned()),
-                Pattern::Directory("docs/design/".to_owned()),
-                Pattern::AnyDepth("Cargo.toml".to_owned()),
+                owned(Pattern::File("Cargo.lock".to_owned())),
+                owned(Pattern::Directory("docs/design/".to_owned())),
+                owned(Pattern::AnyDepth("Cargo.toml".to_owned())),
+                unowned,
             ])
         );
     }
 
     // Goal: every other pattern form is an error that names the line, and so is a pattern
-    // without an owner, which on GitHub would remove the protection.
+    // without an owner that is not a rule path, which on GitHub would remove the protection.
     #[test]
     fn unsupported_patterns_are_errors() {
         let unsupported = [
@@ -692,6 +758,8 @@ mod tests {
         }
         let error = parse_codeowners("/a # @owner\n").expect_err("a comment is not an owner");
         assert!(error.starts_with(".github/CODEOWNERS:1: pattern `/a` has no owner"), "{error}");
+        let near = parse_codeowners("/lints/\n").expect_err("only the rule paths themselves");
+        assert!(near.contains("only the ratchet's rule paths may be unowned"), "{near}");
     }
 
     // Goal: each form covers exactly its paths. Method: for each pattern, paths on both sides of
@@ -722,10 +790,30 @@ mod tests {
     // Goal: the protected paths come back sorted and once each, whatever the input order.
     #[test]
     fn protected_paths_are_sorted_and_unique() {
-        let patterns = [Pattern::Directory("xtask/".to_owned())];
+        let patterns = [owned(Pattern::Directory("xtask/".to_owned()))];
         let changed = paths(&["xtask/b.rs", "src/a.rs", "xtask/a.rs", "xtask/b.rs"]);
         assert_eq!(protected_paths(&patterns, &changed), paths(&["xtask/a.rs", "xtask/b.rs"]));
         assert_eq!(protected_paths(&[], &changed), Vec::<String>::new());
+    }
+
+    // Goal: the last line that matches decides, as on GitHub: an unowned line after an owned
+    // directory frees what it covers, and an owned line after it protects again.
+    #[test]
+    fn the_last_matching_line_decides() {
+        let free = |pattern: Pattern| Line { pattern, is_owned: false };
+        let lines = [
+            owned(Pattern::Directory("xtask/".to_owned())),
+            free(Pattern::Directory("xtask/fixtures/".to_owned())),
+            owned(Pattern::File("xtask/fixtures/kept.txt".to_owned())),
+        ];
+        let changed = paths(&["xtask/a.rs", "xtask/fixtures/b.fixture", "xtask/fixtures/kept.txt"]);
+        assert_eq!(
+            protected_paths(&lines, &changed),
+            paths(&["xtask/a.rs", "xtask/fixtures/kept.txt"])
+        );
+        let reversed = [lines[1].clone(), lines[0].clone()];
+        let all = paths(&["xtask/a.rs", "xtask/fixtures/b.fixture"]);
+        assert_eq!(protected_paths(&reversed, &all), all, "an earlier unowned line is overruled");
     }
 
     // Goal: a section is the text between its heading and the next `#` or `##` heading, without

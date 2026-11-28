@@ -1,0 +1,2547 @@
+//! Whether a rule-path diff only adds rule code or edits existing rule code (ADR-0022).
+//!
+//! Every honest loosening that the review of #57 found edited existing rule code together
+//! with its tests. Mutation testing cannot see that, because the edited tests pin the edited
+//! behaviour; the independent review caught each one. So the ratchet sorts each diff into one
+//! of two classes, and the class decides what stands behind a pass:
+//!
+//! - **Additive**: the diff adds rules and leaves every existing item as it is. It merges on
+//!   the ratchet's proof alone: the corpus, end to end, mutants on the new code, and the data
+//!   checks. The review gate needs no review by the reviewer app, only that none of its
+//!   requests for changes or threads is open ([`super::review`]).
+//! - **Edit**: anything else in the rule paths. The ratchet still runs every check, and the
+//!   review gate also needs an approval of the head commit by the reviewer app; until the app
+//!   exists (#59), a code owner's approval.
+//!
+//! A diff is additive when each change in the rule paths is one of these:
+//!
+//! - (a) a new top-level item of a Rust file, new or existing: a function, a struct, enum,
+//!   union or trait, a lint declared at `Deny` or `Forbid` with `declare_lint!` or
+//!   `declare_tool_lint!` (one below `Deny` fails no gate, so it is an edit), a lint pass
+//!   declared with `declare_lint_pass!`, a test module, and in a new file an import without a
+//!   glob, in an existing file a file module `mod name;`. Its attributes, and those of
+//!   everything in it, are only those of [`ATTRIBUTES`]; it, a test or test module among it,
+//!   names none of
+//!   [`SENSITIVE`] and uses none of [`INPUT_MACROS`]; it holds no `unsafe` code, `extern`
+//!   block, associated constant (a constant is an edit at any depth, since no mutant tests its
+//!   value), or `impl`, trait, module or `macro_rules!` nested inside; and in an existing file
+//!   its name is no
+//!   identifier of the base's file, so that it shadows nothing the existing code names (a
+//!   prelude item such as `drop`, an import, a glob). A new `impl` is additive only for a type
+//!   new in the same file, named by one plain segment, with no type or const parameters and no
+//!   `where` clause, and with lifetime parameters only where they appear in the trait path and
+//!   the method signatures alone (`impl<'tcx> LateLintPass<'tcx> for NewPass`). Its trait may be
+//!   any trait: an `impl` for a plain new type cannot change which method a call on an existing
+//!   type resolves to. Any other `impl` (of an existing type, in another file, generic or
+//!   blanket) can override a trait method or change which method an existing call resolves to,
+//!   so it is an edit;
+//! - (b) a dispatch call ([`dispatch`]): a statement inserted at the top level of an existing
+//!   function's body that calls a new function with shared references and literals only, hands
+//!   the result of a new function returning `Vec<Violation>` to `extend` on a report list of
+//!   that function ([`sinks`]), or registers a new lint or lint pass; each new item is
+//!   dispatched once;
+//! - (c) new registry rows, and changed rows that the data checks prove only tighten: no
+//!   changed field outside those the rule-set check compares or that only document
+//!   ([`super::dialect::registry::unproven_rows`]);
+//! - (d) new fixtures, UI cases and other new files in the rule paths, but no manifest or build
+//!   file ([`BUILD_FILES`]); and the items of a new test module, and new items inside an
+//!   existing test module whose existing items stay as they are, if they name none of
+//!   [`SENSITIVE`], use none of [`INPUT_MACROS`], and pass [`test_item_problem`]: the
+//!   attribute, nesting and `unsafe` checks of (a) at every depth, no constant, static,
+//!   `extern` block, module or macro, and an `impl` only of a type the test module declares
+//!   (review of #55, thread 1); and a null-mutant run shows that no test depends on the source
+//!   text of a mutated file ([`super::mutants`]);
+//! - (e) a changed documentation field of a registry row, and a changed doc comment anywhere;
+//! - (f) the regenerated `docs/RULES.md`.
+//!
+//! Everything else is an edit: a changed or removed function, method, constant, static, type,
+//! `impl`, trait, import, macro or test; a new member of an existing `impl`; a new constant,
+//! static, macro or inline module; a changed or deleted fixture, UI case or other file. Items
+//! are compared token for token, with doc comments left out.
+
+pub mod dispatch;
+pub mod sinks;
+
+use super::dialect;
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use syn::spanned::Spanned;
+
+/// Names that reach the environment, the clock, processes, threads, the network or files:
+/// `std::env`, `env!`, `option_env!`, `std::time`, `std::process`, `std::thread`, `std::net`,
+/// `std::fs`, `std::io`, the methods of `Path` that ask the file system, and the workspace root
+/// that xtask's helpers read the tree from. `File` and `OpenOptions` are reached through `fs`,
+/// so `syn::File` is no such name. New code that names one, a test among it, can pin the file
+/// it tests or behave differently in CI than where the ratchet observes it, so it is an edit.
+pub const SENSITIVE: [&str; 23] = [
+    "time",
+    "SystemTime",
+    "Instant",
+    "thread",
+    "net",
+    "workspace_root",
+    "symlink_metadata",
+    "env",
+    "option_env",
+    "process",
+    "Command",
+    "fs",
+    "io",
+    "read_to_string",
+    "read_dir",
+    "read_link",
+    "exists",
+    "try_exists",
+    "is_file",
+    "is_dir",
+    "is_symlink",
+    "metadata",
+    "canonicalize",
+];
+
+/// The attributes a new item may carry.
+pub const ATTRIBUTES: [&str; 6] = ["doc", "derive", "must_use", "inline", "expect", "test"];
+
+/// The macros that may declare a new lint or lint pass as an item.
+const LINT_MACROS: [&str; 3] = ["declare_lint", "declare_tool_lint", "declare_lint_pass"];
+
+/// The macro that declares a lint pass, a new type.
+const PASS_MACRO: &str = "declare_lint_pass";
+
+/// The generated rule list, which is additive whatever changed in it.
+const RULES_DOC: &str = "docs/RULES.md";
+
+/// Upper bound on the token trees of one item, so that every walk is bounded.
+const TOKENS_MAX: u32 = 2_000_000;
+
+/// The class of a rule-path diff, with what makes it an edit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Class {
+    /// One line per change to existing rule code; empty for an additive diff.
+    pub edits: Vec<String>,
+    /// The head lines of every dispatch call, by file: the new rule's case shows that it runs,
+    /// so a hunk of them needs no mutant of its own.
+    pub dispatch: BTreeMap<String, Vec<(u32, u32)>>,
+    /// The base lines of every statement that a dispatch call replaced, a registration with
+    /// new lints appended, by file: the other side of such a hunk.
+    pub replaced: BTreeMap<String, Vec<(u32, u32)>>,
+    /// The head lines of every new item that holds no code a mutant could change, by file: a
+    /// lint or lint pass declared by macro, a file module's declaration, a struct, an enum or
+    /// a union. The new code that uses them has the mutants, and the new cases show what they
+    /// declare (review of #57, round 8: the canonical new lint had three hunks without one).
+    pub declarations: BTreeMap<String, Vec<(u32, u32)>>,
+    /// The manifests and build files of the rule paths that the diff touches. Each is an edit
+    /// that only a code owner's approval settles, not the reviewer app's (review of #55,
+    /// round 3: the maintainer's decision).
+    pub build_files: Vec<String>,
+}
+
+impl Class {
+    /// True if the diff edits existing rule code.
+    #[must_use]
+    pub fn is_edit(&self) -> bool {
+        !self.edits.is_empty()
+    }
+
+    /// The class's name, as the verdict lines print it.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        if self.is_edit() { "edit" } else { "additive" }
+    }
+}
+
+/// Sorts the changed rule paths `rule_paths` into additive or edit, reading both trees as data.
+///
+/// # Errors
+///
+/// No verdict: a file that cannot be read, or a Rust file that does not parse.
+pub fn classify(base: &Path, head: &Path, rule_paths: &[String]) -> Result<Class, String> {
+    let mut class = Class::default();
+    let mut code = Vec::new();
+    for path in rule_paths {
+        let before = super::source::read_optional(base, path)?;
+        let after = super::source::read_optional(head, path)?;
+        if is_build_file(path) {
+            class.edits.push(format!(
+                "{path}: a manifest or build file in the rule paths, which can change how the rule \
+                 code builds (review of #55)"
+            ));
+            class.build_files.push(path.clone());
+        } else if is_code(path) {
+            code.push(Code::read(path, before, after)?);
+        } else if path != RULES_DOC && before.is_some() {
+            let what = if after.is_some() { "changed" } else { "deleted" };
+            class.edits.push(format!("{path}: an existing file of the rule paths is {what}"));
+        }
+    }
+    let new = new_names(&code)?;
+    let mut dispatched = BTreeSet::new();
+    for file in &code {
+        file.judge(&new, &mut class, &mut dispatched)?;
+    }
+    if rule_paths.iter().any(|path| path == super::source::REGISTRY) {
+        let read = |root: &Path| super::source::read_optional(root, super::source::REGISTRY);
+        if let (Some(before), Some(after)) = (read(base)?, read(head)?) {
+            class.edits.extend(dialect::registry::unproven_rows(&before, &after)?);
+        }
+    }
+    assert!(class.dispatch.keys().all(|path| rule_paths.contains(path)), "dispatch is changed");
+    Ok(class)
+}
+
+/// True for a rule-path Rust file that is code: the lint library and the rule modules, not a
+/// UI case or a fixture.
+fn is_code(path: &str) -> bool {
+    let rust = Path::new(path).extension().is_some_and(|extension| extension == "rs");
+    rust && !path.starts_with("lints/ui/") && !path.starts_with("xtask/fixtures/")
+}
+
+/// The names of the files that tell cargo or rustup how to build: a new one in a rule path is
+/// an edit, and so is a changed or deleted one.
+const BUILD_FILES: [&str; 6] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+    "config.toml",
+];
+
+/// True for a manifest or build file, by its name, or anything below a `.cargo` directory.
+fn is_build_file(path: &str) -> bool {
+    let name = Path::new(path).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
+    BUILD_FILES.contains(&name) || path.split('/').any(|part| part == ".cargo")
+}
+
+/// True for a new item that holds no code a mutant could change: a lint or lint pass declared
+/// by macro, a file module's declaration, a struct, an enum or a union.
+fn is_declaration(item: &syn::Item) -> bool {
+    match item {
+        syn::Item::Macro(declared) => lint_macro_name(&declared.mac).is_some(),
+        syn::Item::Mod(module) => module.content.is_none(),
+        syn::Item::Struct(_) | syn::Item::Enum(_) | syn::Item::Union(_) => true,
+        syn::Item::Const(_)
+        | syn::Item::ExternCrate(_)
+        | syn::Item::Fn(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Impl(_)
+        | syn::Item::Static(_)
+        | syn::Item::Trait(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Type(_)
+        | syn::Item::Use(_)
+        | syn::Item::Verbatim(_)
+        | _ => false,
+    }
+}
+
+/// A line number of a span, as the hunks count them.
+fn line_of(position: usize) -> u32 {
+    u32::try_from(position).expect("source files have fewer than 2^32 lines")
+}
+
+/// One side of a changed Rust file: its text, which the spans point into, and its syntax.
+struct Side {
+    text: String,
+    file: syn::File,
+}
+
+/// One changed Rust file of the rule paths: its two sides, parsed.
+struct Code {
+    path: String,
+    base: Option<Side>,
+    head: Option<Side>,
+}
+
+impl Code {
+    fn read(path: &str, base: Option<String>, head: Option<String>) -> Result<Self, String> {
+        let parse = |side: Option<String>| -> Result<Option<Side>, String> {
+            let Some(text) = side else {
+                return Ok(None);
+            };
+            let file = syn::parse_file(&text)
+                .map_err(|error| format!("{path} does not parse: {error}"))?;
+            Ok(Some(Side { text, file }))
+        };
+        let code = Self { path: path.to_owned(), base: parse(base)?, head: parse(head)? };
+        assert!(code.base.is_some() || code.head.is_some(), "a changed file is on one side");
+        Ok(code)
+    }
+
+    /// The head's top-level items that the base does not have, by key: every item of a new
+    /// file. The registry's tables are judged as data, not here.
+    fn new_items(&self) -> Result<Vec<(String, &syn::Item)>, String> {
+        let Some(head) = &self.head else {
+            return Ok(Vec::new());
+        };
+        let after = keyed(&self.path, head)?;
+        let before = match &self.base {
+            Some(base) => keyed(&self.path, base)?,
+            None => Vec::new(),
+        };
+        let known: BTreeSet<&String> = before.iter().map(|(key, _)| key).collect();
+        Ok(after.into_iter().filter(|(key, _)| !known.contains(key)).collect())
+    }
+
+    /// Judges the file's changes, and records each edit and dispatch call in `class`.
+    fn judge(
+        &self,
+        new: &NewNames,
+        class: &mut Class,
+        dispatched: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        let Some(head) = &self.head else {
+            class.edits.push(format!("{}: an existing rule-path file is deleted", self.path));
+            return Ok(());
+        };
+        let base_names = match &self.base {
+            Some(base) => Some(file_identifiers(&self.path, &base.text)?),
+            None => None,
+        };
+        for (key, item) in self.new_items()? {
+            let named = identifiers_at(&self.path, &head.text, item.span())?;
+            let shadowed = base_names.as_ref();
+            let tokens = tokens_at(&self.path, &head.text, item.span())?;
+            let found = NewItem { path: &self.path, item, named: &named, tokens };
+            if let Some(problem) = found.problem(shadowed, new) {
+                class.edits.push(format!("{}: the new item `{key}` {problem}", self.path));
+            } else if is_declaration(item) {
+                let lines = (line_of(item.span().start().line), line_of(item.span().end().line));
+                class.declarations.entry(self.path.clone()).or_default().push(lines);
+            }
+        }
+        let Some(base) = &self.base else {
+            return Ok(());
+        };
+        let mut existing = Existing { code: self, base, head, new, class, dispatched };
+        existing.compare()
+    }
+}
+
+/// The new items of the diff that a dispatch call or an `impl` may name, by the file that
+/// defines them: a name alone would let a new type in one file vouch for an `impl` of an
+/// existing type of the same name in another (review of #57, round 5).
+#[derive(Debug, Default)]
+pub struct NewNames {
+    /// `(file, function)`: new top-level functions.
+    pub functions: BTreeSet<(String, String)>,
+    /// `(file, type)`: new structs, enums, unions, traits and lint passes.
+    pub types: BTreeSet<(String, String)>,
+    /// New lints, by their declared name, which is unique in the lint library.
+    pub lints: BTreeSet<String>,
+    /// `(file, function)`: the new top-level functions whose return type is exactly
+    /// `Vec<Violation>`, the only ones whose result a dispatch call may `extend` a report list
+    /// with.
+    pub reports: BTreeSet<(String, String)>,
+}
+
+/// The new functions, types and lints of every changed file.
+fn new_names(code: &[Code]) -> Result<NewNames, String> {
+    let mut new = NewNames::default();
+    for file in code {
+        for (_, item) in file.new_items()? {
+            new.add(&file.path, item);
+        }
+    }
+    Ok(new)
+}
+
+impl NewNames {
+    /// Records what the new `item` of the file `path` defines.
+    fn add(&mut self, path: &str, item: &syn::Item) {
+        let before = self.functions.len() + self.types.len() + self.lints.len();
+        let at = |name: String| (path.to_owned(), name);
+        if let syn::Item::Fn(function) = item {
+            let _new = self.functions.insert(at(function.sig.ident.to_string()));
+            if let syn::ReturnType::Type(_, returned) = &function.sig.output
+                && sinks::is_report_list(returned)
+            {
+                let _report = self.reports.insert(at(function.sig.ident.to_string()));
+            }
+        } else if let syn::Item::Macro(declared) = item
+            && let Some(name) = lint_macro_name(&declared.mac)
+        {
+            let segments = &declared.mac.path.segments;
+            let is_pass = segments.last().is_some_and(|last| last.ident == PASS_MACRO);
+            let _new = if is_pass { self.types.insert(at(name)) } else { self.lints.insert(name) };
+        } else if let Some(name) = type_name(item) {
+            let _new = self.types.insert(at(name));
+        }
+        let after = self.functions.len() + self.types.len() + self.lints.len();
+        assert!(after <= before + 1, "an item defines at most one name");
+    }
+}
+
+/// The name of a type an item defines and an `impl` may be for. A type alias is none: an
+/// `impl` of an alias is an `impl` of the type it names.
+fn type_name(item: &syn::Item) -> Option<String> {
+    let ident = match item {
+        syn::Item::Struct(item) => &item.ident,
+        syn::Item::Enum(item) => &item.ident,
+        syn::Item::Union(item) => &item.ident,
+        syn::Item::Trait(item) => &item.ident,
+        syn::Item::Const(_)
+        | syn::Item::ExternCrate(_)
+        | syn::Item::Fn(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Impl(_)
+        | syn::Item::Macro(_)
+        | syn::Item::Mod(_)
+        | syn::Item::Static(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Type(_)
+        | syn::Item::Use(_)
+        | syn::Item::Verbatim(_)
+        | _ => return None,
+    };
+    Some(ident.to_string())
+}
+
+/// The name a lint-declaring macro defines: the lint of `declare_lint! { pub NAME, .. }`, the
+/// last name before the first comma, or the pass of `declare_lint_pass!(Name => [..])`, the
+/// first name. `None` for any other macro.
+fn lint_macro_name(mac: &syn::Macro) -> Option<String> {
+    let macro_name = mac.path.segments.last()?.ident.to_string();
+    if !LINT_MACROS.contains(&macro_name.as_str()) {
+        return None;
+    }
+    let mut names = Vec::new();
+    for tree in mac.tokens.clone() {
+        match tree {
+            TokenTree::Punct(punct) if punct.as_char() == ',' => break,
+            TokenTree::Ident(ident) if ident != "pub" => names.push(ident.to_string()),
+            TokenTree::Punct(_)
+            | TokenTree::Group(_)
+            | TokenTree::Ident(_)
+            | TokenTree::Literal(_) => {}
+        }
+    }
+    if macro_name == PASS_MACRO { names.first().cloned() } else { names.last().cloned() }
+}
+
+/// A new top-level item of a changed file, as the class judges it.
+struct NewItem<'a> {
+    /// The file that holds it.
+    path: &'a str,
+    item: &'a syn::Item,
+    /// Its identifiers, macro bodies included.
+    named: &'a BTreeSet<String>,
+    /// Its tokens.
+    tokens: TokenStream,
+}
+
+impl NewItem<'_> {
+    /// What makes the item an edit, if anything. `shadowed` are the identifiers of the base's
+    /// file, for an existing file.
+    fn problem(&self, shadowed: Option<&BTreeSet<String>>, new: &NewNames) -> Option<String> {
+        if let Some(problem) = reads_outside(self.tokens.clone(), self.named) {
+            return Some(problem);
+        }
+        if let Some(problem) = compiler_state(self.path, self.named) {
+            return Some(problem);
+        }
+        if let syn::Item::Mod(module) = self.item
+            && dialect::is_test_module(module)
+        {
+            // Every item of a new test module is judged as a new item of an existing one is
+            // (review of #55, thread 1).
+            return module_items(module).iter().find_map(|item| {
+                let problem = test_item_problem(item, module)?;
+                Some(format!("holds a test item that {problem}"))
+            });
+        }
+        let attributes = item_attributes(self.item);
+        if let Some(attribute) = attributes.iter().find(|attribute| !is_allowed(attribute)) {
+            let name = dialect::path_text(attribute.path());
+            return Some(format!("carries the attribute `{name}`, which can change what it does"));
+        }
+        if let Some(nested) = nested_item(self.item) {
+            return Some(nested);
+        }
+        if let Some(problem) = kind_problem(self.item, self.path, shadowed.is_some(), new) {
+            return Some(problem);
+        }
+        let defined = defined_name(self.item)?;
+        let shadows = shadowed.is_some_and(|names| names.contains(&defined));
+        shadows.then(|| {
+            format!(
+                "is named `{defined}`, a name the base's code of this file uses, so it can \
+                 shadow what that code names"
+            )
+        })
+    }
+}
+
+/// What makes new code, a test or a test module among it, read from outside: one of
+/// [`INPUT_MACROS`] in `tokens`, or one of [`SENSITIVE`] among `named`. A test that pins the
+/// file it tests, as it compiles (`include_str!(file!())`) or as it runs
+/// (`std::fs::read_to_string`), kills every mutant of the file without testing a rule; other
+/// code can behave differently in CI than where the ratchet observes it (review of #57,
+/// rounds 5 and 6).
+fn reads_outside(tokens: TokenStream, named: &BTreeSet<String>) -> Option<String> {
+    if let Some(input) = input_macro(tokens) {
+        return Some(format!(
+            "uses `{input}!`, which reads the source tree or the environment as it compiles, so \
+             a test can pin the file rather than the rule"
+        ));
+    }
+    let sensitive = SENSITIVE.iter().find(|name| named.contains(**name))?;
+    Some(format!(
+        "names `{sensitive}`: new code that reads the environment, the clock, a process, a \
+         thread, the network or a file can pin the file rather than the rule, or behave \
+         differently in CI than where the ratchet observes it"
+    ))
+}
+
+/// The names that reach the compiler's shared state from lint code: the diagnostic context
+/// and the session, and the calls that reset, steal or flush what other lints reported. A name
+/// is refused if it equals one of them or starts with one followed by `_` (`steal_*`,
+/// `emit_stashed_*`); `sessions` or `dcxs` pass, as names that reach nothing. A new lint pass
+/// shares the `LateContext` with the existing ones, so `cx.tcx.dcx().reset_err_count()` in its
+/// `check_crate_post` would make the reports of `nami_recursion` exit 0 (review of #57,
+/// round 7). `lint::exits_agree` turns such a run into no verdict; this refuses it earlier.
+pub const COMPILER_STATE: [&str; 7] =
+    ["dcx", "sess", "session", "reset_err_count", "steal", "abort_if_errors", "emit_stashed"];
+
+/// What makes new lint code in `path` reach the compiler's shared state, if it names one of
+/// [`COMPILER_STATE`] among `named`.
+fn compiler_state(path: &str, named: &BTreeSet<String>) -> Option<String> {
+    if !path.starts_with("lints/src/") {
+        return None;
+    }
+    let found = named.iter().find(|name| {
+        COMPILER_STATE.iter().any(|state| {
+            name.as_str() == *state
+                || name.strip_prefix(state).is_some_and(|rest| rest.starts_with('_'))
+        })
+    })?;
+    Some(format!(
+        "names `{found}`, which reaches the compiler's diagnostics or session, shared with the \
+         existing lints"
+    ))
+}
+
+/// The macros that read the source tree or the environment as code compiles. A new item,
+/// a test among them, may not use them: a test that pins `include_str!(file!())` kills every
+/// mutant of the file without testing a rule (review of #57, round 5).
+pub const INPUT_MACROS: [&str; 6] =
+    ["include", "include_str", "include_bytes", "file", "env", "option_env"];
+
+/// The first of [`INPUT_MACROS`] that `stream` invokes, macro bodies included.
+fn input_macro(stream: TokenStream) -> Option<String> {
+    let mut pending: Vec<Vec<TokenTree>> = vec![stream.into_iter().collect()];
+    for _ in 0..TOKENS_MAX {
+        let sequence = pending.pop()?;
+        for pair in sequence.windows(2) {
+            if let [TokenTree::Ident(name), TokenTree::Punct(bang)] = pair
+                && bang.as_char() == '!'
+                && INPUT_MACROS.iter().any(|input| name == input)
+            {
+                return Some(name.to_string());
+            }
+        }
+        for tree in sequence {
+            if let TokenTree::Group(group) = tree {
+                pending.push(group.stream().into_iter().collect());
+            }
+        }
+    }
+    panic!("an item has more than {TOKENS_MAX} token sequences");
+}
+
+/// What makes an item of the test module `module`, a new one or a new item of an existing one,
+/// an edit (review of #55, thread 1): an attribute outside [`ATTRIBUTES`] on it; what
+/// [`nested_item`] refuses at any depth in it (`unsafe` code, an `extern` block, a nested
+/// constant, `impl`, trait, module or `macro_rules!`); or a kind that a test needs not: a
+/// constant or static, an `extern` block, a module, a macro, a type alias, or an `impl` other
+/// than a plain one of a type that `module` declares.
+fn test_item_problem(item: &syn::Item, module: &syn::ItemMod) -> Option<String> {
+    let attributes = item_attributes(item);
+    if let Some(attribute) = attributes.iter().find(|attribute| !is_allowed(attribute)) {
+        let name = dialect::path_text(attribute.path());
+        return Some(format!("carries the attribute `{name}`, which can change what it does"));
+    }
+    if let Some(nested) = nested_item(item) {
+        return Some(nested);
+    }
+    match item {
+        syn::Item::Fn(_)
+        | syn::Item::Struct(_)
+        | syn::Item::Enum(_)
+        | syn::Item::Union(_)
+        | syn::Item::Trait(_)
+        | syn::Item::Use(_) => None,
+        syn::Item::Impl(block) => test_impl_problem(block, module),
+        syn::Item::Const(_) | syn::Item::Static(_) => Some(
+            "is a constant or static: mutation testing makes no mutant for its value".to_owned(),
+        ),
+        syn::Item::ExternCrate(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Macro(_)
+        | syn::Item::Mod(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Type(_)
+        | syn::Item::Verbatim(_)
+        | _ => Some(
+            "is not a function, a type, an import or a plain `impl` of a type of the test \
+             module"
+                .to_owned(),
+        ),
+    }
+}
+
+/// What makes an `impl` in the test module `module` an edit: a self type that is not a single
+/// name of a struct, enum, union or trait that `module` declares, such as an existing type of
+/// the rule code, or generic parameters or a `where` clause, which can make it apply to more.
+fn test_impl_problem(block: &syn::ItemImpl, module: &syn::ItemMod) -> Option<String> {
+    let declared: BTreeSet<String> = module_items(module).iter().filter_map(type_name).collect();
+    let named = if let syn::Type::Path(path) = &*block.self_ty
+        && path.qself.is_none()
+    {
+        path.path.get_ident().map(ToString::to_string)
+    } else {
+        None
+    };
+    let local = named.is_some_and(|name| declared.contains(&name));
+    let plain = block.generics.params.is_empty() && block.generics.where_clause.is_none();
+    (!local || !plain).then(|| {
+        "is an `impl` of a type the test module does not declare, or a generic one, which can \
+         change what existing code calls"
+            .to_owned()
+    })
+}
+
+/// What `item` holds, at any depth, that makes it an edit: an `impl`, a trait, a module, a
+/// `macro_rules!`, a constant or a static nested below it; an attribute outside [`ATTRIBUTES`]
+/// on anything in it, an `impl` or trait member among them; and `unsafe` code, an `unsafe
+/// impl` or an `extern` block (review of #57, round 6).
+fn nested_item(item: &syn::Item) -> Option<String> {
+    let mut finder = Nested { depth: 0, found: None };
+    syn::visit::Visit::visit_item(&mut finder, item);
+    assert_eq!(finder.depth, 0, "every item that was entered was left");
+    finder.found
+}
+
+/// Finds what may not be inside a new item.
+struct Nested {
+    /// How many items deep the walk is; the new item itself is at 0.
+    depth: u32,
+    found: Option<String>,
+}
+
+impl Nested {
+    fn flag(&mut self, problem: String) {
+        if self.found.is_none() {
+            self.found = Some(problem);
+        }
+    }
+}
+
+/// The kind of an item that may not nest in a new item, if `node` is one.
+fn nested_kind(node: &syn::Item) -> Option<&'static str> {
+    if let syn::Item::Impl(_) = node {
+        return Some("an `impl`");
+    }
+    if let syn::Item::Trait(_) = node {
+        return Some("a trait");
+    }
+    if let syn::Item::Mod(_) = node {
+        return Some("a module");
+    }
+    if let syn::Item::Const(_) | syn::Item::Static(_) = node {
+        return Some("a constant or static");
+    }
+    if let syn::Item::Macro(declared) = node
+        && declared.mac.path.is_ident("macro_rules")
+    {
+        return Some("a `macro_rules!`");
+    }
+    None
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Nested {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if self.depth > 0
+            && let Some(kind) = nested_kind(node)
+        {
+            self.flag(format!(
+                "holds {kind} inside it, which can reach existing items, or hold a value no \
+                 mutant tests, from where the class does not look"
+            ));
+        }
+        if let syn::Item::ForeignMod(_) = node {
+            self.flag("holds an `extern` block, which is `unsafe` to call".to_owned());
+        }
+        self.depth += 1;
+        syn::visit::visit_item(self, node);
+        self.depth -= 1;
+    }
+
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        if !is_allowed(node) {
+            let name = dialect::path_text(node.path());
+            self.flag(format!(
+                "carries the attribute `{name}` inside it, which can change what it does"
+            ));
+        }
+        syn::visit::visit_attribute(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node.unsafety.is_some() {
+            self.flag("is or holds an `unsafe impl`".to_owned());
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if node.unsafety.is_some() {
+            self.flag("is or holds an `unsafe trait`".to_owned());
+        }
+        syn::visit::visit_item_trait(self, node);
+    }
+
+    fn visit_signature(&mut self, node: &'ast syn::Signature) {
+        if matches!(node.safety, syn::Safety::Unsafe(_)) {
+            self.flag("is or holds an `unsafe fn`".to_owned());
+        }
+        syn::visit::visit_signature(self, node);
+    }
+
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        self.flag("holds an `unsafe` block".to_owned());
+        syn::visit::visit_expr_unsafe(self, node);
+    }
+
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        self.flag(
+            "holds an associated constant: like a top-level one, mutation testing makes no \
+             mutant for its value"
+                .to_owned(),
+        );
+        syn::visit::visit_impl_item_const(self, node);
+    }
+
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        self.flag(
+            "holds an associated constant: like a top-level one, mutation testing makes no \
+             mutant for its value"
+                .to_owned(),
+        );
+        syn::visit::visit_trait_item_const(self, node);
+    }
+}
+
+/// What makes a new `impl` in the file `path` an edit, if anything. It is additive only for a
+/// type new in the same file, named by a single plain segment, with no type or const
+/// parameters and no `where` clause; of any trait, since an `impl` for a plain new type
+/// cannot change which method a call on an existing type resolves to. Lifetime parameters are
+/// allowed, without bounds, when they appear only in the trait path and in method signatures,
+/// as in `impl<'tcx> LateLintPass<'tcx> for NewPass`. An `impl` of an existing type, one in
+/// another file, or a generic or blanket one (`impl<T> Quiet for T`, even when `T` shadows the
+/// new type's name) can override a trait method or change which method an existing call
+/// resolves to (review of #57, round 5).
+fn impl_problem(block: &syn::ItemImpl, path: &str, new: &NewNames) -> Option<String> {
+    let own = self_type(&block.self_ty)
+        .is_some_and(|(name, plain)| plain && new.types.contains(&(path.to_owned(), name)));
+    let mut lifetimes = Vec::new();
+    let mut parameters = true;
+    for parameter in &block.generics.params {
+        if let syn::GenericParam::Lifetime(lifetime) = parameter
+            && lifetime.attrs.is_empty()
+            && lifetime.bounds.is_empty()
+        {
+            lifetimes.push(lifetime.lifetime.ident.to_string());
+        } else {
+            parameters = false;
+        }
+    }
+    if !own || !parameters || block.generics.where_clause.is_some() {
+        return Some(
+            "is an `impl` that is not of a type new in this file, written plainly and without \
+             type or const parameters or a `where` clause; such an `impl` can override a trait \
+             method or change which method an existing call resolves to"
+                .to_owned(),
+        );
+    }
+    let mut finder = Lifetimes { names: &lifetimes, found: None };
+    for member in &block.items {
+        if let syn::ImplItem::Fn(method) = member {
+            syn::visit::Visit::visit_block(&mut finder, &method.block);
+        } else {
+            syn::visit::Visit::visit_impl_item(&mut finder, member);
+        }
+    }
+    finder.found.map(|lifetime| {
+        format!("uses its lifetime `'{lifetime}` outside the trait path and the method signatures")
+    })
+}
+
+/// The first of `names` that `sequence` writes as a lifetime, `'name`, at its top level.
+fn quoted_lifetime(sequence: &[TokenTree], names: &[String]) -> Option<String> {
+    sequence.windows(2).find_map(|pair| {
+        let [TokenTree::Punct(quote), TokenTree::Ident(name)] = pair else {
+            return None;
+        };
+        let named = quote.as_char() == '\'' && names.iter().any(|lifetime| name == lifetime);
+        named.then(|| name.to_string())
+    })
+}
+
+/// Finds a use of one of `names` as a lifetime, macro bodies included.
+struct Lifetimes<'n> {
+    names: &'n [String],
+    found: Option<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Lifetimes<'_> {
+    fn visit_lifetime(&mut self, node: &'ast syn::Lifetime) {
+        let name = node.ident.to_string();
+        if self.found.is_none() && self.names.contains(&name) {
+            self.found = Some(name);
+        }
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let mut pending: Vec<Vec<TokenTree>> = vec![node.tokens.clone().into_iter().collect()];
+        for _ in 0..TOKENS_MAX {
+            let Some(sequence) = pending.pop() else {
+                return;
+            };
+            if self.found.is_none() {
+                self.found = quoted_lifetime(&sequence, self.names);
+            }
+            pending.extend(sequence.into_iter().filter_map(|tree| match tree {
+                TokenTree::Group(group) => Some(group.stream().into_iter().collect()),
+                TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => None,
+            }));
+        }
+        panic!("a macro has more than {TOKENS_MAX} token sequences");
+    }
+}
+
+/// What makes a new lint that `mac` declares an edit: a level below `Deny`, at which its reports
+/// do not fail the gate, so that the lint corpus and the new case say nothing about it (review
+/// of #57, round 9), or a declaration whose level cannot be read. A lint pass has no level.
+fn lint_level_problem(mac: &syn::Macro) -> Option<String> {
+    if mac.path.segments.last().is_some_and(|last| last.ident == PASS_MACRO) {
+        return None;
+    }
+    let declared = crate::tidy::lints::declarations_in(&mac.tokens.to_string());
+    match declared.as_slice() {
+        [lint] if lint.is_enforced() => None,
+        [lint] => Some(format!(
+            "declares the lint `{}` at `{}`, below `Deny`: a new lint that does not fail the \
+             gate is an edit",
+            lint.name, lint.level
+        )),
+        _ => Some(
+            "declares a lint whose level cannot be read as one `pub NAME, Level, \"description\"`"
+                .to_owned(),
+        ),
+    }
+}
+
+/// What makes a new item of this kind in the file `path` an edit, if anything.
+fn kind_problem(
+    item: &syn::Item,
+    path: &str,
+    existing_file: bool,
+    new: &NewNames,
+) -> Option<String> {
+    match item {
+        syn::Item::Fn(_)
+        | syn::Item::Struct(_)
+        | syn::Item::Enum(_)
+        | syn::Item::Union(_)
+        | syn::Item::Trait(_) => None,
+        syn::Item::Impl(block) => impl_problem(block, path, new),
+        syn::Item::Macro(item) if lint_macro_name(&item.mac).is_some() => {
+            lint_level_problem(&item.mac)
+        }
+        syn::Item::Use(import) if !existing_file && !is_glob(&import.tree) => None,
+        syn::Item::Mod(module) if existing_file && module.content.is_none() => None,
+        syn::Item::Const(_) | syn::Item::Static(_) => Some(
+            "is a constant or static: mutation testing makes no mutant for its value".to_owned(),
+        ),
+        syn::Item::Use(_) => Some("is an import into an existing module, or a glob".to_owned()),
+        syn::Item::ExternCrate(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Macro(_)
+        | syn::Item::Mod(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Type(_)
+        | syn::Item::Verbatim(_)
+        | _ => Some("is not a function, a type, an `impl` of a new type or a lint".to_owned()),
+    }
+}
+
+/// The type an `impl` is for, if it is a path without a qualified self: the name of its last
+/// segment, and whether it is that single segment alone, with no arguments and no leading
+/// `::`, as an additive `impl` needs.
+fn self_type(self_ty: &syn::Type) -> Option<(String, bool)> {
+    let syn::Type::Path(path) = self_ty else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let last = path.path.segments.last()?;
+    let plain = path.path.segments.len() == 1
+        && path.path.leading_colon.is_none()
+        && last.arguments.is_none();
+    Some((last.ident.to_string(), plain))
+}
+
+/// True if an import tree holds a glob, which can shadow names.
+fn is_glob(tree: &syn::UseTree) -> bool {
+    let mut pending = vec![tree];
+    for _ in 0..TOKENS_MAX {
+        let Some(part) = pending.pop() else {
+            return false;
+        };
+        match part {
+            syn::UseTree::Glob(_) => return true,
+            syn::UseTree::Path(path) => pending.push(&path.tree),
+            syn::UseTree::Group(group) => pending.extend(group.items.iter()),
+            syn::UseTree::Name(_) | syn::UseTree::Rename(_) => {}
+        }
+    }
+    panic!("an import tree has more than {TOKENS_MAX} parts");
+}
+
+/// The name a new item binds in its module, for the shadowing check.
+fn defined_name(item: &syn::Item) -> Option<String> {
+    if let syn::Item::Fn(function) = item {
+        return Some(function.sig.ident.to_string());
+    }
+    if let syn::Item::Mod(module) = item {
+        return Some(module.ident.to_string());
+    }
+    if let syn::Item::Macro(declared) = item {
+        return lint_macro_name(&declared.mac);
+    }
+    type_name(item)
+}
+
+/// True for an attribute a new item may carry.
+fn is_allowed(attribute: &syn::Attribute) -> bool {
+    ATTRIBUTES.iter().any(|name| attribute.path().is_ident(name))
+}
+
+/// The outer attributes of an item; none for a form syn does not know.
+fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Verbatim(_) | _ => &[],
+    }
+}
+
+/// The tokens of `text` at `span`.
+fn tokens_at(path: &str, text: &str, span: Span) -> Result<TokenStream, String> {
+    let source = text
+        .get(span.byte_range())
+        .ok_or_else(|| format!("{path}: a span lies outside its file"))?;
+    source.parse().map_err(|error| format!("{path}: an item does not lex: {error}"))
+}
+
+/// Every identifier of the file `text`, macro bodies and attributes included.
+fn file_identifiers(path: &str, text: &str) -> Result<BTreeSet<String>, String> {
+    let tokens: TokenStream =
+        text.parse().map_err(|error| format!("{path} does not lex: {error}"))?;
+    Ok(dialect::identifiers(tokens).iter().map(ToString::to_string).collect())
+}
+
+/// Every identifier of `text` at `span`, macro bodies included.
+fn identifiers_at(path: &str, text: &str, span: Span) -> Result<BTreeSet<String>, String> {
+    let tokens = tokens_at(path, text, span)?;
+    Ok(dialect::identifiers(tokens).iter().map(ToString::to_string).collect())
+}
+
+/// The tokens of `text` at `span` as flat text without doc comments, so that a changed comment
+/// changes nothing.
+fn normal_at(path: &str, text: &str, span: Span) -> Result<String, String> {
+    Ok(normal(tokens_at(path, text, span)?))
+}
+
+/// One step of [`normal`]'s walk: a token tree, or the end of a group.
+enum Piece {
+    Tree(TokenTree),
+    Close(&'static str),
+}
+
+/// `stream` as flat text, every `#[doc ..]` and `#![doc ..]` left out.
+fn normal(stream: TokenStream) -> String {
+    let mut pending: Vec<Piece> = stream.into_iter().map(Piece::Tree).collect();
+    pending.reverse();
+    let mut words: Vec<String> = Vec::new();
+    for _ in 0..TOKENS_MAX {
+        let Some(piece) = pending.pop() else {
+            return words.join(" ");
+        };
+        let tree = match piece {
+            Piece::Close(close) => {
+                words.push(close.to_owned());
+                continue;
+            }
+            Piece::Tree(tree) => tree,
+        };
+        match tree {
+            TokenTree::Punct(punct) if punct.as_char() == '#' && doc_follows(&pending) > 0 => {
+                let skipped = doc_follows(&pending);
+                pending.truncate(pending.len() - skipped);
+            }
+            TokenTree::Group(group) => {
+                let (open, close) = match group.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::None => ("", ""),
+                };
+                words.push(open.to_owned());
+                pending.push(Piece::Close(close));
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                pending.extend(inner.into_iter().rev().map(Piece::Tree));
+            }
+            other @ (TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_)) => {
+                words.push(other.to_string());
+            }
+        }
+    }
+    panic!("an item has more than {TOKENS_MAX} token trees");
+}
+
+/// How many pieces after a `#` make up a doc attribute: 1 for `[doc ..]`, 2 for `![doc ..]`,
+/// and 0 if none does.
+fn doc_follows(pending: &[Piece]) -> usize {
+    let is_doc = |piece: Option<&Piece>| match piece {
+        Some(Piece::Tree(TokenTree::Group(group))) => {
+            let first = group.stream().into_iter().next();
+            group.delimiter() == Delimiter::Bracket
+                && matches!(first, Some(TokenTree::Ident(ident)) if ident == "doc")
+        }
+        _ => false,
+    };
+    let last = pending.len().checked_sub(1).and_then(|index| pending.get(index));
+    let second = pending.len().checked_sub(2).and_then(|index| pending.get(index));
+    if is_doc(last) {
+        1
+    } else if matches!(last, Some(Piece::Tree(TokenTree::Punct(bang))) if bang.as_char() == '!')
+        && is_doc(second)
+    {
+        2
+    } else {
+        0
+    }
+}
+
+/// The top-level items of a side by key: `fn name`, `struct Name` and so on, an `impl` by its
+/// header, the test module as such, and any other item by its tokens. A repeated key gets
+/// its count. The registry's tables are left out: the data checks judge them.
+fn keyed<'s>(path: &str, side: &'s Side) -> Result<Vec<(String, &'s syn::Item)>, String> {
+    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+    let mut found = Vec::new();
+    for item in &side.file.items {
+        if path == super::source::REGISTRY && dialect::registry::is_table(item) {
+            continue;
+        }
+        let key = item_key(path, &side.text, item)?;
+        let count = seen.entry(key.clone()).or_insert(0);
+        *count += 1;
+        found.push((if *count == 1 { key } else { format!("{key} #{count}") }, item));
+    }
+    let keys: BTreeSet<&String> = found.iter().map(|(key, _)| key).collect();
+    assert_eq!(keys.len(), found.len(), "the keys of a file are unique");
+    Ok(found)
+}
+
+/// The key of one item; see [`keyed`].
+fn item_key(path: &str, text: &str, item: &syn::Item) -> Result<String, String> {
+    let named = |kind: &str, ident: &syn::Ident| Ok(format!("{kind} {ident}"));
+    match item {
+        syn::Item::Fn(item) => named("fn", &item.sig.ident),
+        syn::Item::Struct(item) => named("struct", &item.ident),
+        syn::Item::Enum(item) => named("enum", &item.ident),
+        syn::Item::Union(item) => named("union", &item.ident),
+        syn::Item::Type(item) => named("type", &item.ident),
+        syn::Item::Trait(item) => named("trait", &item.ident),
+        syn::Item::Const(item) => named("const", &item.ident),
+        syn::Item::Static(item) => named("static", &item.ident),
+        syn::Item::Mod(module) if dialect::is_test_module(module) => {
+            Ok("the test module".to_owned())
+        }
+        syn::Item::Mod(module) => named("mod", &module.ident),
+        syn::Item::Impl(block) => header(path, text, block.span(), block.brace_token.span.open()),
+        other @ (syn::Item::ExternCrate(_)
+        | syn::Item::ForeignMod(_)
+        | syn::Item::Macro(_)
+        | syn::Item::TraitAlias(_)
+        | syn::Item::Use(_)
+        | syn::Item::Verbatim(_)
+        | _) => normal_at(path, text, other.span()),
+    }
+}
+
+/// The normalised text of `text` from the start of `span` to the start of `open`: an item's
+/// attributes and header up to its opening brace.
+fn header(path: &str, text: &str, span: Span, open: Span) -> Result<String, String> {
+    let range = span.byte_range().start..open.byte_range().start;
+    let source =
+        text.get(range).ok_or_else(|| format!("{path}: a header lies outside its file"))?;
+    let tokens: TokenStream =
+        source.parse().map_err(|error| format!("{path}: a header does not lex: {error}"))?;
+    Ok(normal(tokens))
+}
+
+/// A short name of an `impl` for messages: `Visitor`, or `<Visitor as Visit>`.
+fn impl_name(block: &syn::ItemImpl) -> String {
+    let name = self_type(&block.self_ty).map_or_else(|| "a type".to_owned(), |(name, _)| name);
+    let trait_name = block.trait_.as_ref().and_then(|(path, _)| path.segments.last());
+    match trait_name {
+        Some(segment) => format!("<{name} as {}>", segment.ident),
+        None => name,
+    }
+}
+
+/// The key of a member of an `impl`: `fn name`, `const NAME`, `type Name`, or its tokens.
+fn member_key(path: &str, text: &str, member: &syn::ImplItem) -> Result<String, String> {
+    match member {
+        syn::ImplItem::Fn(method) => Ok(format!("fn {}", method.sig.ident)),
+        syn::ImplItem::Const(constant) => Ok(format!("const {}", constant.ident)),
+        syn::ImplItem::Type(alias) => Ok(format!("type {}", alias.ident)),
+        other @ (syn::ImplItem::Macro(_) | syn::ImplItem::Verbatim(_) | _) => {
+            normal_at(path, text, other.span())
+        }
+    }
+}
+
+/// The items of an inline module; none for a file module.
+fn module_items(module: &syn::ItemMod) -> &[syn::Item] {
+    module.content.as_ref().map_or(&[], |(_, items)| items.as_slice())
+}
+
+/// A function with a body, as the comparison sees it: its whole span and its block.
+#[derive(Clone, Copy)]
+struct Function<'a> {
+    span: Span,
+    signature: &'a syn::Signature,
+    block: &'a syn::Block,
+}
+
+/// The comparison of an existing file's two sides.
+struct Existing<'a> {
+    code: &'a Code,
+    base: &'a Side,
+    head: &'a Side,
+    new: &'a NewNames,
+    class: &'a mut Class,
+    dispatched: &'a mut BTreeSet<String>,
+}
+
+impl Existing<'_> {
+    fn edit(&mut self, what: &str) {
+        self.class.edits.push(format!("{}: {what}", self.code.path));
+    }
+
+    fn normal_base(&self, span: Span) -> Result<String, String> {
+        normal_at(&self.code.path, &self.base.text, span)
+    }
+
+    fn normal_head(&self, span: Span) -> Result<String, String> {
+        normal_at(&self.code.path, &self.head.text, span)
+    }
+
+    /// Compares the file's attributes, and every item of the base with the head's item of the
+    /// same key.
+    fn compare(&mut self) -> Result<(), String> {
+        let attributes = |side: &Side| -> Result<Vec<String>, String> {
+            let texts = side
+                .file
+                .attrs
+                .iter()
+                .map(|attribute| normal_at(&self.code.path, &side.text, attribute.span()));
+            let texts: Vec<String> = texts.collect::<Result<_, _>>()?;
+            Ok(texts.into_iter().filter(|text| !text.is_empty()).collect())
+        };
+        if attributes(self.base)? != attributes(self.head)? {
+            self.edit("the file's attributes changed");
+        }
+        let before = keyed(&self.code.path, self.base)?;
+        let after: BTreeMap<String, &syn::Item> =
+            keyed(&self.code.path, self.head)?.into_iter().collect();
+        for (key, item) in before {
+            match after.get(&key) {
+                Some(head_item) => self.compare_item(&key, item, head_item)?,
+                None => self.edit(&format!("the item `{key}` is changed or removed")),
+            }
+        }
+        Ok(())
+    }
+
+    fn compare_item(
+        &mut self,
+        key: &str,
+        before: &syn::Item,
+        after: &syn::Item,
+    ) -> Result<(), String> {
+        if self.normal_base(before.span())? == self.normal_head(after.span())? {
+            return Ok(());
+        }
+        match (before, after) {
+            (syn::Item::Fn(base), syn::Item::Fn(head)) => self.compare_function(
+                &base.sig.ident.to_string(),
+                None,
+                Function { span: base.span(), signature: &base.sig, block: &base.block },
+                Function { span: head.span(), signature: &head.sig, block: &head.block },
+            ),
+            (syn::Item::Impl(base), syn::Item::Impl(head)) => self.compare_impl(base, head),
+            (syn::Item::Mod(base), syn::Item::Mod(head)) if dialect::is_test_module(base) => {
+                self.compare_tests(base, head)
+            }
+            _ => {
+                self.edit(&format!("the item `{key}` changed"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Every member of the base's `impl` must be the head's, but for dispatch calls in its
+    /// methods; a new member is an edit, because it can override what the type does.
+    fn compare_impl(&mut self, base: &syn::ItemImpl, head: &syn::ItemImpl) -> Result<(), String> {
+        let name = impl_name(base);
+        let path = self.code.path.clone();
+        let mut after: BTreeMap<String, &syn::ImplItem> = BTreeMap::new();
+        for member in &head.items {
+            let _replaced = after.insert(member_key(&path, &self.head.text, member)?, member);
+        }
+        let mut before = BTreeSet::new();
+        for member in &base.items {
+            let key = member_key(&path, &self.base.text, member)?;
+            let _new = before.insert(key.clone());
+            let Some(head_member) = after.get(&key).copied() else {
+                self.edit(&format!("`{key}` of `{name}` is changed or removed"));
+                continue;
+            };
+            if self.normal_base(member.span())? == self.normal_head(head_member.span())? {
+                continue;
+            }
+            if let (syn::ImplItem::Fn(old), syn::ImplItem::Fn(changed)) = (member, head_member) {
+                let owner = self_type(&base.self_ty).map(|(owner, _)| owner);
+                self.compare_function(
+                    &format!("{name}::{}", old.sig.ident),
+                    owner.as_deref(),
+                    Function { span: old.span(), signature: &old.sig, block: &old.block },
+                    Function {
+                        span: changed.span(),
+                        signature: &changed.sig,
+                        block: &changed.block,
+                    },
+                )?;
+            } else {
+                self.edit(&format!("`{key}` of `{name}` changed"));
+            }
+        }
+        for key in after.keys().filter(|key| !before.contains(*key)) {
+            self.edit(&format!(
+                "the existing `{name}` has the new member `{key}`, which can override or \
+                 shadow what the type does"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every item of the base's test module must be the head's. New ones are additive unless
+    /// [`Self::check_new_test`] finds them an edit.
+    fn compare_tests(&mut self, base: &syn::ItemMod, head: &syn::ItemMod) -> Result<(), String> {
+        let mut before = BTreeSet::new();
+        for item in module_items(base) {
+            let _new = before.insert(self.normal_base(item.span())?);
+        }
+        let mut after = BTreeSet::new();
+        for item in module_items(head) {
+            let text = self.normal_head(item.span())?;
+            if !before.contains(&text) {
+                self.check_new_test(item, head)?;
+            }
+            let _new = after.insert(text);
+        }
+        for item in module_items(base) {
+            if !after.contains(&self.normal_base(item.span())?) {
+                let key = item_key(&self.code.path, &self.base.text, item)?;
+                self.edit(&format!("the test module's `{key}` is changed or removed"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A new item of the existing test module `module` is an edit if it names one of
+    /// [`SENSITIVE`] or uses one of [`INPUT_MACROS`] ([`reads_outside`]), or if
+    /// [`test_item_problem`] refuses it.
+    fn check_new_test(&mut self, item: &syn::Item, module: &syn::ItemMod) -> Result<(), String> {
+        let tokens = tokens_at(&self.code.path, &self.head.text, item.span())?;
+        let named = identifiers_at(&self.code.path, &self.head.text, item.span())?;
+        let Some(problem) =
+            reads_outside(tokens, &named).or_else(|| test_item_problem(item, module))
+        else {
+            return Ok(());
+        };
+        let key = item_key(&self.code.path, &self.head.text, item)?;
+        self.edit(&format!("the new test `{key}` {problem}"));
+        Ok(())
+    }
+
+    /// The head's body must be the base's with dispatch calls inserted at its top level. `owner`
+    /// is the type of a method, whose report fields its dispatch calls may extend.
+    fn compare_function(
+        &mut self,
+        name: &str,
+        owner: Option<&str>,
+        before: Function<'_>,
+        after: Function<'_>,
+    ) -> Result<(), String> {
+        let places = dispatch::Places {
+            lists: sinks::report_lists(before.signature, before.block, owner, &self.base.file),
+            shared: sinks::shared_parameters(before.signature, before.block),
+        };
+        // A report list is `&mut` or a binding of the body, which a shared parameter never is.
+        assert!(places.lists.is_disjoint(&places.shared), "a shared parameter is no report list");
+        let path = self.code.path.clone();
+        let base_open = before.block.brace_token.span.open();
+        let head_open = after.block.brace_token.span.open();
+        if header(&path, &self.base.text, before.span, base_open)?
+            != header(&path, &self.head.text, after.span, head_open)?
+        {
+            self.edit(&format!("the signature or attributes of `{name}` changed"));
+            return Ok(());
+        }
+        let mut index = 0;
+        for statement in &after.block.stmts {
+            let base_statement = before.block.stmts.get(index);
+            if let Some(old) = base_statement
+                && self.normal_base(old.span())? == self.normal_head(statement.span())?
+            {
+                index += 1;
+                continue;
+            }
+            let sides = dispatch::Sides { base: &self.base.text, head: &self.head.text };
+            let appended = base_statement.and_then(|old| {
+                dispatch::appended_lints(old, statement, sides, self.new).map(|names| (old, names))
+            });
+            let found = match appended {
+                Some((old, names)) => {
+                    index += 1;
+                    let span = old.span();
+                    let lines = (line_of(span.start().line), line_of(span.end().line));
+                    self.class.replaced.entry(path.clone()).or_default().push(lines);
+                    Some(names)
+                }
+                None => dispatch::names(statement, &self.code.path, self.new, &places),
+            };
+            let Some(names) = found else {
+                self.edit(&format!(
+                    "`{name}` changed beyond a dispatch call of a new rule: a statement of the \
+                     head's at line {} is new or changed",
+                    statement.span().start().line
+                ));
+                return Ok(());
+            };
+            self.record(name, statement, names);
+        }
+        if index != before.block.stmts.len() {
+            self.edit(&format!("`{name}` changed: a statement of the base's is removed or moved"));
+        }
+        Ok(())
+    }
+
+    /// Records a dispatch call of `names` in `function`: its lines, and each name once.
+    fn record(&mut self, function: &str, statement: &syn::Stmt, names: Vec<String>) {
+        let span = statement.span();
+        let lines = (line_of(span.start().line), line_of(span.end().line));
+        assert!(lines.0 <= lines.1, "a statement ends after it starts");
+        let ranges = self.class.dispatch.entry(self.code.path.clone()).or_default();
+        ranges.push(lines);
+        for name in names {
+            if !self.dispatched.insert(name.clone()) {
+                self.edit(&format!(
+                    "`{function}` dispatches `{name}` a second time; a new rule has one dispatch \
+                     call"
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Class, classify};
+
+    const RULES: &str = "xtask/src/tidy/rust_source.rs";
+
+    /// The frozen copy of the rule-path file `relative`, under `xtask/fixtures/ratchet/`. The
+    /// tests never read the live rule files, so that an additive change to one, such as a
+    /// dispatch call at the tail of `text::check`, cannot break the anchors they edit (review
+    /// of #57, round 8).
+    fn real(relative: &str) -> String {
+        crate::ratchet::frozen(relative)
+    }
+
+    /// `text` with the one occurrence of `from` replaced by `to`.
+    fn replaced(text: &str, from: &str, to: &str) -> String {
+        assert_eq!(text.matches(from).count(), 1, "the probe's anchor `{from}`");
+        text.replacen(from, to, 1)
+    }
+
+    /// The class of a diff that turns each `(path, base, head)` from `base` into `head`; `None`
+    /// for a file missing on that side.
+    fn class_of(name: &str, files: &[(&str, Option<&str>, Option<&str>)]) -> Class {
+        let scratch = crate::tidy::scratch::Scratch::new(name);
+        for (path, base, head) in files {
+            if let Some(text) = base {
+                scratch.write(&format!("base/{path}"), text);
+            }
+            if let Some(text) = head {
+                scratch.write(&format!("head/{path}"), text);
+            }
+        }
+        let changed: Vec<String> = files.iter().map(|(path, _, _)| (*path).to_owned()).collect();
+        let (base, head) = (scratch.root().join("base"), scratch.root().join("head"));
+        classify(&base, &head, &changed).unwrap()
+    }
+
+    /// The class of the real `path` changed to `head`.
+    fn edited(name: &str, path: &str, head: &str) -> Class {
+        class_of(name, &[(path, Some(&real(path)), Some(head))])
+    }
+
+    /// Asserts that `class` is an edit whose first reason contains `expected`.
+    fn assert_edit(class: &Class, expected: &str) {
+        assert!(class.is_edit(), "an edit: {expected}");
+        assert_eq!(class.name(), "edit");
+        let first = class.edits.first().map_or("", String::as_str);
+        assert!(first.contains(expected), "`{expected}` in {:?}", class.edits);
+    }
+
+    // Goal: round 4 of #57, thread 1: a new `Visit` override in the existing visitor, which turned
+    // every rule off for a path, and a narrowed `report_unsafe`, are edits.
+    #[test]
+    fn a_new_visit_override_is_an_edit() {
+        let base = real(RULES);
+        let visit = "impl<'ast> Visit<'ast> for Visitor<'_> {\n";
+        let skip = "    fn visit_item(&mut self, node: &'ast syn::Item) {\n        if \
+                    !self.path.starts_with(\"crates/solver/src/io\") {\n            \
+                    visit::visit_item(self, node);\n        }\n    }\n";
+        let head = replaced(&base, visit, &format!("{visit}{skip}"));
+        let class = edited("class-visit-item", RULES, &head);
+        assert_edit(&class, "has the new member `fn visit_item`");
+        let unsafe_check = "        if !self.path.starts_with(UNSAFE_ALLOWED_CRATE) {";
+        let narrowed = "        if !self.path.starts_with(UNSAFE_ALLOWED_CRATE) && \
+                        !self.path.starts_with(\"crates/solver/src/ffi\") {";
+        let spared = replaced(&base, unsafe_check, narrowed);
+        assert_edit(&edited("class-unsafe", RULES, &spared), "`Visitor::report_unsafe` changed");
+    }
+
+    // Goal: the exploits of round 3 of #57's review are edits: a private table of exceptions, an
+    // early return in `check_path_start`, an exception inlined into its allowed list, and a
+    // condition added in `visit_path`.
+    #[test]
+    fn the_round_three_exploits_are_edits() {
+        let base = real(RULES);
+        let start = "    fn check_path_start(&mut self, segment: &Ident) {\n";
+        let early = "        if self.path.starts_with(\"crates/solver\") { return; }\n";
+        let allowed = "segment == ban.segment && applies && !registry::is_allowed(ban.allowed, \
+                       self.path)";
+        let inline = "segment == ban.segment && applies && !registry::is_allowed(if ban.id == \
+                      \"direct-libm\" { &[\"crates/kernels/src/math.rs\", \
+                      \"crates/solver/src/lib.rs\"] } else { ban.allowed }, self.path)";
+        let visit = "        if node.segments.len() > 1\n";
+        let table = "const PATH_BAN_ROWS: &[(&str, &[&str])] = &[(\"direct-libm\", \
+                     &[\"crates/solver\"])];";
+        let probes = [
+            (format!("{base}\n{table}\n"), "the new item `const PATH_BAN_ROWS` is a constant"),
+            (replaced(&base, start, &format!("{start}{early}")), "`Visitor::check_path_start`"),
+            (replaced(&base, allowed, inline), "`Visitor::check_path_start` changed"),
+            (
+                replaced(
+                    &base,
+                    visit,
+                    "        if node.segments.len() > 1 && !self.path.ends_with(\"lib.rs\")\n",
+                ),
+                "`<Visitor as Visit>::visit_path` changed",
+            ),
+        ];
+        for (index, (head, expected)) in probes.iter().enumerate() {
+            assert_edit(&edited(&format!("class-round-three-{index}"), RULES, head), expected);
+        }
+    }
+
+    // Goal: round 4, thread 2: a guard added as the first statement of `check_tolerance`, which
+    // cargo-mutants' whole-body mutant "covered", is an edit.
+    #[test]
+    fn a_first_statement_guard_is_an_edit() {
+        let first = "        if !self.scope.is_nami() || self.in_test_code() {";
+        let guard = "        if self.path.starts_with(\"crates/solver/src/io\") { return; }\n";
+        let head = replaced(&real(RULES), first, &format!("{guard}{first}"));
+        let class = edited("class-guard", RULES, &head);
+        assert_edit(&class, "`Visitor::check_tolerance` changed beyond a dispatch call");
+    }
+
+    // Goal: round 4, thread 3: a threshold scaled at its use site, with the unit test edited
+    // along, is an edit, written inline or through a `let`; the edited test is one too.
+    #[test]
+    fn a_threshold_scaled_at_its_use_is_an_edit() {
+        let base = real(RULES);
+        let limit = "    value > 0.0 && value <= MAGIC_TOLERANCE_MAX\n";
+        let scaled =
+            replaced(&base, limit, "    value > 0.0 && value <= MAGIC_TOLERANCE_MAX * 1.0e-3\n");
+        let retested = replaced(&scaled, "x < 0.000_000_5 }", "x < 0.000_000_000_5 }");
+        let class = edited("class-scaled", RULES, &retested);
+        assert_edit(&class, "`is_tolerance` changed");
+        assert!(class.edits.iter().any(|edit| edit.contains("test module")), "{:?}", class.edits);
+        let bound = "    let tolerance_max = MAGIC_TOLERANCE_MAX * 1.0e-3;\n    value > 0.0 && \
+                     value <= tolerance_max\n";
+        let head = replaced(&base, limit, bound);
+        assert_edit(&edited("class-let", RULES, &head), "`is_tolerance` changed");
+    }
+
+    // Goal: round 4, thread 4: `function-length` lifted from every nami crate in `check_body` is
+    // an edit.
+    #[test]
+    fn a_rule_lifted_from_the_nami_crates_is_an_edit() {
+        let check = "        if lines > FUNCTION_LINES_MAX {";
+        let lifted = "        if lines > FUNCTION_LINES_MAX && !self.scope.is_nami() {";
+        let head = replaced(&real(RULES), check, lifted);
+        let class = edited("class-length", RULES, &head);
+        assert_edit(&class, "`Visitor::check_body` changed beyond a dispatch call");
+    }
+
+    // Goal: round 4, thread 5: `runtime-dependency` spared for `crates/kernels` in
+    // `check_manifest` is an edit.
+    #[test]
+    fn a_rule_spared_for_one_crate_is_an_edit() {
+        let manifest = "xtask/src/tidy/manifest.rs";
+        let allowed = "    let is_allowed = |name: &str| name == \"libm\" || \
+                       workspace_crates.iter().any(|ok| ok == name);";
+        let spared = "    let is_kernels = relative.starts_with(\"crates/kernels\");\n    let \
+                      is_allowed =\n        |name: &str| is_kernels || name == \"libm\" || \
+                      workspace_crates.iter().any(|ok| ok == name);";
+        let head = replaced(&real(manifest), allowed, spared);
+        assert_edit(&edited("class-kernels", manifest, &head), "`check_manifest` changed");
+    }
+
+    // Goal: what the dialect used to hold to the base gives an edit now: a changed or new
+    // constant or static, a new read of the environment, a new `impl` of an existing type, a
+    // changed ban application, and the registry's forms outside its tables.
+    #[test]
+    fn changes_the_dialect_used_to_hold_are_edits() {
+        let base = real(RULES);
+        let probes = [
+            (
+                replaced(
+                    &base,
+                    "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-6;",
+                    "const MAGIC_TOLERANCE_MAX: f64 = 1.0e-9;",
+                ),
+                "the item `const MAGIC_TOLERANCE_MAX` changed",
+            ),
+            (format!("{base}\nconst LIMIT: u8 = 1;\n"), "is a constant or static"),
+            (format!("{base}\nstatic LIMIT: u8 = 1;\n"), "is a constant or static"),
+            (
+                format!("{base}\nfn quiet() -> bool {{ std::env::var_os(\"CI\").is_some() }}\n"),
+                "names `env`",
+            ),
+            (
+                format!("{base}\nimpl Visitor<'_> {{ fn extra(&self) {{}} }}\n"),
+                "is an `impl` that is not of a type new in this file",
+            ),
+            (format!("{base}\nstruct Vec;\n"), "is named `Vec`"),
+            (
+                format!("{base}\n#[export_name = \"x\"]\nfn extra() {{}}\n"),
+                "the attribute `export_name`",
+            ),
+            (
+                replaced(
+                    &base,
+                    "any(|banned| name == banned)",
+                    "any(|banned| name == banned && name != \"debug_assert\")",
+                ),
+                "`Visitor::check_macro_name` changed",
+            ),
+            (
+                replaced(&base, "fn check_macro_name(", "fn check_macro_names("),
+                "`fn check_macro_name` of `Visitor` is changed or removed",
+            ),
+            (format!("{base}\nuse std::fmt::Write;\n"), "is an import into an existing module"),
+        ];
+        for (index, (head, expected)) in probes.iter().enumerate() {
+            assert_edit(&edited(&format!("class-held-{index}"), RULES, head), expected);
+        }
+    }
+
+    // Goal: round 5 of #57's review, thread 1: a new `struct Visitor` with its rule in
+    // `text.rs` does not make an inherent `impl Visitor<'_>` in `rust_source.rs` additive, which
+    // turned every rule off for a file starting with `#!`; the new rule in `text.rs` alone is.
+    #[test]
+    fn a_new_type_elsewhere_does_not_vouch_for_an_impl() {
+        let text = "xtask/src/tidy/text.rs";
+        let text_base = real(text);
+        let rule = "\nstruct Visitor {\n    blank_run: u32,\n}\n\nfn \
+                    check_blank_runs(lines: &[&str]) -> Vec<Violation> {\n    let run = \
+                    Visitor { blank_run: 0 };\n    \
+                    assert!(lines.len() < 1 << 30 || run.blank_run == 0, \"x\");\n    \
+                    Vec::new()\n}\n";
+        let end = "        }\n    }\n    violations\n}\n";
+        let call = "        }\n    }\n    violations.extend(check_blank_runs(&lines));\n    \
+                    violations\n}\n";
+        let text_head = format!("{}{rule}", replaced(&text_base, end, call));
+        let alone = edited("class-round-five-text", text, &text_head);
+        assert_eq!(alone.edits, Vec::<String>::new());
+        let rules_base = real(RULES);
+        let shebang = "\nimpl Visitor<'_> {\n    fn visit_file(&mut self, file: &syn::File) \
+                       {\n        if file.shebang.is_none() {\n            \
+                       visit::visit_file(self, file);\n        }\n    }\n}\n";
+        let rules_head = format!("{rules_base}{shebang}");
+        let files = [
+            (text, Some(text_base.as_str()), Some(text_head.as_str())),
+            (RULES, Some(rules_base.as_str()), Some(rules_head.as_str())),
+        ];
+        let class = class_of("class-round-five-visitor", &files);
+        assert_edit(&class, "rust_source.rs: the new item `impl Visitor < ' _ > #3` is an `impl`");
+    }
+
+    // Goal: round 5, thread 2: a blanket `impl<Quieted> Quiet for Quieted`, whose parameter
+    // shadows the new struct of that name, is an edit; and so is any `impl` of a new type that
+    // has type or const parameters, a `where` clause, a path or arguments on its type, or a
+    // lifetime with bounds or used outside the trait path and the method signatures. A plain
+    // `impl` of a new type of the same file, of any trait, with lifetimes only there, is
+    // additive.
+    #[test]
+    fn only_plain_impls_of_new_types_are_additive() {
+        let base = real(RULES);
+        let new = "\ntrait Quiet {\n    fn quiet(&self) {}\n}\n\nstruct Quieted;\n";
+        let refused = [
+            ("impl<Quieted> Quiet for Quieted {}", "`impl` that is not"),
+            ("impl<T> Quiet for Quieted where T: Copy {}", "`impl` that is not"),
+            ("impl<const N: usize> Quiet for Quieted {}", "`impl` that is not"),
+            ("impl<'a: 'static> Quiet for Quieted {}", "`impl` that is not"),
+            ("impl Quiet for self::Quieted {}", "`impl` that is not"),
+            ("impl Quiet for Quieted<u8> {}", "`impl` that is not"),
+            ("impl std::fmt::Debug for Quieted where Self: Sized {}", "`impl` that is not"),
+            (
+                "impl<'a> Iterator for Quieted { type Item = &'a u8; fn next(&mut self) -> \
+                 Option<&'a u8> { None } }",
+                "lifetime `'a` outside",
+            ),
+            (
+                "impl<'a> Quiet for Quieted { fn quiet(&self) { let _: Option<&'a u8> = None; } }",
+                "lifetime `'a` outside",
+            ),
+            (
+                "impl<'a> Quiet for Quieted { fn quiet(&self) { let _ = vec![None::<&'a u8>]; } }",
+                "lifetime `'a` outside",
+            ),
+        ];
+        for (index, (block, expected)) in refused.iter().enumerate() {
+            let head = format!("{base}{new}\n{block}\n");
+            let class = edited(&format!("class-impl-{index}"), RULES, &head);
+            assert!(class.edits.iter().any(|edit| edit.contains(expected)), "{block}: {class:?}");
+        }
+        let allowed = [
+            "impl Quiet for Quieted {}",
+            "impl<'a> Quiet for Quieted {}",
+            "impl<'a> Quiet for Quieted {\n    fn quiet(&self) {\n        let _: &'static str = \
+             \"q\";\n    }\n}",
+            "impl<'ast> Visit<'ast> for Quieted {\n    fn visit_file(&mut self, node: &'ast \
+             syn::File) {\n        visit::visit_file(self, node);\n    }\n}",
+            "impl Iterator for Quieted {\n    type Item = u8;\n    fn next(&mut self) -> \
+             Option<u8> {\n        None\n    }\n}",
+            "impl From<u8> for Quieted {\n    fn from(_: u8) -> Self {\n        Self\n    }\n}",
+            "impl Quieted {\n    fn new() -> Self {\n        Self\n    }\n}",
+            "impl Clone for Quieted {\n    fn clone(&self) -> Self {\n        Self\n    }\n}",
+            "impl std::fmt::Display for Quieted {\n    fn fmt(&self, f: &mut \
+             std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"q\")\n    \
+             }\n}",
+        ];
+        for (index, block) in allowed.iter().enumerate() {
+            let head = format!("{base}{new}\n{block}\n");
+            let class = edited(&format!("class-impl-ok-{index}"), RULES, &head);
+            assert_eq!(class.edits, Vec::<String>::new(), "{block}");
+        }
+    }
+
+    // Goal: an `impl`, a trait, a module or a `macro_rules!` nested in a new function's body,
+    // at any depth, is an edit; a nested function or struct is not.
+    #[test]
+    fn items_nested_in_new_functions_are_edits() {
+        let base = real(RULES);
+        let nested = [
+            (
+                "fn extra() { impl Visitor<'_> { fn visit_file(&mut self, _: &syn::File) {} } }",
+                "an `impl`",
+            ),
+            ("fn extra() { trait Hidden { fn hide(&self) {} } }", "a trait"),
+            ("fn extra() { mod hidden {} }", "a module"),
+            ("fn extra() { if true { macro_rules! hidden { () => {} } } }", "a `macro_rules!`"),
+            ("struct Extra;\nimpl Extra {\n    fn extra() { impl Extra {} }\n}", "an `impl`"),
+        ];
+        for (index, (item, kind)) in nested.iter().enumerate() {
+            let head = format!("{base}\n{item}\n");
+            let class = edited(&format!("class-nested-{index}"), RULES, &head);
+            assert_edit(&class, &format!("holds {kind} inside it"));
+        }
+        let plain = format!(
+            "{base}\nfn extra() -> u8 {{\n    struct Inner;\n    fn inner() -> u8 {{ 1 \
+             }}\n    let _ = Inner;\n    inner()\n}}\n"
+        );
+        assert_eq!(edited("class-nested-plain", RULES, &plain).edits, Vec::<String>::new());
+    }
+
+    // Goal: a new item, a test among them, may not use `include_str!`, `include_bytes!`,
+    // `include!`, `file!`, `env!` or `option_env!`, in a new test module, a new test of an
+    // existing test module, or a new function; any other new test is additive.
+    #[test]
+    fn new_items_may_not_read_the_source_tree() {
+        let base = real(RULES);
+        let test = "    const NONE: [&str; 0] = [];\n";
+        for input in [
+            "include_str!(file!())",
+            "include_bytes!(\"a\")",
+            "include!(\"a\")",
+            "file!()",
+            "env!(\"A\")",
+            "option_env!(\"A\")",
+        ] {
+            let body =
+                format!("    #[test]\n    fn pinned() {{\n        let _ = {input};\n    }}\n");
+            let head = replaced(&base, test, &format!("{test}\n{body}"));
+            let class = edited("class-input-test", RULES, &head);
+            assert_edit(&class, "the new test `fn pinned` uses");
+        }
+        let plain = replaced(
+            &base,
+            test,
+            &format!(
+                "{test}\n    #[test]\n    fn plain() {{\n        assert!(NONE.is_empty(), \
+                 \"x\");\n    }}\n"
+            ),
+        );
+        assert_eq!(edited("class-input-plain", RULES, &plain).edits, Vec::<String>::new());
+        let function = format!("{base}\nfn pinned() -> usize {{ include_str!(\"a\").len() }}\n");
+        assert_edit(&edited("class-input-fn", RULES, &function), "uses `include_str!`");
+        let path = "lints/src/extra.rs";
+        let module = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn pinned() {\n        let _ \
+                      = file!();\n    }\n}\n";
+        assert_edit(&class_of("class-input-module", &[(path, None, Some(module))]), "uses `file!`");
+    }
+
+    // Goal: round 6 of #57's review, thread 2: a new test that reads the file it tests at run
+    // time is an edit, in an existing test module or a new one; so is a new test that reads the
+    // clock, starts a thread or opens a socket.
+    #[test]
+    fn new_tests_may_not_read_the_file_at_run_time() {
+        let base = real(RULES);
+        let test = "    const NONE: [&str; 0] = [];\n";
+        let pinned = "    #[test]\n    fn the_file_is_the_file() {\n        let text = \
+                      std::fs::read_to_string(\n            \
+                      crate::workspace_root().join(\"xtask/src/tidy/rust_source.rs\"),\n        \
+                      )\n        .unwrap();\n        assert_eq!(text.len(), 12345);\n    }\n";
+        let head = replaced(&base, test, &format!("{test}\n{pinned}"));
+        assert_edit(
+            &edited("class-pinned", RULES, &head),
+            "the new test `fn the_file_is_the_file`",
+        );
+        for body in [
+            "std::time::Instant::now()",
+            "std::thread::spawn(|| ())",
+            "std::net::TcpStream::connect(\"a:1\")",
+        ] {
+            let new_test =
+                format!("    #[test]\n    fn outside() {{\n        let _ = {body};\n    }}\n");
+            let probe = replaced(&base, test, &format!("{test}\n{new_test}"));
+            assert_edit(&edited("class-outside", RULES, &probe), "the new test `fn outside` names");
+        }
+        let path = "lints/src/extra.rs";
+        let module = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn pinned() {\n        let _ = \
+                      std::fs::read_to_string(\"lints/src/extra.rs\");\n    }\n}\n";
+        assert_edit(&class_of("class-pinned-module", &[(path, None, Some(module))]), "names `fs`");
+    }
+
+    // Goal: review of #55, thread 1: every item of a new test module is judged as a new item of
+    // an existing test module is. The reviewer's probes, each in a new file's test module and
+    // in the existing test module of `rust_source.rs`, are edits: `#[unsafe(no_mangle)]`, an
+    // `unsafe` block, a constant, an `impl` of an existing type, an `extern` block, and a
+    // nested module. A test module with an import, a helper type and its plain `impl` stays
+    // additive.
+    #[test]
+    fn every_item_of_a_new_test_module_is_judged() {
+        let probes = [
+            ("#[unsafe(no_mangle)]\n    fn f() {}", "carries the attribute `unsafe`"),
+            ("fn f() {\n        unsafe {}\n    }", "`unsafe`"),
+            ("const C: u8 = 1;", "is a constant or static"),
+            ("impl super::Existing {}", "an `impl` of a type the test module does not declare"),
+            ("impl<T> Helper for T {}", "an `impl` of a type the test module does not declare"),
+            ("extern \"C\" {\n        fn g();\n    }", "an `extern` block"),
+            ("mod inner {}", "is not a function, a type, an import"),
+        ];
+        let path = "lints/src/extra.rs";
+        let module = |item: &str| {
+            format!(
+                "struct Existing;\n\n#[cfg(test)]\nmod tests {{\n    use super::*;\n\n    \
+                 trait Helper {{}}\n\n    {item}\n}}\n"
+            )
+        };
+        let plain =
+            module("struct Fake;\n\n    impl Helper for Fake {}\n\n    #[test]\n    fn t() {}");
+        let additive = class_of("class-test-module", &[(path, None, Some(&plain))]);
+        assert_eq!(additive.edits, Vec::<String>::new(), "a plain test module");
+        let base = real(RULES);
+        let test = "    const NONE: [&str; 0] = [];\n";
+        for (item, expected) in probes {
+            let new_file =
+                class_of("class-test-module-probe", &[(path, None, Some(&module(item)))]);
+            assert_edit(&new_file, "holds a test item that");
+            assert!(new_file.edits[0].contains(expected), "{item}: {:?}", new_file.edits);
+            let head = replaced(&base, test, &format!("{test}\n    {item}\n"));
+            let existing = edited("class-test-item-probe", RULES, &head);
+            assert!(
+                existing.edits.iter().any(|edit| edit.contains(expected)),
+                "{item}: {:?}",
+                existing.edits
+            );
+        }
+    }
+
+    // Goal: what a new item holds is judged at every depth: an attribute outside the allowed
+    // ones on an `impl` member or a nested item, `unsafe` code of any kind, an `extern` block,
+    // and a constant, top-level, nested or associated, are edits. A new lint and a new rule with
+    // its own visitor hold none of these and stay additive (the tests above).
+    #[test]
+    fn new_items_are_judged_at_every_depth() {
+        let base = real(RULES);
+        let new = "\nstruct Quieted;\n";
+        let probes = [
+            (
+                "impl Quieted {\n    #[export_name = \"x\"]\n    fn f() {}\n}",
+                "the attribute `export_name` inside",
+            ),
+            (
+                "impl Quieted {\n    #[unsafe(no_mangle)]\n    fn f() {}\n}",
+                "the attribute `unsafe` inside",
+            ),
+            (
+                "fn f() {\n    #[link_section = \"x\"]\n    fn g() {}\n}",
+                "the attribute `link_section` inside",
+            ),
+            ("unsafe impl Send for Quieted {}", "an `unsafe impl`"),
+            ("unsafe trait Hidden {}", "an `unsafe trait`"),
+            ("impl Quieted {\n    unsafe fn f() {}\n}", "an `unsafe fn`"),
+            ("fn f() -> u8 {\n    unsafe { 1 }\n}", "an `unsafe` block"),
+            ("extern \"C\" {\n    fn f();\n}", "an `extern` block"),
+            ("impl Quieted {\n    const LIMIT: u32 = 70;\n}", "an associated constant"),
+            ("trait Limited {\n    const LIMIT: u32 = 70;\n}", "an associated constant"),
+            (
+                "fn f() -> u32 {\n    const LIMIT: u32 = 70;\n    LIMIT\n}",
+                "a constant or static inside",
+            ),
+            ("const LIMIT: u32 = 70;", "is a constant or static"),
+        ];
+        for (index, (item, expected)) in probes.iter().enumerate() {
+            let head = format!("{base}{new}\n{item}\n");
+            assert_edit(&edited(&format!("class-depth-{index}"), RULES, &head), expected);
+        }
+        let test = "    const NONE: [&str; 0] = [];\n";
+        let in_tests = [
+            ("    #[unsafe(export_name = \"x\")]\n    fn helper() {}\n", "the attribute `unsafe`"),
+            ("    fn helper() -> u8 {\n        unsafe { 1 }\n    }\n", "an `unsafe` block"),
+            ("    fn helper() {\n        impl Extra {}\n    }\n", "an `impl` inside"),
+        ];
+        for (index, (item, expected)) in in_tests.iter().enumerate() {
+            let head = replaced(&base, test, &format!("{test}\n{item}"));
+            let class = edited(&format!("class-depth-test-{index}"), RULES, &head);
+            assert_edit(&class, "the new test `fn helper`");
+            assert!(class.edits[0].contains(expected), "{expected}: {:?}", class.edits);
+        }
+    }
+
+    // Goal: a dispatch call resolves its callee by path: a new `fn line_of` in another file does
+    // not make a call of `rust_source.rs`'s existing `line_of` a dispatch; the module of a path
+    // is found from the caller's file.
+    #[test]
+    fn dispatch_calls_resolve_by_path() {
+        let base = real(RULES);
+        let visit = "    visitor.visit_file(&file);\n";
+        let call = "    visitor.violations.extend(line_of(&file));\n";
+        let head = replaced(&base, visit, &format!("{visit}{call}"));
+        let other = ("lints/src/rust_source.rs", None, Some("fn line_of(_: &u8) -> u8 { 1 }\n"));
+        let files = [(RULES, Some(base.as_str()), Some(head.as_str())), other];
+        assert_edit(&class_of("class-by-path", &files), "`check` changed beyond a dispatch call");
+        let resolve = |caller: &str, path: &[&str]| {
+            let segments: Vec<String> = path.iter().map(|segment| (*segment).to_owned()).collect();
+            super::dispatch::module_file(caller, &segments)
+        };
+        let lib = "lints/src/lib.rs";
+        assert_eq!(resolve(lib, &[]).as_deref(), Some(lib));
+        assert_eq!(resolve(lib, &["extra"]).as_deref(), Some("lints/src/extra.rs"));
+        assert_eq!(resolve(RULES, &[]).as_deref(), Some(RULES));
+        assert_eq!(resolve(RULES, &["super", "text"]).as_deref(), Some("xtask/src/tidy/text.rs"));
+        assert_eq!(
+            resolve(RULES, &["crate", "tidy", "text"]).as_deref(),
+            Some("xtask/src/tidy/text.rs")
+        );
+        assert_eq!(
+            resolve(RULES, &["self", "inner"]).as_deref(),
+            Some("xtask/src/tidy/rust_source/inner.rs")
+        );
+        assert_eq!(resolve(lib, &["super"]), None, "above the crate");
+        assert_eq!(resolve(RULES, &["super", "crate"]), None, "`crate` only first");
+        assert_eq!(resolve(RULES, &["inner", "self"]), None, "`self` only first");
+        assert_eq!(resolve("README.md", &[]), None, "no crate");
+    }
+
+    // Goal: the registry's forms outside its tables that the dialect used to refuse are edits:
+    // a variant renamed by an import or a constant, a changed scope rule, and a macro.
+    #[test]
+    fn registry_changes_outside_the_tables_are_edits() {
+        let registry = super::super::source::REGISTRY;
+        let base = real(registry);
+        let scope = "use super::Scope;";
+        let forms = [
+            (
+                replaced(
+                    &base,
+                    scope,
+                    "use super::Scope;\nuse BanScope::NamiCrates as Everywhere;",
+                ),
+                "import",
+            ),
+            (
+                replaced(
+                    &base,
+                    scope,
+                    "use super::Scope;\nconst Everywhere: BanScope = BanScope::NamiCrates;",
+                ),
+                "constant",
+            ),
+            (
+                replaced(&base, "self == Self::Everywhere || scope.is_nami()", "scope.is_nami()"),
+                "changed",
+            ),
+            (
+                format!("{base}\nmacro_rules! live {{ () => {{}} }}\nlive!();\n"),
+                "is not a function",
+            ),
+        ];
+        for (index, (head, expected)) in forms.iter().enumerate() {
+            assert_edit(&edited(&format!("class-registry-{index}"), registry, head), expected);
+        }
+    }
+
+    // Goal: an additive tidy rule is additive: a new function in a rule module, dispatched once
+    // with shared references, beside a changed doc comment and a new unit test; the dispatch
+    // call's lines are recorded. A new function that nothing calls is additive too, and so is a
+    // new rule's own visitor, `impl<'ast> Visit<'ast> for ExtraVisitor`.
+    #[test]
+    fn a_new_rule_with_its_dispatch_call_is_additive() {
+        let base = real(RULES);
+        let visit = "    visitor.visit_file(&file);\n";
+        let dispatch = "    visitor.violations.extend(extra_rule(&path, &file));\n";
+        let rule = "\n/// A new rule.\nfn extra_rule(path: &Path, file: &syn::File) -> \
+                    Vec<Violation> {\n    assert!(!file.items.is_empty() || path.has_root(), \
+                    \"x\");\n    Vec::new()\n}\n";
+        let test = "    const NONE: [&str; 0] = [];\n";
+        let new_test = "    const NONE: [&str; 0] = [];\n\n    #[test]\n    fn extra() {}\n";
+        let head = replaced(&base, visit, &format!("{visit}{dispatch}"));
+        let head = replaced(&head, "/// Parses `text` and runs", "/// Parses `text`, and runs");
+        let head = format!("{}{rule}", replaced(&head, test, new_test));
+        let class = edited("class-additive", RULES, &head);
+        assert_eq!(class.edits, Vec::<String>::new());
+        assert_eq!(class.name(), "additive");
+        let line =
+            u32::try_from(base.lines().position(|l| l == visit.trim_end()).unwrap()).unwrap();
+        assert_eq!(class.dispatch.get(RULES), Some(&vec![(line + 2, line + 2)]));
+        let unused = format!("{base}\nfn spare() -> usize {{ PATH_BANS.len() }}\n");
+        assert!(!edited("class-unused", RULES, &unused).is_edit(), "nothing calls it");
+        let own_visitor = "\nstruct ExtraVisitor {\n    found: u32,\n}\n\nimpl<'ast> Visit<'ast> \
+                           for ExtraVisitor {\n    fn visit_expr_loop(&mut self, node: &'ast \
+                           syn::ExprLoop) {\n        self.found += 1;\n        \
+                           visit::visit_expr_loop(self, node);\n    }\n}\n";
+        let with_visitor = format!("{head}{own_visitor}");
+        let visiting = edited("class-own-visitor", RULES, &with_visitor);
+        assert_eq!(visiting.edits, Vec::<String>::new(), "a new rule with its own visitor");
+    }
+
+    // Goal: round 6 of #57's review, thread 1: `extend` adds only to a report list of the base
+    // function, with a new function that returns `Vec<Violation>`. The four probes, which grow an
+    // allow-list, a rebinding set, the enforced lints and an exemption, are edits, and so is a
+    // report-returning call into a list that is not a report list; a new rule's reports into a
+    // method's `self.violations` are additive.
+    #[test]
+    fn extend_adds_only_reports() {
+        let manifest = "xtask/src/tidy/manifest.rs";
+        let manifest_base = real(manifest);
+        let sort = "    names.sort();\n";
+        let vendored =
+            "\nfn vendored(_root: &&Path) -> Vec<String> {\n    vec![\"rayon\".to_owned()]\n}\n";
+        let grown = format!(
+            "{}{vendored}",
+            replaced(&manifest_base, sort, &format!("    names.extend(vendored(&root));\n{sort}"))
+        );
+        let lints = "    let mut lints = Vec::new();\n";
+        let planned = "\nfn planned_lints(_manifest: &&str) -> Vec<String> {\n    Vec::new()\n}\n";
+        let enforced = format!(
+            "{}{planned}",
+            replaced(
+                &manifest_base,
+                lints,
+                &format!("{lints}    lints.extend(planned_lints(&manifest));\n")
+            )
+        );
+        let reports = "\nfn vendored(_root: &&Path) -> Vec<Violation> {\n    Vec::new()\n}\n";
+        let typed = format!(
+            "{}{reports}",
+            replaced(&manifest_base, sort, &format!("    names.extend(vendored(&root));\n{sort}"))
+        );
+        let rules = real(RULES);
+        let visit = "        bindings.visit_pat(pattern);\n";
+        let rebound = "\nfn rebound(_pattern: &&syn::Pat, finder: &&mut FloatEqualityFinder) -> \
+                       Vec<Ident> {\n    finder.floats.clone()\n}\n";
+        let unbound = format!(
+            "{}{rebound}",
+            replaced(
+                &rules,
+                visit,
+                &format!("{visit}        bindings.names.extend(rebound(&pattern, &self));\n")
+            )
+        );
+        let lint = "lints/src/float_reduction.rs";
+        let exits = "    let mut exits = ExitFinder {";
+        let selection = "\nfn let_bindings(_body: &&Body<'_>) -> Vec<HirId> {\n    Vec::new()\n}\n";
+        let exempted = format!(
+            "{}{selection}",
+            replaced(
+                &real(lint),
+                exits,
+                &format!("    parameters.extend(let_bindings(&body));\n{exits}")
+            )
+        );
+        let probes = [
+            (manifest, grown.as_str(), "`workspace_crates` changed beyond a dispatch call"),
+            (manifest, enforced.as_str(), "`enforced_lints` changed beyond a dispatch call"),
+            (manifest, typed.as_str(), "`workspace_crates` changed beyond a dispatch call"),
+            (RULES, unbound.as_str(), "`FloatEqualityFinder::unbind` changed beyond"),
+            (lint, exempted.as_str(), "`is_selection` changed beyond a dispatch call"),
+        ];
+        for (index, (path, head, expected)) in probes.iter().enumerate() {
+            assert_edit(&edited(&format!("class-extend-{index}"), path, head), expected);
+        }
+    }
+
+    // Goal: round 7 of #57's review: a list is a report list only if the base only adds to it.
+    // On three synthetic bases of `text.rs`, the same additive-looking dispatch is an edit: one
+    // that sorts and dedups its list before returning it, one with an exemption list used in a
+    // filter, and one that imports another type `as Violation`. On the real base it is additive.
+    #[test]
+    fn a_report_list_is_one_the_base_only_adds_to() {
+        let text = "xtask/src/tidy/text.rs";
+        let real_base = real(text);
+        let end = "        }\n    }\n    violations\n}\n";
+        let call = "        }\n    }\n    violations.extend(trailing_space(&lines));\n    \
+                    violations\n}\n";
+        let rule = "\nfn trailing_space(lines: &&[&str]) -> Vec<Violation> {\n    \
+                    assert!(lines.len() < 1 << 30, \"x\");\n    Vec::new()\n}\n";
+        let deduped_end = "        }\n    }\n    violations.sort_by_key(|violation| \
+                           violation.line);\n    violations.dedup_by_key(|violation| \
+                           violation.line);\n    violations\n}\n";
+        let exemption = "\npub fn exempt(path: &Path, text: &str) -> Vec<Violation> {\n    let \
+                         known: Vec<Violation> = Vec::new();\n    check(path, \
+                         text).into_iter().filter(|violation| \
+                         !known.contains(violation)).collect()\n}\n";
+        let known_call = "    let known: Vec<Violation> = Vec::new();\n    \
+                          known.extend(trailing_space(&text));\n";
+        let renamed =
+            real_base.replace("use super::Violation;", "use super::Exemption as Violation;");
+        let deduped = replaced(&real_base, end, deduped_end);
+        let filtered = format!("{real_base}{exemption}");
+        let bases = [
+            (
+                deduped.clone(),
+                replaced(
+                    &deduped,
+                    "    violations.sort_by_key",
+                    "    violations.extend(trailing_space(&lines));\n    \
+                     violations.sort_by_key",
+                ),
+            ),
+            (
+                filtered.clone(),
+                replaced(&filtered, "    let known: Vec<Violation> = Vec::new();\n", known_call),
+            ),
+            (renamed.clone(), replaced(&renamed, end, call)),
+        ];
+        for (index, (base, head)) in bases.iter().enumerate() {
+            let head = format!("{head}{rule}");
+            let class =
+                class_of(&format!("class-only-adds-{index}"), &[(text, Some(base), Some(&head))]);
+            assert!(
+                class.edits.iter().any(|edit| edit.contains("beyond a dispatch call")),
+                "{index}: {:?}",
+                class.edits
+            );
+        }
+        let head = format!("{}{rule}", replaced(&real_base, end, call));
+        assert_eq!(edited("class-only-adds-real", text, &head).edits, Vec::<String>::new());
+    }
+
+    // Goal: a new rule's reports extend a method's `self.violations` additively.
+    #[test]
+    fn extend_into_a_report_field_is_additive() {
+        let report = "        self.report(node.loop_token.span, \"unbounded-loop\", message);\n";
+        let loop_rule = "\nfn loop_rule(_node: &&syn::ExprLoop) -> Vec<Violation> {\n    \
+                         Vec::new()\n}\n";
+        let into_field = format!(
+            "{}{loop_rule}",
+            replaced(
+                &real(RULES),
+                report,
+                &format!("{report}        self.violations.extend(loop_rule(&node));\n")
+            )
+        );
+        let additive = edited("class-extend-field", RULES, &into_field);
+        assert_eq!(additive.edits, Vec::<String>::new(), "into `self.violations`");
+    }
+
+    /// The signature and body of an `impl` member that is a method.
+    fn method_of(member: &syn::ImplItem) -> Option<(&syn::Signature, &syn::Block)> {
+        let syn::ImplItem::Fn(method) = member else {
+            return None;
+        };
+        Some((&method.sig, &method.block))
+    }
+
+    /// The report lists of the function or method `name` in `source`, a method of `owner`.
+    fn lists_of(source: &str, name: &str, owner: Option<&str>) -> Vec<String> {
+        let file = syn::parse_file(source).unwrap();
+        let mut functions = Vec::new();
+        for item in &file.items {
+            if let syn::Item::Fn(function) = item {
+                functions.push((&function.sig, &*function.block));
+            }
+            let members = if let syn::Item::Impl(block) = item { &block.items[..] } else { &[] };
+            functions.extend(members.iter().filter_map(method_of));
+        }
+        let (signature, block) =
+            functions.into_iter().find(|(signature, _)| signature.ident == name).unwrap();
+        super::sinks::report_lists(signature, block, owner, &file).into_iter().collect()
+    }
+
+    // Goal: a report list is one that the base only adds to: a declared `Violation` counts as
+    // the crate's own; a field that another function of the file clears, or that a macro
+    // mentions, is none, though one that another function returns is; a local or a field of a
+    // local that a macro mentions is none.
+    #[test]
+    fn report_lists_need_only_appends() {
+        let declared = "struct Violation;\nfn g() -> Vec<Violation> { let returned = Vec::new(); \
+                        returned }";
+        assert_eq!(lists_of(declared, "g", None), ["returned"]);
+        let fields = "use super::Violation;\nstruct V { violations: Vec<Violation> }\nimpl V { fn \
+                      m(&mut self) { self.violations.push(Violation); } }\nfn take(v: V) -> \
+                      Vec<Violation> { v.violations }";
+        assert_eq!(lists_of(fields, "m", Some("V")), ["self.violations"]);
+        let cleared = format!("{fields}\nfn clear(v: &mut V) {{ v.violations.clear(); }}");
+        assert_eq!(lists_of(&cleared, "m", Some("V")), Vec::<String>::new(), "cleared elsewhere");
+        let shown =
+            format!("{fields}\nfn show(v: &V) {{ assert!(v.violations.is_empty(), \"x\"); }}");
+        assert_eq!(lists_of(&shown, "m", Some("V")), Vec::<String>::new(), "a macro mentions it");
+        let local = "use super::Violation;\nfn g() -> Vec<Violation> { let returned = Vec::new(); \
+                     let _ = format!(\"{:?}\", returned); returned }";
+        assert_eq!(lists_of(local, "g", None), Vec::<String>::new(), "a macro mentions the local");
+        let visitor = "use super::Violation;\nstruct V { violations: Vec<Violation> }\nfn f() -> \
+                       Report { let visitor = V { violations: Vec::new() }; let _ = \
+                       format!(\"{:?}\", visitor.violations); Report { violations: \
+                       visitor.violations } }";
+        assert_eq!(
+            lists_of(visitor, "f", None),
+            Vec::<String>::new(),
+            "a macro mentions the field"
+        );
+    }
+
+    // Goal: the report lists of a function are read from the base's declarations: a typed or
+    // returned local, a `&mut Vec<Violation>` parameter, a `self` field of that type, and a
+    // field of a returned struct literal; nothing else, and nothing without `Violation`
+    // imported as itself.
+    #[test]
+    fn report_lists_are_read_from_declarations() {
+        let unimported = "fn g() -> Vec<Violation> { let returned = Vec::new(); returned }";
+        assert_eq!(lists_of(unimported, "g", None), Vec::<String>::new(), "no import");
+        let source = "use super::Violation;\nstruct V { violations: Vec<Violation>, names: \
+                      Vec<String> }\nfn f(out: &mut \
+                      Vec<Violation>, names: &mut Vec<String>) -> Vec<Violation> { let typed: \
+                      Vec<Violation> = Vec::new(); let other = Vec::new(); let visitor = V { \
+                      violations: Vec::new(), names: Vec::new() }; Report { violations: \
+                      visitor.violations, typed, other } }\nfn g() -> Vec<Violation> { let \
+                      returned = Vec::new(); returned }\nfn h() -> Vec<String> { let returned = \
+                      Vec::new(); returned }\nfn k() { let kept: Vec<Violation> = Vec::new(); }\n\
+                      impl V { fn m(&self) {} fn n() {} }";
+        assert_eq!(lists_of(source, "f", None), ["out", "typed", "visitor.violations"]);
+        assert_eq!(lists_of(source, "g", None), ["returned"]);
+        assert_eq!(lists_of(source, "h", None), Vec::<String>::new(), "not a report list");
+        assert_eq!(lists_of(source, "k", None), Vec::<String>::new(), "not returned");
+        assert_eq!(lists_of(source, "m", Some("V")), ["self.violations"]);
+        assert_eq!(lists_of(source, "n", Some("V")), Vec::<String>::new(), "no `self`");
+        let place = |text: &str| super::sinks::place_name(&syn::parse_str(text).unwrap());
+        assert_eq!(place("self.a.b").as_deref(), Some("self.a.b"));
+        assert_eq!(place("violations").as_deref(), Some("violations"));
+        for other in ["<A as B>::c", "<A>::c", "a::b", "a.0", "f().a", "(a).b"] {
+            assert_eq!(place(other), None, "{other}");
+        }
+    }
+
+    // Goal: a dispatch call that could reach existing state, or names nothing new, is an edit:
+    // a `&mut` argument, a value argument, an existing function, and a second dispatch.
+    #[test]
+    fn look_alike_dispatch_calls_are_edits() {
+        let base = real(RULES);
+        let visit = "    visitor.visit_file(&file);\n";
+        let rule = "\nfn extra_rule(_: &Path) -> Vec<Violation> {\n    Vec::new()\n}\n";
+        let calls = [
+            "    visitor.violations.extend(extra_rule(&mut visitor.violations));\n",
+            "    visitor.violations.extend(extra_rule(path));\n",
+            "    visitor.violations.extend(line_of(&file));\n",
+            "    visitor.violations.extend(extra_rule(&path));\n    extra_rule(&path);\n",
+            "    visitor.violations.clear();\n",
+            "    visitor.violations.extend(extra_rule(&visitor.violations.split_off(0)));\n",
+            "    visitor.take().extend(extra_rule(&path));\n",
+            "    visitor.violations.extend(extra_rule(&<Path as Lookup>::ROOT));\n",
+        ];
+        for (index, call) in calls.iter().enumerate() {
+            let head = format!("{}{rule}", replaced(&base, visit, &format!("{visit}{call}")));
+            let class = edited(&format!("class-look-alike-{index}"), RULES, &head);
+            assert!(class.is_edit(), "{call}");
+            let found = class.edits.iter().any(|edit| edit.contains("`check`"));
+            assert!(found, "{call}: {:?}", class.edits);
+        }
+    }
+
+    // Goal: a new lint is additive: its own file, its declaration, pass and `impl<'tcx>
+    // LateLintPass<'tcx>` in `lib.rs`, the registration appended, and the pass registered; the
+    // module list in `lib.rs`'s docs may change. Registering it twice, another wrapping of the
+    // pass, or a new file that reads the environment, is an edit.
+    #[test]
+    fn a_new_lint_is_additive() {
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let lints = "lint_store.register_lints(&[NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);";
+        let pass = "    lint_store.register_late_lint_pass(Box::new(|_| Box::new(NamiExtra)));\n";
+        let declared = "\ndylint_linting::declare_lint! {\n    /// A new lint.\n    pub \
+                        NAMI_EXTRA,\n    Deny,\n    \"a new lint\"\n}\n\n\
+                        dylint_linting::declare_lint_pass!(NamiExtra => [NAMI_EXTRA]);\n";
+        let pass_impl = "\nimpl<'tcx> LateLintPass<'tcx> for NamiExtra {\n    fn check_expr(&mut \
+                         self, cx: &LateContext<'tcx>, expression: &'tcx Expr<'tcx>) {\n        \
+                         extra::check_expr(cx, NAMI_EXTRA, expression);\n    }\n}\n";
+        let head = replaced(&base, "mod recursion;", "mod extra;\nmod recursion;");
+        let head = replaced(
+            &head,
+            "//! - `nami_recursion`",
+            "//! - `nami_extra`: new.\n//! - `nami_recursion`",
+        );
+        let appended = lints.replace("NAMI_FLOAT_REDUCTION]", "NAMI_FLOAT_REDUCTION, NAMI_EXTRA]");
+        let head = replaced(&head, &format!("    {lints}\n"), &format!("    {appended}\n{pass}"));
+        let head = format!("{head}{declared}{pass_impl}");
+        let extra = "lints/src/extra.rs";
+        let module = "use rustc_hir::Expr;\n\npub fn check_expr(_: &LateContext<'_>, _: &Lint, _: \
+                      &Expr<'_>) {}\n";
+        let class =
+            class_of("class-lint", &[(lib, Some(&base), Some(&head)), (extra, None, Some(module))]);
+        assert_eq!(class.edits, Vec::<String>::new());
+        assert_eq!(class.dispatch.get(lib).map(Vec::len), Some(2), "{:?}", class.dispatch);
+        let twice = replaced(&head, pass, &format!("{pass}{pass}"));
+        let doubled = class_of(
+            "class-lint-twice",
+            &[(lib, Some(&base), Some(&twice)), (extra, None, Some(module))],
+        );
+        assert_edit(&doubled, "a second time");
+        let wrappings = [
+            "Box::new(|_| Arc::new(NamiExtra))",
+            "Arc::new(|_| Box::new(NamiExtra))",
+            "Box::new(move |_| Box::new(NamiExtra))",
+            "Box::new(async |_| Box::new(NamiExtra))",
+            "Box::new(for<'a> |_| Box::new(NamiExtra))",
+            "Box::new(#[inline] |_| Box::new(NamiExtra))",
+        ];
+        for wrapped in wrappings {
+            let other = replaced(&head, "Box::new(|_| Box::new(NamiExtra))", wrapped);
+            let files =
+                [(lib, Some(base.as_str()), Some(other.as_str())), (extra, None, Some(module))];
+            let wrapped_class = class_of("class-lint-wrapped", &files);
+            assert_edit(&wrapped_class, "`register_lints` changed beyond a dispatch call");
+        }
+        let reading =
+            format!("{module}fn quiet() -> bool {{ std::env::var_os(\"CI\").is_some() }}\n");
+        let sensitive = class_of(
+            "class-lint-env",
+            &[(lib, Some(&base), Some(&head)), (extra, None, Some(&reading))],
+        );
+        assert_edit(&sensitive, "names `env`");
+    }
+
+    // Goal: round 8 of #57's review: the new items that hold no code a mutant could change, a
+    // struct, an enum, a union, a file module's declaration and a lint or pass declared by
+    // macro, are recorded with their lines, doc comments included; a function, a trait and an
+    // `impl` are not. A registration with a new lint appended records the base's statement.
+    #[test]
+    fn declarations_are_recorded_with_their_lines() {
+        let path = "lints/src/extra.rs";
+        let text = "/// A.\nstruct A;\n\nenum B {\n    C,\n}\n\nunion D {\n    e: u8,\n}\n\n\
+                    fn f() {}\n\ntrait G {}\n\nimpl G for A {}\n";
+        let class = class_of("class-declarations", &[(path, None, Some(text))]);
+        assert_eq!(class.edits, Vec::<String>::new());
+        assert_eq!(class.declarations.get(path), Some(&vec![(1, 2), (4, 6), (8, 10)]));
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let lints = "NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);";
+        let head = replaced(&base, lints, "NAMI_RECURSION, NAMI_FLOAT_REDUCTION, NAMI_EXTRA]);");
+        let head = replaced(&head, "mod recursion;", "mod extra;\nmod recursion;");
+        let declared = "dylint_linting::declare_lint! {\n    /// A new lint.\n    pub NAMI_EXTRA,\
+                        \n    Deny,\n    \"a new lint\"\n}\n\n\
+                        dylint_linting::declare_lint_pass!(NamiExtra => [NAMI_EXTRA]);\n";
+        let head = format!("{head}\n{declared}");
+        let module = class_of("class-module", &[(lib, Some(&base), Some(&head))]);
+        let line_in = |source: &str, wanted: &str| {
+            let lines: Vec<&str> = source.lines().collect();
+            let index = lines.iter().rposition(|line| line.contains(wanted)).unwrap();
+            u32::try_from(index + 1).unwrap()
+        };
+        let (named, lint) = (line_in(&head, "mod extra;"), line_in(&head, "declare_lint! {"));
+        let pass = line_in(&head, "declare_lint_pass!(NamiExtra");
+        let expected = vec![(named, named), (lint, lint + 5), (pass, pass)];
+        assert_eq!(module.declarations.get(lib), Some(&expected), "{:?}", module.edits);
+        let registration = line_in(&base, lints);
+        assert_eq!(module.replaced.get(lib), Some(&vec![(registration, registration)]));
+    }
+
+    // Goal: round 9 of #57's review: a new lint is additive only at `Deny` or `Forbid`, the
+    // levels that fail the gate; at `Warn` or `Allow`, or with a level that cannot be read, it
+    // is an edit. A lint pass declares no level.
+    #[test]
+    fn a_new_lint_below_deny_is_an_edit() {
+        let path = "lints/src/extra.rs";
+        let declared = |level: &str| {
+            format!(
+                "dylint_linting::declare_lint! {{\n    /// A new lint.\n    pub NAMI_EXTRA,\n    \
+                 {level},\n    \"a new lint\"\n}}\n\n\
+                 dylint_linting::declare_lint_pass!(NamiExtra => [NAMI_EXTRA]);\n"
+            )
+        };
+        for level in ["Deny", "Forbid"] {
+            let class = class_of("class-lint-level", &[(path, None, Some(&declared(level)))]);
+            assert_eq!(class.edits, Vec::<String>::new(), "{level}");
+        }
+        for level in ["Warn", "Allow"] {
+            let class = class_of("class-lint-low", &[(path, None, Some(&declared(level)))]);
+            let expected = format!("declares the lint `nami_extra` at `{level}`, below `Deny`");
+            assert_edit(&class, &expected);
+        }
+        let unread = class_of("class-lint-unread", &[(path, None, Some(&declared("Loud")))]);
+        assert_edit(&unread, "declares a lint whose level cannot be read");
+    }
+
+    // Goal: round 8 of #57's review: the canonical new line rule is additive. Its dispatch call
+    // `trailing_space(path, &lines)` passes `text::check`'s parameter `path: &Path` as it is,
+    // since `&path` would be a needless borrow. A parameter bound with `mut`, `ref` or a
+    // subpattern, or of type `&mut`, or bound again in the body or mentioned by a macro there,
+    // and a local passed as it is, make the call an edit.
+    #[test]
+    fn a_shared_reference_parameter_may_be_passed_as_it_is() {
+        let text = "xtask/src/tidy/text.rs";
+        let base = real(text);
+        let tail = "    }\n    violations\n}\n\n/// True if the first line above";
+        let rule = "\nfn trailing_space(path: &Path, lines: &[&str]) -> Vec<Violation> {\n    \
+                    assert!(!lines.is_empty() || path.has_root(), \"x\");\n    Vec::new()\n}\n";
+        let head = |side: &str, arguments: &str| {
+            let call = format!(
+                "    }}\n    violations.extend(trailing_space({arguments}));\n    violations\n}}\
+                 \n\n/// True if the first line above"
+            );
+            format!("{}{rule}", replaced(side, tail, &call))
+        };
+        let class = edited("class-shared", text, &head(&base, "path, &lines"));
+        assert_eq!(class.edits, Vec::<String>::new(), "the canonical rule");
+        let local = edited("class-shared-local", text, &head(&base, "path, lines"));
+        assert_edit(&local, "`check` changed beyond a dispatch call");
+        let signature = "pub fn check(path: &Path, text: &str)";
+        let first = "    let mut violations = Vec::new();\n";
+        let bases = [
+            replaced(&base, signature, "pub fn check(mut path: &Path, text: &str)"),
+            replaced(&base, signature, "pub fn check(ref path: &Path, text: &str)"),
+            replaced(&base, signature, "pub fn check(path @ _: &Path, text: &str)"),
+            replaced(&base, signature, "pub fn check(path: &mut Path, text: &str)"),
+            replaced(&base, first, &format!("{first}    let path = path;\n")),
+            replaced(
+                &base,
+                first,
+                &format!("{first}    debug_assert!(path.is_relative(), \"x\");\n"),
+            ),
+        ];
+        for other in &bases {
+            let files = [(text, Some(other.as_str()), Some(head(other, "path, &lines")))];
+            let files: Vec<(&str, Option<&str>, Option<&str>)> = files
+                .iter()
+                .map(|(path, before, after)| (*path, *before, after.as_deref()))
+                .collect();
+            let refused = class_of("class-shared-not", &files);
+            assert_edit(&refused, "`check` changed beyond a dispatch call");
+        }
+    }
+
+    // Goal: a new file may import names, but a glob, at any depth of the import tree, is an edit,
+    // because it can bring in names that shadow others.
+    #[test]
+    fn a_glob_import_is_an_edit() {
+        let path = "lints/src/extra.rs";
+        let plain = "use rustc_hir::{Expr, def::Res};\n";
+        assert!(!class_of("class-import", &[(path, None, Some(plain))]).is_edit());
+        for glob in ["use rustc_hir::*;\n", "use rustc_hir::{Expr, def::*};\n"] {
+            let class = class_of("class-glob", &[(path, None, Some(glob))]);
+            assert_edit(&class, "is an import into an existing module, or a glob");
+        }
+    }
+
+    // Goal: the comparison leaves out doc comments, outer and inner, and nothing else: a changed
+    // operator, an attribute or a delimiter changes the text; and a changed comparison in a
+    // rule is an edit.
+    #[test]
+    fn only_doc_comments_are_left_out() {
+        let normal = |text: &str| super::normal(text.parse().unwrap());
+        assert_eq!(normal("/// A doc.\nfn a() {}"), normal("fn a() {}"));
+        assert_eq!(normal("//! A doc.\n#![doc = \"x\"]\nfn a() {}"), normal("fn a() {}"));
+        assert_eq!(normal("#[doc(hidden)]\nfn a() {}"), normal("fn a() {}"));
+        let different = [
+            ("fn a() -> bool { 1 > 2 }", "fn a() -> bool { 1 >= 2 }"),
+            ("#[derive(Debug)]\nstruct A;", "struct A;"),
+            ("#[inline] fn a() {}", "fn a() {}"),
+            ("fn a() { (b) }", "fn a() { [b] }"),
+            ("fn a() { b! }", "fn a() { b }"),
+            ("#![no_std]\nfn a() {}", "fn a() {}"),
+            ("m! { # ! (doc) }", "m! {}"),
+            ("m! { # (doc) }", "m! {}"),
+        ];
+        for (before, after) in different {
+            assert_ne!(normal(before), normal(after), "{before}");
+        }
+        let check = "        if lines > FUNCTION_LINES_MAX {";
+        let head = replaced(&real(RULES), check, "        if lines >= FUNCTION_LINES_MAX {");
+        assert_edit(&edited("class-operator", RULES, &head), "`Visitor::check_body` changed");
+    }
+
+    // Goal: a changed signature or attribute of an existing function is an edit, though its
+    // body is the same; and a removed test module is named as such.
+    #[test]
+    fn headers_and_the_test_module_are_compared() {
+        let base = real(RULES);
+        let signature = "fn is_tolerance(value: f64) -> bool {";
+        let inlined = replaced(&base, signature, &format!("#[inline]\n{signature}"));
+        let expected = "the signature or attributes of `is_tolerance` changed";
+        assert_edit(&edited("class-header", RULES, &inlined), expected);
+        let start = base.find("#[cfg(test)]\nmod tests {").unwrap();
+        let untested = base.get(..start).unwrap();
+        let class = edited("class-no-tests", RULES, untested);
+        assert_edit(&class, "the item `the test module` is changed or removed");
+    }
+
+    // Goal: a new module is additive only as `mod name;` in an existing file, for a new file; an
+    // inline module, or a file module declared in a new file, is an edit.
+    #[test]
+    fn a_new_module_is_additive_only_as_a_new_file() {
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let declared = replaced(&base, "mod recursion;", "mod extra;\nmod recursion;");
+        let new = ("lints/src/extra.rs", None, Some("fn extra() {}\n"));
+        assert!(!class_of("class-mod", &[(lib, Some(&base), Some(&declared)), new]).is_edit());
+        let inline = format!("{base}\nmod extra {{}}\n");
+        assert_edit(&edited("class-mod-inline", lib, &inline), "is not a function");
+        let nested = [("lints/src/extra.rs", None, Some("mod deeper;\n"))];
+        assert_edit(&class_of("class-mod-nested", &nested), "is not a function");
+    }
+
+    // Goal: round 7 of #57's review: a new lint pass that reaches the compiler's shared state,
+    // such as `cx.tcx.dcx().reset_err_count()` in `check_crate_post`, is an edit, though it is
+    // registered through the allowed forms; the same names in a tidy rule are not lint code.
+    #[test]
+    fn new_lint_code_may_not_reach_compiler_state() {
+        let lib = "lints/src/lib.rs";
+        let base = real(lib);
+        let pass = "    lint_store.register_late_lint_pass(Box::new(|_| Box::new(NamiTidyUp)));\n";
+        let lints = "    lint_store.register_lints(&[NAMI_RECURSION, NAMI_FLOAT_REDUCTION]);\n";
+        let tidy_up = "\ndylint_linting::declare_lint! {\n    /// Tidies up.\n    pub \
+                       NAMI_TIDY_UP,\n    Deny,\n    \"tidies up\"\n}\n\n\
+                       dylint_linting::declare_lint_pass!(NamiTidyUp => [NAMI_TIDY_UP]);\n\n\
+                       impl<'tcx> LateLintPass<'tcx> for NamiTidyUp {\n    fn \
+                       check_crate_post(&mut self, cx: &LateContext<'tcx>) {\n        \
+                       cx.tcx.dcx().reset_err_count();\n    }\n}\n";
+        let appended =
+            lints.replace("NAMI_FLOAT_REDUCTION]", "NAMI_FLOAT_REDUCTION, NAMI_TIDY_UP]");
+        let head = format!("{}{tidy_up}", replaced(&base, lints, &format!("{appended}{pass}")));
+        assert_edit(&edited("class-tidy-up", lib, &head), "names `dcx`");
+        for name in ["sess", "steal_mir", "abort_if_errors", "emit_stashed_diagnostics"] {
+            let probe =
+                head.replace("cx.tcx.dcx().reset_err_count()", &format!("let _ = cx.tcx.{name}"));
+            assert_edit(&edited("class-tidy-up-name", lib, &probe), &format!("names `{name}`"));
+        }
+        let tidy = format!("{}\nfn sessions() -> u8 {{ 1 }}\n", real(RULES));
+        assert!(!edited("class-tidy-sess", RULES, &tidy).is_edit(), "not lint code");
+    }
+
+    // Goal: review of #55: a manifest or build file in a rule path is an edit even when it is
+    // new, by its name or below a `.cargo` directory; a fixture named like one is not.
+    #[test]
+    fn a_new_manifest_in_a_rule_path_is_an_edit() {
+        for path in [
+            "lints/src/extra/Cargo.toml",
+            "lints/ui/Cargo.lock",
+            "lints/src/build.rs",
+            "lints/ui/rust-toolchain.toml",
+            "lints/ui/rust-toolchain",
+            "lints/src/.cargo/config.toml",
+            "lints/src/.cargo/other",
+        ] {
+            let class = class_of("class-manifest", &[(path, None, Some("[package]\n"))]);
+            assert_edit(&class, &format!("{path}: a manifest or build file"));
+        }
+        let fixture = [("xtask/fixtures/tidy/cargo.fires.fixture", None, Some("x"))];
+        assert!(!class_of("class-manifest-fixture", &fixture).is_edit());
+    }
+
+    // Goal: new fixtures and UI cases, and the regenerated rule list, are additive; a changed or
+    // deleted fixture or UI case is an edit.
+    #[test]
+    fn data_files_are_additive_only_when_new() {
+        let fixture = "xtask/fixtures/tidy/a.fires.fixture";
+        let case = "lints/ui/a.stderr";
+        let new = [
+            (fixture, None, Some("x")),
+            (case, None, Some("y")),
+            ("docs/RULES.md", Some("a"), Some("b")),
+        ];
+        assert!(!class_of("class-data-new", &new).is_edit());
+        assert_edit(
+            &class_of("class-data-changed", &[(fixture, Some("x"), Some("z"))]),
+            "is changed",
+        );
+        assert_edit(&class_of("class-data-deleted", &[(case, Some("y"), None)]), "is deleted");
+    }
+}

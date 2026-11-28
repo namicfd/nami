@@ -21,9 +21,12 @@ use std::collections::BTreeSet;
 /// What the body says before the repository.
 const FOUND_IN: &str = "- Found in: merge-queue run https://github.com/";
 
-/// What the body says before the issues about earlier failures, and after them.
-const EARLIER: (&str, &str) =
-    (" failed in the queue before, and the issues about those failures are still open: ", ". #");
+/// What the body says before the issues about the PR's other failures, and after them.
+const EARLIER: (&str, &str) = (
+    " also failed in the queue in another merge group, and the issues about those failures are \
+     still open: ",
+    ". #",
+);
 
 /// What the body says before the other PRs of the merge group, and after them.
 const GROUP: (&str, &str) = (" The same merge group also held ", ", so the failure");
@@ -53,6 +56,14 @@ pub fn is_finding(title: &str, body: &str, vocabulary: &Vocabulary, repository: 
             draft.get(..ascii_end(draft)) == body.get(..ascii_end(body))
         })
     })
+}
+
+/// The issues that the queue-failure body `body` names as its PR's failures in other merge
+/// groups; none if it names none, or if the list is not in the form that [`finding`] writes.
+/// `cargo xtask task` lets a session work an issue beside those it names (ADR-0021, point 6).
+#[must_use]
+pub fn other_failures_named(body: &str) -> BTreeSet<u32> {
+    numbers_between(&body.replace("\r\n", "\n"), EARLIER).unwrap_or_default()
 }
 
 /// The failure whose finding `body` would be, read from the body; `None` if a part of it is
@@ -168,7 +179,9 @@ fn quoted_list(list: &str) -> Option<BTreeSet<String>> {
 pub(crate) mod tests {
     use super::is_finding;
     use crate::issue::Draft;
-    use crate::queue::failure::{Codes, FailedJob, Failure, Vocabulary, finding, title};
+    use crate::queue::failure::{
+        Codes, FailedJob, Failure, QUEUE_WORKFLOWS, Vocabulary, finding, title,
+    };
     use crate::queue::forge::Job;
     use std::collections::BTreeSet;
 
@@ -299,6 +312,70 @@ pub(crate) mod tests {
             let upper = here.to_ascii_uppercase();
             assert!(is_finding(&title, &body, &vocabulary(), &upper), "GitHub ignores case");
         }
+    }
+
+    // Goal: the issues that a body names as its PR's failures in other merge groups are read
+    // back as `queue failed` wrote them, also with CRLF line ends; a body that names none, or
+    // whose list is malformed, names none.
+    #[test]
+    fn the_other_failures_a_body_names_are_read_back() {
+        let (_, named) = queue_failure(51, 900, &[60, 61]);
+        let expected: BTreeSet<u32> = [60, 61].into();
+        assert_eq!(super::other_failures_named(&named), expected);
+        assert_eq!(super::other_failures_named(&named.replace('\n', "\r\n")), expected, "CRLF");
+        let (_, alone) = queue_failure(51, 900, &[]);
+        assert!(super::other_failures_named(&alone).is_empty(), "{alone}");
+        let malformed = named.replace("#60, #61", "#60, 61");
+        assert!(super::other_failures_named(&malformed).is_empty(), "{malformed}");
+        assert!(super::other_failures_named("").is_empty(), "no body names nothing");
+    }
+
+    // Goal: the issue about a failed `guardrails` run, which quotes the `ratchet` jobs and
+    // their steps by the names that this checkout's `guardrails.yml` defines, is accepted with
+    // the vocabulary that `trust::load` reads from both queue workflows, so nami-ci[bot]'s
+    // issue about a failed ratchet is trusted like one about a failed `gate`. A step name with
+    // an apostrophe is no plain name, so it is "another step", and still accepted. With
+    // `ci.yml`'s names alone, the same body is refused.
+    #[test]
+    fn a_failed_guardrails_run_is_accepted() {
+        let root = crate::workspace_root();
+        let texts: Vec<String> = QUEUE_WORKFLOWS
+            .iter()
+            .map(|path| std::fs::read_to_string(root.join(path)).expect("a queue workflow"))
+            .collect();
+        let both = Vocabulary::from_workflow(&texts.join("\n"), &root).expect("lints are readable");
+        let steps = [
+            "Check out the base next to the PR",
+            "The pull request's mutation evidence (merge group)",
+            "Toolchains and the pinned dylint, installed in this job",
+        ];
+        let observe = ["Check out the base next to the PR"];
+        for name in ["ratchet", "ratchet (head)", steps[0], steps[2]] {
+            assert!(both.names.contains(name), "guardrails.yml defines `{name}`");
+        }
+        assert!(!both.names.contains(steps[1]), "an apostrophe is no plain name");
+        let failure = Failure {
+            pull: 51,
+            author: "nami-agent[bot]".to_owned(),
+            group: BTreeSet::new(),
+            repository: "namicfd/nami".to_owned(),
+            run: 901,
+            jobs: vec![
+                failed(31, "ratchet", &steps, Some(Codes::default())),
+                failed(32, "ratchet (head)", &observe, None),
+            ],
+            earlier: [9].into(),
+        };
+        let draft = Draft::parse(&finding(&failure, &both)).expect("a finding parses");
+        let quoted = "- Job `ratchet` failed at `Check out the base next to the PR`, `Toolchains \
+                      and the pinned dylint, installed in this job`, another step ([log](";
+        assert!(draft.body.contains(quoted), "{}", draft.body);
+        let head = "- Job `ratchet (head)` failed at `Check out the base next to the PR` ([log](";
+        assert!(draft.body.contains(head), "{}", draft.body);
+        assert!(is_finding(&draft.title, &draft.body, &both, "namicfd/nami"), "{}", draft.body);
+        let ci_only = Vocabulary::from_workflow(&texts[0], &root).expect("lints are readable");
+        assert!(!ci_only.names.contains("ratchet"), "ci.yml has no ratchet job");
+        assert!(!is_finding(&draft.title, &draft.body, &ci_only, "namicfd/nami"));
     }
 
     // Goal: a hostile body is refused, never a panic; only ASCII whitespace at the end is

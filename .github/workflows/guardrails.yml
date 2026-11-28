@@ -1,17 +1,26 @@
-# Checks on what a pull request does to the guardrails themselves (ADR-0020).
-# Neither job is a required check: a guardrail change waits for the code owner anyway
-# (ADR-0015). These jobs tell the code owner where to look first.
+# Checks on what a pull request does to the guardrails themselves (ADR-0020, ADR-0022).
+# `pr body` and `base gate` are not required checks: they tell the code owner where to look
+# first. `ratchet` proves that a PR which changes only rule paths only tightens them (proposed in
+# ADR-0022). It runs in shadow mode: its verdict shows in the job summary of every PR, but it is
+# not a required check, and every guardrail path keeps its code owner, until the policy flip.
 name: guardrails
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # A review runs only the judge again, in ratchet-review.yml, so that no review can cancel the
+  # observing job.
+  # The merge queue waits for every required check on the rebased result (ADR-0009).
+  merge_group:
 
 permissions:
   contents: read
 
+# A push or an edit replaces the run for the same pull request, every job included, so that no
+# job of an older run is left skipped or stale beside the new one. Reviews do not run this
+# workflow.
 concurrency:
-  group: guardrails-${{ github.ref }}
+  group: guardrails-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,6 +31,8 @@ jobs:
   # and a PR from a claimed issue's branch closes that issue (ADR-0021).
   pr-body:
     name: pr body
+    # A merge group has no description.
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Reading issues lets the check confirm that each listed issue is a trusted follow-up.
@@ -36,8 +47,8 @@ jobs:
       - name: cargo xtask pr-body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-          PR_BRANCH: ${{ github.head_ref }}
-          BASE_REF: ${{ github.base_ref }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask pr-body --base "origin/${BASE_REF}"
 
@@ -46,6 +57,7 @@ jobs:
   # rule. It then runs the PR's tidy on the base tree and reports what the PR tightened.
   base-gate:
     name: base gate
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -55,7 +67,7 @@ jobs:
       - uses: ./.github/actions/setup
       - name: Check out the base branch next to the PR
         env:
-          BASE_REF: ${{ github.base_ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: git worktree add "${RUNNER_TEMP}/base" "origin/${BASE_REF}"
       - name: Base tidy on the PR tree (red means the PR loosened a rule it needed)
         working-directory: ${{ runner.temp }}/base
@@ -80,3 +92,231 @@ jobs:
               echo '```'
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
+
+  # The ratchet (ADR-0022) in two jobs, so that the job that judges never runs the PR's code.
+  #
+  # `ratchet (head)` builds and runs the PR's tools on the base's cases, with the base's
+  # `cargo xtask ratchet observe`, and uploads only what they printed, as JSON, with the
+  # fingerprint of the head tree it copied. Its steps get no token: checkout uses a read-only one
+  # and does not keep it. The placements are drawn from a seed of the head's content, so a
+  # re-run draws the same ones.
+  #
+  # In a merge group it observes without mutation testing and the null mutant: the judge reads
+  # their evidence from the pull request's own observation instead, if the rule-path diff is
+  # identical (ADR-0022, amending ADR-0009). So both jobs fit in the queue's 30 minutes: 15 here
+  # and 10 for the judge, against about 2 minutes each measured on the canonical diffs, which
+  # leaves 5 for runners to pick the jobs up.
+  ratchet-head:
+    name: ratchet (head)
+    runs-on: ubuntu-latest
+    # Mutation testing of a large lint change is the slow part (ADR-0022, Consequences).
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 15 || 120 }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Check out the base next to the PR
+        env:
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          # A PR is checked out as GitHub's test merge, whose first parent is the base branch.
+          # A merge group names its base.
+          base="${QUEUE_BASE:-$(git rev-parse HEAD^1)}"
+          git worktree add --detach "${RUNNER_TEMP}/base" "${base}"
+      - name: The base's ratchet observes the PR's tools
+        working-directory: ${{ runner.temp }}/base
+        env:
+          # The base's binary is built outside every cached path.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/observations"
+          if ! grep --quiet '"observe"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          # The observations record the commit observed and the PR head, so that a judge run
+          # after a review judges exactly this commit (ratchet-review.yml).
+          pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
+          # A base whose judge cannot read carried evidence observes mutants in the queue too.
+          no_mutants=()
+          if [ "${EVENT}" = merge_group ] && grep --quiet '"--carried"' xtask/src/ratchet/cli.rs
+          then
+            no_mutants=(--no-mutants)
+          fi
+          cargo xtask ratchet observe --base . --head "${GITHUB_WORKSPACE}" \
+            --out "${RUNNER_TEMP}/observations/observations.json" --work "${RUNNER_TEMP}/work" \
+            --pr-head "${pr_head}" --commit "$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+            "${no_mutants[@]}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ratchet-observations
+          path: ${{ runner.temp }}/observations/
+          if-no-files-found: ignore
+          # The longest that GitHub keeps an artifact of a public repository (90 days; a lower
+          # limit set for the repository caps it), so that a review run can judge a PR that
+          # stayed open that long. After that, a review run gives no verdict.
+          retention-days: 90
+
+  # `ratchet` judges: the base's binary, built here from the base's own checkout, reads the
+  # base's corpus from that checkout, the PR's source as data, and the observations. It runs no
+  # PR code, and its tools come from a pinned install here, never from a cache the PR's code
+  # could have written. It is meant to become the required check, so it already runs on every
+  # event and is never skipped: a skipped job counts as passed for a required check. The summary
+  # names the commits judged: in a merge group, the group's parent commit, which is the entry
+  # ahead in the queue or the target branch, and the group's head.
+  ratchet:
+    name: ratchet
+    needs: ratchet-head
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 10 || 60 }}
+    # Reading the reviews and their threads is the review check; reading runs finds a merge
+    # group's carried evidence.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the base next to the PR
+        env:
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          base="${QUEUE_BASE:-$(git rev-parse HEAD^1)}"
+          git worktree add --detach "${RUNNER_TEMP}/base" "${base}"
+      # The lint library's toolchain and dylint only when something below `lints/`, or the
+      # dylint wrapper, changed: that is when the judge runs the lint checks
+      # (`scope::is_lint_tooling`).
+      - name: Toolchains and the pinned dylint, installed in this job
+        working-directory: ${{ runner.temp }}/base
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            exit 0
+          fi
+          rustup toolchain install
+          if ! git -C "${GITHUB_WORKSPACE}" diff --name-only "$(git rev-parse HEAD)" HEAD \
+            | grep --quiet -E '^(lints/|xtask/src/dylint\.rs$)'; then
+            echo "Nothing below \`lints/\` changed: dylint is not installed." \
+              >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          (cd lints && rustup toolchain install)
+          # The versions are those of .github/actions/setup/action.yml.
+          cargo install --locked --root "${RUNNER_TEMP}/tools" cargo-dylint@6.4.0 dylint-link@6.4.0
+          echo "${RUNNER_TEMP}/tools/bin" >> "${GITHUB_PATH}"
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: ratchet-observations
+          path: ${{ runner.temp }}/observations
+      # A merge group carries the mutation evidence over from the pull request's own
+      # observation: the newest completed `pull_request` run of this workflow for the PR's head
+      # commit, on the PR's branch, from this repository, whose `ratchet (head)` job succeeded.
+      # (The run as a whole may have failed: an edit's judge gives no verdict until it is
+      # approved, and `ratchet-review.yml` judges it again in another workflow.) Its artifact
+      # must download, and the commit it observed must be a full commit whose second parent is
+      # the PR head and whose first parent is an ancestor of the group's base, as
+      # `ratchet-review.yml` checks. The judge then compares the rule-path diffs and the head
+      # tree's fingerprint. Anything missing here leaves no carried evidence: no verdict.
+      - name: The pull request's mutation evidence (merge group)
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          number="$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')"
+          pr_head="$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')"
+          carried="${RUNNER_TEMP}/carried"
+          branch=""
+          if [ -n "${number}" ]; then
+            branch=$(gh api "repos/${GH_REPO}/pulls/${number}" \
+              --jq '[.head.repo.full_name, .head.ref] | @tsv' \
+              | awk -F '\t' -v repo="${GH_REPO}" '$1 == repo { print $2 }' || true)
+          fi
+          run=""
+          if [ -n "${branch}" ]; then
+            runs="repos/${GH_REPO}/actions/workflows/guardrails.yml/runs"
+            candidates=$(gh api "${runs}?event=pull_request&head_sha=${pr_head}&per_page=100" \
+              --jq '.workflow_runs[] | [.created_at, .id, .status, .head_sha, .head_branch,
+                .head_repository.full_name] | @tsv' \
+              | awk -F '\t' -v sha="${pr_head}" -v branch="${branch}" -v repo="${GH_REPO}" \
+                '$3 == "completed" && $4 == sha && $5 == branch && $6 == repo { print $1, $2 }' \
+              | sort -r | cut -d ' ' -f 2 || true)
+            # The newest of at most five matching runs whose observing job succeeded and whose
+            # artifact downloads: an older one is tried when a newer one's download fails.
+            tried=0
+            for candidate in ${candidates}; do
+              [ "${tried}" -lt 5 ] || break
+              tried=$((tried + 1))
+              observed=$(gh api "repos/${GH_REPO}/actions/runs/${candidate}/jobs?per_page=100" \
+                --jq '.jobs[] | select(.name == "ratchet (head)") | .conclusion' || true)
+              [ "${observed}" = success ] || continue
+              rm -rf "${carried}"
+              if gh run download "${candidate}" --name ratchet-observations --dir "${carried}"; then
+                run="${candidate}"
+                break
+              fi
+            done
+          fi
+          commit=""
+          if [ -n "${run}" ]; then
+            commit=$(jq -r '.commit // empty' "${carried}/observations.json" 2> /dev/null || true)
+          fi
+          if [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] && git fetch --quiet --no-tags origin "${commit}" \
+            && [ "$(git rev-parse "${commit}^2" 2> /dev/null)" = "${pr_head}" ] \
+            && git merge-base --is-ancestor "${commit}^1" "${QUEUE_BASE}"; then
+            git worktree add --detach "${carried}/base" "${commit}^1"
+            git worktree add --detach "${carried}/head" "${commit}"
+          else
+            rm -rf "${carried}"
+            echo "No observation of the PR head ${pr_head} on its branch, with its observed" \
+              "commit, was found." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+      - name: The base's ratchet judges
+        working-directory: ${{ runner.temp }}/base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          # The reviewer app's login, once the maintainer has set it up; it reviews in CI (#59).
+          REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          # A merge group's ref is gh-readonly-queue/<base>/pr-<number>-<PR head commit>.
+          number="${PR_NUMBER:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-\([0-9]*\)-.*|\1|p')}"
+          pr_head="${PR_HEAD:-$(echo "${QUEUE_REF}" | sed -n 's|.*/pr-[0-9]*-\([0-9a-f]*\)$|\1|p')}"
+          commits="$(git rev-parse HEAD)..$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)"
+          # Without the carried evidence, a merge group's judge finds no mutation run and gives
+          # no verdict.
+          carried=()
+          if [ -d "${RUNNER_TEMP}/carried/head" ]; then
+            carried=(--carried "${RUNNER_TEMP}/carried")
+          fi
+          set +e
+          cargo xtask ratchet judge --base . --head "${GITHUB_WORKSPACE}" \
+            --observations "${RUNNER_TEMP}/observations/observations.json" \
+            --pr "${number}" --pr-head "${pr_head}" --commits "${commits}" \
+            --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" "${carried[@]}" \
+            > "${RUNNER_TEMP}/ratchet.md"
+          status=$?
+          cat "${RUNNER_TEMP}/ratchet.md" >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"

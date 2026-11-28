@@ -220,7 +220,8 @@ impl Visitor<'_> {
     fn check_macro_name(&mut self, name: &Ident) {
         for ban in MACRO_BANS {
             let is_banned = ban.names.iter().any(|banned| name == banned);
-            if is_banned && !registry::is_allowed(ban.allowed, self.path) {
+            let applies = ban.scope.includes(self.scope);
+            if is_banned && applies && !registry::is_allowed(ban.allowed, self.path) {
                 self.report(name.span(), ban.id, ban.message);
             }
         }

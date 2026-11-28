@@ -187,19 +187,36 @@ fn status(root: &Path, remote: &str, github: &dyn GitHub) -> Result<String, Stri
         lines.push(format!("{:<32} {:<10} {}\n", task.id, description, task.title));
     }
     let repository = issue::github::repository_of(root, remote);
+    let is_issue = |claim: &Claim| matches!(issue::number_of_id(&claim.task), Ok(Some(_)));
+    // What a queue-failure claim waits for depends on the PR's other queue-failure issues.
+    let siblings = if current.iter().any(is_issue) {
+        trust::load(root, &format!("{remote}/main")).and_then(|trust| {
+            github.open_issues().map(|open| queue_failures(&open, &trust, &current))
+        })
+    } else {
+        Ok(Vec::new())
+    };
     for claim in &current {
         let Ok(Some(number)) = issue::number_of_id(&claim.task) else {
             continue;
         };
         // Titles are not printed: whether an issue is trusted is `issue show`'s business.
-        let description = match github.issue(number) {
-            Ok(found) if !found.is_open => "done: the issue is closed".to_owned(),
-            Ok(found) => match queue_failure_hold(github, &found, repository.as_deref()) {
-                Ok(Some(reason)) => format!("{}; {reason}", claimed(claim)),
-                Ok(None) => claimed(claim),
-                Err(error) => format!("{}; its fix's state is unknown: {error}", claimed(claim)),
-            },
-            Err(error) => format!("{}; its state is unknown: {error}", claimed(claim)),
+        let description = match (github.issue(number), siblings.as_deref()) {
+            (Ok(found), _) if !found.is_open => "done: the issue is closed".to_owned(),
+            (Ok(found), Err(error)) if queue_failure_pull(&found).is_some() => {
+                format!("{}; its fix's state is unknown: {error}", claimed(claim))
+            }
+            (Ok(found), siblings) => {
+                let siblings = siblings.unwrap_or(&[]);
+                match queue_failure_hold(github, &found, repository.as_deref(), siblings) {
+                    Ok(Some(reason)) => format!("{}; {reason}", claimed(claim)),
+                    Ok(None) => claimed(claim),
+                    Err(error) => {
+                        format!("{}; its fix's state is unknown: {error}", claimed(claim))
+                    }
+                }
+            }
+            (Err(error), _) => format!("{}; its state is unknown: {error}", claimed(claim)),
         };
         lines.push(format!("{:<32} {description}\n", claim.task));
     }
@@ -252,6 +269,7 @@ fn ready_issues(
     trust::decision_label_exists(&github.repository_labels()?)?;
     let repository = issue::github::repository_of(root, remote);
     let held: BTreeSet<&str> = current.iter().map(|claim| claim.task.as_str()).collect();
+    let siblings = queue_failures(&open, &trust, current);
     let mut lines = Vec::new();
     let mut left_out = Vec::new();
     for found in candidates {
@@ -272,7 +290,7 @@ fn ready_issues(
         if held.contains(id.as_str()) || trust::unworkable(found, &[], &[], &trust).is_some() {
             continue;
         }
-        match is_workable(github, found, &trust, repository.as_deref()) {
+        match is_workable(github, found, &trust, repository.as_deref(), &siblings) {
             Ok(true) => lines.push(format!("{id}\t{}\n", found.title)),
             Ok(false) => {}
             Err(error) => {
@@ -286,18 +304,20 @@ fn ready_issues(
 }
 
 /// True if agents may work on `found` now: its label history allows it, and it is no
-/// queue-failure issue that waits (ADR-0021, point 6).
+/// queue-failure issue that waits (ADR-0021, point 6), given the open queue-failure issues
+/// `siblings`.
 fn is_workable(
     github: &dyn GitHub,
     found: &Issue,
     trust: &trust::Trust,
     repository: Option<&str>,
+    siblings: &[Sibling],
 ) -> Result<bool, String> {
     let (events, comments) = issue::history(github, found)?;
     if trust::unworkable(found, &events, &comments, trust).is_some() {
         return Ok(false);
     }
-    Ok(queue_failure_hold(github, found, repository)?.is_none())
+    Ok(queue_failure_hold(github, found, repository, siblings)?.is_none())
 }
 
 fn claim(root: &Path, remote: &str, github: &dyn GitHub, id: &str) -> Result<String, String> {
@@ -345,7 +365,8 @@ fn claim_issue(
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
     let repository = issue::github::repository_of(root, remote);
-    if let Some(reason) = queue_failure_hold(github, &found, repository.as_deref())? {
+    let siblings = queue_failures(&github.open_issues()?, &trust, &current);
+    if let Some(reason) = queue_failure_hold(github, &found, repository.as_deref(), &siblings)? {
         return Err(format!("cannot claim `{id}`: {reason}"));
     }
     let holder = holder(root);
@@ -355,7 +376,8 @@ fn claim_issue(
         Some(pull) => format!(
             "fix it on #{pull}'s own branch, add `Fixes #{number}` to #{pull}'s description, \
              re-queue #{pull}, and keep the claim: #{pull}'s merge closes the issue (ADR-0021, \
-             point 6)"
+             point 6){}",
+            unnamed_note(&unnamed_siblings(&found, pull, &siblings), pull)
         ),
         None => format!(
             "work on the branch `task/{id}`, and write `Fixes #{number}` in the PR \
@@ -385,15 +407,20 @@ fn queue_failure_pull(found: &Issue) -> Option<u32> {
 /// - the PR's branch is not in this repository, or cannot be looked up: agents check out and
 ///   push only the bot's own branches here, whatever the issue's labels say (ADR-0023), and a
 ///   human handles it;
+/// - another queue-failure issue of the PR, which `found` does not name as a failure of
+///   another merge group, is claimed, or the PR's description closes it: one session at a
+///   time works the PR's queue failures (see [`sibling_hold`]);
 /// - the PR is in the merge queue: a push would take it out again. If it fails there, the
 ///   new run gets its own issue.
 ///
-/// `repository` is this repository's `owner/name`, for `Fixes <owner>/<name>#<n>`. Only whether
-/// the description closes the issue is read, never its text.
+/// `repository` is this repository's `owner/name`, for `Fixes <owner>/<name>#<n>`, and
+/// `siblings` the open queue-failure issues that agents trust. Only whether the description
+/// closes an issue is read, never its text.
 fn queue_failure_hold(
     github: &dyn GitHub,
     found: &Issue,
     repository: Option<&str>,
+    siblings: &[Sibling],
 ) -> Result<Option<String>, String> {
     let Some(pull) = queue_failure_pull(found) else {
         return Ok(None);
@@ -420,6 +447,8 @@ fn queue_failure_hold(
             "#{pull} says `Fixes #{number}`: the fix is in flight and #{pull}'s merge closes the \
              issue, so take other work"
         )
+    } else if let Some(reason) = sibling_hold(found, pull, &fix, siblings, repository) {
+        reason
     } else if github.is_queued(pull)? {
         format!(
             "#{pull} is in the merge queue, and agents never push to a queued PR; take other \
@@ -429,6 +458,100 @@ fn queue_failure_hold(
         return Ok(None);
     };
     Ok(Some(format!("{reason} (ADR-0021, point 6)")))
+}
+
+/// An open queue-failure issue that agents trust, as [`queue_failure_hold`] weighs it against
+/// the other queue-failure issues of its PR.
+struct Sibling {
+    /// The issue's number.
+    number: u32,
+    /// The PR whose failure it records.
+    pull: u32,
+    /// True while someone holds its claim.
+    is_claimed: bool,
+}
+
+/// The open issues in `open` that are queue failures and that agents trust, each with whether
+/// `claims` hold it.
+fn queue_failures(open: &[Issue], trust: &trust::Trust, claims: &[Claim]) -> Vec<Sibling> {
+    let held: BTreeSet<&str> = claims.iter().map(|claim| claim.task.as_str()).collect();
+    let siblings: Vec<Sibling> = open
+        .iter()
+        .filter(|found| found.is_open && trust::refused(found, trust).is_none())
+        .filter_map(|found| {
+            let pull = queue_failure_pull(found)?;
+            let is_claimed = held.contains(issue::id_of(found.number).as_str());
+            Some(Sibling { number: found.number, pull, is_claimed })
+        })
+        .collect();
+    assert!(siblings.len() <= open.len(), "each open issue is one sibling at most");
+    siblings
+}
+
+/// The other queue-failure issues of PR `pull` in `siblings` that `found` does not name as
+/// failures of another merge group. `queue failed` names every open one it sees (ADR-0021,
+/// point 6), and files nothing when one is about the same merge group, so an issue it does
+/// not name was filed beside this one, for the same merge group, when both queue workflows
+/// failed and neither run saw the other's issue.
+fn unnamed_siblings<'s>(found: &Issue, pull: u32, siblings: &'s [Sibling]) -> Vec<&'s Sibling> {
+    let named = queue::shape::other_failures_named(&found.body);
+    let unnamed: Vec<&Sibling> = siblings
+        .iter()
+        .filter(|other| other.pull == pull && other.number != found.number)
+        .filter(|other| !named.contains(&other.number))
+        .collect();
+    assert!(unnamed.iter().all(|other| other.number != found.number), "never itself");
+    unnamed
+}
+
+/// Why `found`, a queue-failure issue of PR `pull`, whose description is `fix`'s, waits for
+/// another queue-failure issue in `siblings` that it does not name, or `None`: that issue is
+/// claimed, or `fix` closes it. Both record one merge group ([`unnamed_siblings`]), so one
+/// session at a time works them, and its push may fix both: two sessions would push to one
+/// branch.
+fn sibling_hold(
+    found: &Issue,
+    pull: u32,
+    fix: &Issue,
+    siblings: &[Sibling],
+    repository: Option<&str>,
+) -> Option<String> {
+    assert_eq!(queue_failure_pull(found), Some(pull), "a queue failure of #{pull}");
+    let number = found.number;
+    let unnamed = unnamed_siblings(found, pull, siblings);
+    let worked = unnamed.iter().find_map(|other| {
+        let other_number = other.number;
+        if other.is_claimed {
+            Some(format!("issue #{other_number} is claimed"))
+        } else {
+            crate::pr::closes(&fix.body, other_number, repository)
+                .then(|| format!("#{pull} says `Fixes #{other_number}`"))
+        }
+    })?;
+    Some(format!(
+        "{worked}, and it records a failure of #{pull} that issue #{number} does not name as \
+         another merge group's: one session at a time works #{pull}'s queue failures, and its \
+         push may fix both, so take other work"
+    ))
+}
+
+/// What the claim of a queue-failure issue of PR `pull` adds about the issues `unnamed`,
+/// which record the same merge group's failure: nothing if there are none.
+fn unnamed_note(unnamed: &[&Sibling], pull: u32) -> String {
+    if unnamed.is_empty() {
+        return String::new();
+    }
+    let numbers: Vec<String> = unnamed.iter().map(|other| format!("#{}", other.number)).collect();
+    let fixes: Vec<String> =
+        unnamed.iter().map(|other| format!("`Fixes #{}`", other.number)).collect();
+    assert_eq!(numbers.len(), fixes.len(), "one `Fixes` line per issue");
+    format!(
+        ". Open issue {} records a failure of #{pull} too, which this issue does not name, so \
+         most likely of the same merge group: if your push fixes it too, also add {} to \
+         #{pull}'s description",
+        numbers.join(", "),
+        fixes.join(", ")
+    )
 }
 
 /// The text of a claim file: who holds the task and from which session.

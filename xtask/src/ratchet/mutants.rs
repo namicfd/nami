@@ -1,0 +1,1052 @@
+//! Mutation testing of the rule-path diff: `cargo mutants --in-diff` must leave no mutant
+//! missed (ADR-0009, ADR-0022).
+//!
+//! The corpus shows that the base's cases still hold. Mutation testing shows that the head's
+//! own tests pin down the code it changed, so that the cases this PR adds are real cases. The
+//! diff is built here from the two trees, one per cargo workspace: `xtask` in the root workspace
+//! and the lint library in `lints/`, which is its own.
+//!
+//! cargo-mutants runs the head's tests, so it runs in the observing job ([`observe`]), which
+//! records its exit code, the number of mutants it listed, `outcomes.json` and `missed.txt`.
+//! The judge reads them strictly ([`judge`]): anything missing, unexpected or inconsistent is
+//! no verdict. A changed hunk without a mutant of its own proves nothing either, because a
+//! changed constant or a deleted line makes none, unless each of its lines is a comment, test
+//! code, a dispatch call or a new declaration that holds no code a mutant could change
+//! ([`super::hunks`], review of #57, round 8). The registry's tables are
+//! the exception: the rule-set check reads them as data, so a change to them alone passes with
+//! no mutant; a changed field that the data checks do not prove makes the diff an edit
+//! ([`super::class`]).
+//!
+//! **The null mutant.** A test that depends on the source text of a file it tests, by reading
+//! the file or by pinning line numbers in it, fails on every mutant of the file, so it makes
+//! every mutant look caught without testing the rule (review of #57, round 7). So the observer
+//! also runs the head's tests, as cargo-mutants runs them, on a copy of the head in which every
+//! file that has mutants carries a change that alters no behaviour ([`null_mutant`]): a blank
+//! line at the top and a comment at the end. If any test fails there, the mutant evidence of
+//! that workspace proves nothing, which is no verdict that no approval settles: the test is
+//! fixed (review of #57, round 14). This closes the tests that pin the file's layout or length,
+//! however they read it. A test written to pin its content instead, by hashing the code
+//! without its first lines, by an anchor inside the mutated code or by comparing tokens, passes
+//! the null mutant and still fails on every real one: that needs deliberate code, so it is a
+//! residual risk of the "code written to deceive" kind (ADR-0022), against which the class's
+//! refusal of `SENSITIVE` names and input macros in new tests is what stands.
+//!
+//! The copy keeps every file's permissions, so that a script a test runs stays executable
+//! (round 8). A head file that already holds the null mutant's comment is no verdict, since a
+//! test could tell the null mutant from the head by it; the observer records that as the null
+//! run's failure and keeps the mutation run (round 14). The run is given [`NULL_SECONDS_MAX`]
+//! seconds in a process group of its own, which is killed whole when the time is up, and its
+//! output is kept in `null-<workspace>.stdout` and `.stderr` in the work directory (round 9).
+//! A run that was killed, or that left out a file with mutants, is no verdict.
+
+use super::observations::{Observations, Run};
+use super::{Check, Finding, Reason, Step, Tools, Verdict};
+use crate::json::{self, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+/// One cargo workspace whose rule paths are mutated.
+struct Workspace {
+    /// Name, for the files the ratchet writes and the observations.
+    name: &'static str,
+    /// Rule-path Rust sources below this prefix are mutated in this workspace.
+    sources: &'static str,
+    /// The workspace's directory below the root; empty for the root.
+    directory: &'static str,
+    /// Arguments that select the package and the test runner.
+    arguments: &'static [&'static str],
+    /// The cargo command that runs the tests as cargo-mutants runs them, for the null mutant.
+    tests: &'static [&'static str],
+}
+
+/// The two workspaces that hold rule paths.
+const WORKSPACES: [Workspace; 2] = [
+    Workspace {
+        name: "xtask",
+        sources: "xtask/src/",
+        directory: "",
+        arguments: &["--package", "xtask", "--test-tool", "nextest"],
+        tests: &["nextest", "run", "--package", "xtask", "--no-tests=pass"],
+    },
+    Workspace {
+        name: "lints",
+        sources: "lints/src/",
+        directory: "lints",
+        arguments: &[],
+        tests: &["test"],
+    },
+];
+
+/// The mode of a null-mutant run, and the name under which it keeps the files it changed.
+const NULL: &str = "null";
+const NULL_FILES: &str = "null-files";
+
+/// Seconds the null mutant's test run may take, its build in a fresh target directory
+/// included, before it is killed and gives no verdict.
+pub const NULL_SECONDS_MAX: u64 = 3600;
+
+/// How often a running null mutant is looked at, in milliseconds.
+const NULL_POLL_MILLISECONDS: u64 = 200;
+
+/// Seconds a killed null-mutant run may take to end before the ratchet stops waiting for it.
+const NULL_REAP_SECONDS: u64 = 10;
+
+/// The comment the null mutant appends to each file that has mutants.
+const NULL_COMMENT: &str = "// The ratchet's null mutant: a change that alters no behaviour.";
+
+/// Seconds a test run may take under one mutant before it counts as timed out.
+const TEST_SECONDS_MAX: &str = "300";
+
+/// The names under which an observation keeps cargo-mutants' results.
+const LISTED: &str = "listed";
+const OUTCOMES: &str = "outcomes.json";
+const MISSED: &str = "missed.txt";
+const TIMEOUT: &str = "timeout.txt";
+
+/// The number of non-blank lines of `text`.
+fn line_count(text: &str) -> u64 {
+    u64::try_from(text.lines().filter(|line| !line.trim().is_empty()).count()).expect("counts fit")
+}
+
+/// The changed rule-path Rust sources of the head that belong to `workspace`: regular files,
+/// never a symbolic link, which the ratchet refuses ([`super::Reason::Refused`]) and never
+/// follows, so that the null mutant's copy, which holds no links, has every file it changes.
+fn sources<'a>(head: &Path, rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
+    rule_paths
+        .iter()
+        .filter(|path| path.starts_with(workspace.sources) && is_rust_source(path))
+        .filter(|path| fs::symlink_metadata(head.join(path)).is_ok_and(|meta| meta.is_file()))
+        .collect()
+}
+
+/// The phases of `observe` for [`Step::Mutants`] and [`Step::NullRun`]: runs cargo-mutants on
+/// the head, once per workspace with changed rule-path sources, then the null mutant where
+/// there are mutants, and records what they left into `observed`. Runs head code; judges
+/// nothing. What fails is recorded as its phase's failure, naming the workspace, and the runs
+/// gathered are kept: a null mutant that cannot be made keeps the mutation run and its missed
+/// mutants (review of #57, round 14).
+pub fn observe(
+    base: &Path,
+    head: &Path,
+    rule_paths: &[String],
+    tools: &Tools<'_>,
+    observed: &mut Observations,
+) {
+    for workspace in &WORKSPACES {
+        let changed = sources(head, rule_paths, workspace);
+        if changed.is_empty() {
+            continue;
+        }
+        let diff: Result<String, String> = changed
+            .iter()
+            .map(|path| unified_diff(base, head, path, workspace.directory))
+            .collect();
+        let ran = diff.and_then(|diff| run_mutants(head, workspace, &diff, tools));
+        let (mutation, mutated) = match super::observing(tools, Step::Mutants, ran) {
+            Ok(ran) => ran,
+            Err(reason) => {
+                observed.fail(Step::Mutants, format!("{}: {reason}", workspace.name));
+                continue;
+            }
+        };
+        observed.runs.push(mutation);
+        let nulled = mutated.and_then(|files| {
+            if files.is_empty() {
+                Ok(None)
+            } else {
+                run_null(head, workspace, &files, tools).map(Some)
+            }
+        });
+        match super::observing(tools, Step::NullRun, nulled) {
+            Ok(Some(null)) => observed.runs.push(null),
+            Ok(None) => {}
+            Err(reason) => observed.fail(Step::NullRun, format!("{}: {reason}", workspace.name)),
+        }
+    }
+}
+
+/// The head's `file`, whose text is `text`, with a change that alters no behaviour: a blank
+/// line at the top, which shifts every line number, and a comment line at the end.
+///
+/// # Errors
+///
+/// No verdict: the head's file already holds the null mutant's comment, so a test could tell
+/// the null mutant from the head by it (review of #57, round 9).
+pub fn null_mutant(file: &str, text: &str) -> Result<String, String> {
+    // `listed_files` gives only plain relative paths; another name here is a caller's bug.
+    assert!(
+        super::tree::is_plain_relative(Path::new(file)),
+        "the null mutant's file is named relative to its workspace: {file}"
+    );
+    if text.contains(NULL_COMMENT) {
+        return Err(format!(
+            "the head's {file} already holds the null mutant's comment `{NULL_COMMENT}`, so the \
+             null mutant cannot be told apart from it"
+        ));
+    }
+    Ok(format!("\n{text}\n{NULL_COMMENT}\n"))
+}
+
+/// Runs the head's tests, as cargo-mutants runs them, on a copy of the head in which each of
+/// the files that have mutants, relative to the workspace, carries the null mutant, all at
+/// once, for at most [`NULL_SECONDS_MAX`] seconds. Runs head code; judges nothing.
+///
+/// # Errors
+///
+/// Returns what failed: a listed file outside the workspace's rule paths or missing, or a copy,
+/// file or command that cannot be made, written or run.
+fn run_null(
+    head: &Path,
+    workspace: &Workspace,
+    mutated: &BTreeSet<String>,
+    tools: &Tools<'_>,
+) -> Result<Run, String> {
+    assert!(!mutated.is_empty(), "the null mutant runs only where there are mutants");
+    let within = |file: &String| Path::new(workspace.directory).join(file);
+    if let Some(outside) = mutated.iter().find(|file| !within(file).starts_with(workspace.sources))
+    {
+        return Err(format!(
+            "cargo-mutants listed {outside} for {}, outside its rule paths `{}`",
+            workspace.name, workspace.sources
+        ));
+    }
+    let destination = tools.work.join(format!("null-{}", workspace.name));
+    let copy = super::tree::Scratch::copy_of(head, &destination)
+        .map_err(|error| format!("cannot copy the head for the null mutant: {error}"))?;
+    let directory = copy.root().join(workspace.directory);
+    for file in mutated {
+        let path = directory.join(file);
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {file} for the null mutant: {error}"))?;
+        fs::write(&path, null_mutant(file, &text)?)
+            .map_err(|error| format!("cannot write the null mutant of {file}: {error}"))?;
+    }
+    let target = tools.work.join(format!("null-target-{}", workspace.name));
+    let mut command = super::command(&tools.cargo, &directory);
+    let _command = command.args(workspace.tests).arg("--target-dir").arg(&target);
+    let log = tools.work.join(format!("null-{}", workspace.name));
+    let (exit, stdout, stderr) = output_within(&mut command, &log, NULL_SECONDS_MAX)?;
+    let files: Vec<&str> = mutated.iter().map(String::as_str).collect();
+    let run = Run {
+        subject: workspace.name.to_owned(),
+        placement: String::new(),
+        mode: NULL.to_owned(),
+        exit,
+        stdout: super::tail(&stdout, 40),
+        stderr: super::tail(&stderr, 40),
+        files: BTreeMap::from([(NULL_FILES.to_owned(), Some(files.join("\n")))]),
+    };
+    // `judge_null` reads the files back one per line, so no name may hold a line break.
+    let recorded = run.files.get(NULL_FILES).cloned().flatten().unwrap_or_default();
+    assert_eq!(recorded.lines().count(), mutated.len(), "one recorded line per mutated file");
+    Ok(run)
+}
+
+/// Runs `command` for at most `seconds` in a process group of its own, its output written to
+/// `log` with the extensions `stdout` and `stderr` so that no pipe fills, and returns its exit
+/// code, `None` if it was killed, and what it printed. A run that does not finish in time is
+/// killed with its whole process group, as the hooks kill theirs, so that no test or build it
+/// started outlives it, and says so on its stderr (review of #57, round 9).
+///
+/// # Errors
+///
+/// Returns what failed if the command or its output files cannot be started or read.
+fn output_within(
+    command: &mut std::process::Command,
+    log: &Path,
+    seconds: u64,
+) -> Result<(Option<i32>, String, String), String> {
+    assert!(seconds > 0, "a time limit is positive");
+    let (out, err) = (log.with_extension("stdout"), log.with_extension("stderr"));
+    assert!(log.extension().is_none(), "the log is named without an extension, which it gets");
+    let file = |path: &Path| {
+        fs::File::create(path).map_err(|error| format!("cannot create {}: {error}", path.display()))
+    };
+    let _redirected = command.stdout(file(&out)?).stderr(file(&err)?);
+    let mut child = crate::hook::in_own_process_group(command)
+        .spawn()
+        .map_err(|error| format!("cannot run the null mutant: {error}"))?;
+    let status = wait_within(&mut child, seconds)?;
+    let read = |path: &Path| fs::read_to_string(path).unwrap_or_default();
+    let Some(status) = status else {
+        let killed = match crate::hook::kill_process_group(&mut child) {
+            Ok(()) => "its process group was killed".to_owned(),
+            Err(error) => error,
+        };
+        let reaped = match wait_within(&mut child, NULL_REAP_SECONDS) {
+            Ok(Some(_)) => "and reaped".to_owned(),
+            Ok(None) => format!("but did not end within {NULL_REAP_SECONDS} s"),
+            Err(error) => error,
+        };
+        let stderr = format!(
+            "{}\nthe tests did not finish within {seconds} s; {killed}, {reaped}",
+            read(&err)
+        );
+        return Ok((None, read(&out), stderr));
+    };
+    Ok((status.code(), read(&out), read(&err)))
+}
+
+/// Waits for `child` for at most `seconds`; `None` if it is still running then.
+///
+/// # Errors
+///
+/// Returns what failed if the child cannot be waited for.
+fn wait_within(
+    child: &mut std::process::Child,
+    seconds: u64,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    for _ in 0..polls_within(seconds) {
+        let status =
+            child.try_wait().map_err(|error| format!("cannot wait for the tests: {error}"))?;
+        if status.is_some() {
+            return Ok(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(NULL_POLL_MILLISECONDS));
+    }
+    child.try_wait().map_err(|error| format!("cannot wait for the tests: {error}"))
+}
+
+/// How many polls, [`NULL_POLL_MILLISECONDS`] apart, fill `seconds`.
+fn polls_within(seconds: u64) -> u64 {
+    let polls = seconds * 1000 / NULL_POLL_MILLISECONDS;
+    assert!(polls >= seconds, "a poll is at most a second apart");
+    polls
+}
+
+/// The files that a listing of cargo-mutants names, relative to the workspace: the `path` of
+/// each `path:line:column: what` line.
+///
+/// # Errors
+///
+/// No verdict: a line that is not of that form, or whose path is not a plain relative one, so
+/// that no null mutant is written outside the copy or to a file nobody named.
+pub fn listed_files(listing: &str) -> Result<BTreeSet<String>, String> {
+    let mut files = BTreeSet::new();
+    let mut lines: u32 = 0;
+    for line in listing.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.splitn(4, ':');
+        let (file, number, column) = (parts.next(), parts.next(), parts.next());
+        let numbered = [number, column].iter().all(|part| part.is_some_and(is_number));
+        let plain = file.is_some_and(|file| super::tree::is_plain_relative(Path::new(file)));
+        let (Some(file), true, true, Some(_)) = (file, numbered, plain, parts.next()) else {
+            return Err(format!(
+                "cargo-mutants listed `{line}`, which is no `path:line:column: mutant` with a \
+                 plain relative path"
+            ));
+        };
+        let _new = files.insert(file.to_owned());
+        lines += 1;
+    }
+    assert_eq!(files.is_empty(), lines == 0, "a listed mutant names a file");
+    Ok(files)
+}
+
+/// True for a non-empty run of ASCII digits.
+fn is_number(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// What the null-mutant run of `workspace` shows: nothing if every file with mutants (`starts`,
+/// relative to the root) carried the null mutant and the tests passed; an unproven item if
+/// they failed, for then the mutant evidence proves nothing.
+///
+/// # Errors
+///
+/// No verdict: no null run, one that did not finish, or one that left out a file with
+/// mutants.
+fn judge_null(
+    observations: &Observations,
+    workspace: &Workspace,
+    starts: &BTreeMap<String, Vec<u32>>,
+) -> Result<Option<String>, String> {
+    assert!(!starts.is_empty(), "the null run is judged only where there are mutants");
+    let run = observations
+        .runs_of(workspace.name, NULL)
+        .next()
+        .ok_or_else(|| format!("the observations hold no null-mutant run of {}", workspace.name))?;
+    assert!(starts.values().all(|lines| !lines.is_empty()), "a file with mutants has a line");
+    let Some(exit) = run.exit else {
+        return Err(format!(
+            "the null-mutant run of {} did not finish (killed, or over {NULL_SECONDS_MAX} s): {}",
+            workspace.name,
+            super::tail(&run.stderr, 5)
+        ));
+    };
+    let listed = run.files.get(NULL_FILES).cloned().flatten().unwrap_or_default();
+    let changed: BTreeSet<String> = listed
+        .lines()
+        .map(|file| {
+            if workspace.directory.is_empty() {
+                file.to_owned()
+            } else {
+                format!("{}/{file}", workspace.directory)
+            }
+        })
+        .collect();
+    if let Some(left_out) = starts.keys().find(|file| !changed.contains(*file)) {
+        return Err(format!(
+            "the null-mutant run of {} left out {left_out}, which has mutants",
+            workspace.name
+        ));
+    }
+    if exit == 0 {
+        return Ok(None);
+    }
+    let files: Vec<&str> = changed.iter().map(String::as_str).collect();
+    Ok(Some(format!(
+        "the mutant evidence of {} proves nothing: a test depends on the source text of {}; \
+         with a blank line at the top and a comment at the end, which alter no behaviour, the \
+         head's tests fail (exit {exit}): {}",
+        workspace.name,
+        files.join(", "),
+        super::tail(&run.stderr, 5)
+    )))
+}
+
+/// What the mutation steps judge.
+pub struct Inputs<'a> {
+    /// The base tree.
+    pub base: &'a Path,
+    /// The head tree.
+    pub head: &'a Path,
+    /// The changed rule paths.
+    pub rule_paths: &'a [String],
+    /// The observations or the carried evidence that hold the runs; `None` when neither could
+    /// be judged, which a failed step already says.
+    pub evidence: Option<&'a Observations>,
+    /// The work directory, `--mutants` and the faults.
+    pub tools: &'a Tools<'a>,
+    /// By file, the lines of the dispatch calls and of the new declarations, whose hunks need
+    /// no mutant of their own; `None` if the diff could not be classified, which leaves out
+    /// only the coverage of the hunks.
+    pub class: Option<&'a super::class::Class>,
+}
+
+/// The first line of every mutant, by file relative to the root, per workspace whose mutation
+/// run was read and has mutants: what its null run must cover.
+type Starts = BTreeMap<&'static str, BTreeMap<String, Vec<u32>>>;
+
+/// Judges the recorded runs in two steps, workspace by workspace: [`Step::Mutants`], the
+/// mutation runs, and [`Step::NullRun`], the null-mutant runs. A workspace that cannot be
+/// judged fails its step, and the other workspaces are judged on (review of #57, round 11).
+pub fn judge(inputs: &Inputs<'_>, verdict: &mut Verdict) {
+    let mut starts = Starts::new();
+    mutation_step(inputs, &mut starts, verdict);
+    null_step(inputs, &starts, verdict);
+    assert!(starts.values().all(|files| !files.is_empty()), "a run with mutants places them");
+}
+
+/// The step [`Step::Mutants`]: each workspace's mutation run, into `verdict`, and where its
+/// mutants are, into `starts`.
+fn mutation_step(inputs: &Inputs<'_>, starts: &mut Starts, verdict: &mut Verdict) {
+    verdict.enter(Step::Mutants);
+    if !inputs.tools.mutants {
+        verdict.skip(Step::Mutants, "mutation testing is skipped (`--no-mutants`)");
+        let what = "mutation testing was skipped (`--no-mutants`)".to_owned();
+        return verdict.unprovable(Reason::Evidence, what);
+    }
+    let Some(evidence) = inputs.evidence else {
+        return verdict.skip(Step::Mutants, NO_EVIDENCE);
+    };
+    verdict.reach(Step::Mutants, inputs.tools);
+    for reason in evidence.failures_of(Step::Mutants) {
+        verdict.fail(Step::Mutants, format!("observing failed: {reason}"));
+    }
+    verdict.ran(Check::Mutants);
+    for workspace in &WORKSPACES {
+        if !sources(inputs.head, inputs.rule_paths, workspace).is_empty() {
+            mutation_run(inputs, evidence, workspace, starts, verdict);
+        }
+    }
+}
+
+/// Judges the mutation run of one workspace. Its missed mutants are recorded from `missed.txt`
+/// before anything that can fail, the exit code, the counts and the timeouts among them, so
+/// that no later failure drops them (review of #57, round 12). What cannot be judged fails
+/// [`Step::Mutants`].
+fn mutation_run(
+    inputs: &Inputs<'_>,
+    evidence: &Observations,
+    workspace: &Workspace,
+    starts: &mut Starts,
+    verdict: &mut Verdict,
+) {
+    let found = evidence
+        .runs_of(workspace.name, "mutants")
+        .next()
+        .ok_or_else(|| format!("the observations hold no mutation run of {}", workspace.name));
+    let run = match verdict.inject(Step::Mutants, inputs.tools, found) {
+        Ok(run) => run,
+        Err(reason) => return verdict.fail(Step::Mutants, reason),
+    };
+    if let Some(Some(missed)) = run.files.get(MISSED) {
+        for finding in missed_findings(missed, workspace.directory) {
+            verdict.record(finding);
+        }
+    }
+    let (count, missed) = match read_run(run) {
+        Ok(read) => read,
+        Err(reason) => return verdict.fail(Step::Mutants, reason),
+    };
+    let missed_count = missed.lines().filter(|line| !line.trim().is_empty()).count();
+    verdict.notes.push(format!("Mutants in {}: {count}, missed: {missed_count}.", workspace.name));
+    // The registry's tables are data, which the rule-set check reads, so a data-only change
+    // passes with no mutant. Every other hunk needs one of its own, unless each of its lines is
+    // exempt (`hunks::is_exempt`): a comment or blank, test code, a dispatch call, a new
+    // declaration, or a registration that a dispatch call appended lints to.
+    let placed =
+        if count == 0 { Ok(BTreeMap::new()) } else { mutant_starts(run, workspace.directory) };
+    let here = match placed {
+        Ok(here) => here,
+        Err(reason) => return verdict.fail(Step::Mutants, reason),
+    };
+    assert!(count > 0 || here.is_empty(), "no mutant places without mutants");
+    // Without a class, no hunk can be told exempt; the diff is no verdict already.
+    let mut uncovered = Vec::new();
+    if let Some(class) = inputs.class {
+        for path in changed_sources(inputs.rule_paths, workspace) {
+            let work = &inputs.tools.work;
+            match uncovered_hunks(inputs.base, inputs.head, path, &here, work, class) {
+                Ok(hunks) => uncovered.extend(hunks),
+                Err(reason) => verdict.fail(Step::Mutants, reason),
+            }
+        }
+    }
+    if count > 0 {
+        verdict.uncovered.extend(uncovered);
+        let _replaced = starts.insert(workspace.name, here);
+    } else if let Some(first) = uncovered.first() {
+        verdict.uncovered.push(format!(
+            "the rule-path change in {} yields no mutant, so mutation testing proves nothing \
+             about it (a changed constant or a deleted line makes none); {first}",
+            workspace.name
+        ));
+    }
+}
+
+/// The step [`Step::NullRun`]: the null-mutant run of each workspace whose mutation run has
+/// mutants. A run whose tests fail shows that the workspace's mutant evidence proves nothing,
+/// and fails the step like a run that is missing or killed: no approval stands in for it, and
+/// the test that depends on the source text is fixed instead (review of #57, round 14).
+fn null_step(inputs: &Inputs<'_>, starts: &Starts, verdict: &mut Verdict) {
+    verdict.enter(Step::NullRun);
+    if !inputs.tools.mutants {
+        return verdict.skip(Step::NullRun, "mutation testing is skipped (`--no-mutants`)");
+    }
+    let Some(evidence) = inputs.evidence else {
+        return verdict.skip(Step::NullRun, NO_EVIDENCE);
+    };
+    verdict.reach(Step::NullRun, inputs.tools);
+    for reason in evidence.failures_of(Step::NullRun) {
+        verdict.fail(Step::NullRun, format!("observing failed: {reason}"));
+    }
+    for workspace in &WORKSPACES {
+        let Some(here) = starts.get(workspace.name) else {
+            continue;
+        };
+        match verdict.inject(Step::NullRun, inputs.tools, judge_null(evidence, workspace, here)) {
+            Ok(Some(what)) => verdict.fail(Step::NullRun, what),
+            Ok(None) => {}
+            Err(reason) => verdict.fail(Step::NullRun, reason),
+        }
+    }
+}
+
+/// Why the mutation steps skip without evidence.
+const NO_EVIDENCE: &str =
+    "no mutation evidence of these trees; the observations or carried-evidence step says why";
+
+/// The changed rule-path Rust sources of `workspace`, in either tree, but the registry, whose
+/// tables the rule-set check reads as data, and whose other changes are edits.
+fn changed_sources<'a>(rule_paths: &'a [String], workspace: &Workspace) -> Vec<&'a String> {
+    rule_paths
+        .iter()
+        .filter(|path| path.starts_with(workspace.sources) && is_rust_source(path))
+        .filter(|path| path.as_str() != super::source::REGISTRY)
+        .collect()
+}
+
+/// The first line of every caught or missed mutant, by file relative to the root.
+fn mutant_starts(run: &Run, directory: &str) -> Result<BTreeMap<String, Vec<u32>>, String> {
+    let text = run.files.get(OUTCOMES).cloned().flatten().unwrap_or_default();
+    let outcomes =
+        json::parse(&text).map_err(|error| format!("{OUTCOMES} is not JSON: {}", error.message))?;
+    let list = outcomes.get("outcomes").and_then(Value::as_array).ok_or_else(|| {
+        format!("{OUTCOMES} of {} lists no outcomes, so no mutant can be placed", run.subject)
+    })?;
+    let mut starts: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for outcome in list {
+        let summary = outcome.get("summary").and_then(Value::as_str).unwrap_or_default();
+        let Some(mutant) = outcome.get("scenario").and_then(|scenario| scenario.get("Mutant"))
+        else {
+            continue;
+        };
+        if summary != "CaughtMutant" && summary != "MissedMutant" {
+            continue;
+        }
+        let file = mutant.get("file").and_then(Value::as_str);
+        let line = match mutant
+            .get("span")
+            .and_then(|span| span.get("start"))
+            .and_then(|start| start.get("line"))
+        {
+            Some(Value::Number(digits)) => digits.parse::<u32>().ok(),
+            _ => None,
+        };
+        let (Some(file), Some(line)) = (file, line) else {
+            return Err(format!("a mutant in {OUTCOMES} of {} has no file or line", run.subject));
+        };
+        let path =
+            if directory.is_empty() { file.to_owned() } else { format!("{directory}/{file}") };
+        starts.entry(path).or_default().push(line);
+    }
+    Ok(starts)
+}
+
+/// Every hunk of `path` that needs a mutant and contains none, as an unproven item, with the
+/// first lines of the mutants by file in `starts`. Besides the test module, `class` names the
+/// lines that need none: in the head, the dispatch calls and the new declarations; in the
+/// base, the statements that a dispatch call appended lints to.
+///
+/// # Errors
+///
+/// No verdict: a side that cannot be read or parsed, or a diff that cannot be made.
+pub(crate) fn uncovered_hunks(
+    base: &Path,
+    head: &Path,
+    path: &str,
+    starts: &BTreeMap<String, Vec<u32>>,
+    work: &Path,
+    class: &super::class::Class,
+) -> Result<Vec<String>, String> {
+    let ranges = |root: &Path| -> Result<Vec<(u32, u32)>, String> {
+        match super::source::read_optional(root, path)? {
+            Some(text) => super::hunks::exempt_ranges(path, &text),
+            None => Ok(Vec::new()),
+        }
+    };
+    let of = |map: &BTreeMap<String, Vec<(u32, u32)>>| map.get(path).cloned().unwrap_or_default();
+    let (mut base_ranges, mut head_ranges) = (ranges(base)?, ranges(head)?);
+    head_ranges.extend(of(&class.dispatch));
+    head_ranges.extend(of(&class.declarations));
+    base_ranges.extend(of(&class.replaced));
+    let lines = starts.get(path).map_or(&[][..], Vec::as_slice);
+    let mut unproven = Vec::new();
+    for hunk in super::hunks::hunks(base, head, path, work)? {
+        if super::hunks::is_exempt(&hunk, &head_ranges, &base_ranges)
+            || super::hunks::contains_mutant(&hunk, lines)
+        {
+            continue;
+        }
+        unproven.push(format!(
+            "the change at {path}:{} contains no mutant (a changed literal, a deleted line or a \
+             moved statement makes none), so mutation testing proves nothing about it",
+            hunk.head_first
+        ));
+    }
+    Ok(unproven)
+}
+
+/// Reads one mutation run: the number of mutants, and `missed.txt`. Everything must agree:
+/// the listing, the outcomes, the exit code and the missed list. A mutant that timed out is
+/// neither caught nor missed, so any timeout is no verdict, naming the mutants from
+/// `timeout.txt`.
+fn read_run(run: &Run) -> Result<(u64, String), String> {
+    let file = |name: &str| -> Result<String, String> {
+        run.files
+            .get(name)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| format!("cargo-mutants left no {name} for {}", run.subject))
+    };
+    let listed: u64 =
+        file(LISTED)?.trim().parse().map_err(|_| "the mutant count is not a number")?;
+    if listed == 0 {
+        return Ok((0, String::new()));
+    }
+    let outcomes = json::parse(&file(OUTCOMES)?)
+        .map_err(|error| format!("{OUTCOMES} is not JSON: {}", error.message))?;
+    let count = |key: &str| -> Result<u64, String> {
+        match outcomes.get(key) {
+            Some(Value::Number(digits)) => {
+                digits.parse().map_err(|_| format!("`{key}` is not a count"))
+            }
+            _ => Err(format!("{OUTCOMES} has no `{key}`")),
+        }
+    };
+    let missed_text = file(MISSED)?;
+    let missed_lines = line_count(&missed_text);
+    let (total, missed, timeouts) = (count("total_mutants")?, count("missed")?, count("timeout")?);
+    let tested = count("caught")? + missed + timeouts + count("unviable")?;
+    // cargo-mutants 27.1.0 (`src/outcome.rs`, `LabOutcome::exit_code`): a timeout wins over a
+    // missed mutant, so misses with a timeout exit 3, and 2 means misses without one.
+    let exit_agrees = match run.exit {
+        Some(0) => missed == 0 && timeouts == 0,
+        Some(2) => missed > 0 && timeouts == 0,
+        Some(3) => timeouts > 0,
+        _ => false,
+    };
+    if total != listed || tested != total || missed != missed_lines || !exit_agrees {
+        return Err(format!(
+            "cargo-mutants in {} does not add up: listed {listed}, total {total}, tested {tested}, \
+             missed {missed} with {missed_lines} in {MISSED}, exit {:?}",
+            run.subject, run.exit
+        ));
+    }
+    if timeouts > 0 {
+        let timed_out = file(TIMEOUT)?;
+        if line_count(&timed_out) != timeouts {
+            return Err(format!(
+                "cargo-mutants in {} counts {timeouts} timeouts and lists {} in {TIMEOUT}",
+                run.subject,
+                line_count(&timed_out)
+            ));
+        }
+        return Err(format!(
+            "{timeouts} mutant(s) in {} timed out, so the head's tests neither catch nor miss \
+             them; make the tests that cover them finish: {}",
+            run.subject,
+            super::tail(&timed_out, 20)
+        ));
+    }
+    Ok((total, missed_text))
+}
+
+/// True for a path with the extension `rs`.
+fn is_rust_source(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|extension| extension == "rs")
+}
+
+/// The diff of one file between base and head, with paths relative to the workspace in
+/// `directory`, as cargo-mutants reads them. Empty if the file did not change.
+fn unified_diff(base: &Path, head: &Path, path: &str, directory: &str) -> Result<String, String> {
+    let old = base.join(path);
+    let old = if old.is_file() { old } else { Path::new("/dev/null").to_path_buf() };
+    let mut command = super::command("git", head);
+    let _command = command
+        .args(["diff", "--no-index", "--no-color", "--no-ext-diff", "--unified=3", "--"])
+        .arg(&old)
+        .arg(head.join(path));
+    let output = super::output(&mut command, "`git diff --no-index`")?;
+    match output.status.code() {
+        Some(0) => Ok(String::new()),
+        Some(1) => {
+            // The root workspace's directory is empty, and no path starts with `/`.
+            let relative = path.strip_prefix(&format!("{directory}/")).unwrap_or(path);
+            let is_new = old == Path::new("/dev/null");
+            Ok(with_headers(&String::from_utf8_lossy(&output.stdout), relative, is_new))
+        }
+        status => Err(format!(
+            "`git diff --no-index` exited with {status:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Replaces the headers that `git diff --no-index` writes, which name the two trees, with the
+/// headers of an ordinary diff of `relative`.
+#[must_use]
+pub fn with_headers(diff: &str, relative: &str, is_new: bool) -> String {
+    let Some(first_hunk) = diff.find("\n@@").map(|index| index + 1) else {
+        return String::new();
+    };
+    let old = if is_new { "/dev/null".to_owned() } else { format!("a/{relative}") };
+    let hunks = diff.get(first_hunk..).expect("the hunk starts inside the diff");
+    let rewritten =
+        format!("diff --git a/{relative} b/{relative}\n--- {old}\n+++ b/{relative}\n{hunks}");
+    assert!(rewritten.ends_with(hunks), "the hunks are kept as they are");
+    rewritten
+}
+
+/// Lists and runs cargo-mutants on the head with the diff, and records what it left. Returns
+/// the run, and the files with mutants relative to the workspace, which the null mutant
+/// changes, or why the listing cannot be read.
+fn run_mutants(
+    head: &Path,
+    workspace: &Workspace,
+    diff: &str,
+    tools: &Tools<'_>,
+) -> Result<(Run, Result<BTreeSet<String>, String>), String> {
+    let diff_file = tools.work.join(format!("mutants-{}.diff", workspace.name));
+    let output_directory = tools.work.join(format!("mutants-{}", workspace.name));
+    fs::write(&diff_file, diff).map_err(|error| format!("cannot write the diff: {error}"))?;
+    if output_directory.exists() {
+        fs::remove_dir_all(&output_directory)
+            .map_err(|error| format!("cannot clear {}: {error}", output_directory.display()))?;
+    }
+    let directory = head.join(workspace.directory);
+    let mutants = |list: bool| {
+        let mut command = super::command(&tools.cargo, &directory);
+        let _command = command
+            .args(["mutants", "--in-diff"])
+            .arg(&diff_file)
+            .arg("--dir")
+            .arg(&directory)
+            .args(workspace.arguments);
+        if list {
+            let _list = command.arg("--list");
+        } else {
+            let _run = command.arg("--output").arg(&output_directory).args([
+                "--no-shuffle",
+                "--timeout",
+                TEST_SECONDS_MAX,
+            ]);
+        }
+        super::output(&mut command, "`cargo mutants`")
+    };
+    let listing = mutants(true)?;
+    let listing_text = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let listed = listing_text.lines().filter(|line| !line.trim().is_empty()).count();
+    // A listing that cannot be read leaves the mutation run to be made and kept; only the
+    // null mutant needs the files.
+    let mutated =
+        if listing.status.success() { listed_files(&listing_text) } else { Ok(BTreeSet::new()) };
+    let listed = if listing.status.success() { Some(listed.to_string()) } else { None };
+    let output = if listed.as_deref() == Some("0") { listing } else { mutants(false)? };
+    let read =
+        |name: &str| fs::read_to_string(output_directory.join("mutants.out").join(name)).ok();
+    let files = BTreeMap::from([
+        (LISTED.to_owned(), listed),
+        (OUTCOMES.to_owned(), read(OUTCOMES)),
+        (MISSED.to_owned(), read(MISSED)),
+        (TIMEOUT.to_owned(), read(TIMEOUT)),
+    ]);
+    let run = Run {
+        subject: workspace.name.to_owned(),
+        placement: String::new(),
+        mode: "mutants".to_owned(),
+        exit: output.status.code(),
+        stdout: super::tail(&String::from_utf8_lossy(&output.stdout), 40),
+        stderr: super::tail(&String::from_utf8_lossy(&output.stderr), 40),
+        files,
+    };
+    Ok((run, mutated))
+}
+
+/// One finding per line of cargo-mutants' `missed.txt`: `path:line:column: what`.
+#[must_use]
+pub fn missed_findings(missed: &str, directory: &str) -> Vec<Finding> {
+    let findings: Vec<Finding> = missed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (place, mutation) = line.split_once(": ").unwrap_or((line, "a mutation"));
+            let place = if directory.is_empty() {
+                place.to_owned()
+            } else {
+                format!("{directory}/{place}")
+            };
+            let message = format!(
+                "the mutant `{mutation}` survives the head's tests; add a case that tells the \
+                 mutated rule from the real one (ADR-0009, ADR-0022)"
+            );
+            Finding::new(&place, Check::Mutants, message)
+        })
+        .collect();
+    assert!(
+        u64::try_from(findings.len()) == Ok(line_count(missed)),
+        "one finding per missed mutant"
+    );
+    findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LISTED, MISSED, OUTCOMES, TIMEOUT, missed_findings, read_run, with_headers};
+    use super::{NULL, NULL_COMMENT, NULL_FILES, WORKSPACES, judge_null, listed_files};
+    use crate::ratchet::observations::{Observations, Run};
+    use std::collections::BTreeMap;
+
+    // Goal: the null mutant shifts every line by one and appends a comment, and keeps the text
+    // in between; a head file that already holds the comment is no verdict. The files of a
+    // listing are the paths of its `path:line:column: what` lines, once each, and any other
+    // line, or a path that is not plain and relative, is no verdict.
+    #[test]
+    fn the_null_mutant_alters_only_layout() {
+        let changed = super::null_mutant("src/a.rs", "fn a() {}\n").unwrap();
+        assert_eq!(changed, format!("\nfn a() {{}}\n\n{NULL_COMMENT}\n"));
+        assert_eq!(changed.lines().nth(1), Some("fn a() {}"));
+        let held = super::null_mutant("src/a.rs", &changed).unwrap_err();
+        assert!(held.contains("src/a.rs already holds the null mutant's comment"), "{held}");
+        let listing = "src/a.rs:1:1: replace a\n\nsrc/a.rs:3:1: delete !\nsrc/b.rs:2:5: x: y\n";
+        let files = listed_files(listing).unwrap();
+        assert_eq!(files.into_iter().collect::<Vec<_>>(), ["src/a.rs", "src/b.rs"]);
+        assert_eq!(listed_files("\n"), Ok(std::collections::BTreeSet::new()));
+        let malformed = [":3:1: y", "src/a.rs:3: y", "src/a.rs:x:1: y", "src/a.rs:3:1", "a b"];
+        let escaping = ["../a.rs:1:1: y", "/a.rs:1:1: y", "src/../a.rs:1:1: y", "src/a.rs::1: y"];
+        for line in malformed.iter().chain(&escaping) {
+            let error = listed_files(&format!("src/c.rs:1:1: x\n{line}\n")).unwrap_err();
+            assert!(error.contains(&format!("listed `{line}`")), "{line}: {error}");
+        }
+    }
+
+    // Goal: a command that finishes in time gives its exit code and what it printed, in files
+    // named for its log; one that does not is killed with its whole process group, so that a
+    // process it started dies too, gives no exit code, and says why on its stderr.
+    #[cfg(unix)]
+    #[test]
+    fn the_null_run_has_a_time_limit() {
+        let work = crate::tidy::scratch::Scratch::new("ratchet-null-time");
+        let log = work.root().join("null-lints");
+        let mut quick = std::process::Command::new("sh");
+        let _quick = quick.args(["-c", "echo out; echo err >&2; exit 3"]);
+        let (exit, stdout, stderr) = super::output_within(&mut quick, &log, 5).unwrap();
+        assert_eq!((exit, stdout.as_str(), stderr.as_str()), (Some(3), "out\n", "err\n"));
+        let kept = std::fs::read_to_string(work.root().join("null-lints.stderr")).unwrap();
+        assert_eq!(kept, "err\n", "the output is kept per workspace");
+        let pid_file = work.root().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let mut slow = std::process::Command::new("sh");
+        let _slow = slow.args(["-c", &script]);
+        let (killed, _, why) = super::output_within(&mut slow, &log, 1).unwrap();
+        assert_eq!(killed, None);
+        assert!(why.contains("did not finish within 1 s; its process group was killed"), "{why}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = || {
+            let probe = std::process::Command::new("kill").args(["-0", pid.trim()]).output();
+            probe.unwrap().status.success()
+        };
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            !alive()
+        });
+        assert!(gone, "the grandchild {} was killed with its group", pid.trim());
+        assert_eq!(super::polls_within(1), 5, "200 ms apart");
+        assert_eq!(super::polls_within(super::NULL_SECONDS_MAX), 18_000, "an hour");
+    }
+
+    /// Observations with one null run of the lint workspace over `files`, exiting `exit`.
+    fn null_run(files: &str, exit: Option<i32>) -> Observations {
+        let run = Run {
+            subject: "lints".to_owned(),
+            placement: String::new(),
+            mode: NULL.to_owned(),
+            exit,
+            stdout: String::new(),
+            stderr: "test failed: pinned".to_owned(),
+            files: BTreeMap::from([(NULL_FILES.to_owned(), Some(files.to_owned()))]),
+        };
+        Observations { runs: vec![run], ..Observations::default() }
+    }
+
+    // Goal: the null run is judged from what was observed: a pass is nothing, a failure makes
+    // the mutant evidence prove nothing and names the files, and a missing run or one that left
+    // out a file with mutants is no verdict.
+    #[test]
+    fn the_null_run_is_judged_strictly() {
+        let lints = &WORKSPACES[1];
+        let starts = BTreeMap::from([("lints/src/a.rs".to_owned(), vec![1])]);
+        assert_eq!(judge_null(&null_run("src/a.rs", Some(0)), lints, &starts), Ok(None));
+        let failed = judge_null(&null_run("src/a.rs", Some(101)), lints, &starts).unwrap().unwrap();
+        assert!(failed.contains("a test depends on the source text of lints/src/a.rs"), "{failed}");
+        assert!(failed.contains("test failed: pinned"), "{failed}");
+        let killed = judge_null(&null_run("src/a.rs", None), lints, &starts).unwrap_err();
+        assert!(killed.contains("did not finish"), "{killed}");
+        let other = BTreeMap::from([("lints/src/b.rs".to_owned(), vec![1])]);
+        let left_out = judge_null(&null_run("src/a.rs", Some(0)), lints, &other).unwrap_err();
+        assert!(left_out.contains("left out lints/src/b.rs"), "{left_out}");
+        let missing = judge_null(&Observations::default(), lints, &starts).unwrap_err();
+        assert!(missing.contains("no null-mutant run of lints"), "{missing}");
+        let xtask = &WORKSPACES[0];
+        let root = BTreeMap::from([("xtask/src/a.rs".to_owned(), vec![1])]);
+        let mut at_root = null_run("xtask/src/a.rs", Some(0));
+        at_root.runs[0].subject = "xtask".to_owned();
+        assert_eq!(judge_null(&at_root, xtask, &root), Ok(None));
+    }
+
+    // Goal: the headers of a `--no-index` diff are replaced by those of the relative path, for
+    // a changed and for a new file, and the hunks are kept; a diff without hunks is empty.
+    #[test]
+    fn diff_headers_name_the_relative_path() {
+        let diff = "diff --git a/tmp/base/lints/src/a.rs b/tmp/head/lints/src/a.rs\n\
+                    index 1..2 100644\n--- a/tmp/base/lints/src/a.rs\n\
+                    +++ b/tmp/head/lints/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        assert_eq!(
+            with_headers(diff, "src/a.rs", false),
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
+             @@ -1 +1 @@\n-old\n+new\n"
+        );
+        let added = with_headers(diff, "src/a.rs", true);
+        assert!(added.contains("\n--- /dev/null\n+++ b/src/a.rs\n"), "{added}");
+        assert_eq!(with_headers("Binary files differ\n", "src/a.rs", false), "");
+    }
+
+    // Goal: each missed mutant becomes a finding at its place, below the workspace directory.
+    #[test]
+    fn missed_mutants_are_findings() {
+        let missed = "src/a.rs:12:5: replace f -> bool with true\n\nsrc/b.rs:3:1: delete !\n";
+        let findings = missed_findings(missed, "lints");
+        let places: Vec<&str> = findings.iter().map(|finding| finding.place.as_str()).collect();
+        assert_eq!(places, ["lints/src/a.rs:12:5", "lints/src/b.rs:3:1"]);
+        assert!(findings[0].message.contains("`replace f -> bool with true` survives"));
+        assert_eq!(missed_findings("xtask/src/c.rs:1:1: x\n", "")[0].place, "xtask/src/c.rs:1:1");
+        assert!(missed_findings("", "").is_empty(), "nothing missed");
+    }
+
+    fn run(exit: Option<i32>, listed: &str, counts: [u32; 5], missed: &str) -> Run {
+        let [total, caught, lost, timeouts, unviable] = counts;
+        let outcomes = format!(
+            "{{\"total_mutants\":{total},\"caught\":{caught},\"missed\":{lost},\
+             \"timeout\":{timeouts},\"unviable\":{unviable}}}"
+        );
+        let files = BTreeMap::from([
+            (LISTED.to_owned(), Some(listed.to_owned())),
+            (OUTCOMES.to_owned(), Some(outcomes)),
+            (MISSED.to_owned(), Some(missed.to_owned())),
+            (
+                TIMEOUT.to_owned(),
+                Some("src/a.rs:2:1: replace b\n".repeat(usize::try_from(timeouts).unwrap())),
+            ),
+        ]);
+        Run {
+            subject: "lints".to_owned(),
+            placement: String::new(),
+            mode: "mutants".to_owned(),
+            exit,
+            stdout: String::new(),
+            stderr: String::new(),
+            files,
+        }
+    }
+
+    // Goal: a mutation run is read only if the listing, the outcomes, `missed.txt` and the
+    // exit code agree, with cargo-mutants 27.1.0's precedence (`LabOutcome::exit_code`): 0 for
+    // none missed and none timed out, 3 for any timeout, missed ones or not, and 2 for missed
+    // ones without a timeout. Any timeout is no verdict that names the mutants. Zero mutants
+    // listed is read as zero, for the judge to call unproven.
+    #[test]
+    fn mutation_runs_are_read_strictly() {
+        let missed = "src/a.rs:1:1: replace a\n";
+        assert_eq!(read_run(&run(Some(0), "2", [2, 2, 0, 0, 0], "")), Ok((2, String::new())));
+        assert_eq!(read_run(&run(Some(2), "2", [2, 1, 1, 0, 0], missed)).unwrap().0, 2);
+        let timed_out = read_run(&run(Some(3), "2", [2, 1, 0, 1, 0], "")).unwrap_err();
+        assert!(timed_out.contains("1 mutant(s) in lints timed out"), "{timed_out}");
+        assert!(timed_out.contains("src/a.rs:2:1: replace b"), "{timed_out}");
+        let mut unlisted = run(Some(3), "2", [2, 1, 0, 1, 0], "");
+        let _emptied = unlisted.files.insert(TIMEOUT.to_owned(), Some(String::new()));
+        assert!(read_run(&unlisted).unwrap_err().contains("lists 0 in timeout.txt"));
+        let both = read_run(&run(Some(3), "2", [2, 0, 1, 1, 0], missed)).unwrap_err();
+        assert!(both.contains("1 mutant(s) in lints timed out"), "a miss and a timeout: {both}");
+        assert_eq!(read_run(&run(Some(0), "0", [0, 0, 0, 0, 0], "")), Ok((0, String::new())));
+        let inconsistent = [
+            run(Some(0), "2", [2, 1, 1, 0, 0], missed),
+            run(Some(0), "2", [2, 1, 0, 1, 0], ""),
+            run(Some(2), "2", [2, 2, 0, 0, 0], ""),
+            run(Some(2), "2", [2, 1, 1, 0, 0], ""),
+            run(Some(3), "2", [2, 2, 0, 0, 0], ""),
+            run(Some(2), "2", [2, 0, 1, 1, 0], missed),
+            run(Some(0), "3", [2, 2, 0, 0, 0], ""),
+            run(Some(0), "2", [2, 1, 0, 0, 0], ""),
+            run(Some(1), "2", [2, 2, 0, 0, 0], ""),
+            run(None, "2", [2, 2, 0, 0, 0], ""),
+        ];
+        for (index, bad) in inconsistent.iter().enumerate() {
+            assert!(read_run(bad).is_err(), "case {index} must not be read");
+        }
+        let mut gone = run(Some(2), "1", [1, 0, 1, 0, 0], missed);
+        let _removed = gone.files.insert(MISSED.to_owned(), None);
+        assert!(read_run(&gone).unwrap_err().contains("left no missed.txt"));
+    }
+}

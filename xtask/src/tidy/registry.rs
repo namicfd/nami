@@ -391,6 +391,8 @@ pub struct MacroBan {
     pub names: &'static [&'static str],
     /// Files or directories, relative to the root, where the macros are allowed.
     pub allowed: &'static [&'static str],
+    /// Which files the ban applies to.
+    pub scope: BanScope,
     /// The violation message: what is wrong, how to fix it, and where the reason is.
     pub message: &'static str,
 }
@@ -410,6 +412,7 @@ pub const MACRO_BANS: &[MacroBan] = &[MacroBan {
     id: "debug-assert-placement",
     names: &["debug_assert", "debug_assert_eq", "debug_assert_ne"],
     allowed: &["crates/kernels"],
+    scope: BanScope::Everywhere,
     message: "`debug_assert!` outside `kernels`; use `assert!`. `debug_assert!` is only for \
               per-cell checks inside hot loops in `kernels` (ADR-0004)",
 }];

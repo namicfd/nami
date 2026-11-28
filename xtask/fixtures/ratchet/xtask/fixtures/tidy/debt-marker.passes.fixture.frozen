@@ -1,0 +1,5 @@
+// path: crates/solver/src/example.rs
+//! Unfinished work is a task in `docs/exec-plans/`, not a comment.
+
+// Ghost cells are filled by the caller; see the plan for the boundary conditions.
+fn fill_ghosts() {}

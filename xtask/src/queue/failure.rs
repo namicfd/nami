@@ -5,10 +5,11 @@
 //! the PR has really left the queue (`crate::queue` checks), the issue names the PR, the
 //! other PRs in the same group, and the failed jobs.
 //!
-//! The issue is filed by the bot, so agents trust it (ADR-0021), but the run tested the PRs'
-//! own code and workflow files: every log line, and every job and step name, is text that a PR
-//! controls. The issue therefore quotes only what it can check against a closed set, the
-//! [`Vocabulary`]: job and step names that `main`'s `ci.yml` defines, tidy's rule IDs and the
+//! The issue is filed by the CI app, `nami-ci[bot]`, and agents trust it only in the shape
+//! that [`super::shape`] checks (ADR-0023), but the run tested the PRs' own code and workflow
+//! files: every log line, and every job and step name, is text that a PR controls. The issue
+//! therefore quotes only what it can check against a closed set, the [`Vocabulary`]: job and
+//! step names that `main`'s `ci.yml` and `guardrails.yml` define, tidy's rule IDs and the
 //! dylint lints' names. Everything else it builds from numbers. The fixer reads the log
 //! through the link.
 
@@ -23,6 +24,16 @@ pub const QUEUE_PREFIX: &str = "gh-readonly-queue/";
 
 /// The workflow whose job and step names an issue may quote, relative to the root.
 pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+/// The workflow of the `ratchet` check (ADR-0022), a required check once the policy flip makes
+/// it one, whose merge-queue failures are filed too: a rule PR whose carried mutation evidence
+/// no longer matches, because another rule PR changed the same files first, is fixed by a
+/// rebase, like any other queue failure.
+pub const GUARDRAILS_WORKFLOW: &str = ".github/workflows/guardrails.yml";
+
+/// The workflows whose failed merge-queue runs are filed, and whose job and step names an issue
+/// may quote.
+pub const QUEUE_WORKFLOWS: [&str; 2] = [CI_WORKFLOW, GUARDRAILS_WORKFLOW];
 
 /// The longest job or step name that an issue quotes.
 const NAME_CHARS_MAX: usize = 80;
@@ -41,7 +52,7 @@ pub struct QueueEntry {
 /// The names that an issue may quote, because `main` defines them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vocabulary {
-    /// Job and step names from `main`'s `ci.yml`.
+    /// Job and step names from `main`'s `ci.yml` and `guardrails.yml`.
     pub names: BTreeSet<String>,
     /// Tidy's rule IDs.
     pub rules: BTreeSet<String>,
@@ -50,18 +61,23 @@ pub struct Vocabulary {
 }
 
 impl Vocabulary {
-    /// The vocabulary of the checkout at `root`: the names in `ci.yml` at `reference`, such as
-    /// `origin/main`, this binary's tidy rules, and the lints declared in `root`'s `lints/`.
-    /// The workflow runs main's xtask in a checkout of main, so all three are main's.
+    /// The vocabulary of the checkout at `root`: the names in the [`QUEUE_WORKFLOWS`] at
+    /// `reference`, such as `origin/main`, this binary's tidy rules, and the lints declared in
+    /// `root`'s `lints/`. The workflow runs main's xtask in a checkout of main, so all three
+    /// are main's.
     ///
     /// # Errors
     ///
-    /// When git cannot show `ci.yml`, or the lint sources cannot be read.
+    /// When git cannot show a workflow, or the lint sources cannot be read.
     pub fn load(root: &Path, reference: &str) -> Result<Self, String> {
-        let object = format!("{reference}:{CI_WORKFLOW}");
-        let workflow = crate::task::claims::git(root, &["show", &object], &[], None)
-            .map_err(|error| format!("cannot read {CI_WORKFLOW} on {reference}: {error}"))?;
-        Self::from_workflow(&workflow, root)
+        let mut workflows = Vec::new();
+        for path in QUEUE_WORKFLOWS {
+            let object = format!("{reference}:{path}");
+            let workflow = crate::task::claims::git(root, &["show", &object], &[], None)
+                .map_err(|error| format!("cannot read {path} on {reference}: {error}"))?;
+            workflows.push(workflow);
+        }
+        Self::from_workflow(&workflows.join("\n"), root)
     }
 
     /// The vocabulary of the workflow text `workflow`, this binary's tidy rules, and the lints
@@ -231,13 +247,19 @@ pub fn finding(failure: &Failure, vocabulary: &Vocabulary) -> String {
         title(pull, failure.run)
     )];
     if !failure.earlier.is_empty() {
+        // Only issues about another merge group of the PR get here: `queue failed` files
+        // nothing when an open issue's run tested the same queue branch and commit, as when
+        // `ci` and `guardrails` both fail for one merge group. If both runs read the open
+        // issues before either files, neither names the other, and `cargo xtask task` keeps
+        // their fixers to one session.
         let earlier: Vec<String> =
             failure.earlier.iter().map(|number| format!("#{number}")).collect();
         pieces.push(format!(
-            " #{pull} failed in the queue before, and the issues about those failures are still \
-             open: {}. #{pull}'s description may already say `Fixes` for them. This is a new \
-             failure: keep those lines, add `Fixes #<this issue>` to #{pull}'s description, and \
-             fix the new cause.",
+            " #{pull} also failed in the queue in another merge group, and the issues about \
+             those failures are still open: {}. #{pull}'s description may already say `Fixes` \
+             for them. This run tested a merge group of its own, so its failure is new: keep \
+             those lines, add `Fixes #<this issue>` to #{pull}'s description, and fix what this \
+             run reports.",
             earlier.join(", ")
         ));
     }
@@ -254,8 +276,9 @@ pub fn finding(failure: &Failure, vocabulary: &Vocabulary) -> String {
     }
     pieces.extend(failure.jobs.iter().map(|failed| job_line(failed, &run_url, vocabulary)));
     pieces.push(
-        "\nThis issue quotes only the job and step names of `main`'s `ci.yml`, tidy's rule IDs \
-         and the dylint lints' names. Read the log for the details.\n"
+        "\nThis issue quotes only the job and step names of `main`'s `ci.yml` and \
+         `guardrails.yml`, tidy's rule IDs and the dylint lints' names. Read the log for the \
+         details.\n"
             .to_owned(),
     );
     pieces.push(proposed_fix(pull, failure.author == BOT_LOGIN));
@@ -324,12 +347,16 @@ fn proposed_fix(pull: u32, by_bot: bool) -> String {
          its file name, its `# ADR-NNNN:` title, its row in `docs/design/README.md` and every \
          reference (ADR-0000). Push to #{pull}'s branch, add `Fixes #<this issue>` to #{pull}'s \
          description, and add #{pull} to the merge queue again. If #{pull} passes as it is, \
-         re-queue it the same way. A push dismisses an approval, so if #{pull} changes protected \
-         paths, it needs the code owner again. Keep the claim: this issue closes when #{pull} \
-         merges, or when a human closes it. While #{pull} is open and says `Fixes #<this \
-         issue>`, queued or not, its fix is in flight: take no new work from this issue and \
-         push nothing to #{pull}. A claim on this issue is stale only if #{pull} has had no \
-         push since the claim and does not say `Fixes #<this issue>`.\n"
+         re-queue it the same way. If the `ratchet` job gave no verdict because its carried \
+         mutation evidence observed another rule-path diff, another rule PR changed the same \
+         files first: the rebase and push are the fix, since they make the ratchet observe \
+         #{pull} on the new base; re-running the workflow does not help. A push dismisses an \
+         approval, so if #{pull} changes protected paths, it needs the code owner again. Keep \
+         the claim: this issue closes when #{pull} merges, or when a human closes it. While \
+         #{pull} is open and says `Fixes #<this issue>`, queued or not, its fix is in flight: \
+         take no new work from this issue and push nothing to #{pull}. A claim on this issue is \
+         stale only if #{pull} has had no push since the claim and does not say `Fixes #<this \
+         issue>`.\n"
     )
 }
 
@@ -463,14 +490,19 @@ mod tests {
         assert_eq!(workflow_names(&longest).len(), 1, "the longest name is kept");
     }
 
-    // Goal: the vocabulary of this checkout has its own workflow's names, tidy's rules and the
-    // dylint lints.
+    // Goal: the vocabulary of this checkout has its own workflows' names, `ci.yml`'s and
+    // `guardrails.yml`'s, tidy's rules and the dylint lints.
     #[test]
     fn the_vocabulary_is_loaded_from_the_checkout() {
         let root = crate::workspace_root();
-        let workflow = std::fs::read_to_string(root.join(super::CI_WORKFLOW)).unwrap();
-        let vocabulary = Vocabulary::from_workflow(&workflow, &root).expect("lints are readable");
+        let texts: Vec<String> = super::QUEUE_WORKFLOWS
+            .iter()
+            .map(|path| std::fs::read_to_string(root.join(path)).unwrap())
+            .collect();
+        let vocabulary =
+            Vocabulary::from_workflow(&texts.join("\n"), &root).expect("lints are readable");
         assert!(vocabulary.names.contains("gate") && vocabulary.names.contains("just check-full"));
+        assert!(vocabulary.names.contains("ratchet"), "the required ratchet job");
         assert!(vocabulary.rules.contains("adr-number"));
         assert!(vocabulary.lints.contains("nami_recursion"));
         let error = Vocabulary::load(&root, "no-such-ref").expect_err("no such reference");
@@ -530,17 +562,18 @@ mod tests {
         }
         let alone = finding(&failure(Vec::new()), &vocabulary());
         assert!(!alone.contains("merge group also held"), "{alone}");
-        assert!(!alone.contains("failed in the queue before"), "{alone}");
+        assert!(!alone.contains("also failed in the queue"), "{alone}");
         assert!(alone.contains("No job of the run reports a failure"), "{alone}");
         assert!(Draft::parse(&alone).is_ok(), "{alone}");
         let again = Failure { earlier: [40, 44].into(), ..failure(Vec::new()) };
         let second = finding(&again, &vocabulary());
         assert!(
             second.contains(
-                " #51 failed in the queue before, and the issues about those failures are still \
-                 open: #40, #44. #51's description may already say `Fixes` for them. This is a \
-                 new failure: keep those lines, add `Fixes #<this issue>` to #51's description, \
-                 and fix the new cause."
+                " #51 also failed in the queue in another merge group, and the issues about those \
+                 failures are still open: #40, #44. #51's description may already say `Fixes` \
+                 for them. This run tested a merge group of its own, so its failure is new: keep \
+                 those lines, add `Fixes #<this issue>` to #51's description, and fix what this \
+                 run reports."
             ),
             "{second}"
         );

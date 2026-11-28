@@ -1,0 +1,184 @@
+# The ratchet's judge again after a review or a resolved thread (ADR-0022): the review check
+# reads the reviews, which arrive after the push. Only the judge runs, on exactly the commit
+# that the latest `guardrails` run for the PR head observed, so a review never starts or
+# cancels the slow `ratchet (head)` job, and never judges a newer merge than was observed.
+name: ratchet review
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_thread:
+    types: [resolved, unresolved]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Only events that can change the review gate count: the reviewer app's reviews and thread
+  # resolutions, reviews by accounts with write access (the code owners among them),
+  # dismissals, which only writers can make, and threads unresolved, which only the PR's author
+  # and writers can do. Any other account's review leaves the verdict as it is: its job gets
+  # another name, so it never becomes the latest `ratchet` check.
+  classify:
+    name: ratchet review (does this event count)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      counted: ${{ steps.classify.outputs.counted }}
+    steps:
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          AUTHOR: ${{ github.event.review.user.login }}
+          ASSOCIATION: ${{ github.event.review.author_association }}
+          SENDER: ${{ github.event.sender.login }}
+          REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
+        run: |
+          counted=false
+          if [ -n "${REVIEWER}" ]; then
+            if [ "${AUTHOR}" = "${REVIEWER}" ] || [ "${SENDER}" = "${REVIEWER}" ]; then
+              counted=true
+            fi
+          fi
+          if [ "${EVENT}" = pull_request_review ]; then
+            case "${ASSOCIATION}" in OWNER | MEMBER | COLLABORATOR) counted=true ;; esac
+            if [ "${ACTION}" = dismissed ]; then counted=true; fi
+          fi
+          # Only the PR's author and writers can unresolve a thread, and an app thread that is
+          # open again changes the gate.
+          if [ "${EVENT}" = pull_request_review_thread ] && [ "${ACTION}" = unresolved ]; then
+            counted=true
+          fi
+          echo "counted=${counted}" >> "${GITHUB_OUTPUT}"
+
+  # The same job as `ratchet` in guardrails.yml, and under the same name when the event counts,
+  # so that the latest verdict for the head commit is the one shown. Its steps never skip on a
+  # counted event: a skipped job counts as passed for a required check.
+  ratchet:
+    needs: classify
+    name: >-
+      ${{ needs.classify.outputs.counted == 'true' && 'ratchet'
+      || 'ratchet (review not counted)' }}
+    runs-on: ubuntu-latest
+    # It may wait for the observing job, which takes up to 120 minutes.
+    timeout-minutes: 180
+    # A newer counted event replaces the judging of an older one for the same pull request.
+    concurrency:
+      group: >-
+        ${{ needs.classify.outputs.counted == 'true'
+        && format('ratchet-review-{0}', github.event.pull_request.number)
+        || format('ratchet-review-ignored-{0}', github.run_id) }}
+      cancel-in-progress: true
+    # Reading the reviews is the review check; reading runs and checks finds the observations
+    # and the previous verdict.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - name: A review that cannot change the verdict
+        if: needs.classify.outputs.counted != 'true'
+        run: echo "This event cannot change the review gate." >> "${GITHUB_STEP_SUMMARY}"
+      - uses: actions/checkout@v7
+        if: needs.classify.outputs.counted == 'true'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The observations and the commit they observed
+        id: observed
+        if: needs.classify.outputs.counted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          run=$(gh run list --workflow guardrails.yml --event pull_request --commit "${PR_HEAD}" \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          commit=""
+          if [ -n "${run}" ]; then
+            gh run watch "${run}" --interval 60 > /dev/null || true
+            gh run download "${run}" --name ratchet-observations \
+              --dir "${RUNNER_TEMP}/observations" || true
+            commit=$(jq -r '.commit // empty' "${RUNNER_TEMP}/observations/observations.json" \
+              2> /dev/null || true)
+          fi
+          # The observed commit must still exist, be the merge of the PR head into a commit of
+          # the base branch, and be checked out here; otherwise the previous verdict stands.
+          judge=false
+          if [ -n "${commit}" ] && git fetch --quiet --no-tags origin "${commit}" \
+            && [ "$(git rev-parse "${commit}^2" 2> /dev/null)" = "${PR_HEAD}" ] \
+            && git merge-base --is-ancestor "${commit}^1" "origin/${BASE_REF}"; then
+            git checkout --quiet --detach "${commit}"
+            git worktree add --detach "${RUNNER_TEMP}/base" "${commit}^1"
+            judge=true
+          fi
+          echo "judge=${judge}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+      # A previous verdict is never reused: a green one would hide a request for changes or a
+      # dismissed approval that came after it. Only a base branch without a ratchet skips, as
+      # `ratchet (head)` and `ratchet` in guardrails.yml do: there is nothing to judge with.
+      - name: No verdict (the observations or the observed commit are gone)
+        if: needs.classify.outputs.counted == 'true' && steps.observed.outputs.judge != 'true'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if git rev-parse --quiet --verify "origin/${BASE_REF}^{commit}" > /dev/null \
+            && ! git show "origin/${BASE_REF}:xtask/src/ratchet/cli.rs" 2> /dev/null \
+            | grep --quiet '"judge"'; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          {
+            echo "ratchet: no verdict: the observations of this head, or the commit they observed,"
+            echo "can no longer be fetched. Re-run the \`guardrails\` workflow for this head (its"
+            echo "\`ratchet (head)\` job observes it again), or push."
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+          exit 2
+      - name: Toolchains and the pinned dylint, installed in this job
+        if: needs.classify.outputs.counted == 'true' && steps.observed.outputs.judge == 'true'
+        working-directory: ${{ runner.temp }}/base
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            exit 0
+          fi
+          rustup toolchain install
+          # Only a change below `lints/`, or to the dylint wrapper, makes the judge run dylint.
+          if ! git -C "${GITHUB_WORKSPACE}" diff --name-only "$(git rev-parse HEAD)" HEAD \
+            | grep --quiet -E '^(lints/|xtask/src/dylint\.rs$)'; then
+            exit 0
+          fi
+          (cd lints && rustup toolchain install)
+          # The versions are those of .github/actions/setup/action.yml.
+          cargo install --locked --root "${RUNNER_TEMP}/tools" cargo-dylint@6.4.0 dylint-link@6.4.0
+          echo "${RUNNER_TEMP}/tools/bin" >> "${GITHUB_PATH}"
+      - name: The base's ratchet judges the observed commit
+        if: needs.classify.outputs.counted == 'true' && steps.observed.outputs.judge == 'true'
+        working-directory: ${{ runner.temp }}/base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          COMMIT: ${{ steps.observed.outputs.commit }}
+          # The reviewer app's login, once the maintainer has set it up; it reviews in CI (#59).
+          REVIEWER: ${{ vars.NAMI_REVIEWER_LOGIN }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/base-target
+        run: |
+          if ! grep --quiet '"judge"' xtask/src/ratchet/cli.rs 2> /dev/null; then
+            echo "The base branch has no ratchet yet; skipped." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          commits="$(git rev-parse HEAD)..${COMMIT}"
+          set +e
+          cargo xtask ratchet judge --base . --head "${GITHUB_WORKSPACE}" \
+            --observations "${RUNNER_TEMP}/observations/observations.json" \
+            --pr "${PR_NUMBER}" --pr-head "${PR_HEAD}" --commits "${commits}" \
+            --reviewer "${REVIEWER}" --work "${RUNNER_TEMP}/work" > "${RUNNER_TEMP}/ratchet.md"
+          status=$?
+          cat "${RUNNER_TEMP}/ratchet.md" >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
