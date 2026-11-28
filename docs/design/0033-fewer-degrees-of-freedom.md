@@ -4,6 +4,7 @@
 - Date: 2026-11-28
 - Deciders: maintainer
 - Amends: ADR-0006, ADR-0008, ADR-0013, ADR-0019
+- Summary: One lint level for every crate, with nami-only lints in checked crate headers. One form for each choice, the other banned. Nightly rustfmt. Tests change only with a code owner's label.
 
 ## Context
 

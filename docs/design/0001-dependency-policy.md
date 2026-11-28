@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: The only runtime dependency is `libm`. Dev and tooling crates are allow-listed. Anything new needs an ADR.
 
 ## Context
 

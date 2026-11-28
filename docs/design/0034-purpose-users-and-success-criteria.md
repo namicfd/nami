@@ -4,6 +4,9 @@
 - Date: 2026-11-26
 - Deciders: maintainer
 - Amends, once accepted: ADR-0001 (pinned Athena++ and AthenaK added to its list of tools)
+- Summary: nami is a production MHD solver: safe, at least as fast as Athena++/AthenaK, flexible
+  enough to outgrow AthenaK, built swarm-first. Failure is unreadable code or significantly worse
+  performance.
 
 ## Context
 

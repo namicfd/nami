@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Public repo in a GitHub org with a merge queue. Strict ~5-minute gate with no test retries. Slow checks run after merge, with automatic revert.
 
 ## Context
 

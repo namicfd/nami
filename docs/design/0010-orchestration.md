@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Phase 1: interactive lead with worktree subagents. Phase 2: sandboxed `claude -p` bash-loop runner.
 
 ## Context
 

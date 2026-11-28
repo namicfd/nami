@@ -3,6 +3,9 @@
 - Status: Proposed
 - Date: 2026-11-26
 - Deciders: maintainer
+- Summary: Blocks of one size in a linear Morton-key octree. Fixed-capacity pools from a memory
+  budget, even under AMR. A fixed list of phases per stage, bulk-synchronous until M7. A `mesh`
+  crate that `kernels` never sees.
 
 ## Context
 

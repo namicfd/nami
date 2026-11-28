@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: References live in a code-owned crate, land before the feature, and are anchored to Toro, SymPy and PyClaw. Thresholds are human-owned.
 
 ## Context
 

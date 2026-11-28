@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0003, ADR-0006
+- Summary: Drop `arithmetic_side_effects`, `default_numeric_fallback` and the `Vec` bans; allow `missing_panics_doc`.
 
 ## Context
 

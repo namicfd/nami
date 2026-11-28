@@ -5,6 +5,9 @@
 - Deciders: maintainer
 - Amends, once accepted: ADR-0001 (a numpy-only output reader in `tools/`, a Python tool besides
   reference generation)
+- Summary: Problem binaries with `run`, `check` and `restart`; a strict TOML subset with no
+  defaults; own binary format with version metadata; restart refuses a different build. Bitwise
+  across platforms, decompositions and restarts.
 
 ## Context
 

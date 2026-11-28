@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Humans approve guardrails, references, ADRs and any change to output bits. Everything else auto-merges after the gates and an AI review.
 
 ## Context
 

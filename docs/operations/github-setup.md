@@ -226,7 +226,7 @@ ADR-0023 sets the rules for every CI job that holds an app's key. Read it before
 - every read, of the open issues and their runs too, uses the workflow's own token, with `actions`, `contents`, `issues` and `pull-requests` read. The `nami-ci` token is narrowed to `issues: write`, only creates the issue, and expires within an hour;
 - it restores no cache, and builds xtask from a clean checkout.
 
-The other job in that workflow, `adr clashes (advisory)`, comments with the workflow's own token and needs no setup.
+The other job in that workflow, `adr clashes`, comments with the workflow's own token and needs no setup. It fails a PR that must move its ADR to a free minute (ADR-20261128-1856), but it is not a required check: it does not run in the merge queue, where tidy's `adr-number` rule fails the clash instead.
 
 ### What was set up
 

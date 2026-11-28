@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-24
 - Deciders: maintainer
+- Summary: Output is bitwise identical across platforms: `libm` only, no `algebraic_*`, `mul_add` only where written explicitly, fixed-order reductions.
 
 ## Context
 

@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0007, ADR-0008, ADR-0010
+- Summary: Crates are named after their directory, with no `nami-` prefix. "Oracle" becomes "reference". Agents may edit protected paths; code-owner review gates the merge.
 
 ## Context
 

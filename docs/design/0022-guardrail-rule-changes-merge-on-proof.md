@@ -4,6 +4,7 @@
 - Date: 2026-11-27
 - Deciders: maintainer
 - Amends: ADR-0008, ADR-0009 (the ratchet job in the merge queue, point 5), ADR-0015, ADR-0020
+- Summary: Rule paths (what a tidy rule or dylint lint reports, its fixtures and UI cases) have no code owner. The base's `cargo xtask ratchet`, a required check, proves without running the PR's code in the judging job that every case the base writes down still holds, the rule tables only tighten and mutation testing misses nothing. An additive change (new rules beside the old code) then merges on that proof, unless the reviewer app has an open request for changes or thread; an edit to existing rule code also needs the reviewer app's approval of the head commit, or a code owner's.
 
 **The number.** #45 also uses 0022, for `0022-purpose-users-and-success-criteria.md`, and 0023 to 0031 after it. The maintainer decided that this ADR keeps 0022 and #45 renumbers. `main` already holds ADR-0023 and ADR-0032, so #45's new numbers must avoid those as well. The ratchet's code, CODEOWNERS, the workflows, `AGENTS.md`, the playbook, the runbook and this index refer to this ADR as ADR-0022.
 

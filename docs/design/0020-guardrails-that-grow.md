@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0008, ADR-0015
+- Summary: Agents add guardrails at the lowest rung that works, or record a learning. The PR description lists protected files and guardrail gaps. The base branch's tidy runs on every PR's tree.
 
 ## Context
 

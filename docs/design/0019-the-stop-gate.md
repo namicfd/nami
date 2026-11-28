@@ -4,6 +4,7 @@
 - Date: 2026-11-25
 - Deciders: maintainer
 - Amends: ADR-0006, ADR-0015
+- Summary: The stop hook runs `just check dylint` unless the tree equals `main` or the last green run, and blocks three times. A session-start hook fixes `PATH` and checks tool versions.
 
 ## Context
 
