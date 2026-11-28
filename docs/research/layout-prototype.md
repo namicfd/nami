@@ -1,9 +1,10 @@
 # Layout prototype: 3D Euler in three layouts, against Athena++
 
-Measured input for `docs/ARCHITECTURE.md` § 4(a) and the ADR that will amend ADR-0003. The code
-is on the branch `research/layout-prototype` (commits `2f971e5`, `f25084c` and `7d99172`, directory
-`research/layout-prototype/`, with a README that says how to reproduce every number here). That
-branch is not merged.
+Measured input for `docs/ARCHITECTURE.md` § 4(a) and the ADR that will amend ADR-0003. Neither
+is on `main` yet: both are in PR #45, and the section numbers of `ARCHITECTURE.md` cited here
+are that PR's. The code is on the branch `research/layout-prototype` (commits `2f971e5`,
+`f25084c` and `7d99172`, directory `research/layout-prototype/`, with a README that says how to
+reproduce the campaigns). That branch is not merged.
 
 ## Result in short
 
@@ -14,9 +15,14 @@ branch is not merged.
   the hybrid reach 1.1× to 1.2×.
 - **The layouts give bitwise-identical output,** and the L1 errors after one wave period match
   Athena++'s to all seven printed digits, at 64³ and at 128³.
-- **With `kernels::math::sqrt` exactly as it is today, nami fails the target:** 0.10× (SoA) and
+- **With a copy of `kernels::math::sqrt`'s body, nami fails the target:** 0.10× (SoA) and
   0.07× (AoS) of Athena++ in the main campaign, or 0.9× in a rebuild that differs only in
-  inlining. Either way it is below 1.0×, and which of the two you get is not under control. Two properties of `sqrt`, not the layout, cause this:
+  inlining. Either way it is below 1.0×, and which of the two you get is not under control. The
+  copy has today's backend and asserts, but it is marked `#[inline(always)]` and lives in the
+  benchmark's own crate; today's function has no inline attribute and sits in another crate,
+  without LTO. Inlining moves these numbers by 9× (see "Side finding"), so the speed of the real
+  cross-crate function is not measured here. Two properties of `sqrt`, not the layout, cause the
+  shortfall:
   1. `libm::sqrt` with the `arch` feature is an inline-asm legacy-SSE `sqrtsd`. In a function that
      also runs AVX code, every call pays an SSE/AVX transition penalty (about 10× here). It is
      also opaque to LLVM, so it can never vectorise.
@@ -27,8 +33,8 @@ branch is not merged.
   per-call asserts to `debug_assert!`, as ADR-0004 already prescribes for per-cell checks, gives
   1.9×.
 - **1.0× Athena++ is reachable,** with room to spare, but only after a decision on `sqrt`
-  (below). The determinism rules themselves cost 13 to 15% (the `algebraic_*` data point), which
-  matches ADR-0005's estimate of 5 to 15%.
+  (below). The determinism rules themselves cost 13% of the `algebraic_*` build's speed (the CA
+  data point: 1 − C/CA), which matches ADR-0005's estimate of 5 to 15%.
 - **Per-face checks can stay on in release builds** and keep the loop vectorised, if they are
   deferred. Each face accumulates its checks into a flag without branching, and the flag is
   asserted once per row. That costs 4 to 5% against no release checks (SoA), and gives the same
@@ -70,7 +76,8 @@ flux difference into a divergence array), then the Heun update.
   zips of rows.
 - `libm` only through a copy of `kernels::math` (`assert!` on the argument and the result), no
   `algebraic_*` and no `mul_add` (configurations A and B; C to G change exactly one rule each, as
-  listed below).
+  listed below). Unlike today's `kernels::math`, the copy marks `sqrt` and its backend call
+  `#[inline(always)]` and is in the same crate as the kernels.
 - `assert!` on lengths before every loop, `debug_assert!` per cell, and a per-block backstop on
   every stage (density and pressure positive and finite, as a branch-free `&` reduction).
 - The workspace release profile (`overflow-checks = true`) and `-C target-cpu=x86-64-v3`.
@@ -82,7 +89,7 @@ flux difference into a divergence array), then the Heun update.
 
 | Name | `math::sqrt` backend | Asserts in `math::sqrt` | Arithmetic |
 |---|---|---|---|
-| A (faithful) | `libm::sqrt` (`arch`: inline-asm `sqrtsd`) | `assert!` | IEEE |
+| A (faithful body, `#[inline(always)]`) | `libm::sqrt` (`arch`: inline-asm `sqrtsd`) | `assert!` | IEEE |
 | B | `f64::sqrt` (LLVM intrinsic, VEX `vsqrtsd`/`vsqrtpd`) | `assert!` | IEEE |
 | C | `f64::sqrt` | `debug_assert!` | IEEE |
 | D | `libm::sqrt` (`arch`) | `debug_assert!` | IEEE |
@@ -137,7 +144,8 @@ identical states (FNV-1a hash of the bits):
 - 128³: hash `b4ff5fa133dad012` (configuration C).
 
 **Against Athena++** (L1 error after one period, Athena++'s norm: volume-weighted mean per
-conserved variable, and their RMS):
+conserved variable, and Athena++'s "RMS-L1-Error", which is √Σ L1² over the variables, not a
+mean):
 
 | Size | Code | Cycles | RMS L1 | d | M1 (= M2 = M3) | E |
 |---|---|---|---|---|---|---|
@@ -229,7 +237,7 @@ campaign.)
   bodies (one HLLC per face) are far too large to unroll fully, and the row lengths (n + 1,
   n + 2 faces) are not multiples of 4 anyway.
 - **Same speed.** The per-repetition ratio is 1.00 within ±1% at the medians. The spread
-  (0.95 to 1.11) is background noise and is symmetric.
+  (0.95 to 1.11) is background noise.
 - **So const generics are not a performance argument.** Whether block sizes are fixed at compile
   time can be decided on other grounds (AMR blocks of one size, the cost of monomorphising every
   size, binary size).
@@ -243,7 +251,8 @@ campaign.)
 
 ## Vectorisation
 
-From `objdump -d` of the benchmark binaries (`tools/vecstats.py`, which counts instructions per
+From `objdump -d` of the benchmark binaries (`research/layout-prototype/tools/vecstats.py` on the
+prototype branch, which counts instructions per
 function). Each sweep function contains the reconstruction, Riemann and flux-difference loops of
 one direction, inlined. "Packed" means `ymm` (4 × f64) AVX2 arithmetic.
 
@@ -321,7 +330,7 @@ quiet (load average median 1.0, max 2.1). Figures are Mzc/s, median with min–m
 (Athena++'s SIMD build: 7.34 at 64³ and 6.78 at 128³ in this campaign. E2/C per repetition:
 0.947 and 0.951 for SoA.)
 
-Vectorisation, from `tools/vecstats.py` on the E and E2 binaries:
+Vectorisation, from `vecstats.py` on the E and E2 binaries:
 
 - The HLLC loop stays packed wherever it was packed in C. SoA's x and transverse sweeps and AoS's
   x-sweep each keep their 4 `vsqrtpd ymm`.
@@ -334,8 +343,8 @@ Vectorisation, from `tools/vecstats.py` on the E and E2 binaries:
 vectorisation, provided they are deferred: accumulated without branching inside the row loop,
 and asserted (or returned as an error) once per row. For SoA the price is 3.6 to 5% of the step,
 and nami still runs at 1.8× Athena++'s fast-math build. Returning a `Result` per row instead of
-asserting changes nothing that matters (E2 is within about 2% of E), so whether a failed row is a `Result` or
-an assertion can be decided on design grounds. The price is in the diagnostics: the
+asserting changes nothing that matters (E2 is within about 2% of E), so whether a failed row
+is a `Result` or an assertion can be decided on design grounds. The price is in the diagnostics: the
 assertion names the row, not the face. Finding the face needs a cold path that rescans the row,
 which this prototype does not have. The pattern applies to any per-face check written as a
 comparison. An `assert!` inside the per-face loop (A, B) does not vectorise and stays at 0.9×
@@ -381,21 +390,30 @@ is small (12.3 against 14.1 Mzc/s).
      per-cell checks). E fits a "checks on by default, a feature to opt out" policy, and the
      opt-out would buy about 4%. Either way, hot loops need an entry point other than today's
      `math::sqrt`;
-   - **a vectorisable, correctly rounded sqrt in `no_std` `kernels`.** Each option changes a
-     rule:
-     - `core::f64::math::sqrt` once stable;
-     - `std` for `kernels`, which weakens ADR-0003's "compiler rejects allocation";
-     - a small audited `unsafe` wrapper around `_mm256_sqrt_pd`/`vsqrtsd`, which amends ADR-0014;
-     - a libm patch that uses VEX encoding when AVX is enabled. This removes the transition
-       penalty but still does not vectorise.
+   - **a vectorisable, correctly rounded sqrt in `no_std` `kernels`.** Every option except the
+     libm patch changes ADR-0005 rule 1 ("`sqrt` comes from `libm::sqrt`"), and with it the
+     `f64::sqrt` ban in `clippy.toml`. Each also touches the rules named against it:
+     - `core::f64::math::sqrt` once stable: ADR-0005 rule 1 and the clippy ban (the ban names
+       `f64::sqrt`, so it needs a row for the `core` path too);
+     - `std` for `kernels`, which gives `f64::sqrt`: ADR-0005 rule 1, the clippy ban, and
+       ADR-0003's "compiler rejects allocation", which it weakens;
+     - a small audited `unsafe` wrapper around `_mm256_sqrt_pd`/`vsqrtsd`: ADR-0005 rule 1,
+       ADR-0014 (`unsafe` only in `alloc-guard`), and `ARCHITECTURE.md` § 5.1 ("never rewritten
+       with intrinsics"). It is also x86-only, so other targets need a second backend;
+     - a libm patch that uses VEX encoding when AVX is enabled: keeps rule 1, but adds a patched
+       dependency (ADR-0001). It removes the transition penalty but still does not vectorise.
 
      Until then, `libm::sqrt` with `arch` under `x86-64-v3` is a performance hazard that depends
-     on inlining: 0.7 or 6.6 Mzc/s for the same SoA arithmetic. Measured without the per-call
-     asserts, the libm backends reach at most 0.86 Mzc/s (D) or 3.2 Mzc/s (G).
-3. **Determinism costs about 13 to 15%** on this problem (`algebraic_*` in PLM and HLLC: 16.2
-   against 14.1 Mzc/s at 64³, 14.2 against 12.3 at 128³). That is inside ADR-0005's estimate,
-   and nami still beats Athena++'s fast-math build by 1.9× while staying bitwise deterministic.
-   No reason to revisit ADR-0005.
+     on inlining: 0.7 or 6.6 Mzc/s for the same SoA arithmetic. Without the per-call asserts,
+     libm's `arch` backend (D) ran SoA and AoS at 0.86 and 0.63 Mzc/s in the `2f971e5` build,
+     whose inlining is the slow one; D was not measured in the `f25084c` build, where A's SoA
+     already reaches 6.65 Mzc/s with the asserts kept. libm's generic backend (G) ran at
+     3.2 Mzc/s. So the data shows that libm is fragile here, not that it is capped below 1 Mzc/s.
+3. **Determinism costs about 13%** of the `algebraic_*` build's speed on this problem
+   (`algebraic_*` in PLM and HLLC: 16.2 against 14.1 Mzc/s at 64³, 14.2 against 12.3 at 128³).
+   That is inside ADR-0005's estimate, and nami still beats Athena++'s fast-math build by 1.9×
+   while staying bitwise deterministic. The ban on reordering (`algebraic_*`, implicit
+   `mul_add`) needs no revisiting; rule 1's choice of `sqrt` backend does (recommendation 2).
 
 4. **Block dimensions at compile time are optional.** Const generics change neither the code
    nor the speed (within ±1%), so § 4(c) can choose fixed or runtime block sizes for other
