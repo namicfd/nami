@@ -1,6 +1,6 @@
 # ADR-0017: CI sets `passes` through the bot's PR
 
-- Status: Proposed
+- Status: Accepted (2026-11-28, by the maintainer)
 - Date: 2026-11-26
 - Deciders: maintainer
 - Amends: ADR-0011 (point 2, "Only CI may set `passes`")
@@ -41,7 +41,8 @@ Neither the agents nor their bot may set `passes`: an agent that marks its own t
    Everything else that sets `passes` stays rejected, whoever opened it. A PR from `bot/passes`, or one that `nami-ci[bot]` opened, that sets no `passes` is rejected too: that branch and that bot exist only to set it. On `pull_request` events, `ci.yml` passes the PR's head ref, head repository and author from the event, so that check needs no network. GitHub is asked only for a merge-queue entry, and for a PR that sets `passes`. In the merge queue, each entry is judged on its own squashed commit, so a flip ahead of a PR in the group is not taken for that PR's.
 5. **The admin bypass is only for exceptions:** a flip that the workflow cannot make, such as a task whose PR came from another branch. Such a PR changes only `tasks.json` files, because the bypass also skips every other required check.
 6. **Agents never set `passes`.** They act as `nami-agent[bot]`, so `check-pr` rejects their PRs that do, and they have no bypass.
-7. **This ADR is interim.** It records the mechanism until a human accepts it or replaces it, for example with a CI identity that may push to `main`.
+7. **This is the mechanism.** The maintainer accepted it on 2026-11-28. Replacing it, for example with a CI identity that may push to `main`, takes a new ADR that supersedes this one.
+8. **The bot's PR needs no human.** `tasks.json` has no code owner, and `main`'s ruleset requires no approval for a PR that touches no owned path (`docs/operations/github-setup.md`, step 3). `check-pr` and the required checks are what let it merge.
 
 ## Enforcement
 
@@ -61,7 +62,7 @@ Known gaps, with no mechanism yet:
 
 ## Consequences
 
-- A task is marked done within one post-merge run of its merge, plus one trip through the merge queue. Its dependants then become ready with no human step.
+- A task is marked done within one post-merge run of its merge, plus one trip through the merge queue. Its dependants then become ready with no human step. That holds only with point 8: the ruleset's "approve the last push" setting asks for one approval on every PR, whatever the approval count, and it held #84, the first `passes` PR, until the maintainer approved it.
 - The acceptance tests run three times: on `main`, in the bot's PR, and in the merge queue. They are named tests, so the cost is small.
 - The bot's PR is rebuilt only when its flips change, its change no longer merges cleanly into `main`, or its required checks failed. A rebuild takes it out of the merge queue until its checks pass again; a PR whose checks failed is not in the queue anyway. Other merges to `main` leave it in place: the run only edits its description, which names the `main` that the tests passed on. If the queue drops it for another reason, the next run turns auto-merge back on.
 - A merge-queue entry, and a PR that sets `passes`, need GitHub's API in the `gate`. When GitHub cannot answer, the check fails. Other PRs need no network for it.
