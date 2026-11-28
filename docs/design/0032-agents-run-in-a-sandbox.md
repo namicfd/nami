@@ -63,11 +63,15 @@ A `PreToolUse` hook with no matcher, in the user-level `~/.claude/settings.json`
 
 The reason it gives says how to restart inside the sandbox. In any other project the hook allows the call at once. Inside the sandbox, both the settings file and the tripwire's script (in `~/.local/share/nami-sandbox/`, with the wrapper) are mounted read-only, so a session cannot edit the user-level tripwire. This holds although `~/.claude` itself is mounted read-write.
 
-The checkout, though, is read-write, and its own `.claude/settings*.json` is in it. A session could add a hook there, and that hook would run, as the maintainer, in a later session started outside the sandbox. Two things limit this:
-- the tripwire still denies that later session's tool calls, though not its hooks;
-- a committed change to `.claude/` is a protected path, so it waits for a code owner (ADR-0015).
+The checkout, though, is read-write, and anything in it may later run as the maintainer outside the sandbox. A session could edit any of these:
+- the checkout's own `.claude/settings*.json`, adding a hook;
+- `xtask/`, a `build.rs` or the `justfile`, which the committed hooks and `just` run through `cargo xtask`.
 
-An uncommitted edit in the maintainer's own checkout is caught by neither. The maintainer starts nami sessions only through the sandbox, and reviews `git status` in a checkout that agents used before using it outside.
+The edit would then run in a later session or command started outside the sandbox. Two things limit this:
+- the tripwire still denies that later session's tool calls, though not its hooks;
+- a committed change to any of these is a protected path, so it waits for a code owner (ADR-0015).
+
+An uncommitted edit in a checkout is caught by neither. The maintainer starts nami sessions and builds only through the sandbox. Before using a checkout that agents used anywhere else, the maintainer reviews `git status --ignored`. The `--ignored` matters: a globally ignored file such as `.claude/settings.local.json` would otherwise not show.
 
 ### 3. The repository does not depend on it
 
