@@ -185,6 +185,10 @@ jobs:
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1"
           CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1"
+          # What `--bare` also turned off: the pinned release stays pinned, and nothing but
+          # the model's API is called.
+          DISABLE_AUTOUPDATER: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
         run: |
           for name in ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID \
             ANTHROPIC_SERVICE_ACCOUNT_ID; do
@@ -199,13 +203,18 @@ jobs:
           oidc="${RUNNER_TEMP}/oidc"
           (umask 077 && mkdir -p "${oidc}")
           export ANTHROPIC_IDENTITY_TOKEN_FILE="${oidc}/token"
-          # The request token goes through stdin, so it never shows in the process list.
+          # The request token goes through stdin, so it never shows in the process list. Each
+          # step returns on failure itself: under `fetch || ...`, bash turns errexit off inside
+          # the function, and a failed fetch must leave the last good token in place (#98's
+          # review). Every token written is kept in `all`, for the leak check below.
           fetch() {
             printf 'Authorization: Bearer %s\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" |
               curl --silent --show-error --fail --header @- \
                 "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com" |
-              jq -re .value > "${oidc}/next"
-            mv -f "${oidc}/next" "${ANTHROPIC_IDENTITY_TOKEN_FILE}"
+              jq -re .value > "${oidc}/next" || return 1
+            [[ -s "${oidc}/next" ]] || return 1
+            cat "${oidc}/next" >> "${oidc}/all" || return 1
+            mv -f "${oidc}/next" "${ANTHROPIC_IDENTITY_TOKEN_FILE}" || return 1
           }
           fetch
           # The claims that the federation rule matches, for the log; never the token.
@@ -221,7 +230,10 @@ jobs:
           refresher=$!
           trap 'kill "${refresher}" 2> /dev/null || true; rm -rf "${oidc}"' EXIT
           status=0
-          "${RUNNER_TEMP}/claude/node_modules/.bin/claude" -p --restricted \
+          # The model's process has no use for GitHub's request token, which mints OIDC tokens
+          # for any audience: only the refresher keeps it.
+          env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+            "${RUNNER_TEMP}/claude/node_modules/.bin/claude" -p --restricted \
             --settings '{"disableAllHooks":true}' --strict-mcp-config --disable-slash-commands \
             --tools Read,Grep,Glob,Agent --permission-prompts none --no-session-persistence \
             --add-dir "${RUNNER_TEMP}/review/tree" --agents agents.json \
@@ -230,10 +242,11 @@ jobs:
             --output-format json --json-schema "$(cat schema.json)" \
             "$(cat prompt.md)" > "${RUNNER_TEMP}/review/result.json" || status=$?
           echo "Claude Code exited with ${status}; the post job reads its result."
+          kill "${refresher}" 2> /dev/null || true
           result="${RUNNER_TEMP}/review/result.json"
           leaked=false
           if grep -qF -- "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${result}"; then leaked=true; fi
-          if grep -qF -f "${ANTHROPIC_IDENTITY_TOKEN_FILE}" "${result}"; then leaked=true; fi
+          if grep -qF -f "${oidc}/all" "${result}"; then leaked=true; fi
           if [[ "${leaked}" == true ]]; then
             : > "${result}"
             echo "::error::The review's answer contains a token; nothing is uploaded."
