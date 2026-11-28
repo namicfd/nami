@@ -413,31 +413,32 @@ mod tests {
     // malformed one, names nothing.
     #[test]
     fn queue_branches_name_their_pull_request() {
-        let entry =
-            |base: &str, pull| QueueEntry { base: base.to_owned(), pull, base_sha: SHA.to_owned() };
-        assert_eq!(
-            queue_entry(&format!("gh-readonly-queue/main/pr-51-{SHA}")),
-            Some(entry("main", 51))
-        );
-        let nested = format!("gh-readonly-queue/release/1.x/pr-7-{SHA}");
-        assert_eq!(queue_entry(&nested), Some(entry("release/1.x", 7)));
-        // Real refs, from run 46132237802: the SHA is the group's base, never the PR head.
-        // #55's group sat on main at 3706935 (#55's head was 2a7af8d), and #85's, queued
-        // behind it, on #55's group commit 200bf9e.
-        let real = |pull, base_sha: &str| QueueEntry {
-            base: "main".to_owned(),
+        let entry = |base: &str, pull, base_sha: &str| QueueEntry {
+            base: base.to_owned(),
             pull,
             base_sha: base_sha.to_owned(),
         };
-        let main = "3706935606fcb8052da5d8c59450d166e62b5194";
-        let ahead = "200bf9ef7b7055db037ca0e77dbee2578bebeec7";
         assert_eq!(
-            queue_entry(&format!("gh-readonly-queue/main/pr-55-{main}")),
-            Some(real(55, main))
+            queue_entry(&format!("gh-readonly-queue/main/pr-51-{SHA}")),
+            Some(entry("main", 51, SHA))
+        );
+        let nested = format!("gh-readonly-queue/release/1.x/pr-7-{SHA}");
+        assert_eq!(queue_entry(&nested), Some(entry("release/1.x", 7, SHA)));
+        // Real refs, from runs 46132237802 and 46132239140, as a record of GitHub's format: the
+        // trailing SHA is the group's base commit, never the PR head. #55's group sat on main at
+        // 3706935 (#55's head was 2a7af8d), and #85's, queued behind it, on #55's group commit
+        // 200bf9e. The parser only splits the ref, so these cases cannot tell a base from a head;
+        // what reads the SHA as the base is the code that uses `base_sha`, and the workflow's
+        // own check that the ref ends in `merge_group.base_sha` (#88).
+        let main_base_sha = "3706935606fcb8052da5d8c59450d166e62b5194";
+        let group_ahead_sha = "200bf9ef7b7055db037ca0e77dbee2578bebeec7";
+        assert_eq!(
+            queue_entry(&format!("gh-readonly-queue/main/pr-55-{main_base_sha}")),
+            Some(entry("main", 55, main_base_sha))
         );
         assert_eq!(
-            queue_entry(&format!("gh-readonly-queue/main/pr-85-{ahead}")),
-            Some(real(85, ahead))
+            queue_entry(&format!("gh-readonly-queue/main/pr-85-{group_ahead_sha}")),
+            Some(entry("main", 85, group_ahead_sha))
         );
         for bad in [
             format!("task/pr-51-{SHA}"),
