@@ -119,7 +119,8 @@ not ready: file an issue and leave it out.
 - Under `Protected files`, list what `cargo xtask protected` prints.
 - No ADR is needed for a check of a rule that is already written down. A new constraint needs
   its paragraph in the style guide. Reversing or narrowing a decision needs an ADR with status
-  `Proposed`.
+  `Proposed`: start it with `cargo xtask adr new <slug>`, which names it after the current UTC
+  minute (ADR-20261128-1856).
 
 CI's base gate then shows the code owner what your rule finds in `main`'s tree.
 

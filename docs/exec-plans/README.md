@@ -130,7 +130,7 @@ It posts a comment in a fixed form, checks that the comment counts, and only the
 **A merge-queue failure** is the one exception to steps 2 and 3 (ADR-0021, point 6). CI files `PR #<n> failed in the merge queue (run <id>)` when PR #n failed the required checks in the queue and left it, one issue per failed run. Only #n's branch can take the fix, so:
 
 1. Claim `issue-<m>` as usual. While #n is open and its description says `Fixes #<m>`, its fix is in flight, whether #n is queued or not: `ready` leaves the issue out and `claim` refuses it. Take other work, and push nothing to #n.
-2. Check out #n's branch, not `task/issue-<m>`. Rebase it onto `main` and run `just check-full`. Two ADRs with one number are the usual cause: renumber #n's ADR, meaning its file name, its title, its row in `docs/design/README.md` and every reference (ADR-0000).
+2. Check out #n's branch, not `task/issue-<m>`. Rebase it onto `main` and run `just check-full`. Two ADRs with one ID are the usual cause: move #n's ADR to a free UTC minute, meaning its file name, its title and every reference, then run `cargo xtask adr index --write` (ADR-20261128-1856).
 3. Push to #n's branch, add `Fixes #<m>` to #n's description, and add #n to the merge queue again. If #n changes protected paths, the push dismisses its approval, and it waits for the code owner again.
 4. Keep the claim. The issue closes when #n merges, or when a human closes it.
 
