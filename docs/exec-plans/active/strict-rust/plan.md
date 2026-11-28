@@ -46,10 +46,11 @@ The tasks form one chain, inserted into the guardrails chain between `doc-exampl
 
 - **Start the lint tasks after #55 and #57 merge.** The two PRs together rewrite 33 files of
   `xtask/src`, and a tree-wide rename would conflict with all of them.
-- **The M0 plan (#49) writes most of `crates/`.** Whichever of the two plans merges second
-  orders its tasks against the other's, because the validator will report overlapping
-  `owner_paths`. The proposed order puts `rustfmt-nightly` through `lints-ident-length` before
-  `m0-scaffold`.
+- **This plan goes before the M0 plan (#49)** (maintainer, 2026-11-28). M0 writes most of
+  `crates/`, and every line it writes first is a line that a lint task has to fix. So M0's
+  `m0-scaffold` depends on `escape-hatch-bans`, the last task that switches on lints or bans.
+  The tidy rules after it fix whatever M0 has written by the time each lands. The validator
+  will report the overlapping `owner_paths` until #49 adds that dependency.
 
 | # | Task | Mechanism |
 |---|---|---|
