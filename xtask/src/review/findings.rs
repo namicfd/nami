@@ -130,8 +130,13 @@ pub fn read_result(text: &str) -> Answer {
     };
     let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("missing");
     let failed = value.get("is_error").and_then(Value::as_bool) != Some(false);
+    let terminal = value.get("terminal_reason").and_then(Value::as_str);
     let outcome = if subtype == "error_max_budget_usd" {
         Outcome::NoVerdict("the review ran over its budget".to_owned())
+    } else if failed && terminal == Some("api_error") {
+        let reason = "the review could not reach the model: an API error, or a failed sign-in \
+                      through the federation rule (the model job's log says which)";
+        Outcome::NoVerdict(reason.to_owned())
     } else if subtype != "success" || failed {
         Outcome::NoVerdict(format!("the review stopped early (`{}`)", plain(subtype)))
     } else {
@@ -395,6 +400,11 @@ mod tests {
         let odd = r#"{"subtype": "@everyone look", "is_error": true}"#;
         let Outcome::NoVerdict(reason) = read_result(odd).outcome else { panic!("no verdict") };
         assert_eq!(reason, "the review stopped early (`other`)");
+        // A failed sign-in, as Claude Code reports it: `subtype` success, `is_error` true.
+        let sign_in = r#"{"subtype": "success", "is_error": true, "terminal_reason": "api_error",
+            "result": "API Error: Token exchange failed with status 400"}"#;
+        let Outcome::NoVerdict(api) = read_result(sign_in).outcome else { panic!("no verdict") };
+        assert!(api.starts_with("the review could not reach the model"), "{api}");
         let key = result(&CLEAN.replace(r#""dropped""#, r#""@x""#));
         let Outcome::NoVerdict(field) = read_result(&key).outcome else { panic!("no verdict") };
         assert_eq!(field, "the review's answer has an unknown field `other`");
