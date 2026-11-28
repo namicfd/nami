@@ -97,7 +97,8 @@ Agents act as `nami-agent[bot]`, never as the maintainer. GitHub does not let an
    | Pull requests | read and write | Open and update PRs. |
    | Workflows | read and write | Pushes that touch `.github/workflows/` need it. Agents may change protected paths (ADR-0015). |
    | Issues | read and write | Read and answer intake issues. |
-   | Actions, Checks | read | Read CI results. |
+   | Actions | read and write | Read CI results, and re-run or dispatch a workflow run that failed for a passing reason, such as the `passes` job (granted 2026-11-28, ADR-0023). |
+   | Checks | read | Read CI results. |
    | Metadata | read | Set automatically. |
 
 4. **Where can this app be installed:** only on this account. Then **Create GitHub App**.
@@ -113,6 +114,18 @@ Agents act as `nami-agent[bot]`, never as the maintainer. GitHub does not let an
 
 6. **Install App** → the organisation → **Only select repositories** → this repository.
 7. Give the app **no** bypass in the ruleset, and do **not** make it a code owner.
+8. **Check it.** The installation's permissions must match the table above, and nothing more. On a machine with the key:
+
+   ```sh
+   # The JWT goes through stdin, as in agent-token.sh, so it never shows in the process list.
+   printf 'Authorization: Bearer %s\n' "$(xtask/agent-token.sh jwt)" |
+     curl -sf -H @- -H "Accept: application/vnd.github+json" \
+       https://api.github.com/app/installations | jq -c '.[] | {account: .account.login, permissions}'
+   # Installed on this repository only: must print ["namicfd/nami"].
+   GH_TOKEN=$(xtask/agent-token.sh) gh api installation/repositories --jq '[.repositories[].full_name]'
+   ```
+
+   On 2026-11-28 it printed `actions: write`, `checks: read`, `contents: write`, `issues: write`, `metadata: read`, `pull_requests: write` and `workflows: write`, for `namicfd`. A permission raised later takes effect only once the installation accepts it (organisation settings → GitHub Apps → the app → review the request).
 
 ### Point the script at the app
 

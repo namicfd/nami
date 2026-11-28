@@ -152,6 +152,9 @@ The authoritative list is `.github/CODEOWNERS`.
   commit and push as the bot, so use plain commands: `git push origin <branch>`. Prefix gh with
   `GH_TOKEN=$(xtask/agent-token.sh)`. If a push or token is refused, stop and ask. Never use a
   human's credentials (`docs/operations/github-setup.md`, step 6).
+- **Actions write is for re-runs only** (ADR-0023). You may re-run the latest run of a workflow
+  when its failure's cause is gone. For `passes`, dispatch it rather than re-run an old run.
+  Never delete, cancel or disable anything in Actions, and never approve a fork's run.
 - **Tasks come from `docs/exec-plans/active/<plan>/tasks.json`** (format and rules:
   `docs/exec-plans/README.md`).
   - Find work with `cargo xtask task ready`, and take it with `cargo xtask task claim <id>`. A
