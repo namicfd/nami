@@ -61,7 +61,13 @@ A `PreToolUse` hook with no matcher, in the user-level `~/.claude/settings.json`
 - the project is a checkout of `namicfd/nami`;
 - the marker is missing.
 
-The reason it gives says how to restart inside the sandbox. In any other project the hook allows the call at once. Inside the sandbox, both the settings file and the tripwire's script (in `~/.local/share/nami-sandbox/`, with the wrapper) are mounted read-only, so a session can neither remove its tripwire nor change it. This holds although `~/.claude` itself is mounted read-write.
+The reason it gives says how to restart inside the sandbox. In any other project the hook allows the call at once. Inside the sandbox, both the settings file and the tripwire's script (in `~/.local/share/nami-sandbox/`, with the wrapper) are mounted read-only, so a session cannot edit the user-level tripwire. This holds although `~/.claude` itself is mounted read-write.
+
+The checkout, though, is read-write, and its own `.claude/settings*.json` is in it. A session could add a hook there, and that hook would run, as the maintainer, in a later session started outside the sandbox. Two things limit this:
+- the tripwire still denies that later session's tool calls, though not its hooks;
+- a committed change to `.claude/` is a protected path, so it waits for a code owner (ADR-0015).
+
+An uncommitted edit in the maintainer's own checkout is caught by neither. The maintainer starts nami sessions only through the sandbox, and reviews `git status` in a checkout that agents used before using it outside.
 
 ### 3. The repository does not depend on it
 
@@ -82,26 +88,35 @@ The sandbox runs as the same uid, on a shared network.
 
 So the sandbox keeps an honest mistake, such as a heredoc run as commands or a missing `GH_TOKEN` prefix, away from the maintainer's credentials. It is not a boundary against deliberate misuse. In particular, the `nami-agent` key is in reach by design: ADR-0023 keeps it on the agents' machines, never in CI. What limits its misuse is on GitHub, not on this machine: the `main` ruleset and the merge queue (ADR-0009), and code-owner review of protected paths (ADR-0015). ADR-0023 keeps the CI apps' keys (`nami-ci`, `nami-reviewer`) in CI only, so they are out of agents' reach.
 
-### 5. Phase 2 is unchanged in shape
+### 5. Phase 2's sandbox is still open
 
-ADR-0010's phase-2 runner still needs a real boundary. That means a separate user or rootless podman, with a token broker in place of a key file in reach. This ADR does not decide which; ADR-0010 leaves that decision to the start of phase 2.
+ADR-0010 leaves phase 2's sandbox to the start of phase 2, and this ADR does not decide it either. It records what this phase taught, as input to that decision:
+- the phase-2 runner needs a real boundary, such as a separate user or rootless podman;
+- since the `nami-agent` key stays in reach here (point 4), a token broker in place of a key file in reach is worth weighing then.
+
+### 6. No agent sessions on macOS until it has a sandbox
+
+bubblewrap exists only on Linux. A macOS machine has neither the sandbox nor the tripwire, so nothing there would stop an unsandboxed nami session. Until a later ADR records an equivalent sandbox and tripwire for macOS (a separate user, or a VM), nami agent sessions run only on Linux machines with this setup. ADR-0010 assumed the maintainer's Mac.
 
 ## Enforcement
 
 - **On the maintainer's machine:** the tripwire (point 2) denies every tool call of a nami session that runs outside the sandbox.
 - **In the repository:** none. By point 3, nothing in the repository can check a setup that lives outside it.
+- **Not enforced:**
+  - point 6, no sessions on macOS, which only the maintainer's practice upholds;
+  - the edit to a checkout's own `.claude/settings*.json` described under point 2, which a code owner catches only once it is committed.
 - **Tests:** the setup was tested by hand on 2026-11-28, and the results are recorded in #78. Re-run that list after any change to the wrapper.
 
 ## Consequences
 
 - **#72's approach is not pursued.** By the maintainer's decision of 2026-11-28, PR #72 and issue #71 were closed, and #75 was closed as redundant, ahead of this ADR's acceptance. Two parts of #72 are kept:
   - the rule that agents write files with the Write tool, never with a heredoc (enforced by #74);
-  - its notes on the order in which gh looks for a token.
+  - its notes on the order in which gh looks for a token, on `~/.netrc` and on macOS. They are kept in a comment on #78, which stays readable after #78 closes. They belong in the runbook (`docs/operations/github-setup.md`, step 6) the next time a PR changes it.
 - **Worktrees live inside the checkout** (`.claude/worktrees/`). A worktree made elsewhere under `$HOME` lands on the sandbox's tmpfs and vanishes with the session.
 - **Git cannot write the common config.** For example, `git worktree add -b` cannot record an upstream, and `git push -u` cannot either. Push with an explicit remote and branch.
 - **Stale paths fail loudly.** An `xtask` binary compiled with another worktree's path in it (#30) now fails, instead of silently running that worktree's rules.
 - **The cost is small.** `just check dylint` ran in 42 s in a fresh worktree, with 105 of 107 compiles served from the shared cache.
-- **It is Linux only.** bubblewrap does not exist on macOS, which ADR-0010 assumed for the maintainer's machine. A macOS machine has neither the sandbox nor the tripwire, so nothing there would stop an unsandboxed nami session. Agent sessions in nami are therefore not run on macOS until it has an equivalent sandbox and tripwire (a separate user, or a VM), which a later ADR would record.
+- **It is Linux only,** so point 6 keeps agent sessions off macOS for now.
 
 ## Alternatives considered
 
