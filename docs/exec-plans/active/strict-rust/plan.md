@@ -13,8 +13,8 @@ session. The decisions and their reasons are in ADR-0033 (Proposed). The plan do
 
 **Who approves.** Since ADR-0022, a PR that changes only rule paths and only adds to them merges
 on the `ratchet` check's proof, without the code owner. The tidy and dylint tasks are written to
-fit that class; the rest touch the trusted core and wait for the owner (ADR-0008, ADR-0015). The
-table's last column says which. A task that turns out to be an edit says so in its PR and asks for
+fit that class wherever their rule's fixes allow; the rest touch the trusted core and wait for the
+owner (ADR-0008, ADR-0015). The table's last column says which, and why. A task that turns out to be an edit says so in its PR and asks for
 the owner's review, as the playbook says.
 
 ## Rules for every task
@@ -55,9 +55,15 @@ The tasks form one chain, inserted into the guardrails chain between `doc-exampl
   first equation-system plan writes before them is a line that a lint task has to fix. The two
   dylint gaps and the glossary cost the same whenever they land.
 - **This plan goes before the M0 plan (#49)** (maintainer, 2026-11-28). So M0's `m0-scaffold`
-  depends on `escape-hatch-bans`, the last task that switches on lints or bans. The tidy rules
-  after it fix whatever M0 has written by the time each lands. The validator reports the
-  overlapping `owner_paths` until #49 adds that dependency.
+  depends on `miri`, the last task of this chain. Tasks all along the chain own paths in
+  `crates/` (the lint fixes, `kernel-shape`, `rustdoc-gate`, `miri`), so no earlier task ends the
+  overlap. The validator reports the overlapping `owner_paths` until #49 adds that dependency.
+
+The Approval column comes from a scan of the tree on 2026-11-28 for what each rule would report.
+"Ratchet" means the task's rule fires nowhere outside the rule paths and unowned files of
+`crates/`, so its PR can be additive. A rule whose fixes reach core files is "owner", and those
+files are in its `owner_paths`. If a task finds firings that the scan missed, it fixes them, adds
+their files to the PR, and asks for the owner; it never narrows the rule.
 
 | # | Task | Mechanism | Approval |
 |---|---|---|---|
@@ -73,11 +79,11 @@ The tasks form one chain, inserted into the guardrails chain between `doc-exampl
 | 10 | `lints-ident-length` | `clippy.toml` | owner |
 | 11 | `float-minmax-ban` | `clippy.toml`, `kernels::math` | owner |
 | 12 | `escape-hatch-bans` | `clippy.toml`, tidy ban tables | owner |
-| 13 | `tidy-naming` | tidy rules | ratchet |
+| 13 | `tidy-naming` | tidy rules | owner (11 abbreviated names in `xtask/` and `lints/`) |
 | 14 | `kernel-shape` | tidy rule | ratchet |
-| 15 | `assertion-shape` | tidy rule | ratchet |
+| 15 | `assertion-shape` | tidy rule | owner (about 140 assertions in `xtask/`) |
 | 16 | `literal-and-cfg-forms` | tidy rules | ratchet |
-| 17 | `comment-and-file-forms` | tidy rules | ratchet |
+| 17 | `comment-sentence` | tidy rule | owner (2 comments in `xtask/`) |
 | 18 | `markdown-title` | tidy rule | ratchet |
 | 19 | `cross-ref` | tidy rule | owner (needs the tree as context) |
 | 20 | `repo-hygiene` | workspace rules | owner |
@@ -139,10 +145,9 @@ Tidy rule `crate-header` (ADR-0033, point 1). Every nami crate root (`crates/*/s
 order, after the crate doc comment:
 
 - `base`, `kernels`: `#![cfg_attr(not(test), no_std)]`, then the nami-only lints;
-- every other nami crate: the nami-only lints;
-- `alloc-guard`: the nami-only lints except `std_instead_of_core`, which it cannot meet because
-  it implements `GlobalAlloc` on `std::alloc::System`. Decide in the task whether that is true;
-  if `core::alloc` serves, it gets the full header.
+- every other nami crate, `alloc-guard` included: the nami-only lints. `GlobalAlloc` and
+  `Layout` come from `core::alloc`; `std::alloc::System` has no `core` counterpart, so the lint
+  does not report it.
 
 The nami-only lints are `#![warn(clippy::print_stdout, clippy::print_stderr,
 clippy::std_instead_of_core, clippy::std_instead_of_alloc)]`. `extern crate alloc` anywhere in
@@ -212,15 +217,20 @@ Out of scope: two-letter abbreviations such as `dt` and `dx`, which are equation
 
 Two tidy rules for `TIGER_STYLE.md`, Naming:
 
-- `qualifier-last`: an identifier in a nami crate does not start with a qualifier: `max_`,
-  `min_`, `num_`, `n_`, `total_`, `count_`, `first_`, `last_`. The message gives the
-  rewritten name (`wave_speed_max`).
-- `abbreviation`: an identifier segment, split at `_` and at case changes, is not one of the
-  abbreviations of `lints-ident-length`, in any crate. This reaches `src_cells` and
-  `BufWriter`-style names that `disallowed-names` cannot.
+- `qualifier-last`: a name that a nami crate declares (a binding, parameter, field, function or
+  constant) does not start with a qualifier: `max_`, `min_`, `num_`, `n_`, `total_`, `count_`,
+  `first_`, `last_`. The message gives the rewritten name (`wave_speed_max`). Test functions are
+  exempt, because their names are sentences. Today it fires once, on `count_allocation` in
+  `crates/alloc-guard/src/lib.rs`.
+- `abbreviation`: a segment of a name that the code declares, split at `_` and at case changes,
+  is not one of the abbreviations of `lints-ident-length`, in any crate. Names the code only uses
+  (`cfg`, `cfg_attr`, `BufReader`) are not its to choose, so they are exempt. Today it fires 11
+  times, in `xtask/src` (the ratchet, `task/passes.rs`, tidy's registry, assertions and
+  `rust_source.rs`), `xtask/tests/ratchet.rs` and `lints/src/recursion.rs`.
 
 Also check that a closure or `Fn` parameter is the last in its function's parameter list
-(`callbacks-last`). `retag-style-guide` tags the three rules.
+(`callbacks-last`). `retag-style-guide` tags the three rules. The fixes in `xtask/` are core
+files, so this task waits for the owner.
 
 ### float-minmax-ban
 
@@ -242,6 +252,10 @@ Out of scope: `f32`, which nami does not use; if it appears, the same bans apply
   matches only the leading path segment, so add a third declarative table that matches an
   identifier anywhere in a path or type, with the same row shape. `macro_rules!` is a new row
   in `MACRO_BANS`, allowed outside `crates/` only.
+- `Cell` is allowed in `crates/alloc-guard`, whose counter is a thread-local `Cell` (ADR-0033,
+  point 5). Nothing else in the nami crates uses these types today.
+- Add the new table to the ratchet's `TABLES` (`xtask/src/ratchet/dialect.rs`), so that the
+  ratchet proves its rows only tighten, as it does for the other ban tables.
 
 Tooling keeps `RefCell` in its test doubles; that is why the type bans are scoped.
 
@@ -251,12 +265,13 @@ Tidy rule `kernel-shape` for `crates/kernels`, checking the template of
 `crates/kernels/src/update.rs` (`TIGER_STYLE.md`, Numerical code):
 
 - a public function takes no `self`;
+- a public function asserts on each of its arguments before its first loop;
 - a function with a `&mut [f64]` parameter asserts, after its last loop, that the slice is all
-  finite (a call to `all_finite` on that parameter);
-- a public function has its assertions before its first loop.
+  finite (a call to `all_finite` on that parameter).
 
-Say in the rule's detail what a syntactic check cannot see: a helper that asserts on the
-caller's behalf is not credited.
+`update_pencil` in `crates/kernels/src/update.rs` passes all three, and the scan found no
+firing elsewhere in `kernels`. Say in the rule's detail what a syntactic check cannot see: a
+helper that asserts on the caller's behalf is not credited.
 
 ### assertion-shape
 
@@ -264,7 +279,9 @@ Tidy rule `assertion-shape`, everywhere: `assert!(a == b)` and `assert!(a != b)`
 `assert_eq!` and `assert_ne!`, which print both sides, and `assert!(a && b)` is two assertions,
 which say which part failed (`TIGER_STYLE.md`, Assertions). Comparisons of floats stay in
 `assert!`, because `float_cmp` already covers them; the rule skips an operand that is a float
-literal.
+literal. It applies to every Rust file that tidy walks, except `lints/ui/`, whose files are
+compiler test input. Today it fires about 110 times on `&&` and 34 times on `==` or `!=`, in 29
+files of `xtask/src` and `xtask/tests`, so this task waits for the owner.
 
 ### cross-ref
 
@@ -294,9 +311,17 @@ file list, so they live in tidy's core (`workspace.rs`) and wait for the owner:
 
 ### markdown-title
 
-Tidy rule `markdown-title`, in `docs.rs`: a Markdown file has exactly one H1, on its first line.
-Fixtures that are Markdown carry their `<!-- path: .. -->` line first, so the rule reads the H1
-after it.
+Tidy rule `markdown-title`, in `docs.rs`: a Markdown document has exactly one H1, on its first
+line. Lines inside fenced code blocks are not headings. Fixtures that are Markdown carry their
+`<!-- path: .. -->` line first, so the rule reads the H1 after it.
+
+It applies to the Markdown files under `docs/` and at the root, but not to:
+
+- files that start with YAML frontmatter (the agents and skills under `.claude/`);
+- GitHub templates under `.github/`;
+- `CLAUDE.md`, which only includes `AGENTS.md`.
+
+With code blocks skipped, it fires nowhere today.
 
 ### orphan-modules
 
@@ -317,21 +342,21 @@ Two tidy rules:
   `crates/kernels/src/math.rs`, the one place where platform differences may be handled
   (ADR-0005). This is rust-lang's `pal` check.
 
-### comment-and-file-forms
+### comment-sentence
 
-Two tidy rules:
+Tidy rule `comment-sentence`, in `text.rs`: a `//` comment on a line of its own, and every
+comment block, starts with a capital letter or a code span and ends with `.`, `:`, `?` or a code
+block (`TIGER_STYLE.md`, Comments). End-of-line comments are exempt, as the style guide says, and
+so are `lints/ui/` and the `// path:` line of fixtures. Today it fires on 2 comments, in
+`xtask/src/ratchet/mutants.rs` and `xtask/src/task/passes.rs`, which are core files.
 
-- `comment-sentence`: a `//` comment on a line of its own, and every comment block, starts with
-  a capital letter or a code span and ends with `.`, `:`, `?` or a code block
-  (`TIGER_STYLE.md`, Comments). End-of-line comments are exempt, as the style guide says.
-- `file-length`: a Rust source file is at most 1,000 lines, tests included. A longer file is
-  split into modules.
+Out of scope: a limit on file length. ADR-0033, point 10, says why it was left out.
 
 ### retag-style-guide
 
 One PR to the core: tag in `docs/TIGER_STYLE.md` every rule that the ratchet-merged tasks above
 now check (`crate-header`, `tidy-naming`, `kernel-shape`, `assertion-shape`,
-`literal-and-cfg-forms`, `comment-and-file-forms`, `markdown-title`, `same-type-params`,
+`literal-and-cfg-forms`, `comment-sentence`, `markdown-title`, `same-type-params`,
 `test-cheat-lints`), replacing `[review]` where the check covers the whole rule. Add a style-guide
 test that names each of these rules and requires its tag. If #77 has moved the tags into the
 registry by then, tag the rows there instead, and the PR may merge on the ratchet.
@@ -358,6 +383,9 @@ A test is identified by its crate, module path and name, so a renamed test count
 `changes-tests` label lifts the check only if a code owner added it; reuse the trust rule of
 `xtask/src/issue/trust.rs`. CI runs it on every PR as a required check, and the failure message
 lists each finding and says how to ask for the label.
+
+CI runs the base branch's `xtask` on the PR's tree, as the base gate does (ADR-0020), so that a
+PR cannot weaken the check and a test in the same change.
 
 This task creates `xtask/tests/workflows.rs`: tests that read `.github/workflows/` and check that
 a job runs a command, so that CI tasks have acceptance tests that CI can run. Its first test
@@ -389,10 +417,18 @@ crates in `crates/` and `xtask/src/tidy`, or shard it.
 ### same-type-params
 
 Dylint lint `nami_same_type_params`: a function in a nami crate with two adjacent parameters of
-the same primitive type (`f64`, `u32`, `bool`) or the same newtype is reported
-(`TIGER_STYLE.md`, Naming, "make arguments impossible to mix up"). A symmetric function such as
-`minmod(a, b)` opts out with `#[expect(nami_same_type_params, reason = "symmetric: ...")]`.
-Declare it at `Deny`, so that the PR is additive. `retag-style-guide` tags the rule.
+the same scalar type (`f64`, an integer type, `bool`) or the same newtype is reported
+(`TIGER_STYLE.md`, Naming, "make arguments impossible to mix up"). Slices are out of scope: the
+kernels take several `&[f64]` of different lengths, which their assertions check. With that
+scope, it fires nowhere today.
+
+A symmetric function such as `minmod(a, b)` opts out with a `# Symmetric` section in its doc
+comment, which says why swapping the arguments gives the same result. An `#[expect]` would use up
+the human-owned budget and need a record to cite (`expect-cites-record`).
+
+Declare it at `Deny`, so that the PR is additive. Its acceptance tests are the UI test and an
+xtask test that it is declared at `Deny`, a test that cannot pass before the lint exists.
+`retag-style-guide` tags the rule.
 
 ### test-cheat-lints
 
@@ -402,6 +438,8 @@ Two dylint lints against known ways of passing a test without doing the work:
   function that is not a test, so that code behaves differently under test;
 - `nami_constant_eq`: a hand-written `PartialEq::eq` (or `PartialOrd`) whose body returns a
   constant.
+
+Both are declared at `Deny`, and as for `same-type-params`, an xtask test checks that.
 
 ### rustdoc-gate
 

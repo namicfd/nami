@@ -260,7 +260,8 @@
         "xtask/src/tidy/rust_source.rs",
         "xtask/fixtures/tidy",
         "xtask/src/tidy/registry.rs",
-        "docs/RULES.md"
+        "docs/RULES.md",
+        "xtask/src/ratchet/dialect.rs"
       ],
       "acceptance": [
         "xtask::clippy_fixtures::every_configured_lint_fires",
@@ -281,7 +282,11 @@
         "xtask/src/tidy/rust_source.rs",
         "xtask/fixtures/tidy",
         "xtask/src/tidy/registry.rs",
-        "docs/RULES.md"
+        "docs/RULES.md",
+        "xtask/src",
+        "xtask/tests",
+        "lints/src",
+        "crates/alloc-guard/src/lib.rs"
       ],
       "acceptance": [
         "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
@@ -302,7 +307,8 @@
         "xtask/src/tidy/rust_source.rs",
         "xtask/fixtures/tidy",
         "xtask/src/tidy/registry.rs",
-        "docs/RULES.md"
+        "docs/RULES.md",
+        "crates/kernels/src"
       ],
       "acceptance": [
         "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
@@ -321,7 +327,9 @@
         "xtask/src/tidy/tokens.rs",
         "xtask/fixtures/tidy",
         "xtask/src/tidy/registry.rs",
-        "docs/RULES.md"
+        "docs/RULES.md",
+        "xtask/src",
+        "xtask/tests"
       ],
       "acceptance": [
         "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
@@ -352,8 +360,8 @@
       "passes": false
     },
     {
-      "id": "comment-and-file-forms",
-      "title": "Tidy rules: comments are sentences, and source files have at most 1,000 lines (TIGER_STYLE.md, Comments)",
+      "id": "comment-sentence",
+      "title": "Tidy rule: a comment on a line of its own is a sentence (TIGER_STYLE.md, Comments)",
       "depends_on": [
         "literal-and-cfg-forms"
       ],
@@ -361,13 +369,14 @@
         "xtask/src/tidy/text.rs",
         "xtask/fixtures/tidy",
         "xtask/src/tidy/registry.rs",
-        "docs/RULES.md"
+        "docs/RULES.md",
+        "xtask/src/ratchet/mutants.rs",
+        "xtask/src/task/passes.rs"
       ],
       "acceptance": [
         "xtask::tidy::fixtures::every_source_rule_fires_on_its_fixture",
         "xtask::tidy::fixtures::every_source_rule_passes_on_its_fixture",
-        "xtask::tidy::text::tests::comment_sentence_rule_fires",
-        "xtask::tidy::text::tests::file_length_rule_fires"
+        "xtask::tidy::text::tests::comment_sentence_rule_fires"
       ],
       "passes": false
     },
@@ -375,7 +384,7 @@
       "id": "markdown-title",
       "title": "Tidy rule: a Markdown file has exactly one H1, on its first line",
       "depends_on": [
-        "comment-and-file-forms"
+        "comment-sentence"
       ],
       "owner_paths": [
         "xtask/src/tidy/docs.rs",
@@ -480,11 +489,13 @@
         "lints/src/lib.rs",
         "lints/ui/same_type_params.rs",
         "lints/ui/same_type_params.stderr",
+        "xtask/src/tidy/lints.rs",
         "xtask/src/tidy/registry.rs",
         "docs/RULES.md"
       ],
       "acceptance": [
-        "nami_lints::ui"
+        "nami_lints::ui",
+        "xtask::tidy::lints::tests::same_type_params_is_declared_at_deny"
       ],
       "passes": false
     },
@@ -502,11 +513,13 @@
         "lints/ui/cfg_test_in_body.stderr",
         "lints/ui/constant_eq.rs",
         "lints/ui/constant_eq.stderr",
+        "xtask/src/tidy/lints.rs",
         "xtask/src/tidy/registry.rs",
         "docs/RULES.md"
       ],
       "acceptance": [
-        "nami_lints::ui"
+        "nami_lints::ui",
+        "xtask::tidy::lints::tests::test_cheat_lints_are_declared_at_deny"
       ],
       "passes": false
     },
@@ -518,6 +531,7 @@
       ],
       "owner_paths": [
         "docs/TIGER_STYLE.md",
+        "xtask/src/tidy/style_guide.rs",
         "xtask/src/tidy/registry.rs",
         "docs/RULES.md"
       ],
